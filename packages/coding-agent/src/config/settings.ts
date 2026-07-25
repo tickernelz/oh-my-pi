@@ -1104,6 +1104,7 @@ export class Settings {
 				// nested overlay preserves global/project-provider sibling values during merge.
 				for (const settingPath of [
 					"modelRoles",
+					"autocompleteMaxVisible",
 					"context.engine",
 					"context.lossless.summaryModel",
 					"gc.blobs",
