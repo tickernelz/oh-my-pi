@@ -101,6 +101,17 @@ jobs:
          - name: Install frozen dependencies
            uses: ./.github/actions/bun-install
 
+         - name: Build glibc Linux x64 native addon
+           uses: ./.github/actions/build-native
+           with:
+              hash: ${{ steps.provenance.outputs.downstream-commit }}
+              platform: linux
+              arch: x64
+              variant: baseline
+              glibc: ${{ env.GLIBC_FLOOR }}
+              skip_validation: "true"
+              save_cache: "false"
+
          - name: Run focused downstream contract gates
            run: >-
               bun test
@@ -114,16 +125,6 @@ jobs:
               bun --cwd=packages/lcm-context run check:types
               bun --cwd=packages/coding-agent run check:types
 
-         - name: Build glibc Linux x64 native addon
-           uses: ./.github/actions/build-native
-           with:
-              hash: ${{ steps.provenance.outputs.downstream-commit }}
-              platform: linux
-              arch: x64
-              variant: baseline
-              glibc: ${{ env.GLIBC_FLOOR }}
-              skip_validation: "true"
-              save_cache: "false"
 
          - name: Build only the Linux x64 release binary
            env:
