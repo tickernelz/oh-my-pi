@@ -22,6 +22,14 @@ function namedStep(job: JsonRecord, name: string): JsonRecord {
 	return record(step, name);
 }
 
+function namedStepIndex(job: JsonRecord, name: string): number {
+	const steps = job.steps;
+	if (!Array.isArray(steps)) throw new Error(`${name} job has no steps`);
+	const index = steps.findIndex(candidate => record(candidate, `${name} step`).name === name);
+	if (index < 0) throw new Error(`Missing workflow step: ${name}`);
+	return index;
+}
+
 describe("downstream release governance", () => {
 	it("defines one tag-only authenticated Linux x64 prerelease publisher", async () => {
 		const release = record(
@@ -45,6 +53,12 @@ describe("downstream release governance", () => {
 			arch: "x64",
 			variant: "baseline",
 		});
+		expect(namedStepIndex(job, "Build glibc Linux x64 native addon")).toBeLessThan(
+			namedStepIndex(job, "Run focused downstream contract gates"),
+		);
+		expect(namedStepIndex(job, "Run focused downstream contract gates")).toBeLessThan(
+			namedStepIndex(job, "Build only the Linux x64 release binary"),
+		);
 
 		const binary = namedStep(job, "Build only the Linux x64 release binary");
 		expect(record(binary.env, "binary provenance")).toMatchObject({
@@ -53,6 +67,8 @@ describe("downstream release governance", () => {
 			OMP_UPSTREAM_COMMIT: `\${{ steps.provenance.outputs.upstream-commit }}`,
 			OMP_DOWNSTREAM_COMMIT: `\${{ steps.provenance.outputs.downstream-commit }}`,
 		});
+		const versionCheck = namedStep(job, "Verify the embedded downstream version");
+		expect(String(versionCheck.run)).toContain('expected="omp/$EXPECTED_VERSION"');
 
 		const signing = namedStep(job, "Create and verify signed checksum manifest");
 		expect(record(signing.env, "signing environment").LCM_RELEASE_SIGNING_KEY).toBe(

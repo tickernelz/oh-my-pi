@@ -144,8 +144,9 @@ jobs:
               runtime_dir="$(mktemp -d)"
               trap 'rm -rf "$runtime_dir"' EXIT
               reported="$(HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "$binary" --version)"
-              if [[ "$reported" != "$EXPECTED_VERSION" ]]; then
-                echo "::error::Binary reports '$reported', expected '$EXPECTED_VERSION'" >&2
+              expected="omp/$EXPECTED_VERSION"
+              if [[ "$reported" != "$expected" ]]; then
+                echo "::error::Binary reports '$reported', expected '$expected'" >&2
                 exit 1
               fi
 
