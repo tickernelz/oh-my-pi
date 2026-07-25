@@ -53,7 +53,7 @@ describe("musl release artifacts", () => {
 		);
 	});
 
-	test("selects the musl asset when the Linux host reports musl", async () => {
+	test("rejects binary install on musl and directs the user to a source build", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-musl-install-"));
 		tempDirs.push(dir);
 		const binDir = path.join(dir, "bin");
@@ -82,8 +82,9 @@ esac
 			PI_INSTALL_DIR: installDir,
 		});
 
-		expect(result.exitCode, result.stderr).toBe(0);
-		expect(result.stdout).toContain("Downloading omp-linux-musl-x64...");
-		expect(await Bun.file(path.join(installDir, "omp")).text()).toBe("binary");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("The downstream Linux x64 release binary requires glibc");
+		expect(result.stderr).toContain("Re-run with --source");
+		expect(await Bun.file(path.join(installDir, "omp")).exists()).toBe(false);
 	});
 });

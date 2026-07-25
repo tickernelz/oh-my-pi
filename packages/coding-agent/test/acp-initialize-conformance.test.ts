@@ -221,11 +221,9 @@ describe("ACP initialize conformance", () => {
 		});
 	});
 
-	it("declares agentInfo.version that matches the published package version", async () => {
+	it("declares the downstream runtime version in agentInfo", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
-		const pkgPath = path.join(import.meta.dir, "..", "package.json");
-		const pkg = (await Bun.file(pkgPath).json()) as { version: string };
 		expect(response.agentInfo).toEqual(
 			expect.objectContaining({
 				name: "oh-my-pi",
@@ -233,7 +231,7 @@ describe("ACP initialize conformance", () => {
 				version: VERSION,
 			}),
 		);
-		expect(response.agentInfo!.version).toBe(pkg.version);
+		expect(response.agentInfo!.version).toMatch(/^\d+\.\d+\.\d+-lcm\.(?:0|[1-9]\d*)$/);
 	});
 
 	it("preserves the agentCapabilities contract clients depend on", async () => {

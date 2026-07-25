@@ -4,13 +4,16 @@
 	"name": "@oh-my-pi/pi-metaharness",
 	"version": "0.0.1",
 	"description": "Unified benchmark runners plus Harbor run storage, REST/SSE APIs, and a live web dashboard",
-	"homepage": "https://omp.sh",
+	"homepage": "https://github.com/tickernelz/oh-my-pi#readme",
 	"author": "Can Boluk",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"url": "git+https://github.com/tickernelz/oh-my-pi.git",
 		"directory": "packages/metaharness"
+	},
+	"bugs": {
+		"url": "https://github.com/tickernelz/oh-my-pi/issues"
 	},
 	"bin": {
 		"metaharness": "src/server.ts"

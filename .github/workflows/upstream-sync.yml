@@ -1,0 +1,58 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out mirror branch
+        uses: actions/checkout@v4
+        with:
+          ref: upstream-main
+          fetch-depth: 0
+
+      - name: Fast-forward mirror
+        id: mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/can1357/oh-my-pi.git
+          git fetch --prune upstream main
+          before=$(git rev-parse HEAD)
+          git merge --ff-only upstream/main
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin HEAD:upstream-main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open sync pull request
+        if: steps.mirror.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh pr list --base main --head upstream-main --state open --json number --jq 'length > 0' | grep -q true; then
+            echo "Existing upstream sync pull request updated."
+            exit 0
+          fi
+          gh pr create \
+            --base main \
+            --head upstream-main \
+            --title "chore(sync): merge upstream main" \
+            --body "Automated mirror update from \`can1357/oh-my-pi:main\`. Review and required CI remain mandatory; this workflow never auto-merges."

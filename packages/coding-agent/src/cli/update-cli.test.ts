@@ -1,28 +1,41 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { runUpdateCommand } from "./update-cli";
+import { getLatestDownstreamRelease } from "./downstream-release";
 
 type FetchInput = string | URL | Request;
 type FetchInit = RequestInit | BunFetchRequestInit;
 
-describe("runUpdateCommand fetch cancellation", () => {
+describe("downstream release metadata", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("checks release metadata with a timeout signal", async () => {
+	it("queries the downstream releases list with a timeout signal and includes prereleases", async () => {
+		let requestedUrl = "";
 		let requestSignal: AbortSignal | undefined;
-		vi.spyOn(console, "log").mockImplementation(() => {});
+		let requestHeaders: Headers | undefined;
 		const fetchStub = Object.assign(
-			async (_input: FetchInput, init?: FetchInit) => {
+			async (input: FetchInput, init?: FetchInit) => {
+				requestedUrl = String(input);
 				requestSignal = init?.signal ?? undefined;
-				return Response.json({ version: "999.0.0" });
+				requestHeaders = new Headers(init?.headers);
+				return Response.json([
+					{ tag_name: "v17.1.3-lcm.8", draft: false, prerelease: true },
+					{ tag_name: "v17.1.3", draft: false, prerelease: false },
+				]);
 			},
 			{ preconnect: globalThis.fetch.preconnect },
 		);
 		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
 
-		await runUpdateCommand({ force: false, check: true });
-
+		await expect(getLatestDownstreamRelease()).resolves.toEqual({
+			tag: "v17.1.3-lcm.8",
+			version: "17.1.3-lcm.8",
+		});
+		expect(requestedUrl).toBe("https://api.github.com/repos/tickernelz/oh-my-pi/releases?per_page=100");
 		expect(requestSignal).toBeInstanceOf(AbortSignal);
+		const userAgent = requestHeaders?.get("user-agent");
+		expect(userAgent).toMatch(/^tickernelz-oh-my-pi\/\d+\.\d+\.\d+-lcm\.\d+ /);
+		expect(userAgent).toMatch(/upstream\/(?:unknown|[0-9a-f]{40}|[0-9a-f]{64}) /i);
+		expect(userAgent).toMatch(/downstream\/(?:unknown|[0-9a-f]{40}|[0-9a-f]{64})$/i);
 	});
 });

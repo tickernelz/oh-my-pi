@@ -1,3 +1,4 @@
+Lossless Context Management, when enabled, runs background summaries with @smol by default (extra model cost), keeps its derived store at ~/.omp/agent/lcm outside your repositories, fails over to native context on errors, and lets you opt out by choosing Native in /settings [NEW]
 Tired of typing "keep going"? Just send a '.'
 You can /btw to ask a side question
 Use /tan to fork the current conversation into a background agent

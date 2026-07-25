@@ -20,6 +20,11 @@ dependencies = [
   "omp-rpc>=0.1.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tickernelz/oh-my-pi#readme"
+Repository = "https://github.com/tickernelz/oh-my-pi"
+Issues = "https://github.com/tickernelz/oh-my-pi/issues"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",

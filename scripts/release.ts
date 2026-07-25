@@ -10,6 +10,7 @@
  */
 import { $, Glob } from "bun";
 import { runChangelogFixer } from "./fix-changelogs";
+import { refuseOfficialChannelPublishing } from "./official-publishing-disabled";
 
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
@@ -195,6 +196,7 @@ function compareVersions(a: string, b: string): number {
 }
 
 async function cmdRelease(versionOrBump: string): Promise<void> {
+	refuseOfficialChannelPublishing("Upstream-style release automation");
 	console.log("\n=== Release Script ===\n");
 
 	// 1. Pre-flight checks

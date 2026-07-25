@@ -28,6 +28,19 @@ Unless user tells you exactly what to write:
 - **Never comment on GitHub** (issues, PRs, discussions).
 - **Never create issues on GitHub**.
 
+
+## Downstream Fork Policy
+
+This repository is the `tickernelz/oh-my-pi` downstream. Its `upstream-main` branch mirrors `can1357/oh-my-pi:main`; downstream `main` contains the reviewed Lossless Context Management delta.
+
+- NEVER commit downstream features to `upstream-main`, merge downstream `main` into it, or force-push it. The scheduled sync workflow may only fast-forward it to `upstream/main`; rewritten upstream history requires manual review.
+- Upstream changes enter downstream `main` through a pull request from `upstream-main`. NEVER auto-merge that pull request or bypass its required checks.
+- Keep all reusable LCM policy and storage code in `packages/lcm-context`. OMP-specific lifecycle, settings, provider, and command adapters belong in their existing owning packages; do not duplicate upstream subsystems inside the LCM package.
+- The OMP session journal remains authoritative. LCM state is a rebuildable derived projection and MUST fail open to native OMP behavior without rewriting, deleting, or taking ownership of journal entries.
+- Send feature-neutral fixes and seams upstream as small independent changes. Do not block downstream delivery on upstream acceptance; remove the downstream duplicate after it lands upstream.
+- Preserve clean rollback to official OMP: do not persist provider-only message shapes or other entries an official build cannot replay, and keep LCM state outside repositories under the OMP data root.
+- Every upstream sync must preserve the LCM crash, provider-protocol, branch-isolation, retrieval-authorization, updater-rollback, and native-failover contracts before merge.
+
 ## Code Quality
 
 - No `any` unless absolutely necessary.

@@ -25,6 +25,7 @@ import type {
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
+import historicalContextWarning from "../prompts/system/historical-context-warning.md" with { type: "text" };
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 
 export {
@@ -41,6 +42,25 @@ import { formatOutputNotice } from "../tools/output-meta";
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 export const LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE = "lsp-late-diagnostic";
 export const BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE = "background-tan-dispatch";
+
+const HISTORICAL_CONTEXT_WARNING = historicalContextWarning.trim();
+
+/** Caller-redacted, citation-bearing history that exists only in transient agent context. */
+export interface HistoricalContextMessage {
+	readonly role: "historicalContext";
+	/** Historical text already redacted and citation-annotated by the caller. */
+	readonly redactedCitedContent: string;
+	/** Message chronology only; omitted from the JSON data block. */
+	readonly timestamp: number;
+}
+
+/** Create transient historical reference data for the agent transform lane. */
+export function createHistoricalContextMessage({
+	redactedCitedContent,
+	timestamp,
+}: Omit<HistoricalContextMessage, "role">): HistoricalContextMessage {
+	return { role: "historicalContext", redactedCitedContent, timestamp };
+}
 
 /**
  * Logs provider-error turns so their actual cause is available outside the
@@ -910,6 +930,7 @@ export interface FileMentionMessage {
 declare module "@oh-my-pi/pi-agent-core" {
 	interface CustomAgentMessages {
 		bashExecution: BashExecutionMessage;
+		historicalContext: HistoricalContextMessage;
 		pythonExecution: PythonExecutionMessage;
 		custom: CustomMessage;
 		hookMessage: HookMessage;
@@ -1081,6 +1102,21 @@ registerMessageCacheInvalidator(message => {
  *  assistant turn immediately followed by its interrupted-thinking marker. */
 function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 	switch (m.role) {
+		case "historicalContext":
+			return [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: HISTORICAL_CONTEXT_WARNING },
+						{
+							type: "text",
+							text: JSON.stringify({ redactedCitedContent: m.redactedCitedContent }),
+						},
+					],
+					attribution: "agent",
+					timestamp: m.timestamp,
+				},
+			];
 		case "bashExecution":
 			if (m.excludeFromContext) {
 				return [];

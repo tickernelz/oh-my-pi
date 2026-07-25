@@ -186,6 +186,7 @@ export interface SessionMaintenanceHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	messages(): AgentMessage[];
+	losslessOwnsRequest(messages: AgentMessage[], signal?: AbortSignal): Promise<boolean>;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -967,6 +968,7 @@ export class SessionMaintenance {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+		if (await this.#host.losslessOwnsRequest([...this.#host.messages(), ...messages])) return;
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
 		// the history at all. The post-turn threshold path already promotes before
@@ -1042,6 +1044,7 @@ export class SessionMaintenance {
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+		if (await this.#host.losslessOwnsRequest(activeMessages, signal)) return;
 
 		// Promote to a larger-context sibling before compacting, mirroring the
 		// pre-prompt (runPrePromptCompactionIfNeeded) and post-turn threshold
@@ -1137,6 +1140,14 @@ export class SessionMaintenance {
 			// MUST keep the only assistant message explaining why the turn
 			// stopped. The branch entry is dropped further down, but only on the
 			// paths that actually schedule a retry/compaction.
+			const losslessOwnsRequest = await this.#host.losslessOwnsRequest(this.#host.messages());
+			if (losslessOwnsRequest) {
+				if (autoContinue) {
+					this.#host.scheduleAgentContinue({ delayMs: 100, generation });
+					return COMPACTION_CHECK_CONTINUATION;
+				}
+				return COMPACTION_CHECK_NONE;
+			}
 			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
 
 			// Try context promotion first - switch to a larger model and retry without compacting
@@ -1238,6 +1249,12 @@ export class SessionMaintenance {
 			logger.warn("response.incomplete with no recovery path (promotion + compaction both unavailable)", {
 				model: `${assistantMessage.provider}/${assistantMessage.model}`,
 			});
+			return COMPACTION_CHECK_NONE;
+		}
+
+		// A ready Lossless projection owns successful automatic-maintenance turns.
+		// Check before native pruning so the authoritative journal stays untouched.
+		if (assistantMessage.stopReason !== "error" && (await this.#host.losslessOwnsRequest(this.#host.messages()))) {
 			return COMPACTION_CHECK_NONE;
 		}
 

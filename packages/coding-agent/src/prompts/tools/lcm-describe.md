@@ -1,0 +1,1 @@
+Describe one current-session LCM source identified by an opaque citation token returned from `lcm_search`. Returns bounded redacted derived text. Artifact links are emitted only when they resolve in the current session; otherwise an opaque unavailable marker is shown.

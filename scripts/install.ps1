@@ -1,12 +1,9 @@
-# OMP Coding Agent Installer for Windows
-# Usage: irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1 | iex
+# Downstream OMP LCM Installer for Windows source builds
+# Usage: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tickernelz/oh-my-pi/main/scripts/install.ps1))) -Source
 #
-# Or with options:
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Binary
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source -Ref v3.20.1
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source -Ref main
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Binary -Ref v3.20.1
+# Native downstream release binaries currently support Linux x64/WSL only.
+# Run install.sh inside WSL for the default binary install. Windows users may
+# pass -Source (and optionally -Ref) to clone tickernelz/oh-my-pi explicitly.
 
 param(
     [switch]$Source,
@@ -16,10 +13,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "can1357/oh-my-pi"
-$Package = "@oh-my-pi/pi-coding-agent"
+$Repo = "tickernelz/oh-my-pi"
 $InstallDir = if ($env:PI_INSTALL_DIR) { $env:PI_INSTALL_DIR } else { "$env:LOCALAPPDATA\omp" }
-$BinaryName = "omp-windows-x64.exe"
 $MinimumBunVersion = "1.3.14"
 
 function Test-BunInstalled {
@@ -168,123 +163,120 @@ function Install-Bun {
     Assert-BunVersion $MinimumBunVersion
 }
 
-function Install-ViaBun {
-    Write-Host "Installing via bun..."
-    if ($Ref) {
-        if (-not (Test-GitInstalled)) {
-            throw "git is required for -Ref when installing from source"
-        }
+function Install-FromSource {
+    Write-Host "Installing cloned downstream source..."
+    if (-not (Test-GitInstalled)) {
+        throw "git is required for -Source"
+    }
 
-        $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("omp-install-" + [System.Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
-
-        try {
-            $repoUrl = "https://github.com/$Repo.git"
-            $cloneOk = $false
-            try {
-                git clone --depth 1 --branch $Ref $repoUrl $tmpRoot | Out-Null
-                $cloneOk = $true
-            } catch {
-                $cloneOk = $false
-            }
-
-            if (-not $cloneOk) {
-                git clone $repoUrl $tmpRoot | Out-Null
-                Push-Location $tmpRoot
-                try {
-                    git checkout $Ref | Out-Null
-                } finally {
-                    Pop-Location
-                }
-            }
-
-            # Pull LFS files
-            if (Test-GitLfsInstalled) {
-                Push-Location $tmpRoot
-                try {
-                    git lfs pull | Out-Null
-                } finally {
-                    Pop-Location
-                }
-            }
-
-            $packagePath = Join-Path $tmpRoot "packages\coding-agent"
-            if (-not (Test-Path $packagePath)) {
-                throw "Expected package at $packagePath"
-            }
-
-            bun install -g $packagePath
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("omp-install-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
+    try {
+        $repoUrl = "https://github.com/$Repo.git"
+        if ($Ref) {
+            & git clone --depth 1 --branch $Ref $repoUrl $tmpRoot | Out-Null
             if ($LASTEXITCODE -ne 0) {
-                throw "Failed to install from $packagePath via bun"
+                Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
+                New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
+                & git clone $repoUrl $tmpRoot | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Failed to clone $repoUrl" }
+                Push-Location $tmpRoot
+                try {
+                    & git checkout $Ref | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "Failed to check out downstream ref $Ref" }
+                } finally {
+                    Pop-Location
+                }
             }
+        } else {
+            & git clone --depth 1 $repoUrl $tmpRoot | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Failed to clone $repoUrl" }
+        }
+
+        if (Test-GitLfsInstalled) {
+            Push-Location $tmpRoot
+            try { & git lfs pull | Out-Null } finally { Pop-Location }
+        }
+
+        $packagePath = Join-Path $tmpRoot "packages\coding-agent"
+        if (-not (Test-Path $packagePath)) {
+            throw "Expected downstream coding-agent package at $packagePath"
+        }
+
+        Push-Location $tmpRoot
+        try {
+            & bun install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install downstream workspace dependencies" }
         } finally {
-            Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
+            Pop-Location
         }
-    } else {
-        bun install -g $Package
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install $Package via bun"
+        Push-Location $packagePath
+        try {
+            & bun run build
+            if ($LASTEXITCODE -ne 0) { throw "Failed to build downstream source" }
+        } finally {
+            Pop-Location
         }
+
+        $builtPath = @(
+            (Join-Path $packagePath "dist\omp.exe"),
+            (Join-Path $packagePath "dist\omp")
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $builtPath) { throw "Downstream build produced no omp executable" }
+        $reported = (& $builtPath --version 2>$null | Select-Object -Last 1)
+        if (-not $reported -or $reported -notmatch '^(?:omp/)?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-lcm\.(?:0|[1-9]\d*))$') {
+            throw "Built source did not report a downstream LCM version: $reported"
+        }
+        $expectedVersion = $Matches[1]
+
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $outPath = Join-Path $InstallDir "omp.exe"
+        $tempPath = "$outPath.new.$([System.Guid]::NewGuid().ToString('N'))"
+        $backupPath = $null
+        Copy-Item $builtPath $tempPath
+        try {
+            if (Test-Path $outPath) {
+                $backupPath = "$outPath.$([System.Guid]::NewGuid().ToString('N')).bak"
+                Move-Item $outPath $backupPath
+            }
+            Move-Item $tempPath $outPath
+            $installedVersion = (& $outPath --version 2>$null | Select-Object -Last 1)
+            if (
+                -not $installedVersion -or
+                $installedVersion -notmatch '^(?:omp/)?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-lcm\.(?:0|[1-9]\d*))$' -or
+                $Matches[1] -ne $expectedVersion
+            ) {
+                throw "Installed binary did not report expected version $expectedVersion"
+            }
+            if ($backupPath) { Remove-Item -Force $backupPath }
+        } catch {
+            if ($backupPath -and (Test-Path $backupPath)) {
+                Remove-Item -Force $outPath -ErrorAction SilentlyContinue
+                Move-Item $backupPath $outPath
+            } elseif (-not $backupPath) {
+                Remove-Item -Force $outPath -ErrorAction SilentlyContinue
+            }
+            throw "Source install failed verification; the previous executable was restored. $_"
+        } finally {
+            Remove-Item -Force $tempPath -ErrorAction SilentlyContinue
+        }
+    } finally {
+        Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
     }
 
     Write-Host ""
-    Write-Host "✓ Installed omp via bun" -ForegroundColor Green
-
+    Write-Host "Installed downstream omp from $Repo" -ForegroundColor Green
     Configure-BashShell
-
     Write-Host "Run 'omp' to get started!"
 }
 
 function Install-Binary {
-    if ($Ref) {
-        Write-Host "Fetching release $Ref..."
-        try {
-            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Ref" -TimeoutSec 60
-        } catch {
-            throw "Release tag not found: $Ref`nFor branch/commit installs, use -Source with -Ref."
-        }
-    } else {
-        Write-Host "Fetching latest release..."
-        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 60
-    }
-
-    $Latest = $Release.tag_name
-    if (-not $Latest) {
-        throw "Failed to fetch release tag"
-    }
-    Write-Host "Using version: $Latest"
-
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-
-    # Download binary
-    $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
-    Write-Host "Downloading $BinaryName..."
-    $OutPath = Join-Path $InstallDir "omp.exe"
-    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath -TimeoutSec 900
-
-    Write-Host ""
-    Write-Host "✓ Installed omp to $OutPath" -ForegroundColor Green
-
-    # Add to PATH if not already there
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $needsRestart = $UserPath -notlike "*$InstallDir*"
-    if ($needsRestart) {
-        Write-Host "Adding $InstallDir to PATH..."
-        [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
-    }
-
-    Configure-BashShell
-
-    if ($needsRestart) {
-        Write-Host "Restart your terminal, then run 'omp' to get started!"
-    } else {
-        Write-Host "Run 'omp' to get started!"
-    }
+    throw "Downstream LCM release binaries currently support Linux x64 (including WSL) only. Run the downstream install.sh inside WSL, or re-run this installer with -Source to clone tickernelz/oh-my-pi."
 }
 
 # Main logic
-if ($Ref -and -not $Source -and -not $Binary) {
-    $Source = $true
+if ($Source -and $Binary) {
+    throw "Choose exactly one of -Source or -Binary"
 }
 
 if ($Source) {
@@ -292,15 +284,7 @@ if ($Source) {
         Install-Bun
     }
     Assert-BunVersion $MinimumBunVersion
-    Install-ViaBun
-} elseif ($Binary) {
-    Install-Binary
+    Install-FromSource
 } else {
-    # Default: use bun if available, otherwise binary
-    if (Test-BunInstalled) {
-        Assert-BunVersion $MinimumBunVersion
-        Install-ViaBun
-    } else {
-        Install-Binary
-    }
+    Install-Binary
 }

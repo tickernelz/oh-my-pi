@@ -26,6 +26,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
+import { handleLcmCommand, LCM_SUBCOMMANDS } from "../lcm/slash-command";
 import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -1749,6 +1750,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			await runtime.ctx.showDebugSelector();
 			runtime.ctx.editor.setText("");
 		},
+	},
+	{
+		name: "lcm",
+		description: "Inspect and operate Lossless Context Management",
+		acpDescription: "Inspect and repair LCM derived state",
+		acpInputHint: "<subcommand>",
+		subcommands: LCM_SUBCOMMANDS,
+		allowArgs: true,
+		handle: handleLcmCommand,
 	},
 	{
 		name: "memory",

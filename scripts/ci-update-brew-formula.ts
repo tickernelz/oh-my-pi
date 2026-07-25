@@ -10,9 +10,10 @@
 //   bun scripts/ci-update-brew-formula.ts v15.10.3        # prints to stdout
 
 import { $ } from "bun";
+import { refuseOfficialChannelPublishing } from "./official-publishing-disabled";
 
-const REPO = process.env.OMP_REPO ?? "can1357/oh-my-pi";
-const HOMEPAGE = "https://omp.sh";
+const REPO = process.env.OMP_REPO ?? "tickernelz/oh-my-pi";
+const HOMEPAGE = "https://github.com/tickernelz/oh-my-pi";
 const DESC = "Coding agent with the IDE wired in";
 
 interface ReleaseAsset {
@@ -113,6 +114,7 @@ end
 }
 
 async function main(): Promise<void> {
+	refuseOfficialChannelPublishing("Homebrew publication preparation");
 	const { tag, out } = parseArgs(process.argv.slice(2));
 	const version = tag.replace(/^v/, "");
 	const assets = await fetchAssets(tag);

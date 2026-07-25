@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { resolveBuildProvenanceFromEnvironment } from "@oh-my-pi/pi-utils/version";
 import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
 
 interface BinaryTarget {
@@ -30,6 +31,7 @@ const transformersVersion = transformersManifest.version;
 // modules are supplied by the in-memory compile plugin, so neither subsystem
 // needs extra `--compile` entrypoints.
 const isDryRun = process.argv.includes("--dry-run");
+const buildProvenance = isDryRun ? undefined : resolveBuildProvenanceFromEnvironment(true);
 const targets: BinaryTarget[] = [
 	{
 		id: "darwin-arm64",
@@ -140,12 +142,14 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 		);
 		return;
 	}
+	if (!buildProvenance) throw new Error("Release build provenance is unavailable");
 
 	await compileCodingAgent({
 		repoRoot,
 		entrypoint,
 		outfile: path.join(repoRoot, target.outfile),
 		transformersVersion,
+		buildProvenance,
 		target: target.target,
 		minifyIdentifiers: true,
 		skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),

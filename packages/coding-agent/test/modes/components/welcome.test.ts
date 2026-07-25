@@ -21,6 +21,20 @@ describe("WelcomeComponent tips", () => {
 		expect(welcome.tip).toBeDefined();
 	});
 
+	it("surfaces the upfront lossless context cost, storage, failover, and opt-out notice", () => {
+		vi.spyOn(theme, "getSymbolPreset").mockReturnValue("nerd");
+		vi.spyOn(Math, "random").mockReturnValue(0);
+
+		const tip = new WelcomeComponent("1.0.0", "model", "provider").tip ?? "";
+		expect(tip).toStartWith("Lossless Context Management");
+		expect(tip).toContain("background summaries with @smol by default");
+		expect(tip).toContain("extra model cost");
+		expect(tip).toContain("derived store at ~/.omp/agent/lcm");
+		expect(tip).toContain("fails over to native context");
+		expect(tip).toContain("opt out");
+		expect(tip).toEndWith("[NEW]");
+	});
+
 	it("selects nerdfont tip with 10% probability under unicode preset", () => {
 		vi.spyOn(theme, "getSymbolPreset").mockReturnValue("unicode");
 

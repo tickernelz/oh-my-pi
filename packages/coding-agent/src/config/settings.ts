@@ -1098,10 +1098,16 @@ export class Settings {
 				}
 			}
 			const nativeProject = await this.#loadYaml(path.join(this.#cwd, ".omp", "config.yml"));
-			const nativeModelRoles = getByPath(nativeProject, ["modelRoles"]);
-			if (nativeModelRoles !== undefined) {
-				merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
+			const nativeOverrides: RawSettings = {};
+			// Keep the native project config surface intentionally narrow. Building one
+			// nested overlay preserves global/project-provider sibling values during merge.
+			for (const settingPath of ["modelRoles", "context.engine", "context.lossless.summaryModel"] as const) {
+				const value = getByPath(nativeProject, SETTING_PATH_SEGMENTS[settingPath]);
+				if (value !== undefined) {
+					setByPath(nativeOverrides, [...SETTING_PATH_SEGMENTS[settingPath]], value);
+				}
 			}
+			merged = this.#deepMerge(merged, nativeOverrides);
 			return this.#migrateRawSettings(merged);
 		} catch {
 			return {};

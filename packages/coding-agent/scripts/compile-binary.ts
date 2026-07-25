@@ -5,6 +5,12 @@ import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
 export const COMPILED_EXTERNAL_DEPENDENCIES: readonly string[] = Object.freeze(["fastembed", "onnxruntime-node"]);
 
 /** Inputs shared by local and release coding-agent binary builds. */
+export interface CodingAgentBuildProvenance {
+	readonly lcmRevision: string;
+	readonly upstreamCommit: string;
+	readonly downstreamCommit: string;
+}
+
 export interface CodingAgentCompileOptions {
 	/** Absolute repository root used for package resolution. */
 	readonly repoRoot: string;
@@ -20,6 +26,8 @@ export interface CodingAgentCompileOptions {
 	readonly minifyIdentifiers?: boolean;
 	/** Disable Bun's built-in Darwin signing before the caller re-signs. */
 	readonly skipBuiltinCodesign?: boolean;
+	/** Downstream version revision and exact commits baked into the executable. */
+	readonly buildProvenance: CodingAgentBuildProvenance;
 }
 
 /**
@@ -40,6 +48,9 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),
+				"process.env.OMP_LCM_REVISION": JSON.stringify(options.buildProvenance.lcmRevision),
+				"process.env.OMP_UPSTREAM_COMMIT": JSON.stringify(options.buildProvenance.upstreamCommit),
+				"process.env.OMP_DOWNSTREAM_COMMIT": JSON.stringify(options.buildProvenance.downstreamCommit),
 			},
 			minify: {
 				identifiers: options.minifyIdentifiers ?? false,

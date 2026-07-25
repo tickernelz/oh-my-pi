@@ -2067,6 +2067,31 @@ export const SETTINGS_SCHEMA = {
 	// Context
 	// ────────────────────────────────────────────────────────────────────────
 
+	"context.engine": {
+		type: "enum",
+		values: ["native", "lossless"] as const,
+		default: "native",
+		ui: {
+			tab: "context",
+			group: "General",
+			label: "Context Engine",
+			description:
+				"Context management engine selected when a session starts or reloads; changing it requires a session reload",
+		},
+	},
+
+	"context.lossless.summaryModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "context",
+			group: "General",
+			label: "Lossless Summary Model",
+			description: "Model selector for background lossless summaries; leave empty to use @smol",
+			condition: "losslessContextActive",
+		},
+	},
+
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",

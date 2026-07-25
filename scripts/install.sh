@@ -1,164 +1,141 @@
 #!/bin/sh
 set -e
 
-# OMP Coding Agent Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.sh | sh
+# Downstream OMP LCM installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/tickernelz/oh-my-pi/main/scripts/install.sh | sh
 #
 # Options:
-#   --source       Install via bun (installs bun if needed)
-#   --binary       Always install prebuilt binary
-#   --ref <ref>    Install specific tag/commit/branch
+#   --binary       Install the downstream Linux x64 release binary (default)
+#   --source       Clone tickernelz/oh-my-pi, build its workspace binary, and install it
+#   --ref <ref>    Release tag for binary mode, or tag/commit/branch with --source
 #   -r <ref>       Shorthand for --ref
 
-REPO="can1357/oh-my-pi"
-PACKAGE="@oh-my-pi/pi-coding-agent"
+REPO="tickernelz/oh-my-pi"
 INSTALL_DIR="${PI_INSTALL_DIR:-$HOME/.local/bin}"
 MIN_BUN_VERSION="1.3.14"
-
-# Parse arguments
-MODE=""
+MODE="binary"
 REF=""
+MODE_SET=""
+TMP_DIR=""
+TEMP_BINARY=""
+VERIFY_DIR=""
+INSTALL_TARGET=""
+INSTALL_BACKUP=""
+INSTALL_VERIFIED=""
+
+restore_previous_binary() {
+    [ -z "$INSTALL_TARGET" ] || rm -f "$INSTALL_TARGET"
+    if [ -n "$INSTALL_BACKUP" ] && [ -e "$INSTALL_BACKUP" ]; then
+        mv "$INSTALL_BACKUP" "$INSTALL_TARGET"
+    fi
+    INSTALL_TARGET=""
+    INSTALL_BACKUP=""
+    INSTALL_VERIFIED=""
+}
+
+cleanup() {
+    if [ -n "$INSTALL_TARGET" ] && [ "$INSTALL_VERIFIED" != "1" ]; then
+        restore_previous_binary
+    fi
+    [ -z "$TEMP_BINARY" ] || rm -f "$TEMP_BINARY"
+    [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+    [ -z "$VERIFY_DIR" ] || rm -rf "$VERIFY_DIR"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --source)
-            MODE="source"
+        --source|--binary)
+            requested_mode=${1#--}
+            if [ -n "$MODE_SET" ] && [ "$MODE" != "$requested_mode" ]; then
+                echo "Choose exactly one of --source or --binary" >&2
+                exit 1
+            fi
+            MODE="$requested_mode"
+            MODE_SET=1
             shift
             ;;
-        --binary)
-            MODE="binary"
+        --ref|-r)
             shift
-            ;;
-        --ref)
-            shift
-            if [ -z "$1" ]; then
-                echo "Missing value for --ref"
+            if [ $# -eq 0 ] || [ -z "$1" ]; then
+                echo "Missing value for --ref" >&2
                 exit 1
             fi
             REF="$1"
             shift
             ;;
         --ref=*)
-            REF="${1#*=}"
+            REF=${1#*=}
             if [ -z "$REF" ]; then
-                echo "Missing value for --ref"
+                echo "Missing value for --ref" >&2
                 exit 1
             fi
-            shift
-            ;;
-        -r)
-            shift
-            if [ -z "$1" ]; then
-                echo "Missing value for -r"
-                exit 1
-            fi
-            REF="$1"
             shift
             ;;
         *)
-            echo "Unknown option: $1"
+            echo "Unknown option: $1" >&2
             exit 1
             ;;
     esac
 done
 
-# If a ref is provided, default to source install
-if [ -n "$REF" ] && [ -z "$MODE" ]; then
-    MODE="source"
-fi
-
-# Check if bun is available
 has_bun() {
     command -v bun >/dev/null 2>&1
 }
 
-# Normalized host architecture (x64|arm64). On macOS this uses
-# `sysctl hw.optional.arm64` so it stays correct inside a Rosetta session,
-# where `uname -m` reports the translated x86_64.
 host_arch() {
-    if [ "$(uname -s)" = "Darwin" ]; then
-        if [ "$(sysctl -in hw.optional.arm64 2>/dev/null || /usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null)" = "1" ]; then
-            echo "arm64"
-        else
-            echo "x64"
-        fi
-        return
-    fi
     case "$(uname -m)" in
-        x86_64|amd64)  echo "x64" ;;
+        x86_64|amd64) echo "x64" ;;
         arm64|aarch64) echo "arm64" ;;
-        *)             uname -m ;;
+        *) uname -m ;;
     esac
 }
 
-# Bun's own architecture (x64|arm64), or empty when it can't be determined.
 bun_arch() {
     bun -e 'process.stdout.write(process.arch)' 2>/dev/null
 }
 
-# True when Bun's architecture matches the host. If Bun's arch can't be read,
-# assume a match rather than block the install.
-bun_arch_matches_host() {
-    ba="$(bun_arch)"
-    [ -z "$ba" ] && return 0
-    [ "$ba" = "$(host_arch)" ]
-}
-
 version_ge() {
-    current="$1"
-    minimum="$2"
-
-    current_major="${current%%.*}"
-    current_rest="${current#*.}"
-    current_minor="${current_rest%%.*}"
-    current_patch="${current_rest#*.}"
-    current_patch="${current_patch%%.*}"
-
-    minimum_major="${minimum%%.*}"
-    minimum_rest="${minimum#*.}"
-    minimum_minor="${minimum_rest%%.*}"
-    minimum_patch="${minimum_rest#*.}"
-    minimum_patch="${minimum_patch%%.*}"
+    current=$1
+    minimum=$2
+    current_major=${current%%.*}
+    current_rest=${current#*.}
+    current_minor=${current_rest%%.*}
+    current_patch=${current_rest#*.}
+    current_patch=${current_patch%%.*}
+    minimum_major=${minimum%%.*}
+    minimum_rest=${minimum#*.}
+    minimum_minor=${minimum_rest%%.*}
+    minimum_patch=${minimum_rest#*.}
+    minimum_patch=${minimum_patch%%.*}
 
     if [ "$current_major" -ne "$minimum_major" ]; then
         [ "$current_major" -gt "$minimum_major" ]
-        return $?
+        return
     fi
-
     if [ "$current_minor" -ne "$minimum_minor" ]; then
         [ "$current_minor" -gt "$minimum_minor" ]
-        return $?
+        return
     fi
-
     [ "$current_patch" -ge "$minimum_patch" ]
 }
 
 require_bun_version() {
     version_raw=$(bun --version 2>/dev/null || true)
-    if [ -z "$version_raw" ]; then
-        echo "Failed to read bun version"
-        exit 1
-    fi
-
     version_clean=${version_raw%%-*}
-    if ! version_ge "$version_clean" "$MIN_BUN_VERSION"; then
-        echo "Bun ${MIN_BUN_VERSION} or newer is required. Current version: ${version_clean}"
-        echo "Upgrade Bun at https://bun.sh/docs/installation"
+    if [ -z "$version_clean" ] || ! version_ge "$version_clean" "$MIN_BUN_VERSION"; then
+        echo "Bun ${MIN_BUN_VERSION} or newer is required. Current version: ${version_clean:-unknown}" >&2
+        echo "Upgrade Bun at https://bun.sh/docs/installation" >&2
         exit 1
     fi
 }
 
-# Check if git is available
-has_git() {
-    command -v git >/dev/null 2>&1
-}
-
-# Install bun
 install_bun() {
     echo "Installing bun..."
     if command -v bash >/dev/null 2>&1; then
         curl -fsSL https://bun.sh/install | bash
     else
-        echo "bash not found; attempting install with sh..."
         curl -fsSL https://bun.sh/install | sh
     fi
     export BUN_INSTALL="$HOME/.bun"
@@ -166,147 +143,276 @@ install_bun() {
     require_bun_version
 }
 
-# Check if git-lfs is available
-has_git_lfs() {
-    command -v git-lfs >/dev/null 2>&1
-}
+install_from_source() {
+    if ! command -v git >/dev/null 2>&1; then
+        echo "git is required for --source" >&2
+        exit 1
+    fi
+    if ! has_bun; then
+        install_bun
+    fi
+    require_bun_version
+    bun_runtime_arch=$(bun_arch)
+    if [ -n "$bun_runtime_arch" ] && [ "$bun_runtime_arch" != "$(host_arch)" ]; then
+        echo "Bun reports architecture '$bun_runtime_arch' but this host is '$(host_arch)'." >&2
+        echo "Install a native Bun before building the downstream fork from source." >&2
+        exit 1
+    fi
 
-# Install via bun
-install_via_bun() {
-    echo "Installing via bun..."
+    TMP_DIR=$(mktemp -d)
+    repo_url="https://github.com/${REPO}.git"
     if [ -n "$REF" ]; then
-        if ! has_git; then
-            echo "git is required for --ref when installing from source"
-            exit 1
-        fi
-
-        TMP_DIR="$(mktemp -d)"
-        trap 'rm -rf "$TMP_DIR"' EXIT
-
-        if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$TMP_DIR" >/dev/null 2>&1; then
-            :
-        else
-            git clone "https://github.com/${REPO}.git" "$TMP_DIR"
+        if ! git clone --depth 1 --branch "$REF" "$repo_url" "$TMP_DIR" >/dev/null 2>&1; then
+            git clone "$repo_url" "$TMP_DIR"
             (cd "$TMP_DIR" && git checkout "$REF")
         fi
-
-        # Pull LFS files
-        if has_git_lfs; then
-            (cd "$TMP_DIR" && git lfs pull)
-        fi
-
-        if [ ! -d "$TMP_DIR/packages/coding-agent" ]; then
-            echo "Expected package at ${TMP_DIR}/packages/coding-agent"
-            exit 1
-        fi
-
-        bun install -g "$TMP_DIR/packages/coding-agent" || {
-            echo "Failed to install from source"
-            exit 1
-        }
     else
-        bun install -g "$PACKAGE" || {
-            echo "Failed to install $PACKAGE"
-            exit 1
-        }
+        git clone --depth 1 "$repo_url" "$TMP_DIR"
     fi
+
+    if command -v git-lfs >/dev/null 2>&1; then
+        (cd "$TMP_DIR" && git lfs pull)
+    fi
+    package_path="$TMP_DIR/packages/coding-agent"
+    if [ ! -d "$package_path" ]; then
+        echo "Expected downstream coding-agent package at $package_path" >&2
+        exit 1
+    fi
+    echo "Installing downstream workspace dependencies..."
+    (cd "$TMP_DIR" && bun install --frozen-lockfile) || {
+        echo "Failed to install the cloned downstream workspace dependencies" >&2
+        exit 1
+    }
+    echo "Building downstream omp from source..."
+    (cd "$package_path" && bun run build) || {
+        echo "Failed to build the cloned downstream source" >&2
+        exit 1
+    }
+    built_binary="$package_path/dist/omp"
+    if [ ! -x "$built_binary" ]; then
+        echo "Expected built downstream binary at $built_binary" >&2
+        exit 1
+    fi
+    source_reported=$("$built_binary" --version 2>/dev/null | tr -d '\r' | tail -n 1)
+    source_version=${source_reported#omp/}
+    if ! printf '%s\n' "$source_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-lcm\.(0|[1-9][0-9]*)$'; then
+        echo "Built source did not report a downstream LCM version: ${source_reported:-no output}" >&2
+        exit 1
+    fi
+    mkdir -p "$INSTALL_DIR"
+    TEMP_BINARY=$(mktemp "$INSTALL_DIR/.omp.new.XXXXXX")
+    cp "$built_binary" "$TEMP_BINARY"
+    chmod +x "$TEMP_BINARY"
+    install_verified_binary "$TEMP_BINARY" "$source_version"
     echo ""
-    echo "✓ Installed omp via bun"
+    echo "Installed downstream omp from ${REPO}${REF:+ at $REF}"
     echo "Run 'omp' to get started!"
 }
 
-# Install binary from GitHub releases
-install_binary() {
-    # Detect platform
-    OS="$(uname -s)"
-    ARCH="$(host_arch)"
-
-    case "$OS" in
-        Linux)  PLATFORM="linux" ;;
-        Darwin) PLATFORM="darwin" ;;
-        *)      echo "Unsupported OS: $OS"; exit 1 ;;
-    esac
-
-    case "$ARCH" in
-        x64|arm64) ;;
-        *)         echo "Unsupported architecture: $ARCH"; exit 1 ;;
-    esac
-
-    if [ "$PLATFORM" = "linux" ]; then
-        if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
-            PLATFORM="linux-musl"
-        fi
-    fi
-
-    BINARY="omp-${PLATFORM}-${ARCH}"
-    # Get release tag
-    if [ -n "$REF" ]; then
-        echo "Fetching release $REF..."
-        if RELEASE_JSON=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases/tags/${REF}"); then
-            LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-        else
-            echo "Release tag not found: $REF"
-            echo "For branch/commit installs, use --source with --ref."
-            exit 1
-        fi
-    else
-        echo "Fetching latest release..."
-        RELEASE_JSON=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases/latest")
-        LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-    fi
-
-    if [ -z "$LATEST" ]; then
-        echo "Failed to fetch release tag"
+require_binary_platform() {
+    os_name=$(uname -s)
+    arch_name=$(host_arch)
+    if [ "$os_name" != "Linux" ] || [ "$arch_name" != "x64" ]; then
+        echo "Downstream LCM release binaries currently support Linux x64 (including WSL) only." >&2
+        echo "Detected ${os_name}-${arch_name}. Use --source on a supported source-build host." >&2
         exit 1
     fi
-    echo "Using version: $LATEST"
+    if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
+        echo "The downstream Linux x64 release binary requires glibc; this host uses musl." >&2
+        echo "Re-run with --source to build for this host." >&2
+        exit 1
+    fi
+}
 
-    mkdir -p "$INSTALL_DIR"
-    # Download binary
-    BINARY_URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
-    echo "Downloading ${BINARY}..."
-    curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 30 "$BINARY_URL" -o "${INSTALL_DIR}/omp"
-    chmod +x "${INSTALL_DIR}/omp"
-    echo ""
-    echo "✓ Installed omp to ${INSTALL_DIR}/omp"
-
-    # Check if in PATH
-    case ":$PATH:" in
-        *":$INSTALL_DIR:"*) echo "Run 'omp' to get started!" ;;
-        *) echo "Add ${INSTALL_DIR} to your PATH, then run 'omp'" ;;
+require_release_verifier() {
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "Authenticated downstream binary installs require OpenSSL 3 with Ed25519 support." >&2
+        echo "Install OpenSSL 3, or use --source to build the checked-out downstream source." >&2
+        exit 1
+    fi
+    openssl_version=$(openssl version 2>/dev/null || true)
+    case "$openssl_version" in
+        OpenSSL\ 3.*) ;;
+        *)
+            echo "Authenticated downstream binary installs require OpenSSL 3; found ${openssl_version:-unknown}." >&2
+            echo "Upgrade OpenSSL, or use --source to build the checked-out downstream source." >&2
+            exit 1
+            ;;
     esac
 }
 
-# Main logic
-case "$MODE" in
-    source)
-        if ! has_bun; then
-            install_bun
-        fi
-        require_bun_version
-        if ! bun_arch_matches_host; then
-            echo "Error: bun reports architecture '$(bun_arch)' but this host is '$(host_arch)'."
-            echo "Installing from source with this bun would produce a mismatched binary"
-            echo "(e.g. x86_64 under Rosetta on Apple Silicon), causing slow startup and AVX warnings."
-            echo "Install a native bun for your architecture, or re-run without --source to fetch the prebuilt $(host_arch) binary."
+write_release_public_key() {
+    cat > "$1" <<'PUBLIC_KEY'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA1PObMDAzy1CcEElh48DM1yf3Ff1UqqmETbpbXP/iVIw=
+-----END PUBLIC KEY-----
+PUBLIC_KEY
+}
+
+read_signed_asset_hash() {
+    final_byte=$(tail -c 1 "$1" | od -An -tu1 | tr -d '[:space:]')
+    [ "$final_byte" = "10" ] || return 1
+    if LC_ALL=C grep -q '[^ -~]' "$1"; then return 1; fi
+    awk -v selected="$2" '
+        BEGIN { invalid = 0; found = 0 }
+        {
+            hash = substr($0, 1, 64)
+            separator = substr($0, 65, 2)
+            name = substr($0, 67)
+            if (length(hash) != 64 || hash !~ /^[0-9a-f]+$/ || separator != "  " ||
+                name !~ /^[A-Za-z0-9._-]+$/ || seen[name]++) {
+                invalid = 1
+            }
+            if (name == selected) {
+                found++
+                expected = hash
+            }
+        }
+        END {
+            if (invalid || found != 1) exit 1
+            print expected
+        }
+    ' "$1"
+}
+
+extract_downstream_tags() {
+    grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-lcm\.[1-9][0-9]*"' |
+        sed -E 's/.*"([^"]+)"/\1/'
+}
+
+fetch_release_tag() {
+    if [ -n "$REF" ]; then
+        echo "Fetching downstream release $REF..." >&2
+        release_json=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases/tags/${REF}") || {
+            echo "Downstream release tag not found: $REF" >&2
+            echo "For branch or commit installs, use --source --ref $REF." >&2
+            exit 1
+        }
+        latest=$(printf '%s\n' "$release_json" | extract_downstream_tags | tail -n 1)
+        if [ "$latest" != "$REF" ]; then
+            echo "Release $REF is not a downstream <upstream>-lcm.<revision> build." >&2
             exit 1
         fi
-        install_via_bun
-        ;;
-    binary)
-        install_binary
-        ;;
-    *)
-        # Default: use bun only when it matches the host architecture, otherwise
-        # fall back to the prebuilt binary so Rosetta bun can't force an x86_64 build.
-        if has_bun && bun_arch_matches_host; then
-            require_bun_version
-            install_via_bun
-        else
-            if has_bun; then
-                echo "Detected bun with architecture '$(bun_arch)' on a '$(host_arch)' host; using the prebuilt binary instead."
-            fi
-            install_binary
-        fi
-        ;;
+    else
+        echo "Fetching latest downstream LCM release..." >&2
+        release_json=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
+            echo "Failed to fetch releases from https://github.com/${REPO}" >&2
+            exit 1
+        }
+        latest=$(
+            printf '%s\n' "$release_json" | extract_downstream_tags |
+                while IFS= read -r tag; do printf '%s %s\n' "${tag#v}" "$tag"; done |
+                sort -V | tail -n 1 | cut -d ' ' -f 2
+        )
+    fi
+    if [ -z "$latest" ]; then
+        echo "No downstream LCM release tags were found in ${REPO}." >&2
+        exit 1
+    fi
+    printf '%s\n' "$latest"
+}
+
+verify_binary_version() {
+    candidate=$1
+    expected=$2
+    reported=$("$candidate" --version 2>/dev/null | tr -d '\r' | tail -n 1) || return 1
+    case "$reported" in
+        "$expected"|"omp/$expected") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_verified_binary() {
+    candidate=$1
+    expected=$2
+    if ! verify_binary_version "$candidate" "$expected"; then
+        echo "Candidate binary did not report expected downstream version $expected; existing installation was not changed." >&2
+        exit 1
+    fi
+
+    INSTALL_TARGET="$INSTALL_DIR/omp"
+    INSTALL_BACKUP=""
+    INSTALL_VERIFIED=""
+    if [ -e "$INSTALL_TARGET" ] || [ -L "$INSTALL_TARGET" ]; then
+        INSTALL_BACKUP="$INSTALL_TARGET.$(date +%s).$$.bak"
+        mv "$INSTALL_TARGET" "$INSTALL_BACKUP"
+    fi
+    if ! mv "$candidate" "$INSTALL_TARGET"; then
+        restore_previous_binary
+        echo "Could not atomically install the downstream binary; the previous installation was restored." >&2
+        exit 1
+    fi
+    TEMP_BINARY=""
+    if ! verify_binary_version "$INSTALL_TARGET" "$expected"; then
+        restore_previous_binary
+        echo "Installed binary failed verification; the previous installation was restored." >&2
+        exit 1
+    fi
+    INSTALL_VERIFIED=1
+    [ -z "$INSTALL_BACKUP" ] || rm -f "$INSTALL_BACKUP"
+    INSTALL_TARGET=""
+    INSTALL_BACKUP=""
+}
+
+install_binary() {
+    require_binary_platform
+    require_release_verifier
+    latest=$(fetch_release_tag)
+    expected=${latest#v}
+    binary_name="omp-linux-x64"
+    release_url="https://github.com/${REPO}/releases/download/${latest}"
+    echo "Using version: $expected"
+
+    VERIFY_DIR=$(mktemp -d)
+    checksums_path="$VERIFY_DIR/SHA256SUMS"
+    signature_path="$VERIFY_DIR/SHA256SUMS.sig"
+    public_key_path="$VERIFY_DIR/downstream-release-ed25519.pem"
+    echo "Authenticating release manifest from ${REPO}..."
+    curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 1048576 \
+        "$release_url/SHA256SUMS" -o "$checksums_path"
+    curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 64 \
+        "$release_url/SHA256SUMS.sig" -o "$signature_path"
+    signature_bytes=$(wc -c < "$signature_path")
+    if [ "$signature_bytes" -ne 64 ]; then
+        echo "Invalid SHA256SUMS.sig length: expected 64 bytes, received $signature_bytes." >&2
+        exit 1
+    fi
+    write_release_public_key "$public_key_path"
+    if ! openssl pkeyutl -verify -pubin -inkey "$public_key_path" -rawin \
+        -in "$checksums_path" -sigfile "$signature_path" >/dev/null 2>&1; then
+        echo "SHA256SUMS.sig is not valid for the pinned downstream release key." >&2
+        exit 1
+    fi
+    expected_hash=$(read_signed_asset_hash "$checksums_path" "$binary_name") || {
+        echo "Signed SHA256SUMS has no unique, valid entry for $binary_name." >&2
+        exit 1
+    }
+
+    mkdir -p "$INSTALL_DIR"
+    TEMP_BINARY=$(mktemp "$INSTALL_DIR/.omp.new.XXXXXX")
+    echo "Downloading authenticated $binary_name from ${REPO}..."
+    curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 30 \
+        "$release_url/$binary_name" -o "$TEMP_BINARY"
+    actual_hash=$(openssl dgst -sha256 -r "$TEMP_BINARY" | awk '{ print $1 }')
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        echo "SHA-256 mismatch for $binary_name; existing installation was not changed." >&2
+        exit 1
+    fi
+    rm -rf "$VERIFY_DIR"
+    VERIFY_DIR=""
+    chmod +x "$TEMP_BINARY"
+    install_verified_binary "$TEMP_BINARY" "$expected"
+
+    echo ""
+    echo "Installed authenticated downstream omp to $INSTALL_DIR/omp"
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) echo "Run 'omp' to get started!" ;;
+        *) echo "Add $INSTALL_DIR to your PATH, then run 'omp'" ;;
+    esac
+}
+
+case "$MODE" in
+    source) install_from_source ;;
+    binary) install_binary ;;
+    *) echo "Unsupported install mode: $MODE" >&2; exit 1 ;;
 esac

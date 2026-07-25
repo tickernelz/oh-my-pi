@@ -36,6 +36,7 @@ import {
 	LEAF_TARGETS,
 } from "../packages/natives/scripts/gen-npm-packages.ts";
 import { fixDtsExtensions } from "./fix-dts-extensions.ts";
+import { refuseOfficialChannelPublishing } from "./official-publishing-disabled";
 
 export interface PublishPackage {
 	dir: string;
@@ -347,6 +348,7 @@ async function publishPackage(pkg: PublishPackage): Promise<void> {
 }
 
 if (import.meta.main) {
+	if (!isDryRun) refuseOfficialChannelPublishing("npm publication");
 	if (nativeLeafTag) {
 		await publishNativeLeafPackage(nativeLeafTag);
 	} else {

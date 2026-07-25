@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added strict compiled-build provenance resolution for downstream version, upstream commit, downstream commit, and LCM revision, plus canonical per-project LCM data-root helpers.
+
 ## [17.0.9] - 2026-07-23
 
 ### Breaking Changes

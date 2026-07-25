@@ -317,6 +317,43 @@ describe("Settings.reloadForCwd", () => {
 			expect(settings.get("compaction.enabled")).toBe(true);
 		});
 
+		it("merges only native context overrides over global settings", async () => {
+			await Bun.write(
+				path.join(agentDir, "config.yml"),
+				YAML.stringify(
+					{
+						context: { engine: "native", lossless: { summaryModel: "global-summary" } },
+					},
+					null,
+					2,
+				),
+			);
+			fs.mkdirSync(path.join(startDir, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(startDir, ".omp", "config.yml"),
+				YAML.stringify({ context: { engine: "lossless" }, compaction: { enabled: false } }, null, 2),
+			);
+			fs.mkdirSync(path.join(bareProject, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(bareProject, ".omp", "config.yml"),
+				YAML.stringify(
+					{ context: { lossless: { summaryModel: "project-summary" } }, compaction: { enabled: false } },
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			expect(settings.get("context.engine")).toBe("lossless");
+			expect(settings.get("context.lossless.summaryModel")).toBe("global-summary");
+			expect(settings.get("compaction.enabled")).toBe(true);
+
+			await settings.reloadForCwd(bareProject);
+			expect(settings.get("context.engine")).toBe("native");
+			expect(settings.get("context.lossless.summaryModel")).toBe("project-summary");
+			expect(settings.get("compaction.enabled")).toBe(true);
+		});
+
 		it("merges concurrent role writes under the project file lock", async () => {
 			const first = await Settings.loadIsolated({ cwd: startDir, agentDir });
 			const second = await Settings.loadIsolated({ cwd: startDir, agentDir });

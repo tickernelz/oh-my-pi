@@ -23,9 +23,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://omp.sh/"
-Repository = "https://github.com/can1357/oh-my-pi"
-Documentation = "https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md"
+Homepage = "https://github.com/tickernelz/oh-my-pi#readme"
+Repository = "https://github.com/tickernelz/oh-my-pi"
+Documentation = "https://github.com/tickernelz/oh-my-pi/blob/main/docs/rpc.md"
+Issues = "https://github.com/tickernelz/oh-my-pi/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

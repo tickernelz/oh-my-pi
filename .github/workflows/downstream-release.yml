@@ -1,0 +1,214 @@
+name: Authenticated downstream prerelease
+
+on:
+   push:
+      tags:
+         - "v*-lcm.*"
+
+concurrency:
+   group: downstream-release-${{ github.ref }}
+   cancel-in-progress: false
+
+env:
+   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+   GLIBC_FLOOR: "2.17"
+   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+permissions:
+   contents: read
+
+jobs:
+   release_linux_x64:
+      name: Build and publish authenticated Linux x64 prerelease
+      if: github.repository == 'tickernelz/oh-my-pi'
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: write
+      steps:
+         - name: Check out the tagged downstream commit
+           uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              ref: ${{ github.ref }}
+              fetch-depth: 0
+              persist-credentials: false
+
+         - name: Resolve and validate release provenance
+           id: provenance
+           shell: bash
+           env:
+              RELEASE_TAG: ${{ github.ref_name }}
+           run: |
+              set -euo pipefail
+
+              if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-lcm\.([1-9][0-9]*)$ ]]; then
+                echo "::error::Invalid downstream release tag: $RELEASE_TAG" >&2
+                exit 1
+              fi
+              upstream_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+              lcm_revision="${BASH_REMATCH[4]}"
+
+              git fetch --no-tags origin \
+                +refs/heads/main:refs/remotes/origin/main \
+                +refs/heads/upstream-main:refs/remotes/origin/upstream-main
+
+              downstream_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+              tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+              checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+              if [[ "$downstream_commit" != "$tag_commit" || "$downstream_commit" != "$checkout_commit" ]]; then
+                echo "::error::Tag, event, and checkout do not resolve to the same downstream commit" >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$downstream_commit" refs/remotes/origin/main; then
+                echo "::error::Tagged commit is not reachable from downstream main" >&2
+                exit 1
+              fi
+
+              upstream_main_tip="$(git rev-parse 'refs/remotes/origin/upstream-main^{commit}')"
+              mapfile -t upstream_bases < <(git merge-base --all "$downstream_commit" "$upstream_main_tip")
+              if [[ "${#upstream_bases[@]}" -ne 1 ]]; then
+                echo "::error::Expected one exact upstream merge base, found ${#upstream_bases[@]}" >&2
+                exit 1
+              fi
+              upstream_commit="${upstream_bases[0]}"
+
+              for manifest in \
+                packages/utils/package.json \
+                packages/natives/package.json \
+                packages/coding-agent/package.json; do
+                manifest_version="$(jq -er '.version' "$manifest")"
+                if [[ "$manifest_version" != "$upstream_version" ]]; then
+                  echo "::error::$manifest version $manifest_version does not match tag upstream version $upstream_version" >&2
+                  exit 1
+                fi
+              done
+              upstream_manifest_version="$(git show "$upstream_commit:packages/utils/package.json" | jq -er '.version')"
+              if [[ "$upstream_manifest_version" != "$upstream_version" ]]; then
+                echo "::error::Upstream base $upstream_commit reports $upstream_manifest_version, expected $upstream_version" >&2
+                exit 1
+              fi
+
+              {
+                echo "tag=$RELEASE_TAG"
+                echo "version=${RELEASE_TAG#v}"
+                echo "upstream-version=$upstream_version"
+                echo "lcm-revision=$lcm_revision"
+                echo "upstream-commit=$upstream_commit"
+                echo "upstream-main-tip=$upstream_main_tip"
+                echo "downstream-commit=$downstream_commit"
+              } >> "$GITHUB_OUTPUT"
+
+         - uses: ./.github/actions/setup-system-deps
+         - name: Install frozen dependencies
+           uses: ./.github/actions/bun-install
+
+         - name: Run focused downstream contract gates
+           run: >-
+              bun test
+              packages/lcm-context/test
+              packages/coding-agent/test/lcm-project-identity.test.ts
+              packages/coding-agent/test/update-cli.test.ts
+              packages/coding-agent/test/downstream-artifact-verification.test.ts
+
+         - name: Run downstream type gates
+           run: |
+              bun --cwd=packages/lcm-context run check:types
+              bun --cwd=packages/coding-agent run check:types
+
+         - name: Build glibc Linux x64 native addon
+           uses: ./.github/actions/build-native
+           with:
+              hash: ${{ steps.provenance.outputs.downstream-commit }}
+              platform: linux
+              arch: x64
+              variant: baseline
+              glibc: ${{ env.GLIBC_FLOOR }}
+              skip_validation: "true"
+              save_cache: "false"
+
+         - name: Build only the Linux x64 release binary
+           env:
+              RELEASE_TARGETS: linux-x64
+              OMP_LCM_REVISION: ${{ steps.provenance.outputs.lcm-revision }}
+              OMP_UPSTREAM_COMMIT: ${{ steps.provenance.outputs.upstream-commit }}
+              OMP_DOWNSTREAM_COMMIT: ${{ steps.provenance.outputs.downstream-commit }}
+           run: bun run ci:release:build-binaries
+
+         - name: Verify the embedded downstream version
+           shell: bash
+           env:
+              EXPECTED_VERSION: ${{ steps.provenance.outputs.version }}
+           run: |
+              set -euo pipefail
+              binary="packages/coding-agent/binaries/omp-linux-x64"
+              runtime_dir="$(mktemp -d)"
+              trap 'rm -rf "$runtime_dir"' EXIT
+              reported="$(HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "$binary" --version)"
+              if [[ "$reported" != "$EXPECTED_VERSION" ]]; then
+                echo "::error::Binary reports '$reported', expected '$EXPECTED_VERSION'" >&2
+                exit 1
+              fi
+
+         - name: Create and verify signed checksum manifest
+           shell: bash
+           env:
+              LCM_RELEASE_SIGNING_KEY: ${{ secrets.LCM_RELEASE_SIGNING_KEY }}
+           run: |
+              set -euo pipefail
+              if [[ -z "$LCM_RELEASE_SIGNING_KEY" ]]; then
+                echo "::error::LCM_RELEASE_SIGNING_KEY is not configured" >&2
+                exit 1
+              fi
+
+              release_dir="downstream-release"
+              asset="omp-linux-x64"
+              mkdir -p "$release_dir"
+              install -m 0755 "packages/coding-agent/binaries/$asset" "$release_dir/$asset"
+              cd "$release_dir"
+
+              hash="$(sha256sum "$asset" | cut -d ' ' -f1)"
+              if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "::error::sha256sum returned an invalid digest" >&2
+                exit 1
+              fi
+              printf '%s  %s\n' "$hash" "$asset" > SHA256SUMS
+              sha256sum --check --strict SHA256SUMS
+
+              key_file="${RUNNER_TEMP}/lcm-release-ed25519.pem"
+              umask 077
+              printf '%s' "$LCM_RELEASE_SIGNING_KEY" > "$key_file"
+              trap 'rm -f "$key_file"' EXIT
+              openssl pkey -in "$key_file" -noout >/dev/null
+              openssl pkeyutl -sign -rawin \
+                -inkey "$key_file" \
+                -in SHA256SUMS \
+                -out SHA256SUMS.sig
+              signature_size="$(wc -c < SHA256SUMS.sig)"
+              if [[ "$signature_size" -ne 64 ]]; then
+                echo "::error::Expected a raw 64-byte Ed25519 signature, received $signature_size bytes" >&2
+                exit 1
+              fi
+              openssl pkeyutl -verify -rawin -pubin \
+                -inkey ../packages/coding-agent/src/cli/downstream-release-ed25519.pem \
+                -in SHA256SUMS \
+                -sigfile SHA256SUMS.sig
+
+         - name: Create Linux x64 prerelease
+           uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+           with:
+              tag_name: ${{ steps.provenance.outputs.tag }}
+              name: OMP ${{ steps.provenance.outputs.version }}
+              prerelease: true
+              draft: false
+              make_latest: false
+              fail_on_unmatched_files: true
+              files: |
+                 downstream-release/omp-linux-x64
+                 downstream-release/SHA256SUMS
+                 downstream-release/SHA256SUMS.sig
+              body: |
+                 Authenticated downstream Linux x64 canary prerelease.
+
+                 - Upstream version: `${{ steps.provenance.outputs.upstream-version }}`
+                 - Upstream commit: `${{ steps.provenance.outputs.upstream-commit }}`
+                 - Downstream commit: `${{ steps.provenance.outputs.downstream-commit }}`
+                 - LCM revision: `${{ steps.provenance.outputs.lcm-revision }}`

@@ -25,7 +25,12 @@ import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
-import { type SessionEntry, type SessionHeader, TITLE_CHANGE_ENTRY_TYPE } from "../session/session-entries";
+import {
+	assertJournalableEntry,
+	type SessionEntry,
+	type SessionHeader,
+	TITLE_CHANGE_ENTRY_TYPE,
+} from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { OutputMeta } from "../tools/output-meta";
 import { buildSessionData, type SessionData, type SubSession } from "./html";
@@ -91,6 +96,7 @@ export interface ShareSessionResult {
 /** Build the snapshot that gets sealed and uploaded, redacted when an obfuscator is provided. */
 export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOptions): SessionData {
 	const data = buildSessionData(sm, options?.state);
+	assertShareDataJournalable(data);
 	return options?.obfuscator?.hasSecrets() ? redactSessionDataForShare(options.obfuscator, data) : data;
 }
 
@@ -516,6 +522,14 @@ interface SealedSession {
 	truncated: boolean;
 }
 
+function assertShareDataJournalable(data: SessionData): void {
+	for (const entry of data.entries) assertJournalableEntry(entry);
+	if (!data.subSessions) return;
+	for (const subSession of Object.values(data.subSessions)) {
+		for (const entry of subSession.entries) assertJournalableEntry(entry);
+	}
+}
+
 /** Seal `data`, trimming content until the sealed blob fits `maxBytes`. Exported for tests. */
 export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: number): Promise<SealedSession> {
 	let sealed = await sealSessionData(key, data);
@@ -545,6 +559,7 @@ export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: num
 
 /** `[12B IV][AES-256-GCM(gzip(JSON))]` — decrypted and gunzipped by share-loader.js. */
 async function sealSessionData(key: CryptoKey, data: SessionData): Promise<Uint8Array<ArrayBuffer>> {
+	assertShareDataJournalable(data);
 	const compressed = Bun.gzipSync(new TextEncoder().encode(JSON.stringify(data)));
 	const iv = new Uint8Array(IV_LENGTH);
 	crypto.getRandomValues(iv);

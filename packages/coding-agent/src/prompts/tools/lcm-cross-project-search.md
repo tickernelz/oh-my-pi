@@ -1,0 +1,1 @@
+Search exactly one known LCM project selected by its exact project ID or explicit absolute project path. This never searches all projects and never automatically includes another project. Results are bounded redacted derived matches with project-qualified citations.

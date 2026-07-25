@@ -4,7 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Flat SolidJS operations console bundled by Vite and served by robomp's FastAPI app.",
-  "homepage": "https://omp.sh",
+  "homepage": "https://github.com/tickernelz/oh-my-pi#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tickernelz/oh-my-pi.git",
+    "directory": "python/robomp/web"
+  },
+  "bugs": {
+    "url": "https://github.com/tickernelz/oh-my-pi/issues"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",

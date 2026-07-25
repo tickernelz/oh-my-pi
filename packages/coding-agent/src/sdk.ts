@@ -96,6 +96,7 @@ import {
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
+import { registerLcmProject } from "./lcm/project-catalog";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
 import {
 	discoverAndLoadMCPTools,
@@ -1656,6 +1657,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
+			getLcmRuntime: settings.get("context.engine") === "lossless" ? () => session : undefined,
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
@@ -2880,9 +2882,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return obfuscateMessages(obfuscator, converted);
 		};
 
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
+		const sideTransformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
 			const withContext = await extensionRunner.emitContext(messages);
 			return wrapSteeringForModel(withContext);
+		};
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal) => {
+			const projected = session ? await session.projectLcmContext(messages, signal) : messages;
+			return await sideTransformContext(projected, signal);
 		};
 		// Per-request provider-context transforms. Obfuscate FIRST so secrets are
 		// redacted from text before snapcompact rasterizes it into PNG frames, then
@@ -3062,6 +3068,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			hasEditTool: true,
 			requireYieldTool: false,
+			getLcmRuntime: undefined,
 			getSessionId: () => {
 				const id = sessionManager.getSessionId?.();
 				return id ? `${id}-advisor` : null;
@@ -3138,7 +3145,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? () => createVibeTools(toolSession)
 					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
-			transformContext,
+			sideTransformContext,
+			lcm:
+				settings.get("context.engine") === "lossless"
+					? {
+							agentDir,
+							summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
+							registerProject: async project => {
+								await registerLcmProject(project, agentDir);
+							},
+						}
+					: undefined,
 			transformProviderContext,
 			onPayload,
 			onResponse,

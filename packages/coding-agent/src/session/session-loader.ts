@@ -3,6 +3,7 @@ import { getBlobsDir, isEnoent, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import { BlobStore, isBlobRef, resolveImageData, resolveImageDataUrl } from "./blob-store";
 import { buildSessionContext } from "./session-context";
 import {
+	assertJournalableEntry,
 	type FileEntry,
 	type RawFileEntry,
 	SESSION_TITLE_SLOT_BYTES,
@@ -30,6 +31,7 @@ function splitTitleSlot(content: string): { body: string; slot: SessionTitleUpda
 }
 
 function foldTitleSlot(entries: FileEntry[], slot: SessionTitleUpdate | undefined): FileEntry[] {
+	for (const entry of entries) assertJournalableEntry(entry);
 	if (!slot || entries.length === 0) return entries;
 	const header = entries[0] as SessionHeader;
 	if (header.type !== "session" || typeof header.id !== "string") return entries;

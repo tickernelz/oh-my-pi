@@ -8,6 +8,7 @@ import {
 	shareSession,
 } from "../src/export/share";
 import { SecretObfuscator } from "../src/secrets/obfuscator";
+import { createHistoricalContextMessage } from "../src/session/messages";
 import type { SessionEntry } from "../src/session/session-entries";
 import type { SessionManager } from "../src/session/session-manager";
 
@@ -35,8 +36,8 @@ function messageEntry(id: string, parentId: string | null, text: string): Sessio
 		id,
 		parentId,
 		timestamp: "2026-06-12T00:00:00.000Z",
-		message: { role: "user", content: [{ type: "text", text }] },
-	} as unknown as SessionEntry;
+		message: { role: "user", content: [{ type: "text", text }], timestamp: 1 },
+	};
 }
 
 function sessionData(entries: SessionEntry[], leafId: string): SessionData {
@@ -83,7 +84,7 @@ describe("sealToFit", () => {
 
 	test("replaces large inline images with placeholders before trimming text", async () => {
 		const key = await makeKey();
-		const imageEntry = {
+		const imageEntry: SessionEntry = {
 			type: "message",
 			id: "img",
 			parentId: null,
@@ -94,8 +95,9 @@ describe("sealToFit", () => {
 					{ type: "text", text: "see screenshot" },
 					{ type: "image", data: randomHex(800_000), mimeType: "image/png" },
 				],
+				timestamp: 1,
 			},
-		} as unknown as SessionEntry;
+		};
 		const data = sessionData([imageEntry], "img");
 
 		const { sealed, truncated } = await sealToFit(key, data, SERVER_MAX_SEALED_BYTES);
@@ -104,6 +106,34 @@ describe("sealToFit", () => {
 		const flat = JSON.stringify(await open(key, sealed));
 		expect(flat).toContain("[image omitted from share]");
 		expect(flat).toContain("see screenshot");
+	});
+
+	test("rejects transient history in root and nested transcripts", async () => {
+		const key = await makeKey();
+		const historicalEntry: SessionEntry = {
+			type: "message",
+			id: "historical",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: createHistoricalContextMessage({ redactedCitedContent: "history", timestamp: 1 }),
+		};
+		const expected = "Historical context messages are transient and cannot be persisted";
+
+		await expect(
+			sealToFit(key, sessionData([historicalEntry], historicalEntry.id), SERVER_MAX_SEALED_BYTES),
+		).rejects.toThrow(expected);
+
+		const nested = sessionData([], "root");
+		nested.subSessions = {
+			child: {
+				agentId: "child",
+				parent: null,
+				header: null,
+				entries: [historicalEntry],
+				leafId: historicalEntry.id,
+			},
+		};
+		await expect(sealToFit(key, nested, SERVER_MAX_SEALED_BYTES)).rejects.toThrow(expected);
 	});
 });
 

@@ -137,6 +137,15 @@ describe("Settings", () => {
 			expect(getDefault("startup.showSplash")).toBe(false);
 		});
 
+		it("keeps existing configurations on native context management", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("context.engine")).toBe("native");
+			expect(settings.get("context.lossless.summaryModel")).toBeUndefined();
+			expect(getDefault("context.engine")).toBe("native");
+			expect(getEnumValues("context.engine")).toEqual(["native", "lossless"]);
+		});
+
 		it("defaults provider in-flight request limits to an empty map", async () => {
 			const settings = Settings.isolated();
 			expect(settings.get("providers.maxInFlightRequests")).toEqual({});

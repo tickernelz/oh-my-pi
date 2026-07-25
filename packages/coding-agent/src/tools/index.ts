@@ -16,6 +16,7 @@ import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { LcmRetrievalRuntime } from "../lcm/operations";
 import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import type { MnemopiSessionState } from "../mnemopi/state";
@@ -50,6 +51,7 @@ import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
 import { HubTool, isIrcEnabled } from "./hub";
 import { InspectImageTool } from "./inspect-image";
+import { LcmCrossProjectSearchTool, LcmDescribeTool, LcmRecallTool, LcmSearchTool } from "./lcm";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -63,6 +65,13 @@ import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { isMountableUnderXdev, XdevRegistry } from "./xdev";
 import { YieldTool } from "./yield";
+
+const LCM_RETRIEVAL_TOOL_NAMES: Readonly<Record<string, true>> = {
+	lcm_search: true,
+	lcm_describe: true,
+	lcm_recall: true,
+	lcm_cross_project_search: true,
+};
 
 export * from "../edit";
 export * from "../goals";
@@ -88,6 +97,7 @@ export * from "./grep";
 export * from "./hub";
 export * from "./image-gen";
 export * from "./inspect-image";
+export * from "./lcm";
 export * from "./learn";
 export * from "./manage-skill";
 export * from "./memory-edit";
@@ -235,6 +245,8 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** Current-session LCM retrieval/completion port; owning primary sessions wire this without forwarding it implicitly. */
+	getLcmRuntime?: () => LcmRetrievalRuntime | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -416,6 +428,10 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	lcm_search: LcmSearchTool.createIf,
+	lcm_describe: LcmDescribeTool.createIf,
+	lcm_recall: LcmRecallTool.createIf,
+	lcm_cross_project_search: s => new LcmCrossProjectSearchTool(s),
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
@@ -544,6 +560,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
 		if (name === "goal") return goalEnabled && goalModeActive;
+		if (LCM_RETRIEVAL_TOOL_NAMES[name]) {
+			const explicitlyRequested = requestedTools?.includes(name) === true;
+			const defaultTopLevelLossless =
+				!restrictToolNames &&
+				(session.taskDepth ?? 0) === 0 &&
+				session.settings.get("context.engine") === "lossless";
+			return explicitlyRequested || defaultTopLevelLossless;
+		}
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return session.settings.get("bash.enabled");
 		if (name === "eval") return allowEval;

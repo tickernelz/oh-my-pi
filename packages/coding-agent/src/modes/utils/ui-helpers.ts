@@ -150,6 +150,9 @@ export class UiHelpers {
 				this.ctx.chatContainer.addChild(component);
 				break;
 			}
+			case "historicalContext":
+				// Transform-only transient context has no transcript representation.
+				break;
 			case "hookMessage":
 			case "custom": {
 				if (message.display) {

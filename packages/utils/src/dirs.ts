@@ -14,7 +14,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { engines, version } from "../package.json" with { type: "json" };
+import { engines } from "../package.json" with { type: "json" };
+
+export * from "./version";
 
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
@@ -24,9 +26,6 @@ export const CONFIG_DIR_NAME: string = ".omp";
 
 /** Ordered main settings filenames: canonical write target first, legacy-compatible YAML fallback second. */
 export const MAIN_CONFIG_FILENAMES = ["config.yml", "config.yaml"] as const;
-
-/** Version (e.g. "1.0.0") */
-export const VERSION: string = version;
 
 /** Minimum Bun version */
 export const MIN_BUN_VERSION: string = engines.bun.replace(/[^0-9.]/g, "");
@@ -763,6 +762,11 @@ export function getSessionsDir(agentDir?: string): string {
 /** Get the content-addressed blob store directory (~/.omp/agent/blobs). */
 export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
+}
+
+/** Get the Lossless Context Management data directory (~/.omp/agent/lcm). */
+export function getLcmDir(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "lcm", "data");
 }
 
 /** Get the custom themes directory (~/.omp/agent/themes). */

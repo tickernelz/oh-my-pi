@@ -25,6 +25,8 @@
 # Usage: scripts/ci-macos-sign.sh <path-to-binary>
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bun "$SCRIPT_DIR/official-publishing-disabled.ts" "macOS signing and notarization"
 
 if [[ "${OSTYPE:-}" != darwin* ]]; then
 	echo "ci-macos-sign: must run on macOS" >&2
@@ -50,7 +52,6 @@ if ((${#missing[@]})); then
 	exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTITLEMENTS="$SCRIPT_DIR/macos-entitlements.plist"
 if [[ ! -f "$ENTITLEMENTS" ]]; then
 	echo "ci-macos-sign: entitlements not found: $ENTITLEMENTS" >&2

@@ -262,6 +262,9 @@ export class ChatTranscriptBuilder {
 				this.container.addChild(component);
 				break;
 			}
+			case "historicalContext":
+				// Transform-only transient context has no transcript representation.
+				break;
 			case "hookMessage":
 			case "custom":
 				this.#appendCustomMessage(message);

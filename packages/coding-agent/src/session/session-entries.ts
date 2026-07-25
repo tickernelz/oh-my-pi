@@ -60,9 +60,23 @@ export interface SessionEntryBase {
 	timestamp: string;
 }
 
+/**
+ * Shared session-entry consumers operate on the agent's complete in-memory message union.
+ * Journal write/load boundaries reject transient-only roles before they can become durable.
+ */
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+}
+
+/** Reject transform-only messages at every session journal boundary. */
+export function assertJournalableEntry(entry: unknown): void {
+	if (entry === null || typeof entry !== "object" || !("type" in entry) || entry.type !== "message") return;
+	if (!("message" in entry)) return;
+	const message = entry.message;
+	if (message !== null && typeof message === "object" && "role" in message && message.role === "historicalContext") {
+		throw new TypeError("Historical context messages are transient and cannot be persisted");
+	}
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
