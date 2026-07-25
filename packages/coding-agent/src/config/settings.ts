@@ -1092,23 +1092,34 @@ export class Settings {
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			let merged: RawSettings = {};
-			for (const item of result.items as SettingsCapabilityItem[]) {
-				if (item.level === "project") {
-					merged = this.#deepMerge(merged, item.data as RawSettings);
-				}
-			}
-			const nativeProject = await this.#loadYaml(path.join(this.#cwd, ".omp", "config.yml"));
 			const nativeOverrides: RawSettings = {};
-			// Keep the native project config surface intentionally narrow. Building one
-			// nested overlay preserves global/project-provider sibling values during merge.
-			for (const settingPath of ["modelRoles", "context.engine", "context.lossless.summaryModel"] as const) {
-				const value = getByPath(nativeProject, SETTING_PATH_SEGMENTS[settingPath]);
-				if (value !== undefined) {
-					setByPath(nativeOverrides, [...SETTING_PATH_SEGMENTS[settingPath]], value);
+			for (const item of result.items as SettingsCapabilityItem[]) {
+				if (item.level !== "project") continue;
+				if (item._source.provider !== "native" || path.basename(item.path) !== "config.yml") {
+					merged = this.#deepMerge(merged, item.data as RawSettings);
+					continue;
+				}
+
+				// Keep the native project config surface intentionally narrow. Building one
+				// nested overlay preserves global/project-provider sibling values during merge.
+				for (const settingPath of [
+					"modelRoles",
+					"context.engine",
+					"context.lossless.summaryModel",
+					"gc.blobs",
+					"gc.archive",
+					"gc.wal",
+					"gc.coldArchiveAfterDays",
+					"gc.retainNewestGlobal",
+					"gc.retainNewestPerCwd",
+				] as const) {
+					const value = getByPath(item.data, SETTING_PATH_SEGMENTS[settingPath]);
+					if (value !== undefined) {
+						setByPath(nativeOverrides, [...SETTING_PATH_SEGMENTS[settingPath]], value);
+					}
 				}
 			}
-			merged = this.#deepMerge(merged, nativeOverrides);
-			return this.#migrateRawSettings(merged);
+			return this.#migrateRawSettings(this.#deepMerge(merged, nativeOverrides));
 		} catch {
 			return {};
 		}

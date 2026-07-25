@@ -14,10 +14,11 @@ import { Buffer } from "node:buffer";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { removeWithRetries, VERSION } from "@oh-my-pi/pi-utils";
+import { removeWithRetries, UPSTREAM_VERSION, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type ChangelogEntry,
 	parseChangelog,
+	parseChangelogVersion,
 	RECENT_CHANGELOG_ENTRY_LIMIT,
 	readLastChangelogVersion,
 	renderChangelogEntries,
@@ -88,6 +89,15 @@ describe("selectStartupChangelog", () => {
 		expect(selection.selectedEntries).toBe(0);
 	});
 
+	test("advances a downstream revision marker without replaying the same upstream release", () => {
+		const selection = selectStartupChangelog(history, "2.0.0-lcm.3", "2.0.0-lcm.4");
+
+		expect(selection.markdown).toBeUndefined();
+		expect(selection.persistCurrentVersion).toBe(true);
+		expect(selection.truncated).toBe(false);
+		expect(selection.selectedEntries).toBe(0);
+	});
+
 	test("selects at most the three newest unseen releases for an older marker", () => {
 		const selection = selectStartupChangelog(
 			[
@@ -152,13 +162,20 @@ describe("selectStartupChangelog", () => {
 	});
 });
 
+describe("parseChangelogVersion", () => {
+	test("normalizes downstream LCM versions to the upstream numeric core", () => {
+		expect(parseChangelogVersion("17.1.3-lcm.4")).toMatchObject({ major: 17, minor: 1, patch: 3 });
+		expect(parseChangelogVersion("17.1.3-lcm.04")).toBeUndefined();
+	});
+});
+
 describe("parseChangelog", () => {
 	test("reads the embedded release history when no package path is available", async () => {
 		const entries = await parseChangelog(undefined);
 		const latest = entries[0];
 
-		expect(`${latest?.major}.${latest?.minor}.${latest?.patch}`).toBe(VERSION);
-		expect(latest?.content).toContain(`## [${VERSION}]`);
+		expect(`${latest?.major}.${latest?.minor}.${latest?.patch}`).toBe(UPSTREAM_VERSION);
+		expect(latest?.content).toContain(`## [${UPSTREAM_VERSION}]`);
 	});
 });
 
