@@ -86,27 +86,61 @@ describe("downstream release governance", () => {
 		]);
 	});
 
-	it("keeps the inherited CI workflow read-only and free of official publishers", async () => {
+	it("keeps CI read-only, hosted on supported Linux x64, and free of publishers", async () => {
 		const ci = record(
 			Bun.YAML.parse(await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text()),
 			"ci.yml",
 		);
 		const jobs = record(ci.jobs, "CI jobs");
-		for (const removed of [
-			"release_binary",
-			"release_github",
-			"release_github_verify",
-			"release_npm",
-			"release_brew",
-		]) {
-			expect(jobs[removed]).toBeUndefined();
-		}
+		const expectedJobs = [
+			"release_metadata",
+			"native_artifact_lookup",
+			"check",
+			"native_linux_x64",
+			"test_workspace",
+			"test_coding_agent_singleton",
+			"test_ts_native",
+			"test_coding_agent_ui",
+			"test_coding_agent_runtime",
+			"test_coding_agent_native",
+			"test_smoke",
+			"install_methods",
+		];
+		expect(Object.keys(jobs)).toEqual(expectedJobs);
+		expect(ci.permissions).toEqual({ contents: "read", actions: "read" });
+
+		const lookup = record(jobs.native_artifact_lookup, "native_artifact_lookup");
+		expect(Object.keys(record(lookup.outputs, "native artifact lookup outputs"))).toEqual([
+			"source-hash",
+			"linux-x64-run-id",
+		]);
+		const native = record(jobs.native_linux_x64, "native_linux_x64");
+		const nativeMatrix = record(record(native.strategy, "native strategy").matrix, "native matrix");
+		expect(nativeMatrix.include).toEqual([{ variant: "baseline", rust_checks: true }, { variant: "modern" }]);
+
+		const serialized = JSON.stringify(ci);
+		expect(serialized).not.toMatch(/omp-kata|macos-15-intel|native_cross_platform|cross-platform-run-id/);
+		expect(serialized).not.toMatch(/pi-natives-(?:linux-(?:arm64|musl)|darwin|win32)/);
+
 		for (const [name, value] of Object.entries(jobs)) {
-			const permissions = record(value, name).permissions;
-			if (permissions === undefined) continue;
-			const scoped = record(permissions, `${name} permissions`);
-			expect(scoped.contents).not.toBe("write");
-			expect(scoped["id-token"]).not.toBe("write");
+			const job = record(value, name);
+			expect(job["runs-on"], `${name} runner`).toBe("ubuntu-22.04");
+			const permissions = job.permissions;
+			if (permissions !== undefined) {
+				expect(Object.values(record(permissions, `${name} permissions`))).not.toContain("write");
+			}
+
+			const steps = job.steps;
+			if (!Array.isArray(steps)) throw new Error(`${name} job has no steps`);
+			for (const [index, candidate] of steps.entries()) {
+				const step = record(candidate, `${name} step ${index}`);
+				const uses = typeof step.uses === "string" ? step.uses : "";
+				const run = typeof step.run === "string" ? step.run : "";
+				expect(uses, `${name} step ${index}`).not.toMatch(/release|publish|attest/i);
+				expect(run, `${name} step ${index}`).not.toMatch(
+					/\b(?:npm|bun)\s+(?:run\s+)?(?:publish|prepublishOnly)\b|\bgh\s+release\b|scripts\/(?:release|setup-npm-trust|ci-release-publish|ci-update-brew-formula|ci-macos-(?:sign|upload-secrets))/i,
+				);
+			}
 		}
 	});
 

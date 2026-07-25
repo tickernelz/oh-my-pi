@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	compareDownstreamVersions,
+	DOWNSTREAM_INSTALL_COMMAND,
 	selectLatestDownstreamRelease,
 } from "@oh-my-pi/pi-coding-agent/cli/downstream-release";
 import * as pluginCli from "@oh-my-pi/pi-coding-agent/cli/plugin-cli";
@@ -150,6 +151,12 @@ describe("downstream release selection", () => {
 });
 
 describe("update install origin handling", () => {
+	it("exports the authenticated private-repository bootstrap command", () => {
+		expect(DOWNSTREAM_INSTALL_COMMAND).toBe(
+			'gh api -H "Accept: application/vnd.github.raw+json" repos/tickernelz/oh-my-pi/contents/scripts/install.sh | sh',
+		);
+	});
+
 	it("preserves the legacy plugin update shorthand", () => {
 		expect(parseUpdateArgs(["update", "-l"])).toEqual({ force: false, check: false, plugins: true });
 	});
@@ -168,7 +175,7 @@ describe("update install origin handling", () => {
 		).toBe("mise");
 
 		for (const method of ["bun", "npm", "brew", "mise"] as const) {
-			expect(() => assertDownstreamUpdateTarget({ method })).toThrow("tickernelz/oh-my-pi");
+			expect(() => assertDownstreamUpdateTarget({ method })).toThrow(DOWNSTREAM_INSTALL_COMMAND);
 		}
 	});
 
@@ -186,10 +193,13 @@ describe("update install origin handling", () => {
 	});
 
 	it("accepts only the downstream Linux x64 binary target", () => {
+		const sourceCommand = `${DOWNSTREAM_INSTALL_COMMAND} -s -- --source`;
 		expect(getDownstreamBinaryName("linux", "x64", false)).toBe("omp-linux-x64");
 		expect(() => getDownstreamBinaryName("linux", "x64", true)).toThrow("requires glibc");
+		expect(() => getDownstreamBinaryName("linux", "x64", true)).toThrow(sourceCommand);
 		expect(() => getDownstreamBinaryName("darwin", "arm64", false)).toThrow("Linux x64 (including WSL) only");
-		expect(() => getDownstreamBinaryName("win32", "x64", false)).toThrow("--source");
+		expect(() => getDownstreamBinaryName("darwin", "arm64", false)).toThrow(sourceCommand);
+		expect(() => getDownstreamBinaryName("win32", "x64", false)).toThrow(sourceCommand);
 	});
 });
 

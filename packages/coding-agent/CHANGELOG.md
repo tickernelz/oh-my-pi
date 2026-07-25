@@ -11,6 +11,7 @@
 ### Changed
 
 - Replaced upstream self-update and install publication paths with authenticated private-fork prereleases: compiled binaries report exact upstream/downstream/LCM provenance, verify a pinned Ed25519 signature over `SHA256SUMS`, and preserve the current executable on every verification failure.
+- Private release checks and downloads now authenticate with `GH_TOKEN`, `GITHUB_TOKEN`, or the existing GitHub CLI login; bootstrap guidance uses `gh api` so a private repository never depends on inaccessible raw URLs.
 
 ## [17.1.3] - 2026-07-24
 

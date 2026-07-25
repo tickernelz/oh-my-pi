@@ -17,13 +17,15 @@ import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import { verifyDownloadedArtifactHash, verifyPinnedChecksumManifest } from "./downstream-artifact-verification";
 import {
 	compareDownstreamVersions,
-	DOWNSTREAM_INSTALLER,
+	DOWNSTREAM_INSTALL_COMMAND,
 	DOWNSTREAM_REPO,
 	type DownstreamReleaseInfo,
+	getDownstreamGitHubHeaders,
 	getLatestDownstreamRelease,
+	resolveDownstreamGitHubToken,
 } from "./downstream-release";
 
-const DOWNSTREAM_SOURCE_INSTALL = `curl -fsSL ${DOWNSTREAM_INSTALLER} | sh -s -- --source`;
+const DOWNSTREAM_SOURCE_INSTALL = `${DOWNSTREAM_INSTALL_COMMAND} -s -- --source`;
 const RELEASE_AUTH_TIMEOUT_MS = 30_000;
 const BINARY_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 const MAX_CHECKSUMS_BYTES = 1024 * 1024;
@@ -218,7 +220,7 @@ export function assertDownstreamUpdateTarget(
 	throw new Error(
 		`This ${target.method}-managed installation cannot be updated by the downstream LCM updater. ` +
 			`Package-manager channels publish upstream OMP, not tickernelz/oh-my-pi. ` +
-			`Install the downstream binary with: curl -fsSL ${DOWNSTREAM_INSTALLER} | sh`,
+			`Install the downstream binary with: ${DOWNSTREAM_INSTALL_COMMAND}`,
 	);
 }
 
@@ -340,10 +342,17 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
-async function fetchReleaseAsset(url: string, assetName: string, timeoutMs: number): Promise<Response> {
+export async function fetchDownstreamReleaseAsset(
+	url: string,
+	assetName: string,
+	token: string,
+	timeoutMs: number,
+	fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<Response> {
 	let response: Response;
 	try {
-		response = await fetch(url, {
+		response = await fetchImpl(url, {
+			headers: getDownstreamGitHubHeaders(token, "application/octet-stream"),
 			redirect: "follow",
 			signal: withTimeoutSignal(timeoutMs),
 		});
@@ -391,7 +400,7 @@ async function readBoundedResponse(response: Response, maxBytes: number, assetNa
 	return bytes;
 }
 
-async function updateViaBinaryAt(targetPath: string, release: DownstreamReleaseInfo): Promise<void> {
+async function updateViaBinaryAt(targetPath: string, release: DownstreamReleaseInfo, token: string): Promise<void> {
 	const binaryName = getDownstreamBinaryName();
 	const releaseUrl = `https://github.com/${DOWNSTREAM_REPO}/releases/download/${encodeURIComponent(release.tag)}`;
 	const tempPath = `${targetPath}.${process.pid}.${crypto.randomUUID()}.new`;
@@ -401,8 +410,8 @@ async function updateViaBinaryAt(targetPath: string, release: DownstreamReleaseI
 	try {
 		console.log(chalk.dim(`Authenticating ${release.tag} from ${DOWNSTREAM_REPO}…`));
 		const [checksumsResponse, signatureResponse] = await Promise.all([
-			fetchReleaseAsset(`${releaseUrl}/SHA256SUMS`, "SHA256SUMS", RELEASE_AUTH_TIMEOUT_MS),
-			fetchReleaseAsset(`${releaseUrl}/SHA256SUMS.sig`, "SHA256SUMS.sig", RELEASE_AUTH_TIMEOUT_MS),
+			fetchDownstreamReleaseAsset(`${releaseUrl}/SHA256SUMS`, "SHA256SUMS", token, RELEASE_AUTH_TIMEOUT_MS),
+			fetchDownstreamReleaseAsset(`${releaseUrl}/SHA256SUMS.sig`, "SHA256SUMS.sig", token, RELEASE_AUTH_TIMEOUT_MS),
 		]);
 		const [checksums, signature] = await Promise.all([
 			readBoundedResponse(checksumsResponse, MAX_CHECKSUMS_BYTES, "SHA256SUMS"),
@@ -411,9 +420,10 @@ async function updateViaBinaryAt(targetPath: string, release: DownstreamReleaseI
 		const expectedHash = await verifyPinnedChecksumManifest({ checksums, signature, assetName: binaryName });
 
 		console.log(chalk.dim(`Downloading ${binaryName}…`));
-		const binaryResponse = await fetchReleaseAsset(
+		const binaryResponse = await fetchDownstreamReleaseAsset(
 			`${releaseUrl}/${binaryName}`,
 			binaryName,
+			token,
 			BINARY_DOWNLOAD_TIMEOUT_MS,
 		);
 		const tempHandle = await fs.promises.open(tempPath, "wx", 0o600);
@@ -456,9 +466,11 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		process.exit(1);
 	}
 
+	let githubToken: string;
 	let release: DownstreamReleaseInfo;
 	try {
-		release = await getLatestDownstreamRelease();
+		githubToken = await resolveDownstreamGitHubToken();
+		release = await getLatestDownstreamRelease(RELEASE_AUTH_TIMEOUT_MS, githubToken);
 	} catch (err) {
 		console.error(chalk.red(`Failed to check ${DOWNSTREAM_REPO} for updates: ${err}`));
 		process.exit(1);
@@ -477,7 +489,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	if (opts.check) return;
 
 	try {
-		await updateViaBinaryAt(target.path, release);
+		await updateViaBinaryAt(target.path, release, githubToken);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		process.exit(1);
@@ -498,6 +510,8 @@ ${chalk.bold("Options:")}
 ${chalk.bold("Distribution:")}
   App updates are Linux x64 binaries from https://github.com/${DOWNSTREAM_REPO}/releases.
   Bun, npm, Homebrew, and mise installations must be replaced with the downstream binary.
+  Private release access requires gh auth login or GH_TOKEN/GITHUB_TOKEN.
+  Install or replace with: ${DOWNSTREAM_INSTALL_COMMAND}
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} update              Update to latest downstream version

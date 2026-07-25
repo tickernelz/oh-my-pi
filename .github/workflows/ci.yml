@@ -19,15 +19,13 @@ concurrency:
 
 env:
    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-   # glibc floor for shipped linux native addons. The omp-kata runner image is
-   # Ubuntu 24.04 (glibc 2.39); a plain native build links 2.39 symbol versions
-   # and fails to dlopen on older distros. Building the linux-gnu addons through
-   # cargo-zigbuild against this floor keeps them portable. Bump to raise the
-   # minimum supported glibc.
+   # glibc floor for shipped Linux native addons. Ubuntu 22.04 ships a newer
+   # glibc, so plain native builds link symbol versions unavailable on older
+   # distros. Build linux-gnu addons through cargo-zigbuild against this floor
+   # to keep them portable. Bump only to raise the minimum supported glibc.
    GLIBC_FLOOR: "2.17"
-   # audiopus_sys bundles an opus tree whose CMakeLists declares a
-   # cmake_minimum_required below 3.5; CMake 4.x refuses to configure it
-   # without this override (macOS runner images ship CMake 4).
+   # audiopus_sys bundles an opus tree whose CMakeLists declares a minimum below
+   # 3.5; CMake 4.x refuses it without this native/install override.
    CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 permissions:
@@ -40,7 +38,7 @@ jobs:
    # in this downstream; authenticated LCM prereleases use downstream-release.yml.
    release_metadata:
       name: Resolve release metadata
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
          release-tag: ${{ steps.detect.outputs.release-tag }}
@@ -79,24 +77,16 @@ jobs:
               } >> "$GITHUB_OUTPUT"
 
    # Compute a stable hash of every input that affects the native cdylib output,
-   # then look for any prior successful main run that already uploaded the
-   # native artifacts for this hash. Two independent outputs:
-   #   * `linux-x64-run-id` — set when the linux x64 canary
-   #     (`pi-natives-linux-x64-modern-h<hash>`) is present on a prior main run,
-   #     so native-dependent TS test jobs and `native_linux_x64` can reuse it.
-   #   * `cross-platform-run-id` — set when ALL cross-platform native artifacts
-   #     also have non-expired artifacts on that same prior run, so
-   #     `native_cross_platform` can skip the cold rebuild on main pushes after
-   #     dep changes have already warmed sccache there.
-   # Non-release native jobs are skipped when their canary hits; the canary
-   # retention window (see build-native action) is the effective TTL.
+   # then look for a prior successful main run that already uploaded the Linux
+   # x64 baseline + modern artifacts for this hash. The modern artifact is the
+   # canary because both variants upload from the same matrix job. Non-release
+   # native jobs can reuse that run until its artifacts expire.
    native_artifact_lookup:
-      name: Look up cached native artifacts
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      name: Look up cached Linux x64 native artifacts
+      runs-on: ubuntu-22.04
       outputs:
          source-hash: ${{ steps.compute.outputs.source-hash }}
          linux-x64-run-id: ${{ steps.find.outputs.linux-x64-run-id }}
-         cross-platform-run-id: ${{ steps.find.outputs.cross-platform-run-id }}
       steps:
          - uses: actions/checkout@v4
          - name: Compute native source hash
@@ -113,7 +103,7 @@ jobs:
                     | cut -c1-16)
               echo "source-hash=$source_hash" >> "$GITHUB_OUTPUT"
               echo "Native source hash: $source_hash"
-         - name: Find prior main build with matching native artifacts
+         - name: Find prior main build with matching Linux x64 native artifacts
            id: find
            env:
               GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -124,46 +114,14 @@ jobs:
               # implies the baseline sibling is also there (they upload from the
               # same job).
               linux_canary="pi-natives-linux-x64-modern-h${hash}"
-              # Required set for cross-platform reuse — names must match the
-              # `actions/upload-artifact` `name:` template in build-native action.
-              cross_platform_required=(
-                "pi-natives-linux-arm64-h${hash}"
-                "pi-natives-linux-musl-x64-baseline-h${hash}"
-                "pi-natives-linux-musl-arm64-h${hash}"
-                "pi-natives-darwin-x64-baseline-h${hash}"
-                "pi-natives-darwin-arm64-h${hash}"
-                "pi-natives-win32-x64-baseline-h${hash}"
-              )
               linux_x64_run_id=""
-              cross_platform_run_id=""
               for candidate in $(gh run list \
                   --workflow=ci.yml --branch=main --status=success --event=push \
                   --limit=20 --json databaseId --jq='.[].databaseId'); do
                 names=$(gh api "/repos/${{ github.repository }}/actions/runs/$candidate/artifacts?per_page=100" \
                     --jq '.artifacts[] | select(.expired == false) | .name')
-                if [ -z "$linux_x64_run_id" ] && echo "$names" | grep -qFx "$linux_canary"; then
+                if echo "$names" | grep -qFx "$linux_canary"; then
                   linux_x64_run_id="$candidate"
-                fi
-                if [ -z "$cross_platform_run_id" ]; then
-                  all_found=true
-                  # Cross-platform reuse requires the linux canary AND every
-                  # cross-platform artifact, since release_binary downloads them
-                  # from the same run.
-                  if ! echo "$names" | grep -qFx "$linux_canary"; then
-                    all_found=false
-                  else
-                    for req in "${cross_platform_required[@]}"; do
-                      if ! echo "$names" | grep -qFx "$req"; then
-                        all_found=false
-                        break
-                      fi
-                    done
-                  fi
-                  if $all_found; then
-                    cross_platform_run_id="$candidate"
-                  fi
-                fi
-                if [ -n "$linux_x64_run_id" ] && [ -n "$cross_platform_run_id" ]; then
                   break
                 fi
               done
@@ -172,20 +130,12 @@ jobs:
               else
                 echo "No cached Linux x64 native artifacts for hash $hash; native_linux_x64 will rebuild."
               fi
-              if [ -n "$cross_platform_run_id" ]; then
-                echo "Reusing cross-platform native artifacts from run $cross_platform_run_id"
-              else
-                echo "No cached cross-platform native artifacts for hash $hash; native_cross_platform will rebuild on main."
-              fi
-              {
-                echo "linux-x64-run-id=$linux_x64_run_id"
-                echo "cross-platform-run-id=$cross_platform_run_id"
-              } >> "$GITHUB_OUTPUT"
+              echo "linux-x64-run-id=$linux_x64_run_id" >> "$GITHUB_OUTPUT"
 
    # Fast lint, type check, and browser bundle build (no Rust, no native build needed)
    check:
       name: Lint, type check & web build
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -194,8 +144,8 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Linux x64 baseline + modern: required by `test`, so it runs on every PR
-   # unless native_artifact_lookup found a cached run. Release runs always
+   # Linux x64 baseline + modern: required by native-dependent test jobs, so it
+   # runs on every PR unless native_artifact_lookup found a cached run. Release runs always
    # rebuild for fresh artifacts but skip clippy + Rust tests (skip_validation):
    # the bump commit only changes version strings over content that already
    # passed validation on its main-push run.
@@ -203,7 +153,7 @@ jobs:
       name: "Native: Linux x64 (${{ matrix.variant }})"
       needs: [release_metadata, native_artifact_lookup]
       if: ${{ needs.release_metadata.outputs.is-release == 'true' || needs.native_artifact_lookup.outputs.linux-x64-run-id == '' }}
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       strategy:
          fail-fast: false
          matrix:
@@ -223,59 +173,9 @@ jobs:
               skip_validation: ${{ needs.release_metadata.outputs.is-release }}
               save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-   # Pre-warm the cross-platform native build cache on `main`, in addition to
-   # building the artifacts that ship in releases. Skipped on main when
-   # native_artifact_lookup already found a recent run with all artifacts intact.
-   native_cross_platform_kata:
-      name: "Native: ${{ matrix.platform }} ${{ matrix.libc || '' }} ${{ matrix.arch }}"
-      needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native_artifact_lookup.outputs.cross-platform-run-id == '') }}
-      strategy:
-         fail-fast: false
-         matrix:
-            include:
-               - { os: omp-kata, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
-               - { os: omp-kata, platform: linux, libc: musl, arch: x64, target: x86_64-unknown-linux-musl, variant: baseline }
-               - { os: omp-kata, platform: linux, libc: musl, arch: arm64, target: aarch64-unknown-linux-musl }
-               - { os: omp-kata, platform: win32, arch: x64, target: x86_64-pc-windows-msvc, variant: baseline }
-      runs-on: ${{ matrix.os }}
-      steps:
-         - uses: actions/checkout@v4
-         - uses: ./.github/actions/build-native
-           with:
-              hash: ${{ needs.native_artifact_lookup.outputs.source-hash }}
-              platform: ${{ matrix.platform }}
-              arch: ${{ matrix.arch }}
-              libc: ${{ matrix.libc }}
-              variant: ${{ matrix.variant }}
-              target: ${{ matrix.target }}
-              glibc: ${{ matrix.platform == 'linux' && matrix.libc != 'musl' && env.GLIBC_FLOOR || '' }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
-   native_cross_platform_macos:
-      name: "Native: ${{ matrix.platform }} ${{ matrix.arch }}"
-      needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native_artifact_lookup.outputs.cross-platform-run-id == '') }}
-      strategy:
-         fail-fast: false
-         matrix:
-            include:
-               - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
-               - { os: macos-14, platform: darwin, arch: arm64 }
-      runs-on: ${{ matrix.os }}
-      steps:
-         - uses: actions/checkout@v4
-         - uses: ./.github/actions/build-native
-           with:
-              hash: ${{ needs.native_artifact_lookup.outputs.source-hash }}
-              platform: ${{ matrix.platform }}
-              arch: ${{ matrix.arch }}
-              variant: ${{ matrix.variant }}
-              target: ${{ matrix.target }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 20
@@ -305,7 +205,7 @@ jobs:
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 20
@@ -337,7 +237,7 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 25
@@ -368,7 +268,7 @@ jobs:
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 25
@@ -399,7 +299,7 @@ jobs:
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 25
@@ -431,7 +331,7 @@ jobs:
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 25
@@ -462,7 +362,7 @@ jobs:
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_linux_x64, native_artifact_lookup]
       if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
       timeout-minutes: 15
@@ -493,52 +393,24 @@ jobs:
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/ensure-rust-toolchain
            with:
               toolchain: nightly-2026-04-29
          - uses: ./.github/actions/ensure-cmake
-         - name: Detect runner environment
-           id: detect
-           shell: bash
-           run: |
-              # $SCCACHE_BUCKET is injected only on self-hosted omp-kata pods; its
-              # presence selects baked sccache + shared S3. GitHub-hosted runners
-              # (PRs) need sccache-action to export the GHA cache URL/token into the
-              # step env — a bare binary install leaves SCCACHE_GHA_ENABLED set with
-              # no cache URL, so sccache server startup fails ("cache url for ghac
-              # not found"). Mirrors the build-native action's sccache wiring.
-              if [ -n "${SCCACHE_BUCKET:-}" ]; then
-                echo "on_infra=true" >> "$GITHUB_OUTPUT"
-              else
-                echo "on_infra=false" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Ensure baked sccache (omp-kata)
-           if: steps.detect.outputs.on_infra == 'true'
-           uses: ./.github/actions/ensure-sccache
-           with:
-              version: "0.15.0"
-         - name: Setup sccache (GitHub-hosted)
-           if: steps.detect.outputs.on_infra == 'false'
+         - name: Setup sccache
            uses: mozilla-actions/sccache-action@v0.0.10
          - name: Enable sccache for cargo
-           # Conditional backend: self-hosted omp-kata injects a shared S3
-           # (RustFS) sccache via pod env; GitHub-hosted runners keep the GHA
-           # cache. CARGO_INCREMENTAL=0 keeps sccache from silently no-oping.
            shell: bash
            run: |
               {
                 echo "RUSTC_WRAPPER=sccache"
                 echo "CARGO_INCREMENTAL=0"
+                echo "SCCACHE_GHA_ENABLED=true"
               } >> "$GITHUB_ENV"
-              if [ -n "${SCCACHE_BUCKET:-}" ]; then
-                echo "sccache backend: shared S3 ($SCCACHE_BUCKET @ $SCCACHE_ENDPOINT)"
-              else
-                echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-                echo "sccache backend: GitHub Actions cache"
-              fi
+
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
          - name: Install method smoke tests

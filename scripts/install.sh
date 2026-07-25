@@ -2,7 +2,8 @@
 set -e
 
 # Downstream OMP LCM installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/tickernelz/oh-my-pi/main/scripts/install.sh | sh
+# Usage: gh api -H "Accept: application/vnd.github.raw+json" repos/tickernelz/oh-my-pi/contents/scripts/install.sh | sh
+# Source: gh api -H "Accept: application/vnd.github.raw+json" repos/tickernelz/oh-my-pi/contents/scripts/install.sh | sh -s -- --source
 #
 # Options:
 #   --binary       Install the downstream Linux x64 release binary (default)
@@ -22,6 +23,7 @@ VERIFY_DIR=""
 INSTALL_TARGET=""
 INSTALL_BACKUP=""
 INSTALL_VERIFIED=""
+GITHUB_AUTH_TOKEN=""
 
 restore_previous_binary() {
     [ -z "$INSTALL_TARGET" ] || rm -f "$INSTALL_TARGET"
@@ -43,6 +45,75 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+trim_whitespace() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+resolve_github_auth_token() {
+    github_token_candidate=$(trim_whitespace "${GH_TOKEN:-}")
+    if [ -z "$github_token_candidate" ]; then
+        github_token_candidate=$(trim_whitespace "${GITHUB_TOKEN:-}")
+    fi
+    if [ -z "$github_token_candidate" ] && command -v gh >/dev/null 2>&1; then
+        github_token_candidate=$(
+            unset GH_TOKEN GITHUB_TOKEN
+            gh auth token 2>/dev/null || true
+        )
+        github_token_candidate=$(trim_whitespace "$github_token_candidate")
+    fi
+    if [ -z "$github_token_candidate" ]; then
+        echo "Private GitHub access is required. Run 'gh auth login' or set GH_TOKEN or GITHUB_TOKEN." >&2
+        exit 1
+    fi
+    github_token_single_line=$(printf '%s' "$github_token_candidate" | tr -d '\r\n')
+    if [ "$github_token_single_line" != "$github_token_candidate" ]; then
+        echo "GitHub token must be a single line. Run 'gh auth login' or set GH_TOKEN or GITHUB_TOKEN." >&2
+        exit 1
+    fi
+    GITHUB_AUTH_TOKEN=$github_token_candidate
+    unset GH_TOKEN GITHUB_TOKEN
+}
+
+github_curl() (
+    github_accept=$1
+    shift
+    unset GH_TOKEN GITHUB_TOKEN
+    github_config_token=$(printf '%s' "$GITHUB_AUTH_TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    {
+        printf 'header = "Authorization: Bearer %s"\n' "$github_config_token"
+        printf '%s\n' 'header = "User-Agent: oh-my-pi-installer"'
+        printf 'header = "Accept: %s"\n' "$github_accept"
+    } | curl --config - "$@"
+)
+
+github_asset_curl() (
+    github_asset_url=$1
+    github_asset_output=$2
+    shift 2
+    unset GH_TOKEN GITHUB_TOKEN
+    github_redirect_url=$(github_curl "application/octet-stream" -fsS --connect-timeout 10 --max-time 60 \
+        -o /dev/null -w '%{redirect_url}' -- "$github_asset_url") || {
+        echo "Failed to request private release asset from $github_asset_url." >&2
+        exit 1
+    }
+    case "$github_redirect_url" in
+        https://*) ;;
+        *)
+            echo "GitHub did not return an HTTPS release-asset redirect for $github_asset_url." >&2
+            exit 1
+            ;;
+    esac
+    unset GITHUB_AUTH_TOKEN
+    curl -fsSL --connect-timeout 10 "$@" -o "$github_asset_output" -- "$github_redirect_url"
+)
+
+gh_repo_clone() (
+    GH_TOKEN=$GITHUB_AUTH_TOKEN
+    export GH_TOKEN
+    unset GITHUB_TOKEN
+    exec gh repo clone "$@"
+)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -144,6 +215,12 @@ install_bun() {
 }
 
 install_from_source() {
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "GitHub CLI is required to clone the private downstream source." >&2
+        echo "Install gh, then run 'gh auth login' or set GH_TOKEN or GITHUB_TOKEN." >&2
+        exit 1
+    fi
+    resolve_github_auth_token
     if ! command -v git >/dev/null 2>&1; then
         echo "git is required for --source" >&2
         exit 1
@@ -160,14 +237,24 @@ install_from_source() {
     fi
 
     TMP_DIR=$(mktemp -d)
-    repo_url="https://github.com/${REPO}.git"
     if [ -n "$REF" ]; then
-        if ! git clone --depth 1 --branch "$REF" "$repo_url" "$TMP_DIR" >/dev/null 2>&1; then
-            git clone "$repo_url" "$TMP_DIR"
-            (cd "$TMP_DIR" && git checkout "$REF")
+        if ! gh_repo_clone "$REPO" "$TMP_DIR" -- --depth 1 --branch "$REF" >/dev/null 2>&1; then
+            rm -rf "$TMP_DIR"
+            TMP_DIR=$(mktemp -d)
+            gh_repo_clone "$REPO" "$TMP_DIR" || {
+                echo "Failed to clone private repository $REPO. Run 'gh auth login' or set GH_TOKEN or GITHUB_TOKEN." >&2
+                exit 1
+            }
+            (cd "$TMP_DIR" && git checkout "$REF") || {
+                echo "Ref not found in $REPO: $REF" >&2
+                exit 1
+            }
         fi
     else
-        git clone --depth 1 "$repo_url" "$TMP_DIR"
+        gh_repo_clone "$REPO" "$TMP_DIR" -- --depth 1 || {
+            echo "Failed to clone private repository $REPO. Run 'gh auth login' or set GH_TOKEN or GITHUB_TOKEN." >&2
+            exit 1
+        }
     fi
 
     if command -v git-lfs >/dev/null 2>&1; then
@@ -283,7 +370,7 @@ extract_downstream_tags() {
 fetch_release_tag() {
     if [ -n "$REF" ]; then
         echo "Fetching downstream release $REF..." >&2
-        release_json=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases/tags/${REF}") || {
+        release_json=$(github_curl "application/vnd.github+json" -fsS --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases/tags/${REF}") || {
             echo "Downstream release tag not found: $REF" >&2
             echo "For branch or commit installs, use --source --ref $REF." >&2
             exit 1
@@ -295,7 +382,7 @@ fetch_release_tag() {
         fi
     else
         echo "Fetching latest downstream LCM release..." >&2
-        release_json=$(curl -fsSL --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
+        release_json=$(github_curl "application/vnd.github+json" -fsS --connect-timeout 10 --max-time 60 "https://api.github.com/repos/${REPO}/releases?per_page=100") || {
             echo "Failed to fetch releases from https://github.com/${REPO}" >&2
             exit 1
         }
@@ -356,6 +443,7 @@ install_verified_binary() {
 
 install_binary() {
     require_binary_platform
+    resolve_github_auth_token
     require_release_verifier
     latest=$(fetch_release_tag)
     expected=${latest#v}
@@ -368,10 +456,8 @@ install_binary() {
     signature_path="$VERIFY_DIR/SHA256SUMS.sig"
     public_key_path="$VERIFY_DIR/downstream-release-ed25519.pem"
     echo "Authenticating release manifest from ${REPO}..."
-    curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 1048576 \
-        "$release_url/SHA256SUMS" -o "$checksums_path"
-    curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 64 \
-        "$release_url/SHA256SUMS.sig" -o "$signature_path"
+    github_asset_curl "$release_url/SHA256SUMS" "$checksums_path" --max-time 60 --max-filesize 1048576
+    github_asset_curl "$release_url/SHA256SUMS.sig" "$signature_path" --max-time 60 --max-filesize 64
     signature_bytes=$(wc -c < "$signature_path")
     if [ "$signature_bytes" -ne 64 ]; then
         echo "Invalid SHA256SUMS.sig length: expected 64 bytes, received $signature_bytes." >&2
@@ -391,8 +477,7 @@ install_binary() {
     mkdir -p "$INSTALL_DIR"
     TEMP_BINARY=$(mktemp "$INSTALL_DIR/.omp.new.XXXXXX")
     echo "Downloading authenticated $binary_name from ${REPO}..."
-    curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 30 \
-        "$release_url/$binary_name" -o "$TEMP_BINARY"
+    github_asset_curl "$release_url/$binary_name" "$TEMP_BINARY" --speed-limit 1024 --speed-time 30
     actual_hash=$(openssl dgst -sha256 -r "$TEMP_BINARY" | awk '{ print $1 }')
     if [ "$actual_hash" != "$expected_hash" ]; then
         echo "SHA-256 mismatch for $binary_name; existing installation was not changed." >&2
