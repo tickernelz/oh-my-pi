@@ -94,6 +94,49 @@ it("reports overlay provenance for a null tombstone that blocks the global fallb
 	}
 });
 
+it("reports generic setting-leaf provenance across merge precedence", async () => {
+	const root = path.join(os.tmpdir(), `setting-provenance-${Snowflake.next()}`);
+	const agentDir = path.join(root, "agent");
+	const projectDir = path.join(root, "project");
+	const globalOnlyDir = path.join(root, "global-only");
+	const overlayPath = path.join(root, "overlay.yml");
+	const settingPath = "context.lossless.summaryModel" as const;
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.mkdirSync(path.join(projectDir, ".omp"), { recursive: true });
+	fs.mkdirSync(globalOnlyDir, { recursive: true });
+	fs.writeFileSync(path.join(agentDir, "config.yml"), "context:\n  lossless:\n    summaryModel: global/model\n");
+	fs.writeFileSync(
+		path.join(projectDir, ".omp", "config.yml"),
+		"context:\n  lossless:\n    summaryModel: project/model\n",
+	);
+	fs.writeFileSync(overlayPath, "context:\n  lossless:\n    summaryModel: overlay/model\n");
+
+	try {
+		const runtime = await Settings.loadReadOnly({
+			cwd: projectDir,
+			agentDir,
+			configFiles: [overlayPath],
+			overrides: { [settingPath]: "runtime/model" },
+		});
+		expect(runtime.get(settingPath)).toBe("runtime/model");
+		expect(runtime.getSettingProvenance(settingPath)).toBe("runtime");
+
+		runtime.clearOverride(settingPath);
+		expect(runtime.get(settingPath)).toBe("overlay/model");
+		expect(runtime.getSettingProvenance(settingPath)).toBe("overlay");
+
+		const project = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		expect(project.get(settingPath)).toBe("project/model");
+		expect(project.getSettingProvenance(settingPath)).toBe("project");
+
+		const global = await Settings.loadReadOnly({ cwd: globalOnlyDir, agentDir });
+		expect(global.get(settingPath)).toBe("global/model");
+		expect(global.getSettingProvenance(settingPath)).toBe("global");
+		expect(Settings.isolated().getSettingProvenance(settingPath)).toBe("default");
+	} finally {
+		if (fs.existsSync(root)) removeSyncWithRetries(root);
+	}
+});
 describe("Settings.reloadForCwd", () => {
 	let settingsState: SettingsTestState | undefined;
 

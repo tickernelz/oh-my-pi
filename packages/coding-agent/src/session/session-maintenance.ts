@@ -64,7 +64,7 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import { findCompactMode } from "./compact-modes";
-import { convertToLlm, stripImagesFromMessage } from "./messages";
+import { convertToLlm, type LcmFallbackCategory, stripImagesFromMessage } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	resolveCompactionConfiguredTarget,
@@ -187,6 +187,7 @@ export interface SessionMaintenanceHost {
 	sessionId(): string;
 	messages(): AgentMessage[];
 	losslessOwnsRequest(messages: AgentMessage[], signal?: AbortSignal): Promise<boolean>;
+	takeLosslessFallbackCategory?(): LcmFallbackCategory | undefined;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -2000,6 +2001,7 @@ export class SessionMaintenance {
 			result.details,
 			false,
 			result.preserveData,
+			staleEntry.lcmFallback,
 		);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
@@ -2631,6 +2633,7 @@ export class SessionMaintenance {
 				return COMPACTION_CHECK_NONE;
 			}
 
+			const lcmFallback = this.#host.takeLosslessFallbackCategory?.();
 			this.#host.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
@@ -2639,6 +2642,7 @@ export class SessionMaintenance {
 				details,
 				fromExtension,
 				preserveData,
+				lcmFallback,
 			);
 			const newEntries = this.#host.sessionManager.getEntries();
 			const sessionContext = this.#host.buildDisplaySessionContext();

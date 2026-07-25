@@ -20,14 +20,7 @@ import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
 
 import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
-import type {
-	Citation,
-	DoctorReport,
-	PurgeResult,
-	RebuildResult,
-	SearchHit,
-	SourceDescription,
-} from "@oh-my-pi/lcm-context";
+import type { DoctorReport, PurgeResult, RebuildResult, SearchHit } from "@oh-my-pi/lcm-context";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -55,9 +48,9 @@ import {
 	type CompactionResult,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
-	effectiveReserveTokens,
 	estimateTokens,
 	generateBranchSummary,
+	resolveThresholdTokens,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -161,6 +154,13 @@ import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
+import type {
+	LcmDescription,
+	LcmExpandOptions,
+	LcmHandle,
+	LcmResolvedExpansion,
+	LcmSearchOptions,
+} from "../lcm/operations";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
@@ -318,7 +318,14 @@ import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
 import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
-import { type LcmCompletionRequest, type LcmProjectionLimits, type LcmPublicStatus, SessionLcm } from "./session-lcm";
+import {
+	type LcmCompletionRequest,
+	type LcmProjectionLimits,
+	type LcmPublicStatus,
+	normalizeLcmBranch,
+	SessionLcm,
+	type SessionLcmJournal,
+} from "./session-lcm";
 import {
 	COMPACTION_CHECK_NONE,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
@@ -1204,7 +1211,7 @@ export class AgentSession {
 					{
 						sessionManager: this.sessionManager,
 						obfuscator: this.#obfuscator,
-						projectionLimits: () => this.#lcmProjectionLimits(),
+						projectionLimits: messages => this.#lcmProjectionLimits(messages),
 						projectionFits: messages => this.#lcmProjectionFits(messages),
 						complete: request => this.lcmComplete(request),
 					},
@@ -1373,6 +1380,7 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 			messages: () => this.messages,
 			losslessOwnsRequest: (messages, signal) => this.#lcm?.ownsRequest(messages, signal) ?? Promise.resolve(false),
+			takeLosslessFallbackCategory: () => this.#lcm?.takePendingFallbackCategory(),
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
 			planReferencePath: () => this.#planReferencePath,
@@ -4123,13 +4131,20 @@ export class AgentSession {
 		return this.agent.state.messages;
 	}
 
-	#lcmProjectionLimits(): LcmProjectionLimits | undefined {
+	#lcmProjectionLimits(messages: readonly AgentMessage[]): LcmProjectionLimits | undefined {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
-		const reserve = effectiveReserveTokens(contextWindow, this.settings.getGroup("compaction"));
-		const tokenBudget = Math.floor(contextWindow - reserve - computeNonMessageTokens(this) - 512);
-		if (tokenBudget <= 0) return undefined;
+		const compaction = this.settings.getGroup("compaction");
+		if (!compaction.enabled || compaction.strategy === "off") return undefined;
+		const hardThresholdTokens = resolveThresholdTokens(contextWindow, compaction);
+		const nonMessageTokens = computeNonMessageTokens(this);
+		let sourceTokens = nonMessageTokens;
+		for (const message of messages) sourceTokens += estimateTokens(message);
+		const tokenBudget = Math.floor(hardThresholdTokens - nonMessageTokens - 512);
 		return {
+			sourceTokens,
+			softThresholdTokens: Math.floor(hardThresholdTokens * 0.8),
+			hardThresholdTokens,
 			tokenBudget,
 			freshTail: {
 				maxSources: 32,
@@ -4139,7 +4154,7 @@ export class AgentSession {
 	}
 
 	#lcmProjectionFits(messages: readonly AgentMessage[]): boolean {
-		const limits = this.#lcmProjectionLimits();
+		const limits = this.#lcmProjectionLimits(messages);
 		if (!limits) return false;
 		let tokens = 0;
 		for (const message of messages) {
@@ -4151,7 +4166,10 @@ export class AgentSession {
 
 	/** Apply the pinned Lossless projection to primary requests only. */
 	async projectLcmContext(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
-		return this.#lcm ? await this.#lcm.project(messages, signal) : messages;
+		if (!this.#lcm) return messages;
+		const result = await this.#lcm.project(messages, signal);
+		if (result.projection && !signal?.aborted) this.#emit({ type: "lcm_projection", projection: result.projection });
+		return result.messages;
 	}
 
 	async #rebindLcm(): Promise<void> {
@@ -4166,28 +4184,54 @@ export class AgentSession {
 		return this.#lcm?.enabled === true;
 	}
 
-	lcmStatus(): Promise<LcmPublicStatus | null> {
-		return this.#lcm?.status() ?? Promise.resolve(null);
+	setLcmSummaryModel(selector: string | undefined): void {
+		this.#lcm?.setSummaryModel(selector);
+	}
+
+	async lcmStatus(): Promise<LcmPublicStatus> {
+		const status = this.#lcm ? await this.#lcm.status() : { runtime: { phase: "disabled" as const } };
+		const selector = status.runtime.summaryModelSelector;
+		if (!selector || status.runtime.resolvedSummaryModel) return status;
+		const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+			settings: this.settings,
+			matchPreferences: getModelMatchPreferences(this.settings),
+		}).model;
+		if (!resolved) return status;
+		return {
+			...status,
+			runtime: { ...status.runtime, resolvedSummaryModel: `${resolved.provider}/${resolved.id}` },
+		};
 	}
 
 	lcmDoctor(): Promise<DoctorReport | null> {
 		return this.#lcm?.doctor() ?? Promise.resolve(null);
 	}
 
-	lcmRebuild(): Promise<RebuildResult | null> {
+	lcmRebuildCurrent(): Promise<RebuildResult | null> {
 		return this.#lcm?.rebuild() ?? Promise.resolve(null);
 	}
 
-	lcmPurge(): Promise<PurgeResult | null> {
+	lcmRebuildProject(projectId: string, journals: readonly SessionLcmJournal[]): Promise<RebuildResult | null> {
+		if (!this.#lcm) return Promise.resolve(null);
+		const obfuscator = this.#obfuscator;
+		const redact = obfuscator?.hasSecrets() ? (text: string) => obfuscator.obfuscate(text) : String;
+		return this.#lcm.rebuildProject(journals.map(journal => normalizeLcmBranch(journal, projectId, redact)));
+	}
+
+	lcmGc(): Promise<PurgeResult | null> {
 		return this.#lcm?.purge() ?? Promise.resolve(null);
 	}
 
-	lcmSearch(query: string, limit?: number): Promise<SearchHit[]> {
-		return this.#lcm?.search(query, limit) ?? Promise.resolve([]);
+	lcmSearch(query: string, options?: LcmSearchOptions): Promise<SearchHit[]> {
+		return this.#lcm?.search(query, options) ?? Promise.resolve([]);
 	}
 
-	lcmDescribe(citation: Citation): Promise<SourceDescription | null> {
-		return this.#lcm?.describe(citation) ?? Promise.resolve(null);
+	lcmDescribe(handle: LcmHandle): Promise<LcmDescription | null> {
+		return this.#lcm?.describe(handle) ?? Promise.resolve(null);
+	}
+
+	lcmExpand(options: LcmExpandOptions): Promise<LcmResolvedExpansion | null> {
+		return this.#lcm?.expand(options) ?? Promise.resolve(null);
 	}
 
 	/** Provider-safe, history-free one-shot used by LCM summary and recall. */
@@ -4204,6 +4248,7 @@ export class AgentSession {
 		const model = resolved.model;
 		const affinitySessionId = this.#activeProviderSessionId();
 		if (!model) throw new Error(`LCM completion could not resolve ${request.modelSelector ?? "@smol"}`);
+		request.onResolvedModel?.(`${model.provider}/${model.id}`);
 		const resolver = this.#modelRegistry.resolver(model, affinitySessionId);
 		const resolvedApiKey = await resolveApiKeyOnce(resolver, request.signal);
 		if (!resolvedApiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);

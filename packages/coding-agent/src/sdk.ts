@@ -96,6 +96,7 @@ import {
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
+import type { LcmRetrievalRuntime } from "./lcm/operations";
 import { registerLcmProject } from "./lcm/project-catalog";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
 import {
@@ -476,6 +477,8 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/** Concrete parent capability required to expose this child's own scoped LCM runtime. */
+	parentLcmRuntime?: LcmRetrievalRuntime;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Parent Mnemopi state to alias for subagent memory tools. */
@@ -1658,6 +1661,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getLcmRuntime: settings.get("context.engine") === "lossless" ? () => session : undefined,
+			getForwardedLcmRuntime: options.parentLcmRuntime ? () => options.parentLcmRuntime : undefined,
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
@@ -3151,8 +3155,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? {
 							agentDir,
 							summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
-							registerProject: async project => {
-								await registerLcmProject(project, agentDir);
+							registerProject: async (project, journal) => {
+								await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
 							},
 						}
 					: undefined,

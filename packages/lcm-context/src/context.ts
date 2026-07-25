@@ -1,7 +1,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { initializeLcmSchema, LCM_SCHEMA_VERSION, UnsupportedLcmSchemaError } from "./schema";
+import { initializeLcmSchema, LCM_SCHEMA_VERSION, summaryHandleForInput, UnsupportedLcmSchemaError } from "./schema";
 import type {
 	Citation,
 	ClaimSummaryJobsOptions,
@@ -10,15 +10,19 @@ import type {
 	ContextScope,
 	DoctorCheck,
 	DoctorReport,
+	FileDescription,
+	FileReference,
 	JobStatusCounts,
 	LcmContext,
 	LcmContextOptions,
+	LcmFileMetadata,
 	LcmStatus,
 	ProjectedHistoricalItem,
 	ProjectionRequest,
 	ProjectSearchRequest,
 	PurgeResult,
 	RebuildResult,
+	ReconcileOptions,
 	ReconcileResult,
 	RunSummaryJobsOptions,
 	RunSummaryJobsResult,
@@ -27,10 +31,17 @@ import type {
 	SourceDescription,
 	SourceEntry,
 	SourceSnapshot,
+	SummaryAttemptProvenance,
 	SummaryCompletion,
 	SummaryCompletionCallback,
+	SummaryDescription,
+	SummaryExpansion,
+	SummaryExpansionRequest,
 	SummaryJob,
 	SummaryJobInput,
+	SummaryReference,
+	SummaryStage,
+	SummaryStrategy,
 } from "./types";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
@@ -65,6 +76,14 @@ interface BranchRow {
 	revision: number;
 }
 
+interface BranchScheduleRow extends BranchRow {
+	session_id: string;
+	branch_id: string;
+	summary_token_budget: number | null;
+	fresh_tail_max_sources: number | null;
+	fresh_tail_max_tokens: number | null;
+}
+
 interface CurrentSourceRow {
 	id: number;
 	entry_id: string;
@@ -92,11 +111,23 @@ interface ProjectSourceRow extends ActiveSourceRow {
 
 interface SummaryRow {
 	summary_id: string;
+	stable_handle: string;
 	input_hash: string;
 	level: number;
 	redacted_text: string;
 	token_count: number;
 	created_at: number;
+}
+
+interface FileRow {
+	file_id: string;
+	project_id: string;
+	content_hash: string;
+	path: string;
+	file_type: string;
+	byte_size: number;
+	token_count: number;
+	exploration_summary: string;
 }
 
 interface SummaryCandidate extends SummaryRow {
@@ -129,6 +160,8 @@ interface JobRow {
 	lease_expires_at: number | null;
 	lease_input_tokens: number | null;
 	lease_output_budget: number | null;
+	stage: SummaryStage;
+	transport_retry_count: number;
 }
 
 interface JobInputRow {
@@ -222,6 +255,35 @@ function normalizeScope(scope: ContextScope): ContextScope {
 	};
 }
 
+function normalizeFiles(files: readonly LcmFileMetadata[] | undefined, label: string): LcmFileMetadata[] {
+	if (files === undefined) return [];
+	if (!Array.isArray(files)) throw new TypeError(`${label} must be an array`);
+	const seen = new Set<string>();
+	return files.map((file, index) => {
+		const prefix = `${label}[${index}]`;
+		const fileId = assertIdentifier(file.fileId, `${prefix}.fileId`);
+		if (seen.has(fileId)) throw new TypeError(`duplicate file id: ${fileId}`);
+		seen.add(fileId);
+		const contentHash = assertIdentifier(file.contentHash, `${prefix}.contentHash`);
+		const filePath = assertIdentifier(file.path, `${prefix}.path`);
+		const fileType = assertIdentifier(file.fileType, `${prefix}.fileType`);
+		const byteSize = assertInteger(file.byteSize, `${prefix}.byteSize`, 0);
+		const tokenCount = assertInteger(file.tokenCount, `${prefix}.tokenCount`, 0);
+		if (typeof file.explorationSummary !== "string") {
+			throw new TypeError(`${prefix}.explorationSummary must be a string`);
+		}
+		return {
+			fileId,
+			contentHash,
+			path: filePath,
+			fileType,
+			byteSize,
+			tokenCount,
+			explorationSummary: file.explorationSummary.slice(0, 4_000),
+		};
+	});
+}
+
 function normalizeSnapshot(snapshot: SourceSnapshot): NormalizedSnapshot {
 	const scope = normalizeScope(snapshot.scope);
 	if (!Array.isArray(snapshot.entries)) throw new TypeError("entries must be an array");
@@ -260,7 +322,8 @@ function normalizeSnapshot(snapshot: SourceSnapshot): NormalizedSnapshot {
 		];
 		artifactRefs.sort();
 		const artifactRefsJson = JSON.stringify(artifactRefs);
-		const sourceKey = contentAddress([
+		const files = normalizeFiles(entry.files, `entries[${position}].files`);
+		const sourceIdentity = [
 			"lcm-source-v1",
 			scope.projectId,
 			entry.contentHash,
@@ -268,10 +331,13 @@ function normalizeSnapshot(snapshot: SourceSnapshot): NormalizedSnapshot {
 			entry.kind,
 			entry.redactedText,
 			artifactRefsJson,
-		]);
+		];
+		if (files.length > 0) sourceIdentity.push(JSON.stringify(files));
+		const sourceKey = contentAddress(sourceIdentity);
 		normalized.push({
 			...entry,
 			artifactRefs,
+			files,
 			sourceKey,
 			artifactRefsJson,
 			tokenCount: estimateTokens(entry.redactedText),
@@ -316,6 +382,61 @@ function atomicUnits<T extends { atomic_group_id: string | null }>(rows: readonl
 	return units;
 }
 
+interface FreshTailSelection {
+	start: number;
+	tokens: number;
+	count: number;
+}
+
+function selectFreshTail<T extends { atomic_group_id: string | null; token_count: number }>(
+	rows: readonly T[],
+	tokenBudget: number,
+	maxSources: number,
+	maxTokens: number,
+): FreshTailSelection {
+	const units = atomicUnits(rows);
+	let start = rows.length;
+	let tokens = 0;
+	let count = 0;
+	const tokenLimit = Math.min(maxTokens, tokenBudget);
+	for (let unitIndex = units.length - 1; unitIndex >= 0; unitIndex--) {
+		const unit = units[unitIndex];
+		if (!unit || count >= maxSources) break;
+		const unitTokens = unit.reduce((total, row) => total + row.token_count, 0);
+		const expandsSourceLimit = count + unit.length > maxSources;
+		const isAtomicClosure = unit.some(row => row.atomic_group_id !== null);
+		if ((expandsSourceLimit && !isAtomicClosure) || tokens + unitTokens > tokenLimit) break;
+		start -= unit.length;
+		tokens += unitTokens;
+		count += unit.length;
+	}
+	return { start, tokens, count };
+}
+
+function strategyForStage(stage: SummaryStage): SummaryStrategy {
+	switch (stage) {
+		case "normal":
+			return "preserve_details";
+		case "aggressive":
+			return "bullet_points";
+		case "deterministic":
+			return "deterministic_truncate";
+	}
+}
+
+function outputBudgetForStage(stage: SummaryStage, maxOutputTokens: number, inputTokenCount: number): number {
+	const normalBudget = Math.min(maxOutputTokens, inputTokenCount - 1);
+	if (stage === "normal") return normalBudget;
+	if (stage === "aggressive") return Math.min(inputTokenCount - 1, Math.max(1, Math.floor(normalBudget / 2)));
+	return Math.min(512, inputTokenCount - 1);
+}
+
+function nextStage(stage: SummaryStage): SummaryStage | null {
+	if (stage === "normal") return "aggressive";
+	if (stage === "aggressive") return "deterministic";
+	return null;
+}
+
 function findAlignedSequences<T extends { source_key: string; atomic_group_id: string | null }>(
 	rows: readonly T[],
 	lineage: readonly string[],
@@ -348,6 +469,21 @@ function findAlignedSequence<T extends { source_key: string; atomic_group_id: st
 	lineage: readonly string[],
 ): number {
 	return findAlignedSequences(rows, lineage)[0] ?? -1;
+}
+
+function containsSequence(sequence: readonly string[], candidate: readonly string[]): boolean {
+	if (candidate.length === 0 || candidate.length > sequence.length) return false;
+	for (let start = 0; start <= sequence.length - candidate.length; start++) {
+		let matches = true;
+		for (let offset = 0; offset < candidate.length; offset++) {
+			if (sequence[start + offset] !== candidate[offset]) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) return true;
+	}
+	return false;
 }
 
 function parseArtifactRefs(serialized: string): string[] {
@@ -429,14 +565,20 @@ class SqliteLcmContext implements LcmContext {
 		transaction.immediate();
 	}
 
-	reconcile(snapshot: SourceSnapshot): ReconcileResult {
+	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult {
 		this.#assertAvailable();
 		const normalized = normalizeSnapshot(snapshot);
-		const transaction = this.#db.transaction(() => this.#reconcileNormalized(normalized, this.#options.now()));
+		const transaction = this.#db.transaction(() =>
+			this.#reconcileNormalized(normalized, this.#options.now(), options?.summarize),
+		);
 		return transaction.immediate();
 	}
 
-	#reconcileNormalized(snapshot: NormalizedSnapshot, now: number): ReconcileResult {
+	#reconcileNormalized(
+		snapshot: NormalizedSnapshot,
+		now: number,
+		summarize?: false | Pick<ProjectionRequest, "tokenBudget" | "freshTail">,
+	): ReconcileResult {
 		const branch = this.#ensureBranch(snapshot.scope, now);
 		const current = this.#activeRows(branch.id);
 		const unchanged =
@@ -504,7 +646,20 @@ class SqliteLcmContext implements LcmContext {
 			this.#db.run("UPDATE branches SET revision = ?, reconciled_at = ? WHERE id = ?", [revision, now, branch.id]);
 		}
 
-		const schedule = this.#scheduleBranch(branch.id, snapshot.scope, revision, now);
+		if (summarize && typeof summarize === "object") {
+			const tokenBudget = assertInteger(summarize.tokenBudget, "summarize.tokenBudget", 0);
+			const maxSources = assertInteger(summarize.freshTail.maxSources, "summarize.freshTail.maxSources", 0);
+			const maxTokens = assertInteger(summarize.freshTail.maxTokens, "summarize.freshTail.maxTokens", 0);
+			this.#db.run(
+				`UPDATE branches SET summary_token_budget = ?, fresh_tail_max_sources = ?, fresh_tail_max_tokens = ?
+				 WHERE id = ?`,
+				[tokenBudget, maxSources, maxTokens, branch.id],
+			);
+		}
+		const schedule =
+			summarize === false
+				? { queued: 0, reused: 0 }
+				: this.#scheduleBranch(branch.id, snapshot.scope, revision, now, summarize);
 		return {
 			changed: !unchanged,
 			revision,
@@ -547,6 +702,61 @@ class SqliteLcmContext implements LcmContext {
 				now,
 			],
 		);
+		for (let ordinal = 0; ordinal < (entry.files?.length ?? 0); ordinal++) {
+			const file = entry.files![ordinal]!;
+			const existing = this.#db
+				.query<
+					{
+						project_id: string;
+						content_hash: string;
+						path: string;
+						file_type: string;
+						byte_size: number;
+						token_count: number;
+						exploration_summary: string;
+					},
+					[string]
+				>(
+					`SELECT project_id, content_hash, path, file_type, byte_size, token_count, exploration_summary
+					 FROM file_records WHERE file_id = ?`,
+				)
+				.get(file.fileId);
+			if (
+				existing &&
+				(existing.project_id !== projectId ||
+					existing.content_hash !== file.contentHash ||
+					existing.path !== file.path ||
+					existing.file_type !== file.fileType ||
+					existing.byte_size !== file.byteSize ||
+					existing.token_count !== file.tokenCount ||
+					existing.exploration_summary !== file.explorationSummary)
+			) {
+				throw new TypeError(`file metadata collision: ${file.fileId}`);
+			}
+			if (!existing) {
+				this.#db.run(
+					`INSERT INTO file_records
+						(file_id, project_id, content_hash, path, file_type, byte_size, token_count, exploration_summary, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					[
+						file.fileId,
+						projectId,
+						file.contentHash,
+						file.path,
+						file.fileType,
+						file.byteSize,
+						file.tokenCount,
+						file.explorationSummary,
+						now,
+					],
+				);
+			}
+			this.#db.run("INSERT OR IGNORE INTO source_files (source_key, ordinal, file_id) VALUES (?, ?, ?)", [
+				entry.sourceKey,
+				ordinal,
+				file.fileId,
+			]);
+		}
 	}
 
 	#activeRows(branchRowId: number): CurrentSourceRow[] {
@@ -587,8 +797,14 @@ class SqliteLcmContext implements LcmContext {
 			.all(projectId);
 	}
 
-	#scheduleBranch(branchRowId: number, scope: ContextScope, revision: number, now: number): ScheduleStats {
-		const rows = this.#db
+	#scheduleBranch(
+		branchRowId: number,
+		scope: ContextScope,
+		revision: number,
+		now: number,
+		summarize?: Pick<ProjectionRequest, "tokenBudget" | "freshTail">,
+	): ScheduleStats {
+		let rows = this.#db
 			.query<Pick<ActiveSourceRow, "source_key" | "token_count" | "atomic_group_id">, [number]>(
 				`SELECT bs.source_key, sc.token_count, bs.atomic_group_id
 				 FROM branch_sources bs JOIN source_contents sc ON sc.source_key = bs.source_key
@@ -596,6 +812,15 @@ class SqliteLcmContext implements LcmContext {
 			)
 			.all(branchRowId);
 		const stats: ScheduleStats = { queued: 0, reused: 0 };
+		if (summarize) {
+			const tail = selectFreshTail(
+				rows,
+				summarize.tokenBudget,
+				summarize.freshTail.maxSources,
+				summarize.freshTail.maxTokens,
+			);
+			rows = rows.slice(0, tail.start);
+		}
 		if (rows.length === 0) return stats;
 
 		const chunks: Array<typeof rows> = [];
@@ -762,6 +987,10 @@ class SqliteLcmContext implements LcmContext {
 				historical: [],
 				freshTailSourceIds: [],
 				uncoveredSourceIds: [],
+				sourceTokens: 0,
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: 0,
 				estimatedTokens: 0,
 				pendingJobs: 0,
 			};
@@ -774,23 +1003,12 @@ class SqliteLcmContext implements LcmContext {
 			boundary += unit.length;
 			atomicBoundaries.add(boundary);
 		}
-		let tailStart = rows.length;
-		let tailTokens = 0;
-		let tailCount = 0;
-		const effectiveTailTokenLimit = Math.min(maxTailTokens, tokenBudget);
-		for (let unitIndex = units.length - 1; unitIndex >= 0; unitIndex--) {
-			const unit = units[unitIndex];
-			if (!unit || tailCount >= maxTailSources) break;
-			const unitTokens = unit.reduce((total, row) => total + row.token_count, 0);
-			const expandsSourceLimit = tailCount + unit.length > maxTailSources;
-			const isAtomicClosure = unit.some(row => row.atomic_group_id !== null);
-			if ((expandsSourceLimit && !isAtomicClosure) || tailTokens + unitTokens > effectiveTailTokenLimit) break;
-			tailStart -= unit.length;
-			tailTokens += unitTokens;
-			tailCount += unit.length;
-		}
+		const tail = selectFreshTail(rows, tokenBudget, maxTailSources, maxTailTokens);
+		const tailStart = tail.start;
+		const tailTokens = tail.tokens;
 
 		const historical: ProjectedHistoricalItem[] = [];
+		const selectedLevelCounts: Record<number, number> = {};
 		const candidates = this.#summaryCandidates(scope.projectId);
 		const byFirstSource = new Map<string, SummaryCandidate[]>();
 		for (const candidate of candidates) {
@@ -838,12 +1056,14 @@ class SqliteLcmContext implements LcmContext {
 			historical.push({
 				kind: "summary",
 				summaryId: selected.summary_id,
+				summaryHandle: selected.stable_handle,
 				level: selected.level,
 				redactedText: selected.redacted_text,
 				tokenCount: selected.token_count,
 				sourceIds: coveredRows.map(source => source.entry_id),
 				citations: coveredRows.map(source => this.#citation(source)),
 			});
+			selectedLevelCounts[selected.level] = (selectedLevelCounts[selected.level] ?? 0) + 1;
 			cursor += selected.lineage.length;
 			usedTokens += selected.token_count;
 		}
@@ -854,6 +1074,10 @@ class SqliteLcmContext implements LcmContext {
 			historical,
 			freshTailSourceIds: rows.slice(tailStart).map(row => row.entry_id),
 			uncoveredSourceIds: rows.slice(cursor, tailStart).map(row => row.entry_id),
+			sourceTokens: rows.reduce((total, row) => total + row.token_count, 0),
+			selectedLevelCounts,
+			coveredSourceCount: cursor,
+			freshSourceCount: tail.count,
 			estimatedTokens: usedTokens,
 			pendingJobs: this.#count(
 				"SELECT COUNT(*) AS count FROM summary_jobs WHERE project_id = ? AND status IN ('pending', 'leased', 'failed')",
@@ -865,8 +1089,8 @@ class SqliteLcmContext implements LcmContext {
 	#summaryCandidates(projectId: string): SummaryCandidate[] {
 		const rows = this.#db
 			.query<SummaryRow & { ordinal: number; source_key: string }, [string]>(
-				`SELECT s.summary_id, s.input_hash, s.level, s.redacted_text, s.token_count, s.created_at,
-					sl.ordinal, sl.source_key
+				`SELECT s.summary_id, s.stable_handle, s.input_hash, s.level, s.redacted_text, s.token_count,
+					s.created_at, sl.ordinal, sl.source_key
 				 FROM summaries s JOIN summary_lineage sl ON sl.summary_id = s.summary_id
 				 WHERE s.project_id = ? ORDER BY s.summary_id, sl.ordinal`,
 			)
@@ -877,6 +1101,7 @@ class SqliteLcmContext implements LcmContext {
 			if (!current || current.summary_id !== row.summary_id) {
 				current = {
 					summary_id: row.summary_id,
+					stable_handle: row.stable_handle,
 					input_hash: row.input_hash,
 					level: row.level,
 					redacted_text: row.redacted_text,
@@ -901,8 +1126,8 @@ class SqliteLcmContext implements LcmContext {
 		const transaction = this.#db.transaction(() => {
 			const candidateLimit = Math.min(Math.max(limit * 16, limit), 1_000);
 			const candidates = this.#db
-				.query<Pick<JobRow, "job_id" | "project_id">, [number, number, number]>(
-					`SELECT job_id, project_id FROM summary_jobs
+				.query<Pick<JobRow, "job_id" | "project_id" | "stage">, [number, number, number]>(
+					`SELECT job_id, project_id, stage FROM summary_jobs
 					 WHERE available_at <= ? AND (
 						status IN ('pending', 'failed') OR
 						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
@@ -931,7 +1156,7 @@ class SqliteLcmContext implements LcmContext {
 					continue;
 				}
 				const inputTokenCount = inputs.reduce((total, input) => total + input.tokenCount, 0);
-				const outputTokenBudget = Math.min(maxOutputTokens, inputTokenCount - 1);
+				const outputTokenBudget = outputBudgetForStage(candidate.stage, maxOutputTokens, inputTokenCount);
 				if (outputTokenBudget < 1) {
 					this.#db.run(
 						"UPDATE summary_jobs SET status = 'obsolete', last_error = 'input too small to compress', updated_at = ? WHERE job_id = ?",
@@ -944,7 +1169,7 @@ class SqliteLcmContext implements LcmContext {
 				const changed = this.#db.run(
 					`UPDATE summary_jobs SET status = 'leased', worker_id = ?, lease_token = ?, lease_expires_at = ?,
 						lease_input_tokens = ?, lease_output_budget = ?, attempt_count = attempt_count + 1,
-						last_error = NULL, updated_at = ?
+						last_strategy = ?, last_input_tokens = ?, updated_at = ?
 					 WHERE job_id = ? AND available_at <= ? AND (
 						status IN ('pending', 'failed') OR
 						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
@@ -955,6 +1180,8 @@ class SqliteLcmContext implements LcmContext {
 						leaseExpiresAt,
 						inputTokenCount,
 						outputTokenBudget,
+						strategyForStage(candidate.stage),
+						inputTokenCount,
 						now,
 						candidate.job_id,
 						now,
@@ -984,6 +1211,22 @@ class SqliteLcmContext implements LcmContext {
 		return transaction.immediate();
 	}
 
+	nextSummaryJobDelayMs(): number | null {
+		this.#assertAvailable();
+		const now = this.#options.now();
+		const row = this.#db
+			.query<{ available_at: number | null }, []>(
+				`SELECT MIN(CASE
+					WHEN status = 'leased' THEN lease_expires_at
+					ELSE available_at
+				 END) AS available_at
+				 FROM summary_jobs
+				 WHERE status IN ('pending', 'failed', 'leased')`,
+			)
+			.get();
+		return row?.available_at === null || row?.available_at === undefined ? null : Math.max(0, row.available_at - now);
+	}
+
 	#loadClaimedJob(
 		jobId: string,
 		leaseToken: string,
@@ -993,7 +1236,9 @@ class SqliteLcmContext implements LcmContext {
 		outputTokenBudget: number,
 	): SummaryJob | null {
 		const job = this.#db
-			.query<Pick<JobRow, "job_id" | "level">, [string]>("SELECT job_id, level FROM summary_jobs WHERE job_id = ?")
+			.query<Pick<JobRow, "job_id" | "level" | "stage" | "transport_retry_count">, [string]>(
+				"SELECT job_id, level, stage, transport_retry_count FROM summary_jobs WHERE job_id = ?",
+			)
 			.get(jobId);
 		if (!job) return null;
 		return {
@@ -1006,6 +1251,9 @@ class SqliteLcmContext implements LcmContext {
 			sourceCount: this.#jobLineage(jobId).length,
 			inputTokenCount,
 			outputTokenBudget,
+			stage: job.stage,
+			strategy: strategyForStage(job.stage),
+			transportRetryCount: job.transport_retry_count,
 		};
 	}
 
@@ -1104,12 +1352,20 @@ class SqliteLcmContext implements LcmContext {
 				? locallyMeasuredTokens
 				: assertInteger(completion.tokenCount, "completion.tokenCount", 0);
 		const tokenCount = Math.max(locallyMeasuredTokens, reportedTokens);
+		const provenance = completion.provenance;
+		if (provenance) {
+			assertIdentifier(provenance.promptHash, "completion.provenance.promptHash");
+			if (provenance.modelSelector !== undefined)
+				assertIdentifier(provenance.modelSelector, "completion.provenance.modelSelector");
+			if (provenance.resolvedModel !== undefined)
+				assertIdentifier(provenance.resolvedModel, "completion.provenance.resolvedModel");
+		}
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): CompleteSummaryJobResult => {
 			const job = this.#db
 				.query<JobRow, [string]>(
 					`SELECT job_id, project_id, input_hash, level, status, lease_token, lease_expires_at,
-						lease_input_tokens, lease_output_budget
+						lease_input_tokens, lease_output_budget, stage, transport_retry_count
 					 FROM summary_jobs WHERE job_id = ?`,
 				)
 				.get(jobId);
@@ -1123,6 +1379,13 @@ class SqliteLcmContext implements LcmContext {
 			) {
 				return { accepted: false, reason: "lease_lost" };
 			}
+			const strategy = strategyForStage(job.stage);
+			if (provenance && provenance.strategy !== strategy) {
+				throw new TypeError(`completion provenance strategy ${provenance.strategy} does not match ${strategy}`);
+			}
+			const promptHash = provenance?.promptHash ?? null;
+			const modelSelector = provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null;
+			const resolvedModel = provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null;
 			const lineage = this.#jobLineage(jobId);
 			if (!this.#lineageActiveSomewhere(job.project_id, lineage)) {
 				this.#db.run(
@@ -1133,13 +1396,49 @@ class SqliteLcmContext implements LcmContext {
 				return { accepted: false, reason: "stale" };
 			}
 			if (tokenCount >= job.lease_input_tokens || tokenCount > job.lease_output_budget) {
+				const advanced = nextStage(job.stage);
+				if (advanced) {
+					this.#db.run(
+						`UPDATE summary_jobs SET status = 'pending', stage = ?, worker_id = NULL, lease_token = NULL,
+							lease_expires_at = NULL, available_at = ?, last_error = 'summary did not compress input',
+							non_compression_count = non_compression_count + 1, last_strategy = ?, last_prompt_hash = ?,
+							last_model_selector = ?, last_resolved_model = ?, last_input_tokens = ?, last_output_tokens = ?,
+							updated_at = ? WHERE job_id = ? AND lease_token = ?`,
+						[
+							advanced,
+							now,
+							strategy,
+							promptHash,
+							modelSelector,
+							resolvedModel,
+							job.lease_input_tokens,
+							tokenCount,
+							now,
+							jobId,
+							leaseToken,
+						],
+					);
+					return { accepted: false, reason: "escalated", stage: advanced };
+				}
 				this.#db.run(
-					`UPDATE summary_jobs SET status = 'failed', worker_id = NULL, lease_token = NULL,
-						lease_expires_at = NULL, available_at = ?, last_error = 'summary did not compress input', updated_at = ?
-					 WHERE job_id = ? AND lease_token = ?`,
-					[now, now, jobId, leaseToken],
+					`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
+						lease_expires_at = NULL, last_error = 'deterministic summary did not compress input',
+						non_compression_count = non_compression_count + 1, last_strategy = ?, last_prompt_hash = ?,
+						last_model_selector = ?, last_resolved_model = ?, last_input_tokens = ?, last_output_tokens = ?,
+						updated_at = ? WHERE job_id = ? AND lease_token = ?`,
+					[
+						strategy,
+						promptHash,
+						modelSelector,
+						resolvedModel,
+						job.lease_input_tokens,
+						tokenCount,
+						now,
+						jobId,
+						leaseToken,
+					],
 				);
-				return { accepted: false, reason: "not_compressed" };
+				return { accepted: false, reason: "deterministic_failed" };
 			}
 
 			let summary = this.#db
@@ -1147,6 +1446,18 @@ class SqliteLcmContext implements LcmContext {
 					"SELECT summary_id FROM summaries WHERE project_id = ? AND input_hash = ?",
 				)
 				.get(job.project_id, job.input_hash);
+			const jobInputs = this.#db
+				.query<JobInputRow, [string]>("SELECT input_kind, ref_id FROM job_inputs WHERE job_id = ? ORDER BY ordinal")
+				.all(jobId);
+			const handleInputs = jobInputs.map(input => {
+				if (input.input_kind === "source") return { kind: "source" as const, id: input.ref_id };
+				const child = this.#db
+					.query<{ stable_handle: string }, [string]>("SELECT stable_handle FROM summaries WHERE summary_id = ?")
+					.get(input.ref_id);
+				if (!child) throw new Error(`Missing child summary ${input.ref_id}`);
+				return { kind: "summary" as const, id: child.stable_handle };
+			});
+			const stableHandle = summaryHandleForInput(job.project_id, job.level, handleInputs);
 			if (!summary) {
 				const summaryId = `sum_${contentAddress([
 					"lcm-summary-v1",
@@ -1156,9 +1467,25 @@ class SqliteLcmContext implements LcmContext {
 				])}`;
 				this.#db.run(
 					`INSERT INTO summaries
-						(summary_id, project_id, input_hash, level, redacted_text, token_count, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					[summaryId, job.project_id, job.input_hash, job.level, completion.redactedText, tokenCount, now],
+						(summary_id, stable_handle, project_id, input_hash, level, redacted_text, token_count, strategy,
+						 prompt_hash, model_selector, resolved_model, input_token_count, output_token_count, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					[
+						summaryId,
+						stableHandle,
+						job.project_id,
+						job.input_hash,
+						job.level,
+						completion.redactedText,
+						tokenCount,
+						strategy,
+						promptHash,
+						modelSelector,
+						resolvedModel,
+						job.lease_input_tokens,
+						tokenCount,
+						now,
+					],
 				);
 				for (let ordinal = 0; ordinal < lineage.length; ordinal++) {
 					this.#db.run("INSERT INTO summary_lineage (summary_id, ordinal, source_key) VALUES (?, ?, ?)", [
@@ -1167,12 +1494,7 @@ class SqliteLcmContext implements LcmContext {
 						lineage[ordinal]!,
 					]);
 				}
-				const children = this.#db
-					.query<JobInputRow, [string]>(
-						"SELECT input_kind, ref_id FROM job_inputs WHERE job_id = ? ORDER BY ordinal",
-					)
-					.all(jobId)
-					.filter(input => input.input_kind === "summary");
+				const children = jobInputs.filter(input => input.input_kind === "summary");
 				for (let ordinal = 0; ordinal < children.length; ordinal++) {
 					this.#db.run("INSERT INTO summary_children (summary_id, ordinal, child_summary_id) VALUES (?, ?, ?)", [
 						summaryId,
@@ -1184,9 +1506,22 @@ class SqliteLcmContext implements LcmContext {
 			}
 			this.#db.run(
 				`UPDATE summary_jobs SET status = 'completed', result_summary_id = ?, worker_id = NULL,
-					lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ?
+					lease_token = NULL, lease_expires_at = NULL, last_error = NULL, last_strategy = ?,
+					last_prompt_hash = ?, last_model_selector = ?, last_resolved_model = ?,
+					last_input_tokens = ?, last_output_tokens = ?, updated_at = ?
 				 WHERE job_id = ? AND lease_token = ?`,
-				[summary.summary_id, now, jobId, leaseToken],
+				[
+					summary.summary_id,
+					strategy,
+					promptHash,
+					modelSelector,
+					resolvedModel,
+					job.lease_input_tokens,
+					tokenCount,
+					now,
+					jobId,
+					leaseToken,
+				],
 			);
 			this.#scheduleProject(job.project_id, now);
 			return { accepted: true, summaryId: summary.summary_id };
@@ -1196,17 +1531,32 @@ class SqliteLcmContext implements LcmContext {
 
 	#scheduleProject(projectId: string, now: number): ScheduleStats {
 		const branches = this.#db
-			.query<{ id: number; session_id: string; branch_id: string; revision: number }, [string]>(
-				"SELECT id, session_id, branch_id, revision FROM branches WHERE project_id = ? ORDER BY id",
+			.query<BranchScheduleRow, [string]>(
+				`SELECT id, session_id, branch_id, revision, summary_token_budget,
+					fresh_tail_max_sources, fresh_tail_max_tokens
+				 FROM branches WHERE project_id = ? ORDER BY id`,
 			)
 			.all(projectId);
 		const total: ScheduleStats = { queued: 0, reused: 0 };
 		for (const branch of branches) {
+			const summarize =
+				branch.summary_token_budget !== null &&
+				branch.fresh_tail_max_sources !== null &&
+				branch.fresh_tail_max_tokens !== null
+					? {
+							tokenBudget: branch.summary_token_budget,
+							freshTail: {
+								maxSources: branch.fresh_tail_max_sources,
+								maxTokens: branch.fresh_tail_max_tokens,
+							},
+						}
+					: undefined;
 			const result = this.#scheduleBranch(
 				branch.id,
 				{ projectId, sessionId: branch.session_id, branchId: branch.branch_id },
 				branch.revision,
 				now,
+				summarize,
 			);
 			total.queued += result.queued;
 			total.reused += result.reused;
@@ -1214,18 +1564,47 @@ class SqliteLcmContext implements LcmContext {
 		return total;
 	}
 
-	failSummaryJob(jobId: string, leaseToken: string, redactedError: string, retryDelayMs: number): boolean {
+	failSummaryJob(
+		jobId: string,
+		leaseToken: string,
+		redactedError: string,
+		retryDelayMs: number,
+		provenance?: SummaryAttemptProvenance,
+	): boolean {
 		this.#assertAvailable();
 		assertIdentifier(jobId, "jobId");
 		assertIdentifier(leaseToken, "leaseToken");
 		if (typeof redactedError !== "string") throw new TypeError("redactedError must be a string");
 		assertInteger(retryDelayMs, "retryDelayMs", 0);
+		if (provenance) {
+			assertIdentifier(provenance.promptHash, "provenance.promptHash");
+			if (provenance.modelSelector !== undefined)
+				assertIdentifier(provenance.modelSelector, "provenance.modelSelector");
+			if (provenance.resolvedModel !== undefined)
+				assertIdentifier(provenance.resolvedModel, "provenance.resolvedModel");
+		}
 		const now = this.#options.now();
 		const result = this.#db.run(
 			`UPDATE summary_jobs SET status = 'failed', worker_id = NULL, lease_token = NULL,
-				lease_expires_at = NULL, available_at = ?, last_error = ?, updated_at = ?
+				lease_expires_at = NULL, available_at = ?, last_error = ?,
+				transport_retry_count = transport_retry_count + 1,
+				last_strategy = COALESCE(?, last_strategy), last_prompt_hash = COALESCE(?, last_prompt_hash),
+				last_model_selector = COALESCE(?, last_model_selector),
+				last_resolved_model = COALESCE(?, last_resolved_model),
+				last_input_tokens = lease_input_tokens, updated_at = ?
 			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
-			[now + retryDelayMs, boundedDiagnostic(redactedError), now, jobId, leaseToken, now],
+			[
+				now + retryDelayMs,
+				boundedDiagnostic(redactedError),
+				provenance?.strategy ?? null,
+				provenance?.promptHash ?? null,
+				provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null,
+				provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null,
+				now,
+				jobId,
+				leaseToken,
+				now,
+			],
 		);
 		return Number(result.changes) > 0;
 	}
@@ -1236,13 +1615,20 @@ class SqliteLcmContext implements LcmContext {
 	): Promise<RunSummaryJobsResult> {
 		assertInteger(options.retryDelayMs, "retryDelayMs", 0);
 		const jobs = this.claimSummaryJobs(options);
-		const result: RunSummaryJobsResult = { claimed: jobs.length, completed: 0, failed: 0, stale: 0 };
+		const result: RunSummaryJobsResult = {
+			claimed: jobs.length,
+			completed: 0,
+			failed: 0,
+			stale: 0,
+			escalated: 0,
+		};
 		for (const job of jobs) {
 			try {
 				const completion = await complete(job);
 				const accepted = this.completeSummaryJob(job.jobId, job.leaseToken, completion);
 				if (accepted.accepted) result.completed++;
-				else if (accepted.reason === "not_compressed") result.failed++;
+				else if (accepted.reason === "escalated") result.escalated++;
+				else if (accepted.reason === "deterministic_failed") result.failed++;
 				else result.stale++;
 			} catch (error) {
 				if (this.failSummaryJob(job.jobId, job.leaseToken, errorName(error), options.retryDelayMs)) result.failed++;
@@ -1255,16 +1641,24 @@ class SqliteLcmContext implements LcmContext {
 	search(request: SearchRequest): SearchHit[] {
 		this.#assertAvailable();
 		const scope = normalizeScope(request);
-		const limit = assertInteger(request.limit ?? 20, "limit", 1);
+		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), 100);
+		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), 1_000);
 		const match = this.#ftsMatch(request.query);
 		if (!match) return [];
 		const branchRows = this.#activeSourceRows(scope);
 		if (branchRows.length === 0) return [];
-		const documents = this.#searchDocuments(scope.projectId, match, limit);
+		let scopedLineage: string[] | undefined;
+		if (request.summaryHandle !== undefined) {
+			const handle = assertIdentifier(request.summaryHandle, "summaryHandle");
+			const root = this.#summaryByHandle(scope.projectId, handle);
+			if (!root) return [];
+			scopedLineage = this.#summaryLineage(root.summary_id);
+			if (findAlignedSequence(branchRows, scopedLineage) < 0) return [];
+		}
 		const hits: SearchHit[] = [];
-		for (const document of documents) {
-			if (hits.length >= limit) break;
+		for (const document of this.#searchDocuments(scope.projectId, match, offset + limit)) {
 			if (document.document_kind === "source") {
+				if (scopedLineage && !scopedLineage.includes(document.ref_id)) continue;
 				const matches = branchRows.filter(row => row.source_key === document.ref_id);
 				if (matches.length === 0) continue;
 				hits.push({
@@ -1276,25 +1670,29 @@ class SqliteLcmContext implements LcmContext {
 				});
 				continue;
 			}
-			const lineage = this.#summaryLineage(document.ref_id);
+			const summary = this.#summaryById(document.ref_id);
+			if (!summary) continue;
+			const lineage = this.#summaryLineage(summary.summary_id);
+			if (scopedLineage && !containsSequence(scopedLineage, lineage)) continue;
 			const start = findAlignedSequence(branchRows, lineage);
 			if (start < 0) continue;
-			const citedRows = branchRows.slice(start, start + lineage.length);
 			hits.push({
 				kind: "summary",
-				id: document.ref_id,
+				id: summary.summary_id,
+				summaryHandle: summary.stable_handle,
 				redactedText: document.redacted_text,
 				rank: Number(document.rank),
-				citations: citedRows.map(row => this.#citation(row)),
+				citations: branchRows.slice(start, start + lineage.length).map(row => this.#citation(row)),
 			});
 		}
-		return hits;
+		return hits.slice(offset, offset + limit);
 	}
 
 	searchProject(request: ProjectSearchRequest): SearchHit[] {
 		this.#assertAvailable();
 		const projectId = assertIdentifier(request.projectId, "projectId");
-		const limit = assertInteger(request.limit ?? 20, "limit", 1);
+		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), 100);
+		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), 1_000);
 		const match = this.#ftsMatch(request.query);
 		if (!match) return [];
 		const projectRows = this.#activeProjectSourceRows(projectId);
@@ -1307,8 +1705,7 @@ class SqliteLcmContext implements LcmContext {
 		}
 
 		const hits: SearchHit[] = [];
-		for (const document of this.#searchDocuments(projectId, match, limit)) {
-			if (hits.length >= limit) break;
+		for (const document of this.#searchDocuments(projectId, match, offset + limit)) {
 			if (document.document_kind === "source") {
 				const matches = projectRows.filter(row => row.source_key === document.ref_id);
 				if (matches.length === 0) continue;
@@ -1321,7 +1718,9 @@ class SqliteLcmContext implements LcmContext {
 				});
 				continue;
 			}
-			const lineage = this.#summaryLineage(document.ref_id);
+			const summary = this.#summaryById(document.ref_id);
+			if (!summary) continue;
+			const lineage = this.#summaryLineage(summary.summary_id);
 			const citations: Citation[] = [];
 			for (const branchRows of byBranch.values()) {
 				for (const start of findAlignedSequences(branchRows, lineage)) {
@@ -1331,17 +1730,18 @@ class SqliteLcmContext implements LcmContext {
 			if (citations.length === 0) continue;
 			hits.push({
 				kind: "summary",
-				id: document.ref_id,
+				id: summary.summary_id,
+				summaryHandle: summary.stable_handle,
 				redactedText: document.redacted_text,
 				rank: Number(document.rank),
 				citations,
 			});
 		}
-		return hits;
+		return hits.slice(offset, offset + limit);
 	}
 
-	#searchDocuments(projectId: string, match: string, limit: number): SearchDocumentRow[] {
-		const candidateLimit = Math.min(Math.max(limit * 16, 64), 1_000);
+	#searchDocuments(projectId: string, match: string, requested: number): SearchDocumentRow[] {
+		const candidateLimit = Math.min(Math.max(requested * 16, 64), 1_000);
 		return this.#db
 			.query<SearchDocumentRow, [string, string, number]>(
 				`SELECT d.document_kind, d.ref_id, d.redacted_text, bm25(search_fts) AS rank
@@ -1349,6 +1749,28 @@ class SqliteLcmContext implements LcmContext {
 				 WHERE search_fts MATCH ? AND d.project_id = ? ORDER BY rank, d.id LIMIT ?`,
 			)
 			.all(match, projectId, candidateLimit);
+	}
+
+	#summaryById(summaryId: string): SummaryRow | null {
+		return (
+			this.#db
+				.query<SummaryRow, [string]>(
+					`SELECT summary_id, stable_handle, input_hash, level, redacted_text, token_count, created_at
+					 FROM summaries WHERE summary_id = ?`,
+				)
+				.get(summaryId) ?? null
+		);
+	}
+
+	#summaryByHandle(projectId: string, summaryHandle: string): SummaryRow | null {
+		return (
+			this.#db
+				.query<SummaryRow, [string, string]>(
+					`SELECT summary_id, stable_handle, input_hash, level, redacted_text, token_count, created_at
+					 FROM summaries WHERE project_id = ? AND stable_handle = ?`,
+				)
+				.get(projectId, summaryHandle) ?? null
+		);
 	}
 
 	#summaryLineage(summaryId: string): string[] {
@@ -1365,6 +1787,38 @@ class SqliteLcmContext implements LcmContext {
 		const tokens = query.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu);
 		if (!tokens || tokens.length === 0) return null;
 		return [...new Set(tokens)].map(token => `"${token.replaceAll('"', '""')}"`).join(" AND ");
+	}
+
+	#toFileMetadata(row: FileRow): LcmFileMetadata {
+		return {
+			fileId: row.file_id,
+			contentHash: row.content_hash,
+			path: row.path,
+			fileType: row.file_type,
+			byteSize: row.byte_size,
+			tokenCount: row.token_count,
+			explorationSummary: row.exploration_summary,
+		};
+	}
+
+	#filesForSource(sourceKey: string): LcmFileMetadata[] {
+		return this.#db
+			.query<FileRow, [string]>(
+				`SELECT f.file_id, f.project_id, f.content_hash, f.path, f.file_type, f.byte_size,
+					f.token_count, f.exploration_summary
+				 FROM source_files sf JOIN file_records f ON f.file_id = sf.file_id
+				 WHERE sf.source_key = ? ORDER BY sf.ordinal`,
+			)
+			.all(sourceKey)
+			.map(row => this.#toFileMetadata(row));
+	}
+
+	#filesForLineage(lineage: readonly string[]): LcmFileMetadata[] {
+		const files = new Map<string, LcmFileMetadata>();
+		for (const sourceKey of lineage) {
+			for (const file of this.#filesForSource(sourceKey)) files.set(file.fileId, file);
+		}
+		return [...files.values()];
 	}
 
 	describe(citation: Citation): SourceDescription | null {
@@ -1401,6 +1855,146 @@ class SqliteLcmContext implements LcmContext {
 			atomicGroupId: row.atomic_group_id,
 			redactedText: row.redacted_text,
 			artifactRefs: parseArtifactRefs(row.artifact_refs),
+			files: this.#filesForSource(row.source_key),
+		};
+	}
+
+	#describeSummaryRow(
+		scope: ContextScope,
+		row: SummaryRow,
+		branchRows: readonly ActiveSourceRow[],
+	): SummaryDescription | null {
+		const lineage = this.#summaryLineage(row.summary_id);
+		if (findAlignedSequence(branchRows, lineage) < 0) return null;
+		const parentHandles: string[] = [];
+		for (const parent of this.#db
+			.query<{ summary_id: string; stable_handle: string }, [string]>(
+				`SELECT parent.summary_id, parent.stable_handle FROM summary_children edge
+				 JOIN summaries parent ON parent.summary_id = edge.summary_id
+				 WHERE edge.child_summary_id = ? ORDER BY parent.level, parent.summary_id`,
+			)
+			.all(row.summary_id)) {
+			if (findAlignedSequence(branchRows, this.#summaryLineage(parent.summary_id)) >= 0) {
+				parentHandles.push(parent.stable_handle);
+			}
+		}
+		return {
+			...scope,
+			summaryHandle: row.stable_handle,
+			kind: row.level === 0 ? "leaf" : "condensed",
+			level: row.level,
+			redactedText: row.redacted_text,
+			tokenCount: row.token_count,
+			sourceCount: lineage.length,
+			childCount: this.#count("SELECT COUNT(*) AS count FROM summary_children WHERE summary_id = ?", row.summary_id),
+			parentHandles: [...new Set(parentHandles)],
+			files: this.#filesForLineage(lineage),
+		};
+	}
+
+	describeSummary(reference: SummaryReference): SummaryDescription | null {
+		this.#assertAvailable();
+		const scope = normalizeScope(reference);
+		const summaryHandle = assertIdentifier(reference.summaryHandle, "summaryHandle");
+		const row = this.#summaryByHandle(scope.projectId, summaryHandle);
+		if (!row) return null;
+		return this.#describeSummaryRow(scope, row, this.#activeSourceRows(scope));
+	}
+
+	describeFile(reference: FileReference): FileDescription | null {
+		this.#assertAvailable();
+		const scope = normalizeScope(reference);
+		const fileId = assertIdentifier(reference.fileId, "fileId");
+		const row = this.#db
+			.query<FileRow, [string, string]>(
+				`SELECT file_id, project_id, content_hash, path, file_type, byte_size, token_count, exploration_summary
+				 FROM file_records WHERE project_id = ? AND file_id = ?`,
+			)
+			.get(scope.projectId, fileId);
+		if (!row) return null;
+		const sources = this.#activeSourceRows(scope)
+			.filter(source => this.#filesForSource(source.source_key).some(file => file.fileId === fileId))
+			.map(source => this.#citation(source));
+		if (sources.length === 0) return null;
+		return { ...scope, ...this.#toFileMetadata(row), sources };
+	}
+
+	expandSummary(request: SummaryExpansionRequest): SummaryExpansion | null {
+		this.#assertAvailable();
+		const scope = normalizeScope(request);
+		const summaryHandle = assertIdentifier(request.summaryHandle, "summaryHandle");
+		const depth = Math.min(assertInteger(request.depth ?? 1, "depth", 1), 4);
+		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), 1_000);
+		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), 50);
+		const maxTokens = Math.min(assertInteger(request.maxTokens ?? 4_000, "maxTokens", 1), 8_000);
+		const branchRows = this.#activeSourceRows(scope);
+		const rootRow = this.#summaryByHandle(scope.projectId, summaryHandle);
+		if (!rootRow) return null;
+		const root = this.#describeSummaryRow(scope, rootRow, branchRows);
+		if (!root) return null;
+		const rootLineage = this.#summaryLineage(rootRow.summary_id);
+		const rootStart = findAlignedSequence(branchRows, rootLineage);
+		if (rootStart < 0) return null;
+		const rootRows = branchRows.slice(rootStart, rootStart + rootLineage.length);
+		const sourcesByKey = new Map<string, ActiveSourceRow[]>();
+		for (const source of rootRows) {
+			const occurrences = sourcesByKey.get(source.source_key);
+			if (occurrences) occurrences.push(source);
+			else sourcesByKey.set(source.source_key, [source]);
+		}
+		const sourceOffsets = new Map<string, number>();
+		const candidates: SummaryExpansion["items"][number][] = [];
+		const visit = (summary: SummaryRow, itemDepth: number): void => {
+			const children = this.#db
+				.query<{ summary_id: string }, [string]>(
+					"SELECT child_summary_id AS summary_id FROM summary_children WHERE summary_id = ? ORDER BY ordinal",
+				)
+				.all(summary.summary_id);
+			if (children.length > 0) {
+				for (const childRef of children) {
+					const child = this.#summaryById(childRef.summary_id);
+					if (!child) continue;
+					const description = this.#describeSummaryRow(scope, child, branchRows);
+					if (!description) continue;
+					candidates.push({ kind: "summary", depth: itemDepth, summary: description });
+					if (itemDepth < depth) visit(child, itemDepth + 1);
+				}
+				return;
+			}
+			for (const sourceKey of this.#summaryLineage(summary.summary_id)) {
+				const offset = sourceOffsets.get(sourceKey) ?? 0;
+				const source = sourcesByKey.get(sourceKey)?.[offset];
+				if (!source) continue;
+				sourceOffsets.set(sourceKey, offset + 1);
+				candidates.push({
+					kind: "source",
+					depth: itemDepth,
+					citation: this.#citation(source),
+					tokenCount: source.token_count,
+					files: this.#filesForSource(source.source_key),
+				});
+			}
+		};
+		visit(rootRow, 1);
+		const items: SummaryExpansion["items"][number][] = [];
+		let estimatedTokens = 0;
+		for (const item of candidates.slice(offset)) {
+			if (items.length >= limit) break;
+			const rawTokens = item.kind === "summary" ? item.summary.tokenCount : item.tokenCount;
+			const itemTokens = Math.min(Math.max(1, rawTokens), maxTokens);
+			if (items.length > 0 && estimatedTokens + itemTokens > maxTokens) break;
+			items.push(item);
+			estimatedTokens += itemTokens;
+		}
+		const next = offset + items.length;
+		return {
+			root,
+			items,
+			offset,
+			totalItems: candidates.length,
+			estimatedTokens,
+			truncated: next < candidates.length,
+			...(next < candidates.length ? { nextOffset: next } : {}),
 		};
 	}
 
@@ -1526,6 +2120,7 @@ class SqliteLcmContext implements LcmContext {
 			this.#db.run("DELETE FROM summaries");
 			this.#db.run("DELETE FROM branches");
 			this.#db.run("DELETE FROM source_contents");
+			this.#db.run("DELETE FROM file_records");
 			this.#db.run("DELETE FROM search_documents");
 			this.#db.run("INSERT INTO search_fts(search_fts) VALUES('rebuild')");
 			let activeSources = 0;
@@ -1603,7 +2198,13 @@ class SqliteLcmContext implements LcmContext {
 					  AND NOT EXISTS (SELECT 1 FROM job_lineage jl WHERE jl.source_key = source_contents.source_key)
 				`).changes,
 			);
-			return { tombstones, jobs, summaries, sourceContents };
+			const files = Number(
+				this.#db.run(`
+					DELETE FROM file_records
+					WHERE NOT EXISTS (SELECT 1 FROM source_files sf WHERE sf.file_id = file_records.file_id)
+				`).changes,
+			);
+			return { tombstones, jobs, summaries, sourceContents, files };
 		});
 		return transaction.immediate();
 	}

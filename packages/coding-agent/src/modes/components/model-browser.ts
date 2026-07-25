@@ -13,6 +13,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import {
 	type Component,
+	Ellipsis,
 	fuzzyRank,
 	Input,
 	matchesKey,
@@ -332,6 +333,11 @@ const PERF_TPS_MIN_WIDTH = 76;
 const PERF_FULL_MIN_WIDTH = 96;
 /** What the per-row perf column shows at the current width. */
 type PerfMode = "off" | "tps" | "full";
+
+/** Match truncation markers to the active symbol preset. */
+function browserEllipsis(): Ellipsis {
+	return theme.getSymbolPreset() === "ascii" ? Ellipsis.Ascii : Ellipsis.Unicode;
+}
 
 /**
  * The reusable browser component. Renders a fixed-height block
@@ -715,7 +721,7 @@ export class ModelBrowser implements Component {
 	): string {
 		if (item.id === "separator") {
 			const dashCount = Math.max(0, width - 4);
-			const line = theme.fg("muted", "─".repeat(dashCount));
+			const line = theme.fg("muted", theme.boxSharp.horizontal.repeat(dashCount));
 			return `  ${line}  `;
 		}
 		const disabled = this.#isDisabled(item);
@@ -739,7 +745,7 @@ export class ModelBrowser implements Component {
 		const meta = `${perfCol}${theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth))}  ${theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth))}`;
 		const metaWidth = ctxWidth + costWidth + 2 + (perfWidth > 0 ? perfWidth + 2 : 0);
 		const available = Math.max(1, width - metaWidth - 1);
-		left = truncateToWidth(left, available);
+		left = truncateToWidth(left, available, browserEllipsis());
 		const gap = Math.max(0, available - visibleWidth(left));
 
 		let line = `${left}${" ".repeat(gap)} ${meta}`;
@@ -770,11 +776,11 @@ export class ModelBrowser implements Component {
 			facts.push(`~${formatTps(perf.tps)}`);
 			if (perf.ttftMs !== null) facts.push(`${formatTtft(perf.ttftMs)} ttft`);
 		}
-		const line1 = truncateToWidth(theme.fg("muted", `  ${facts.join(" · ")}`), width);
+		const line1 = truncateToWidth(theme.fg("muted", `  ${facts.join(theme.sep.dot)}`), width, browserEllipsis());
 
 		if (this.#isDisabled(selected)) {
 			const warning = `  ${theme.status.disabled} current context ${formatNumber(this.#currentContextTokens).toLowerCase()} exceeds ${formatNumber(model.contextWindow ?? 0).toLowerCase()} limit`;
-			return [line1, truncateToWidth(theme.fg("warning", warning), width)];
+			return [line1, truncateToWidth(theme.fg("warning", warning), width, browserEllipsis())];
 		}
 
 		const chips: string[] = [];
@@ -792,7 +798,10 @@ export class ModelBrowser implements Component {
 		};
 		for (const role of MODEL_ROLE_IDS) pushRole(role);
 		for (const role in this.#roles) pushRole(role);
-		const line2 = chips.length > 0 ? truncateToWidth(`  ${chips.join(theme.fg("dim", " · "))}`, width) : "";
+		const line2 =
+			chips.length > 0
+				? truncateToWidth(`  ${chips.join(theme.fg("dim", theme.sep.dot))}`, width, browserEllipsis())
+				: "";
 		return [line1, line2];
 	}
 
@@ -816,7 +825,7 @@ export class ModelBrowser implements Component {
 		if (total === 0) {
 			const message =
 				this.#emptyText?.() ?? (this.query.trim() ? "  No matching models" : "  No models available in this scope");
-			lines.push(truncateToWidth(theme.fg("muted", message), width));
+			lines.push(truncateToWidth(theme.fg("muted", message), width, browserEllipsis()));
 			for (let i = 1; i < this.#maxVisible; i++) lines.push("");
 		} else {
 			// Per-window column widths keep the metadata block aligned without
@@ -850,10 +859,13 @@ export class ModelBrowser implements Component {
 					),
 				);
 			}
+			const ascii = theme.getSymbolPreset() === "ascii";
 			const scrollView = new ScrollView(rows, {
 				height: rows.length,
 				scrollbar: "auto",
 				totalRows: total,
+				ellipsis: browserEllipsis(),
+				...(ascii ? { trackChar: "|", thumbChar: "#" } : {}),
 				theme: { track: t => theme.fg("muted", t), thumb: t => theme.fg("accent", t) },
 			});
 			scrollView.setScrollOffset(startIndex);

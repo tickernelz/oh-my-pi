@@ -242,6 +242,7 @@ export class RpcSubagentRegistry {
 	handleEvent(payload: SubagentEventPayload): void {
 		if (this.#staleSubagentIds.has(payload.id)) return;
 		if (this.#subscriptionLevel !== "events") return;
+		if (payload.event.type === "lcm_projection") return;
 		this.#output({ type: "subagent_event", payload } satisfies RpcSubagentEventFrame);
 	}
 

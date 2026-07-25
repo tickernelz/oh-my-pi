@@ -51,7 +51,7 @@ import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
 import { HubTool, isIrcEnabled } from "./hub";
 import { InspectImageTool } from "./inspect-image";
-import { LcmCrossProjectSearchTool, LcmDescribeTool, LcmRecallTool, LcmSearchTool } from "./lcm";
+import { LcmCrossProjectSearchTool, LcmDescribeTool, LcmExpandTool, LcmRecallTool, LcmSearchTool } from "./lcm";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -70,6 +70,7 @@ const LCM_RETRIEVAL_TOOL_NAMES: Readonly<Record<string, true>> = {
 	lcm_search: true,
 	lcm_describe: true,
 	lcm_recall: true,
+	lcm_expand: true,
 	lcm_cross_project_search: true,
 };
 
@@ -245,8 +246,10 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
-	/** Current-session LCM retrieval/completion port; owning primary sessions wire this without forwarding it implicitly. */
+	/** This session's own project/session/branch-scoped LCM retrieval port. */
 	getLcmRuntime?: () => LcmRetrievalRuntime | undefined;
+	/** Concrete parent capability forwarded only across a Task child boundary. */
+	getForwardedLcmRuntime?: () => LcmRetrievalRuntime | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -430,6 +433,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	manage_skill: ManageSkillTool.createIf,
 	lcm_search: LcmSearchTool.createIf,
 	lcm_describe: LcmDescribeTool.createIf,
+	lcm_expand: LcmExpandTool.createIf,
 	lcm_recall: LcmRecallTool.createIf,
 	lcm_cross_project_search: s => new LcmCrossProjectSearchTool(s),
 };
@@ -560,6 +564,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
 		if (name === "goal") return goalEnabled && goalModeActive;
+		if (name === "lcm_expand") {
+			return (session.taskDepth ?? 0) > 0 && session.getForwardedLcmRuntime?.() !== undefined;
+		}
 		if (LCM_RETRIEVAL_TOOL_NAMES[name]) {
 			const explicitlyRequested = requestedTools?.includes(name) === true;
 			const defaultTopLevelLossless =

@@ -57,6 +57,12 @@ async function pathExists(filePath: string): Promise<boolean> {
 	}
 }
 
+async function fileContentHash(filePath: string): Promise<string> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for await (const chunk of Bun.file(filePath).stream()) hasher.update(chunk);
+	return hasher.digest("hex");
+}
+
 async function resolveMentionPath(filePath: string, cwd: string): Promise<string | null> {
 	// Exact resolution only. The TUI @-selector inserts the real, complete path, so a
 	// mention that does not resolve to an existing file or directory is prose, not a file
@@ -217,6 +223,7 @@ export async function generateFileMentionMessages(
 						path: resolvedPath,
 						content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 						byteSize: stat.size,
+						contentHash: await fileContentHash(absolutePath),
 						skippedReason: "tooLarge",
 					});
 					continue;
@@ -253,6 +260,7 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
+					contentHash: await fileContentHash(absolutePath),
 					skippedReason: "tooLarge",
 				});
 				continue;
@@ -262,6 +270,7 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: binary file, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
+					contentHash: await fileContentHash(absolutePath),
 					skippedReason: "binary",
 				});
 				continue;

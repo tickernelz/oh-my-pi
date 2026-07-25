@@ -1,8 +1,9 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Effort } from "@oh-my-pi/pi-ai";
+import type { Effort, Model } from "@oh-my-pi/pi-ai";
 import {
 	type Component,
 	Container,
+	Ellipsis,
 	extractPrintableText,
 	fuzzyRank,
 	getKeybindings,
@@ -26,11 +27,14 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ShapeTarget } from "@oh-my-pi/snapcompact";
+import { resolveModelRoleValue } from "../../config/model-resolver";
 import {
 	getDefault,
 	getType,
 	normalizeProviderMaxInFlightRequests,
 	type SettingPath,
+	type SettingProvenance,
+	type Settings,
 	settings,
 	validateProviderMaxInFlightRequests,
 } from "../../config/settings";
@@ -44,6 +48,7 @@ import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
+import { buildBrowserItems, ModelBrowser, resolveRoleAssignments, sortModelItems } from "./model-browser";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
@@ -179,7 +184,7 @@ class SelectSubmenu extends Container {
 
 		// Hint
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
+		this.addChild(new Text(theme.fg("dim", `  Enter to select${theme.sep.dot}Esc to go back`), 0, 0));
 
 		// Footer (e.g. the snapcompact shape preview) below the interactive rows,
 		// so the list never shifts while browsing.
@@ -218,6 +223,110 @@ class SelectSubmenu extends Container {
 
 	handleInput(data: string): void {
 		this.#selectList.handleInput(data);
+	}
+}
+
+interface SummaryModelSubmenuOptions {
+	settings: Settings;
+	models: ReadonlyArray<Model>;
+	useDefault: boolean;
+	currentModelSelector?: string;
+	staleSelector?: string;
+	onDefault: () => void;
+	onPick: (selector: string) => void;
+	onCancel: () => void;
+}
+
+/** Two-step runtime submenu: choose the dynamic default or browse authenticated models. */
+class SummaryModelSubmenu implements Component {
+	#action: SelectSubmenu;
+	#browser: ModelBrowser;
+	#active: Component;
+	#browserLineOffset = 0;
+
+	constructor(options: SummaryModelSubmenuOptions) {
+		const storage = options.settings.getStorage();
+		const mruOrder = storage?.getModelUsageOrder() ?? [];
+		const models = [...options.models];
+		const roles = resolveRoleAssignments(options.settings, models, models);
+		const items = buildBrowserItems(models);
+		sortModelItems(items, { roles, mruOrder });
+
+		this.#browser = new ModelBrowser(options.settings);
+		this.#browser.setMaxVisible(7);
+		this.#browser.setRoles(roles);
+		this.#browser.setMruOrder(mruOrder);
+		this.#browser.setPerfStats(storage?.getModelPerf() ?? new Map());
+		this.#browser.setItems(items);
+		if (options.currentModelSelector) {
+			this.#browser.setCurrentSelector(options.currentModelSelector);
+			this.#browser.selectSelector(options.currentModelSelector);
+		}
+		this.#browser.onActivate = item => options.onPick(item.selector);
+
+		const staleFooter = options.staleSelector
+			? new Text(
+					theme.fg(
+						"warning",
+						`Unavailable selector: ${options.staleSelector || "(empty)"}. Choose an authenticated model or use the default.`,
+					),
+					0,
+					0,
+				)
+			: undefined;
+		this.#action = new SelectSubmenu(
+			"Lossless Summary Model",
+			"The default resolves @smol when each new summary job is claimed.",
+			[
+				{ value: "default", label: "Use default (@smol)" },
+				{ value: "choose", label: theme.getSymbolPreset() === "ascii" ? "Choose model..." : "Choose model…" },
+			],
+			options.useDefault ? "default" : "choose",
+			value => {
+				if (value === "default") {
+					options.onDefault();
+				} else {
+					this.#active = this.#browser;
+				}
+			},
+			options.onCancel,
+			undefined,
+			undefined,
+			staleFooter,
+		);
+		this.#browser.onCancel = () => {
+			this.#active = this.#action;
+		};
+		this.#active = this.#action;
+	}
+
+	render(width: number): readonly string[] {
+		if (this.#active === this.#action) return this.#action.render(width);
+		const lines = [
+			theme.bold(theme.fg("accent", "Choose lossless summary model")),
+			theme.fg("muted", "Available authenticated and custom models"),
+		];
+		this.#browserLineOffset = lines.length + 1;
+		lines.push("", ...this.#browser.render(width));
+		lines.push(theme.fg("dim", "  Type to search | Enter/click twice to choose | Esc to go back"));
+		const ellipsis = theme.getSymbolPreset() === "ascii" ? Ellipsis.Ascii : Ellipsis.Unicode;
+		return lines.map(line => truncateToWidth(line, width, ellipsis));
+	}
+
+	handleInput(data: string): void {
+		this.#active.handleInput?.(data);
+	}
+
+	routeMouse(event: SgrMouseEvent, line: number, col: number): void {
+		if (this.#active === this.#browser) {
+			this.#browser.routeMouse(event, line - this.#browserLineOffset);
+		} else {
+			this.#action.routeMouse(event, line, col);
+		}
+	}
+
+	invalidate(): void {
+		this.#active.invalidate?.();
 	}
 }
 
@@ -495,6 +604,10 @@ export interface SettingsRuntimeContext {
 	thinkingLevel: ThinkingLevel | undefined;
 	/** Available themes */
 	availableThemes: string[];
+	/** Models allowed by the active session/cycling scope. */
+	models: ReadonlyArray<Model>;
+	/** Full authenticated runtime inventory used only by the Lossless summary model picker. */
+	summaryModels: ReadonlyArray<Model>;
 	/** Provider/source ids shown in /model. */
 	providers: string[];
 	/** Working directory for plugins tab */
@@ -609,17 +722,22 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	#footerHintText(): string {
+		const separator = theme.sep.dot;
+		const vertical = theme.getSymbolPreset() === "ascii" ? "Up/Down" : "↑/↓";
+		const horizontal = theme.getSymbolPreset() === "ascii" ? "Left/Right" : "←/→";
 		if (this.#searchList) {
-			return "Enter to change · Tab to jump tabs · Esc to exit search";
+			return `Enter to change${separator}Tab to jump tabs${separator}Esc to exit search`;
 		}
 		if (this.#currentTabId === "plugins") {
-			return "Tab to switch tabs · Esc to close";
+			return `Tab to switch tabs${separator}Esc to close`;
 		}
 		if (this.#currentList?.sectionFocused) {
-			return "↑/↓ to jump sections · Tab/Enter to settings · ←/→ to switch tabs · Esc to close";
+			return `${vertical} to jump sections${separator}Tab/Enter to settings${separator}${horizontal} to switch tabs${separator}Esc to close`;
 		}
-		const nav = this.#hasSectionJump ? "Tab to jump sections · ←/→ to switch tabs" : "Tab to switch tabs";
-		return `Enter/Space to change · ${nav} · Type to search · Esc to close`;
+		const nav = this.#hasSectionJump
+			? `Tab to jump sections${separator}${horizontal} to switch tabs`
+			: "Tab to switch tabs";
+		return `Enter/Space to change${separator}${nav}${separator}Type to search${separator}Esc to close`;
 	}
 
 	/** Single-line search banner: accent icon, editable query with live cursor, right-aligned match count. */
@@ -931,65 +1049,127 @@ export class SettingsSelectorComponent implements Component {
 
 		switch (def.type) {
 			case "boolean":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: currentValue ? "true" : "false",
 					values: ["true", "false"],
 					changed,
-				};
+				});
 
 			case "enum":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: String(currentValue ?? ""),
 					values: [...def.values],
 					changed,
-				};
+				});
 
 			case "submenu":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 					changed,
-				};
+				});
 
 			case "text":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: this.#formatTextInputValue(def, currentValue),
 					submenu: (cv, done) => this.#createTextInput(def, cv, done),
 					changed,
-				};
+				});
 
 			case "providerLimits":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: this.#formatProviderLimitsValue(currentValue),
 					submenu: (_cv, done) => this.#createProviderLimitsInput(done),
 					changed,
-				};
+				});
 
 			case "multiselect":
-				return {
+				return this.#applyProvenance(def, {
 					id: def.path,
 					label: def.label,
 					description: def.description,
 					currentValue: this.#formatMultiSelectValue(def, currentValue),
 					submenu: (_cv, done) => this.#createMultiSelect(def, done),
 					changed,
-				};
+				});
 		}
+	}
+
+	/** Make non-global effective leaves visibly read-only instead of writing a shadowed global value. */
+	#applyProvenance(def: SettingDef, item: SettingItem): SettingItem {
+		const provenance = settings.getSettingProvenance(def.path);
+		let description = item.description ?? def.description;
+		if (def.path === "context.lossless.summaryModel") {
+			const state = this.#summaryModelState(settings.get(def.path));
+			if (state.stale) {
+				description += ` Saved selector ${state.storedSelector || "(empty)"} is unavailable.`;
+			}
+		}
+		if (provenance === "global" || provenance === "default") {
+			return description === item.description ? item : { ...item, description };
+		}
+
+		const owner: Record<Exclude<SettingProvenance, "global" | "default">, string> = {
+			project: "Project settings for the current working directory",
+			overlay: "A --config or PI_CONFIG_FILES overlay",
+			runtime: "A runtime override",
+		};
+		description += ` Read-only: ${owner[provenance]} owns this value; edit or remove it at that source. This screen writes global settings only.`;
+		return {
+			...item,
+			description,
+			values: undefined,
+			submenu: (_currentValue, done) =>
+				new SelectSubmenu(
+					def.label,
+					description,
+					[{ value: "back", label: "Back" }],
+					"back",
+					() => done(),
+					() => done(),
+				),
+		};
+	}
+
+	#summaryModelState(value: unknown): {
+		storedSelector: string | undefined;
+		resolvedSelector: string | undefined;
+		usesDefault: boolean;
+		stale: boolean;
+	} {
+		const provenance = settings.getSettingProvenance("context.lossless.summaryModel");
+		const storedSelector = typeof value === "string" ? value : undefined;
+		const configuredSelector = storedSelector?.trim();
+		const usesDefault = provenance === "default" || !configuredSelector;
+		const resolved = resolveModelRoleValue(
+			usesDefault ? "@smol" : configuredSelector,
+			[...this.context.summaryModels],
+			{
+				settings,
+			},
+		);
+		const resolvedSelector = resolved.model ? `${resolved.model.provider}/${resolved.model.id}` : undefined;
+		return {
+			storedSelector,
+			resolvedSelector,
+			usesDefault,
+			stale: !usesDefault && resolvedSelector === undefined,
+		};
 	}
 
 	/**
@@ -1012,6 +1192,12 @@ export class SettingsSelectorComponent implements Component {
 
 	#getSubmenuCurrentValue(path: SettingPath, value: unknown): string {
 		const rawValue = String(value ?? "");
+		if (path === "context.lossless.summaryModel") {
+			const state = this.#summaryModelState(value);
+			if (state.usesDefault) return "@smol (default)";
+			const display = state.storedSelector?.trim() ?? "";
+			return state.stale ? `${display} (unavailable)` : display;
+		}
 		if (path === "compaction.thresholdPercent" && (rawValue === "-1" || rawValue === "")) {
 			return "default";
 		}
@@ -1021,6 +1207,30 @@ export class SettingsSelectorComponent implements Component {
 		return rawValue;
 	}
 
+	#createSummaryModelSubmenu(done: (value?: string) => void): Component {
+		const path = "context.lossless.summaryModel" as const;
+		const state = this.#summaryModelState(settings.get(path));
+		return new SummaryModelSubmenu({
+			settings,
+			models: this.context.summaryModels,
+			useDefault: state.usesDefault,
+			...(state.resolvedSelector ? { currentModelSelector: state.resolvedSelector } : {}),
+			...(state.stale ? { staleSelector: state.storedSelector ?? "" } : {}),
+			onDefault: () => {
+				settings.unset(path);
+				const next = settings.get(path);
+				this.callbacks.onChange(path, next);
+				done(this.#getSubmenuCurrentValue(path, next));
+			},
+			onPick: selector => {
+				settings.set(path, selector);
+				this.callbacks.onChange(path, selector);
+				done(selector);
+			},
+			onCancel: () => done(),
+		});
+	}
+
 	/**
 	 * Create a submenu for a submenu-type setting.
 	 */
@@ -1028,7 +1238,8 @@ export class SettingsSelectorComponent implements Component {
 		def: SettingDef & { type: "submenu" },
 		currentValue: string,
 		done: (value?: string) => void,
-	): Container {
+	): Component {
+		if (def.path === "context.lossless.summaryModel") return this.#createSummaryModelSubmenu(done);
 		let options = def.options;
 
 		// Special case: inject runtime options for thinking level

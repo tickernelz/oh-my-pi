@@ -91,4 +91,12 @@ describe("CacheInvalidationMarkerComponent", () => {
 		expect(dividerWidth).toBeGreaterThan(0);
 		expect(dividerWidth).toBeLessThan(80);
 	});
+
+	it("truncates the bare cache label to narrow terminal widths", () => {
+		const width = 10;
+		const lines = new CacheInvalidationMarkerComponent({ reprocessedTokens: 50_999 }).render(width);
+		const divider = Bun.stripANSI(lines[1]!);
+		expect(divider.length).toBeGreaterThan(0);
+		expect(Bun.stringWidth(divider)).toBeLessThanOrEqual(width);
+	});
 });

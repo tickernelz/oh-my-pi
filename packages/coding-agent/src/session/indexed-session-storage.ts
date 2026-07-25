@@ -184,7 +184,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		};
 	}
 
-	listFilesSync(dir: string, pattern: string): string[] {
+	listFilesSync(dir: string, pattern: string, _options?: { strict?: boolean }): string[] {
 		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
 		const out: string[] = [];
 		for (const path of this.#index.keys()) {

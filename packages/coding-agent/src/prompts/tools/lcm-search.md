@@ -1,1 +1,1 @@
-Search the current Lossless Context Management (LCM) project/session/branch index. Returns only bounded redacted derived matches and opaque citation tokens. Use `lcm_describe` with a returned citation token for a source description.
+Search the current Lossless Context Management (LCM) project/session/branch index with bounded pagination and an optional summary-handle scope. Returns only redacted derived matches plus executable opaque summary/source handles. Use `lcm_describe` to inspect a handle or delegate a summary handle to a child with `lcm_expand`.

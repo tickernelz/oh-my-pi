@@ -1,3 +1,4 @@
+import type { ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
@@ -15,6 +16,7 @@ export type AgentSessionEvent =
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
 	  })
+	| { type: "lcm_projection"; projection: ContextProjection }
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";

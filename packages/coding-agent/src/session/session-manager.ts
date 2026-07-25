@@ -1732,6 +1732,11 @@ export class SessionManager {
 		return this.#sessionDir;
 	}
 
+	/** Storage backend used by read-only session discovery and loading. */
+	getSessionStorage(): SessionStorage {
+		return this.#storage;
+	}
+
 	getSessionId(): string {
 		return this.#sessionId;
 	}
@@ -2002,6 +2007,7 @@ export class SessionManager {
 		details?: T,
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
+		lcmFallback?: CompactionEntry["lcmFallback"],
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -2013,6 +2019,7 @@ export class SessionManager {
 			details,
 			fromExtension,
 			preserveData,
+			lcmFallback,
 		};
 		this.#recordEntry(entry);
 		return entry.id;

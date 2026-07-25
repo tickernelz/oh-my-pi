@@ -1,3 +1,4 @@
+import type { ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { Container, Image, type ImageBudget, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
@@ -8,6 +9,7 @@ import { getPreviewLines, resolveImageOptions, TRUNCATE_LENGTHS } from "../../to
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
+import { LcmProjectionMarkerComponent } from "./lcm-projection-marker";
 
 /**
  * Max lines of a turn-ending provider error rendered inline in the transcript.
@@ -170,6 +172,9 @@ function lerpHex(from: string, to: string, t: number): string {
 export class AssistantMessageComponent extends Container {
 	#contentContainer: Container;
 	#markerSlot: Container;
+	#cacheInvalidation?: CacheInvalidation;
+	#lcmProjectionMarker?: LcmProjectionMarkerComponent;
+	#markersExpanded = false;
 	#lastMessage?: AssistantMessage;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
 	#convertedKittyImages = new Map<string, ImageContent>();
@@ -251,8 +256,8 @@ export class AssistantMessageComponent extends Container {
 		super();
 		this.#transcriptBlockFinalized = message !== undefined;
 
-		// Slim cache-invalidation divider, populated above the content when this
-		// turn's request lost the prompt cache (see setCacheInvalidation).
+		// Renderer-only response markers are populated by live events. They are
+		// deliberately absent when persisted assistant messages are replayed.
 		this.#markerSlot = new Container();
 		this.addChild(this.#markerSlot);
 
@@ -265,17 +270,40 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	/**
-	 * Show or clear the slim cache-invalidation divider above this turn. Set at
-	 * `message_end` (live) or during rebuild, once the turn's usage is known and
-	 * compared against the previous turn's cache footprint. Bumps the transcript
-	 * block version so the change repaints even after content finalized.
-	 */
+	/** Show or clear the prompt-cache invalidation evidence for this response. */
 	setCacheInvalidation(info: CacheInvalidation | undefined): void {
+		this.#cacheInvalidation = info;
+		this.#rebuildMarkers();
+	}
+
+	/** Attach a fitted LCM projection to this response without mutating its message. */
+	setLcmProjection(projection: ContextProjection | undefined): void {
+		if (!projection && !this.#lcmProjectionMarker) return;
+		this.#lcmProjectionMarker = projection ? new LcmProjectionMarkerComponent(projection, false) : undefined;
+		if (this.#markersExpanded) this.#lcmProjectionMarker?.setExpanded(true);
+		this.#rebuildMarkers();
+	}
+
+	/** Ctrl+O reveals projection evidence once; a later global collapse does not hide it. */
+	setExpanded(expanded: boolean): void {
+		if (!expanded || this.#markersExpanded) return;
+		this.#markersExpanded = true;
+		this.#lcmProjectionMarker?.setExpanded(true);
+		this.#blockVersion++;
+	}
+
+	#rebuildMarkers(): void {
 		this.#markerSlot.clear();
-		if (info) {
-			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(info));
+		if (!this.#lcmProjectionMarker && !this.#cacheInvalidation) {
+			this.#blockVersion++;
+			return;
 		}
+		this.#markerSlot.addChild(new Spacer(1));
+		if (this.#lcmProjectionMarker) this.#markerSlot.addChild(this.#lcmProjectionMarker);
+		if (this.#cacheInvalidation) {
+			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(this.#cacheInvalidation, false));
+		}
+		this.#markerSlot.addChild(new Spacer(1));
 		this.#blockVersion++;
 	}
 

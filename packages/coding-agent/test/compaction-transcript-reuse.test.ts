@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
+import type { ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -11,11 +13,15 @@ function buildContext(): InteractiveModeContext {
 	return {
 		chatContainer,
 		transcriptMessageComponents: new WeakMap(),
+		pendingTools: new Map(),
+		lastAssistantUsage: undefined,
 		getUserMessageText: (message: Message) =>
 			message.role === "user" && typeof message.content === "string" ? message.content : "",
 		viewSession: {
 			extensionRunner: undefined,
 			sessionManager: { putBlobSync: () => "unused" },
+			isStreaming: false,
+			retryAttempt: 0,
 		},
 		ui: { requestRender: vi.fn(), imageBudget: undefined },
 		settings: { get: vi.fn(() => false) },
@@ -33,6 +39,7 @@ describe("post-compaction transcript reuse", () => {
 	it("retains settled user and assistant components across a rebuild", () => {
 		const ctx = buildContext();
 		const helpers = new UiHelpers(ctx);
+		ctx.addMessageToChat = helpers.addMessageToChat.bind(helpers);
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "large settled user turn", timestamp: Date.now() },
 			{
@@ -54,13 +61,56 @@ describe("post-compaction transcript reuse", () => {
 			},
 		];
 
+		const projection = {
+			revision: 1,
+			ready: true,
+			historical: [
+				{
+					kind: "summary",
+					summaryId: "summary-a",
+					summaryHandle: "handle-a",
+					level: 0,
+					redactedText: "summary",
+					tokenCount: 100,
+					sourceIds: ["source-a"],
+					citations: [],
+				},
+			],
+			freshTailSourceIds: ["fresh"],
+			uncoveredSourceIds: [],
+			sourceTokens: 20_000,
+			selectedLevelCounts: { 0: 1 },
+			coveredSourceCount: 8,
+			freshSourceCount: 1,
+			estimatedTokens: 4_000,
+			pendingJobs: 0,
+		} satisfies ContextProjection;
+
 		for (const message of messages) helpers.addMessageToChat(message);
 		const settledComponents = ctx.chatContainer.children;
+		const assistant = settledComponents.find(
+			(component): component is AssistantMessageComponent => component instanceof AssistantMessageComponent,
+		);
+		if (!assistant) throw new Error("Expected a settled assistant component");
+		assistant.setLcmProjection(projection);
+		assistant.setCacheInvalidation({ reprocessedTokens: 8_000 });
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("LCM context");
 		ctx.chatContainer.clear();
 		for (const message of messages) {
 			helpers.addMessageToChat(message, { reuseSettledComponent: true });
 		}
-
 		expect(ctx.chatContainer.children).toEqual(settledComponents);
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("cache miss");
+
+		assistant.setLcmProjection(projection);
+		ctx.chatContainer.clear();
+		helpers.renderSessionContext(
+			{ messages: [messages[1]!], models: {}, injectedTtsrRules: [], mode: "none" },
+			{ reuseSettledComponents: true },
+		);
+		expect(ctx.chatContainer.children).toEqual([assistant]);
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("cache miss");
 	});
 });

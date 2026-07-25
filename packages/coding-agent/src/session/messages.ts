@@ -34,6 +34,7 @@ export {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	type LcmFallbackCategory,
 } from "@oh-my-pi/pi-agent-core/compaction/messages";
 
 import type { OutputMeta } from "../tools/output-meta";
@@ -918,6 +919,8 @@ export interface FileMentionMessage {
 		lineCount?: number;
 		/** File size in bytes, if known. */
 		byteSize?: number;
+		/** SHA-256 of the referenced bytes, computed before oversized content is omitted. */
+		contentHash?: string;
 		/** Why the file contents were omitted from auto-read. */
 		skippedReason?: "tooLarge" | "binary";
 		image?: ImageContent;

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added Lossless Context Management project catalog and explicit current/cross-project retrieval: gated `lcm_search`, `lcm_describe`, `lcm_recall`, and `lcm_cross_project_search` tools; bounded isolated `@smol` recall with redacted citations; and unified `/lcm` status, doctor, rebuild, purge, search, describe, and project operations.
+- Added Lossless Context Management project catalog and explicit current/cross-project retrieval: gated `lcm_search`, `lcm_describe`, `lcm_recall`, and `lcm_cross_project_search` tools; bounded isolated `@smol` recall with redacted handles; and unified `/lcm` status, doctor, explicit current/project rebuild, retention-aware GC, search, describe, and project operations.
 - Added the opt-in native Lossless context engine: per-project SQLite stores reconcile the committed journal, build immutable leased summary DAGs with host-owned side completions, project branch-aware history before extensions, fail open to native compaction, and support lazy project backfill plus settings/onboarding surfaces.
 - Added a transient `historicalContext` message lane that lowers citation-bearing history to untrusted agent-attributed user data for every provider while rejecting it from journals, replication, exports, and share snapshots.
 

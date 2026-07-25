@@ -1,1 +1,1 @@
-Describe one current-session LCM source identified by an opaque citation token returned from `lcm_search`. Returns bounded redacted derived text. Artifact links are emitted only when they resolve in the current session; otherwise an opaque unavailable marker is shown.
+Describe one opaque LCM source, summary, or file handle within the current session/branch scope. Returns bounded redacted metadata and text. Large files remain reference-only; artifact and filesystem availability is explicit and unavailable content is never reconstructed from SQLite.

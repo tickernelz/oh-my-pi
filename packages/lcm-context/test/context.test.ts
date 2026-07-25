@@ -1,10 +1,33 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type ContextScope, type LcmContext, openLcmContext, type SourceEntry, type SourceSnapshot } from "../src";
+import { initializeLcmSchema, summaryHandleForInput } from "../src/schema";
 
 const MAIN: ContextScope = { projectId: "project", sessionId: "session", branchId: "main" };
+
+function contentAddress(parts: readonly string[]): string {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const part of parts) {
+		hasher.update(`${Buffer.byteLength(part, "utf8")}:`);
+		hasher.update(part);
+	}
+	return hasher.digest("hex");
+}
+
+function legacyFilelessSourceKey(source: SourceEntry): string {
+	return contentAddress([
+		"lcm-source-v1",
+		source.projectId,
+		source.contentHash,
+		String(source.timestamp),
+		source.kind,
+		source.redactedText,
+		JSON.stringify([...new Set(source.artifactRefs)].sort()),
+	]);
+}
 
 function entry(
 	scope: ContextScope,
@@ -73,13 +96,124 @@ describe("LCM context contracts", () => {
 		const second = context.reconcile(snapshot(MAIN, sources));
 		expect(first).toMatchObject({ changed: true, revision: 1, activeSources: 2 });
 		expect(second).toMatchObject({ changed: false, revision: 1, activeSources: 2 });
-		expect(context.status()).toMatchObject({ schemaVersion: 3, journalMode: "wal" });
+		expect(context.status()).toMatchObject({ schemaVersion: 5, journalMode: "wal" });
 
 		const duplicate = [sources[0]!, { ...sources[1]!, entryId: "e1" }];
 		expect(() => context.reconcile(snapshot(MAIN, duplicate))).toThrow("duplicate source entry id");
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 10, maxTokens: 100 } });
 		expect(projection.freshTailSourceIds).toEqual(["e1", "e2"]);
 		expect(projection.revision).toBe(1);
+	});
+
+	test("v4 migration enforces stable handles on later updates", () => {
+		const migrationPath = path.join(tempDir, "v4.db");
+		const db = new Database(migrationPath);
+		try {
+			db.run(
+				"CREATE TABLE summaries (summary_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, level INTEGER NOT NULL)",
+			);
+			db.run(
+				"CREATE TABLE summary_children (summary_id TEXT NOT NULL, ordinal INTEGER NOT NULL, child_summary_id TEXT NOT NULL)",
+			);
+			db.run(
+				"CREATE TABLE summary_lineage (summary_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_key TEXT NOT NULL)",
+			);
+			db.run("INSERT INTO summaries (summary_id, project_id, level) VALUES ('sum-v4', 'project', 0)");
+			db.run("INSERT INTO summary_lineage (summary_id, ordinal, source_key) VALUES ('sum-v4', 0, 'source-v4')");
+			db.run("PRAGMA user_version = 4");
+
+			initializeLcmSchema(db, 1_000);
+			expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+			expect(
+				db.query<{ stable_handle: string }, []>("SELECT stable_handle FROM summaries").get()?.stable_handle,
+			).toStartWith("summary_");
+			expect(() => db.run("UPDATE summaries SET stable_handle = NULL")).toThrow("summary stable_handle is required");
+		} finally {
+			db.close();
+		}
+	});
+
+	test("v5 reconciliation preserves fileless v4 source identity and migrated summary alignment", async () => {
+		const migrationPath = path.join(tempDir, "v4-fileless.db");
+		const source = entry(
+			MAIN,
+			"e1",
+			"legacy fileless source with enough content to keep its migrated summary useful",
+		);
+		const sourceKey = legacyFilelessSourceKey(source);
+		const summaryHandle = summaryHandleForInput(MAIN.projectId, 0, [{ kind: "source", id: sourceKey }]);
+		const inputHash = contentAddress(["lcm-summary-input-v1", MAIN.projectId, "0", "source", sourceKey]);
+		const db = new Database(migrationPath);
+		try {
+			initializeLcmSchema(db, 1_000);
+			db.run("DROP TRIGGER summaries_stable_handle_required");
+			db.run("DROP TRIGGER summaries_stable_handle_update_required");
+			db.run("DROP INDEX summaries_stable_handle");
+			db.run("DROP TABLE source_files");
+			db.run("DROP TABLE file_records");
+			db.run("ALTER TABLE summaries DROP COLUMN stable_handle");
+			db.run("PRAGMA user_version = 4");
+
+			const branch = db.run(
+				"INSERT INTO branches (project_id, session_id, branch_id, reconciled_at) VALUES (?, ?, ?, ?)",
+				[MAIN.projectId, MAIN.sessionId, MAIN.branchId, now],
+			);
+			db.run(
+				`INSERT INTO source_contents
+					(source_key, project_id, content_hash, timestamp_ms, kind, redacted_text, artifact_refs, token_count, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				[
+					sourceKey,
+					MAIN.projectId,
+					source.contentHash,
+					source.timestamp,
+					source.kind,
+					source.redactedText,
+					JSON.stringify(source.artifactRefs),
+					Math.ceil(Buffer.byteLength(source.redactedText, "utf8") / 4),
+					now,
+				],
+			);
+			db.run(
+				`INSERT INTO branch_sources
+					(branch_row_id, entry_id, parent_entry_id, position, source_key, active, created_at)
+				 VALUES (?, ?, NULL, 0, ?, 1, ?)`,
+				[Number(branch.lastInsertRowid), source.entryId, sourceKey, now],
+			);
+			db.run(
+				`INSERT INTO summaries
+					(summary_id, project_id, input_hash, level, redacted_text, token_count, created_at)
+				 VALUES ('sum-v4-fileless', ?, ?, 0, 'migrated summary', 1, ?)`,
+				[MAIN.projectId, inputHash, now],
+			);
+			db.run("INSERT INTO summary_lineage (summary_id, ordinal, source_key) VALUES ('sum-v4-fileless', 0, ?)", [
+				sourceKey,
+			]);
+		} finally {
+			db.close();
+		}
+
+		const migrated = await openLcmContext({ dbPath: migrationPath, now: () => now });
+		try {
+			expect(migrated.reconcile(snapshot(MAIN, [source]))).toMatchObject({
+				changed: false,
+				revision: 0,
+				insertedSources: 0,
+				tombstonedSources: 0,
+				queuedJobs: 0,
+				reusedSummaries: 1,
+			});
+			expect(migrated.describeSummary({ ...MAIN, summaryHandle })).toMatchObject({
+				summaryHandle,
+				sourceCount: 1,
+				files: [],
+			});
+			expect(migrated.expandSummary({ ...MAIN, summaryHandle })?.items).toMatchObject([
+				{ kind: "source", citation: { sourceId: source.entryId, sourceKey, position: 0 } },
+			]);
+		} finally {
+			migrated.close();
+		}
 	});
 
 	test("a completion callback failure leaves its job retryable without corrupting committed sources", async () => {
@@ -90,7 +224,7 @@ describe("LCM context contracts", () => {
 				throw new Error("simulated process exit");
 			},
 		);
-		expect(crashed).toEqual({ claimed: 1, completed: 0, failed: 1, stale: 0 });
+		expect(crashed).toEqual({ claimed: 1, completed: 0, failed: 1, stale: 0, escalated: 0 });
 		expect(context.status().jobs.failed).toBe(1);
 		now += 50;
 		const retried = context.claimSummaryJobs({
@@ -158,6 +292,27 @@ describe("LCM context contracts", () => {
 		expect(covered).toEqual(["e1", "e2", "e3", "e4", "e5"]);
 		expect(new Set(covered).size).toBe(covered.length);
 		expect(projection.estimatedTokens).toBeLessThanOrEqual(100);
+	});
+
+	test("summary expansion cites each repeated source-key occurrence in branch order", async () => {
+		const first = entry(MAIN, "e1", "identical source content long enough to produce one useful leaf summary");
+		const second = { ...first, entryId: "e2", parentId: first.entryId };
+		context.reconcile(snapshot(MAIN, [first, second]));
+		await completeEveryJob(context);
+
+		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
+		const summaryHandle = projection.historical[0]?.summaryHandle;
+		if (!summaryHandle) throw new Error("expected a completed leaf summary");
+		const expansion = context.expandSummary({ ...MAIN, summaryHandle });
+		const citations = expansion?.items.flatMap(item => (item.kind === "source" ? [item.citation] : []));
+		expect(citations?.map(citation => [citation.sourceId, citation.position])).toEqual([
+			["e1", 0],
+			["e2", 1],
+		]);
+		expect(citations?.map(citation => citation.sourceKey)).toEqual([
+			legacyFilelessSourceKey(first),
+			legacyFilelessSourceKey(first),
+		]);
 	});
 
 	test("fresh-tail cut includes an assistant and every parallel tool result as one atomic closure", async () => {
@@ -271,9 +426,10 @@ describe("LCM context contracts", () => {
 			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: sourceText, tokenCount: 1 }),
 		).toEqual({
 			accepted: false,
-			reason: "not_compressed",
+			reason: "escalated",
+			stage: "aggressive",
 		});
-		expect(context.status().jobs.failed).toBe(1);
+		expect(context.status().jobs.pending).toBe(1);
 
 		const [retry] = context.claimSummaryJobs({
 			workerId: "replacement",

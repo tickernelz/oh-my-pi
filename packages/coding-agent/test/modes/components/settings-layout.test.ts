@@ -154,9 +154,10 @@ describe("settings layout", () => {
 		});
 		expect(engine?.description.toLowerCase()).toContain("reload");
 		expect(summaryModel).toMatchObject({
-			type: "text",
+			type: "submenu",
 			label: "Lossless Summary Model",
 			group: "General",
+			options: [],
 		});
 		expect(summaryModel?.description).toContain("@smol");
 		expect(summaryModel?.condition?.()).toBe(false);

@@ -99,6 +99,8 @@ export function createPersistedSubagentReviverFactory(
 				parentAgentId: ref.parentId,
 				expectedAgentRef: expectedRef,
 				taskDepth,
+				// Persisted ancestry cannot prove that a current runtime is the exact
+				// historical parent, so cold revival never forwards the LCM capability.
 				toolNames: init.tools,
 				outputSchema: init.outputSchema,
 				outputSchemaMode: init.outputSchemaMode,

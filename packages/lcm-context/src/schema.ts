@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const LCM_SCHEMA_VERSION = 3;
+export const LCM_SCHEMA_VERSION = 5;
 
 export class UnsupportedLcmSchemaError extends Error {
 	readonly foundVersion: number;
@@ -10,6 +10,26 @@ export class UnsupportedLcmSchemaError extends Error {
 		this.name = "UnsupportedLcmSchemaError";
 		this.foundVersion = foundVersion;
 	}
+}
+
+export interface SummaryHandleInput {
+	kind: "source" | "summary";
+	id: string;
+}
+
+/** Stable executable handle derived only from ordered summarized input identity. */
+export function summaryHandleForInput(projectId: string, level: number, inputs: readonly SummaryHandleInput[]): string {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const part of [
+		"lcm-summary-handle-v1",
+		projectId,
+		String(level),
+		...inputs.flatMap(input => [input.kind, input.id]),
+	]) {
+		hasher.update(`${Buffer.byteLength(part, "utf8")}:`);
+		hasher.update(part);
+	}
+	return `summary_${hasher.digest("hex")}`;
 }
 
 function migration1(db: Database): void {
@@ -239,7 +259,119 @@ function migration3(db: Database): void {
 	db.run("ALTER TABLE summary_jobs ADD COLUMN lease_output_budget INTEGER");
 }
 
-const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [migration1, migration2, migration3];
+function migration4(db: Database): void {
+	db.run(
+		"ALTER TABLE summary_jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'normal' CHECK (stage IN ('normal', 'aggressive', 'deterministic'))",
+	);
+	db.run(
+		"ALTER TABLE summary_jobs ADD COLUMN transport_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (transport_retry_count >= 0)",
+	);
+	db.run(
+		"ALTER TABLE summary_jobs ADD COLUMN non_compression_count INTEGER NOT NULL DEFAULT 0 CHECK (non_compression_count >= 0)",
+	);
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_strategy TEXT");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_prompt_hash TEXT");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_model_selector TEXT");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_resolved_model TEXT");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_input_tokens INTEGER");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN last_output_tokens INTEGER");
+	db.run("ALTER TABLE summaries ADD COLUMN strategy TEXT");
+	db.run("ALTER TABLE summaries ADD COLUMN prompt_hash TEXT");
+	db.run("ALTER TABLE summaries ADD COLUMN model_selector TEXT");
+	db.run("ALTER TABLE summaries ADD COLUMN resolved_model TEXT");
+	db.run("ALTER TABLE summaries ADD COLUMN input_token_count INTEGER");
+	db.run("ALTER TABLE summaries ADD COLUMN output_token_count INTEGER");
+	db.run("ALTER TABLE branches ADD COLUMN summary_token_budget INTEGER");
+	db.run("ALTER TABLE branches ADD COLUMN fresh_tail_max_sources INTEGER");
+	db.run("ALTER TABLE branches ADD COLUMN fresh_tail_max_tokens INTEGER");
+	// A v3 non-compression failure must resume at the next strategy, never repeat
+	// the identical prompt after upgrade.
+	db.run(
+		`UPDATE summary_jobs SET stage = 'aggressive', non_compression_count = 1
+		 WHERE status = 'failed' AND last_error = 'summary did not compress input'`,
+	);
+}
+
+function migration5(db: Database): void {
+	// Internal summary IDs remain graph-local. The executable handle follows
+	// canonical ordered job inputs: source keys for leaves and already-stable
+	// child handles for condensed nodes, independent of generated prose.
+	db.run("ALTER TABLE summaries ADD COLUMN stable_handle TEXT");
+	const summaries = db
+		.query<{ summary_id: string; project_id: string; level: number }, []>(
+			"SELECT summary_id, project_id, level FROM summaries ORDER BY level, summary_id",
+		)
+		.all();
+	for (const summary of summaries) {
+		const children = db
+			.query<{ stable_handle: string | null }, [string]>(
+				`SELECT child.stable_handle FROM summary_children edge
+				 JOIN summaries child ON child.summary_id = edge.child_summary_id
+				 WHERE edge.summary_id = ? ORDER BY edge.ordinal`,
+			)
+			.all(summary.summary_id);
+		let inputs: SummaryHandleInput[];
+		if (children.length > 0) {
+			if (children.some(child => child.stable_handle === null)) {
+				throw new Error(`Cannot derive stable handle for summary ${summary.summary_id}`);
+			}
+			inputs = children.map(child => ({ kind: "summary", id: child.stable_handle! }));
+		} else {
+			inputs = db
+				.query<{ source_key: string }, [string]>(
+					"SELECT source_key FROM summary_lineage WHERE summary_id = ? ORDER BY ordinal",
+				)
+				.all(summary.summary_id)
+				.map(row => ({ kind: "source", id: row.source_key }));
+		}
+		db.run("UPDATE summaries SET stable_handle = ? WHERE summary_id = ?", [
+			summaryHandleForInput(summary.project_id, summary.level, inputs),
+			summary.summary_id,
+		]);
+	}
+	db.run("CREATE UNIQUE INDEX summaries_stable_handle ON summaries(stable_handle)");
+	db.run(`
+		CREATE TRIGGER summaries_stable_handle_required
+		BEFORE INSERT ON summaries WHEN new.stable_handle IS NULL
+		BEGIN
+			SELECT RAISE(ABORT, 'summary stable_handle is required');
+		END
+	`);
+	db.run(`
+		CREATE TRIGGER summaries_stable_handle_update_required
+		BEFORE UPDATE OF stable_handle ON summaries WHEN new.stable_handle IS NULL
+		BEGIN
+			SELECT RAISE(ABORT, 'summary stable_handle is required');
+		END
+	`);
+
+	db.run(`
+		CREATE TABLE file_records (
+			file_id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			path TEXT NOT NULL,
+			file_type TEXT NOT NULL,
+			byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+			token_count INTEGER NOT NULL CHECK (token_count >= 0),
+			exploration_summary TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		) STRICT
+	`);
+	db.run("CREATE INDEX file_records_project ON file_records(project_id, file_id)");
+	db.run(`
+		CREATE TABLE source_files (
+			source_key TEXT NOT NULL REFERENCES source_contents(source_key) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+			file_id TEXT NOT NULL REFERENCES file_records(file_id),
+			PRIMARY KEY (source_key, ordinal),
+			UNIQUE (source_key, file_id)
+		) WITHOUT ROWID, STRICT
+	`);
+	db.run("CREATE INDEX source_files_file ON source_files(file_id, source_key)");
+}
+
+const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [migration1, migration2, migration3, migration4, migration5];
 
 export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {
 	// The busy handler must be installed before WAL recovery or any migration lock.

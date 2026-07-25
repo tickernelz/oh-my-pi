@@ -58,7 +58,20 @@ describe("LCM project catalog", () => {
 		await registerLcmProject(entry, agentDir, 10);
 		await registerLcmProject(entry, agentDir, 20);
 
-		expect(await listLcmProjects(agentDir)).toEqual([{ ...entry, lastSeen: 20 }]);
+		expect(await listLcmProjects(agentDir)).toEqual([{ ...entry, lastSeen: 20, journalDirs: [] }]);
+	});
+
+	it("merges durable journal-directory discovery hints without duplicates", async () => {
+		const entry = project(agentDir, "v1-journals", path.join(tempDir, "stable"));
+		const firstDir = path.join(tempDir, "sessions", "root");
+		const secondDir = path.join(tempDir, "sessions", "nested");
+		await registerLcmProject(entry, agentDir, 10, firstDir);
+		await registerLcmProject(entry, agentDir, 20, secondDir);
+		await registerLcmProject(entry, agentDir, 30, firstDir);
+
+		expect(await listLcmProjects(agentDir)).toEqual([
+			{ ...entry, lastSeen: 30, journalDirs: [secondDir, firstDir].sort() },
+		]);
 	});
 
 	it("resolves only an exact id or an explicit canonical absolute path", async () => {

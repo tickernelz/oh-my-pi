@@ -44,6 +44,8 @@ export interface BranchSummaryMessage {
 	timestamp: number;
 }
 
+export type LcmFallbackCategory = "deadline" | "provider" | "store" | "unfit";
+
 export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
@@ -58,6 +60,8 @@ export interface CompactionSummaryMessage {
 	images?: ImageContent[];
 	/** Post-pass dead-end warning attached to this compaction (progress guard). */
 	warning?: string;
+	/** Sanitized display-only reason that native compaction replaced bounded LCM work. */
+	lcmFallback?: LcmFallbackCategory;
 	timestamp: number;
 }
 
@@ -108,6 +112,7 @@ export function createCompactionSummaryMessage(
 	images?: ImageContent[],
 	blocks?: (TextContent | ImageContent)[],
 	warning?: string,
+	lcmFallback?: LcmFallbackCategory,
 ): CompactionSummaryMessage {
 	const imageBlocks =
 		blocks?.filter((block): block is ImageContent => block.type === "image") ??
@@ -121,6 +126,7 @@ export function createCompactionSummaryMessage(
 		blocks: blocks && blocks.length > 0 ? blocks : undefined,
 		images: imageBlocks && imageBlocks.length > 0 ? imageBlocks : undefined,
 		warning,
+		...(lcmFallback ? { lcmFallback } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

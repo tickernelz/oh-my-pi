@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { LcmFallbackCategory } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { ImageContent, MessageAttribution, ServiceTierByFamily, TextContent } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
 
@@ -121,6 +122,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	 * compaction divider.
 	 */
 	warning?: string;
+	/** Sanitized display-only reason native compaction replaced bounded LCM work. */
+	lcmFallback?: LcmFallbackCategory;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {

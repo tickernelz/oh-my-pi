@@ -4,6 +4,17 @@ export interface ContextScope {
 	branchId: string;
 }
 
+/** Metadata-only reference to content owned by the journal, artifact store, or filesystem. */
+export interface LcmFileMetadata {
+	fileId: string;
+	contentHash: string;
+	path: string;
+	fileType: string;
+	byteSize: number;
+	tokenCount: number;
+	explorationSummary: string;
+}
+
 /**
  * A committed journal entry normalized by the caller.
  *
@@ -20,6 +31,8 @@ export interface SourceEntry extends ContextScope {
 	redactedText: string;
 	contentHash: string;
 	artifactRefs: readonly string[];
+	/** Large files are metadata-only; their bytes never enter the derived store. */
+	files?: readonly LcmFileMetadata[];
 }
 
 export interface SourceSnapshot {
@@ -54,6 +67,10 @@ export interface ReconcileResult {
 	queuedJobs: number;
 	reusedSummaries: number;
 }
+export interface ReconcileOptions {
+	/** Schedule summaries only for the historical prefix outside this protected tail. */
+	summarize?: false | Pick<ProjectionRequest, "tokenBudget" | "freshTail">;
+}
 
 export interface FreshTailLimits {
 	/** Target source count; an indivisible `atomicGroupId` closure may expand it. */
@@ -78,11 +95,24 @@ export interface Citation extends ContextScope {
 export interface ProjectedHistoricalItem {
 	kind: "summary";
 	summaryId: string;
+	/** Stable executable identity derived from canonical summarized inputs. */
+	summaryHandle: string;
 	level: number;
 	redactedText: string;
 	tokenCount: number;
 	sourceIds: readonly string[];
 	citations: readonly Citation[];
+}
+
+export type SummaryStage = "normal" | "aggressive" | "deterministic";
+
+export type SummaryStrategy = "preserve_details" | "bullet_points" | "deterministic_truncate";
+
+export interface SummaryAttemptProvenance {
+	promptHash: string;
+	modelSelector?: string;
+	resolvedModel?: string;
+	strategy: SummaryStrategy;
 }
 
 export interface ContextProjection {
@@ -92,6 +122,13 @@ export interface ContextProjection {
 	historical: readonly ProjectedHistoricalItem[];
 	freshTailSourceIds: readonly string[];
 	uncoveredSourceIds: readonly string[];
+	/** Estimated tokens in every active source before projection. */
+	sourceTokens: number;
+	/** Number of selected summaries at each hierarchy level. */
+	selectedLevelCounts: Readonly<Record<number, number>>;
+	coveredSourceCount: number;
+	freshSourceCount: number;
+	/** Estimated tokens after projection, including the protected fresh tail. */
 	estimatedTokens: number;
 	pendingJobs: number;
 }
@@ -113,6 +150,9 @@ export interface SummaryJob {
 	sourceCount: number;
 	inputTokenCount: number;
 	outputTokenBudget: number;
+	stage: SummaryStage;
+	strategy: SummaryStrategy;
+	transportRetryCount: number;
 }
 
 export interface ClaimSummaryJobsOptions {
@@ -128,13 +168,16 @@ export interface SummaryCompletion {
 	redactedText: string;
 	/** Optional provider measurement; the package also measures text locally and uses the larger value. */
 	tokenCount?: number;
+	provenance?: SummaryAttemptProvenance;
 }
 
 export type SummaryCompletionCallback = (job: SummaryJob) => Promise<SummaryCompletion>;
 
 export type CompleteSummaryJobResult =
 	| { accepted: true; summaryId: string }
-	| { accepted: false; reason: "lease_lost" | "stale" | "not_compressed" };
+	| { accepted: false; reason: "lease_lost" | "stale" }
+	| { accepted: false; reason: "escalated"; stage: SummaryStage }
+	| { accepted: false; reason: "deterministic_failed" };
 
 export interface RunSummaryJobsOptions extends ClaimSummaryJobsOptions {
 	retryDelayMs: number;
@@ -145,22 +188,31 @@ export interface RunSummaryJobsResult {
 	completed: number;
 	failed: number;
 	stale: number;
+	escalated: number;
 }
 
 export interface SearchRequest extends ContextScope {
 	query: string;
 	limit?: number;
+	/** Zero-based offset after scope filtering. */
+	offset?: number;
+	/** Restrict matches to the active placement of this summary handle. */
+	summaryHandle?: string;
 }
 
 export interface ProjectSearchRequest {
 	projectId: string;
 	query: string;
 	limit?: number;
+	/** Zero-based offset after project/branch filtering. */
+	offset?: number;
 }
 
 export interface SearchHit {
 	kind: "source" | "summary";
 	id: string;
+	/** Present for summary hits; unlike `id`, stable across regenerated prose. */
+	summaryHandle?: string;
 	redactedText: string;
 	/** SQLite FTS5 BM25 rank; lower values are better. */
 	rank: number;
@@ -174,6 +226,51 @@ export interface SourceDescription extends Citation {
 	atomicGroupId: string | null;
 	redactedText: string;
 	artifactRefs: readonly string[];
+	files: readonly LcmFileMetadata[];
+}
+
+export interface SummaryReference extends ContextScope {
+	summaryHandle: string;
+}
+
+export interface FileReference extends ContextScope {
+	fileId: string;
+}
+
+export interface SummaryDescription extends SummaryReference {
+	kind: "leaf" | "condensed";
+	level: number;
+	redactedText: string;
+	tokenCount: number;
+	sourceCount: number;
+	childCount: number;
+	parentHandles: readonly string[];
+	files: readonly LcmFileMetadata[];
+}
+
+export interface FileDescription extends FileReference, LcmFileMetadata {
+	sources: readonly Citation[];
+}
+
+export interface SummaryExpansionRequest extends SummaryReference {
+	depth?: number;
+	offset?: number;
+	limit?: number;
+	maxTokens?: number;
+}
+
+export type SummaryExpansionItem =
+	| { kind: "summary"; depth: number; summary: SummaryDescription }
+	| { kind: "source"; depth: number; citation: Citation; tokenCount: number; files: readonly LcmFileMetadata[] };
+
+export interface SummaryExpansion {
+	root: SummaryDescription;
+	items: readonly SummaryExpansionItem[];
+	offset: number;
+	totalItems: number;
+	estimatedTokens: number;
+	truncated: boolean;
+	nextOffset?: number;
 }
 
 export interface JobStatusCounts {
@@ -215,6 +312,7 @@ export interface PurgeResult {
 	jobs: number;
 	summaries: number;
 	sourceContents: number;
+	files: number;
 }
 
 export interface RebuildResult {
@@ -224,16 +322,26 @@ export interface RebuildResult {
 }
 
 export interface LcmContext extends Disposable {
-	reconcile(snapshot: SourceSnapshot): ReconcileResult;
+	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult;
 	project(request: ProjectionRequest): ContextProjection;
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[];
+	nextSummaryJobDelayMs(): number | null;
 	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean;
 	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult;
-	failSummaryJob(jobId: string, leaseToken: string, redactedError: string, retryDelayMs: number): boolean;
+	failSummaryJob(
+		jobId: string,
+		leaseToken: string,
+		redactedError: string,
+		retryDelayMs: number,
+		provenance?: SummaryAttemptProvenance,
+	): boolean;
 	runSummaryJobs(options: RunSummaryJobsOptions, complete: SummaryCompletionCallback): Promise<RunSummaryJobsResult>;
 	search(request: SearchRequest): SearchHit[];
 	searchProject(request: ProjectSearchRequest): SearchHit[];
 	describe(citation: Citation): SourceDescription | null;
+	describeSummary(reference: SummaryReference): SummaryDescription | null;
+	describeFile(reference: FileReference): FileDescription | null;
+	expandSummary(request: SummaryExpansionRequest): SummaryExpansion | null;
 	status(): LcmStatus;
 	doctor(): DoctorReport;
 	/** Logically quarantine this derived store until `rebuild` succeeds. */

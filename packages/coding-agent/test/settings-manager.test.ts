@@ -392,6 +392,39 @@ describe("Settings", () => {
 			expect(savedSettings.theme).toEqual({ dark: "anthracite" });
 		});
 
+		it("unsets a YAML leaf while preserving concurrently edited siblings", async () => {
+			await writeSettings({
+				context: { engine: "lossless", lossless: { retained: "loaded" } },
+				unrelated: { keep: true },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// The save must replay only the deletion against this newer file.
+			await writeSettings({
+				context: { engine: "lossless", lossless: { summaryModel: "old/model", retained: "external" } },
+				unrelated: { keep: true, added: "outside" },
+			});
+			settings.unset("context.lossless.summaryModel");
+			await settings.flush();
+
+			const saved = await readSettings();
+			expect(saved).toEqual({
+				context: { engine: "lossless", lossless: { retained: "external" } },
+				unrelated: { keep: true, added: "outside" },
+			});
+			expect(settings.get("context.lossless.summaryModel")).toBeUndefined();
+		});
+
+		it("prunes only empty ancestors when unsetting a nested leaf", async () => {
+			await writeSettings({ context: { engine: "lossless", lossless: { summaryModel: "old/model" } } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.unset("context.lossless.summaryModel");
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ context: { engine: "lossless" } });
+		});
+
 		it("should let in-memory changes override file changes for same key", async () => {
 			await writeSettings({
 				theme: { dark: "anthracite" },

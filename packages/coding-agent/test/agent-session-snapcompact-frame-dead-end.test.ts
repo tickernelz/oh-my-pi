@@ -73,6 +73,8 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		/** Seed a kept-recent entry between firstKeptEntryId and the archive —
 		 *  re-emitted by buildSessionContext, so the rescue budget must charge it. */
 		preArchiveKeptText?: string;
+		/** Display-only LCM fail-open reason carried by the stale compaction entry. */
+		lcmFallback?: CompactionEntry["lcmFallback"];
 	}): Promise<void> {
 		tempDir = TempDir.createSync("@pi-snapcompact-frame-dead-end-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
@@ -160,6 +162,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 				{ readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] },
 				false,
 				makeArchivePreserveData(options.frameCount),
+				options.lcmFallback,
 			);
 		}
 
@@ -242,7 +245,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 	}
 
 	it("rebuilds a stale trailing snapcompact archive and skips the no-progress warning", async () => {
-		await createSession({ frameCount: SEEDED_FRAME_COUNT });
+		await createSession({ frameCount: SEEDED_FRAME_COUNT, lcmFallback: "deadline" });
 		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		// Over the band until the rescue rebuilds the archive, then well under —
@@ -298,6 +301,8 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(snapcompact.getPreservedArchive(stale.preserveData)?.frames.length).toBe(SEEDED_FRAME_COUNT);
 		const rebuiltArchive = snapcompact.getPreservedArchive(rebuilt.preserveData);
 		expect(rebuiltArchive?.frames.length).toBe(4);
+		expect(stale.lcmFallback).toBe("deadline");
+		expect(rebuilt.lcmFallback).toBe("deadline");
 
 		// The frame rescue fired first: the elide/image tiers (provable no-ops
 		// on a compaction tail) were skipped, and no misleading warning.

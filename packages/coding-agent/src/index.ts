@@ -31,6 +31,7 @@ export { type FileSlashCommand, loadSlashCommands as discoverSlashCommands } fro
 export * from "./lcm/operations";
 export * from "./lcm/project-catalog";
 export * from "./lcm/project-identity";
+export * from "./lcm/rebuild";
 export type * from "./lsp";
 // Main entry point
 export * from "./main";

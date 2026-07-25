@@ -1,1 +1,1 @@
-Search exactly one known LCM project selected by its exact project ID or explicit absolute project path. This never searches all projects and never automatically includes another project. Results are bounded redacted derived matches with project-qualified citations.
+Search exactly one explicitly selected, catalog-authorized LCM project with bounded pagination. Returns redacted derived matches and project-qualified opaque summary/source handles; it never unions projects or opens an arbitrary store.

@@ -30,6 +30,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"lcm_search",
 	"lcm_describe",
 	"lcm_recall",
+	"lcm_expand",
 	"lcm_cross_project_search",
 ] as const;
 

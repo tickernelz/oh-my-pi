@@ -1754,7 +1754,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "lcm",
 		description: "Inspect and operate Lossless Context Management",
-		acpDescription: "Inspect and repair LCM derived state",
+		acpDescription: "Inspect and maintain LCM derived state",
 		acpInputHint: "<subcommand>",
 		subcommands: LCM_SUBCOMMANDS,
 		allowArgs: true,
