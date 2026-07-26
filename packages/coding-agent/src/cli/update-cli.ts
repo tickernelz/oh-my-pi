@@ -55,6 +55,8 @@ interface UpdateMethodResolutionOptions {
 	miseBinDirs?: readonly string[];
 	miseDataDir?: string;
 	npmBinDir?: string;
+	/** Whether the path is a standalone executable instead of a package-manager symlink. */
+	ompIsRegularFile?: boolean;
 }
 
 export type UpdateTarget =
@@ -168,7 +170,7 @@ function resolveUpdateMethod(
 	bunBinDir: string | undefined,
 	options: UpdateMethodResolutionOptions = {},
 ): UpdateMethod {
-	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir } = options;
+	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir, ompIsRegularFile = false } = options;
 	const launcherExtension = path.extname(ompPath).toLowerCase();
 	const isWindowsScriptLauncher = [".cmd", ".ps1", ".bat"].includes(launcherExtension);
 	if (homebrewPrefix && isPathInDirectory(ompPath, homebrewPrefix)) return "brew";
@@ -180,8 +182,13 @@ function resolveUpdateMethod(
 	) {
 		return "mise";
 	}
-	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir)) return "bun";
-	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir)) || isWindowsScriptLauncher) return "npm";
+	// A plain POSIX executable in a package-manager bin directory is the
+	// downstream standalone binary, not a managed install. Windows package
+	// managers use regular-file launchers, so file type is not decisive there.
+	const isStandaloneRegularFile = ompIsRegularFile && process.platform !== "win32";
+	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir) && !isStandaloneRegularFile) return "bun";
+	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir) && !isStandaloneRegularFile) || isWindowsScriptLauncher)
+		return "npm";
 	return "binary";
 }
 
@@ -209,7 +216,18 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const ompPath = resolveOmpPath();
 	if (!ompPath) throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
 
-	const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir, npmBinDir });
+	let ompIsRegularFile = false;
+	try {
+		const stat = fs.lstatSync(ompPath);
+		ompIsRegularFile = stat.isFile() && !stat.isSymbolicLink();
+	} catch {}
+	const method = resolveUpdateMethod(ompPath, bunBinDir, {
+		homebrewPrefix,
+		miseBinDirs,
+		miseDataDir,
+		npmBinDir,
+		ompIsRegularFile,
+	});
 	return method === "binary" ? { method, path: ompPath } : { method };
 }
 
