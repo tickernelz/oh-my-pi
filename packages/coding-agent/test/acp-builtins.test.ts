@@ -46,6 +46,7 @@ interface FakeAcpBuiltinSession {
 	getTodoPhases(): Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	refreshBaseSystemPrompt(): Promise<void>;
+	refreshLcmSettingsAndRebind(): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
@@ -145,6 +146,7 @@ function createRuntime() {
 			this._todoPhases = phases;
 		},
 		async refreshBaseSystemPrompt() {},
+		async refreshLcmSettingsAndRebind() {},
 		getAsyncJobSnapshot: () => null,
 		formatSessionAsText: () => "",
 		dumpLlmRequestToTmpDir: async () => undefined,
@@ -788,6 +790,10 @@ describe("wave 3 commands", () => {
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		const originalProjectDir = process.cwd();
 		const reloadForCwd = spyOn(runtime.settings, "reloadForCwd");
+		let lcmRebinds = 0;
+		session.refreshLcmSettingsAndRebind = async () => {
+			lcmRebinds++;
+		};
 		let configNotified = 0;
 		runtime.notifyConfigChanged = () => {
 			configNotified++;
@@ -802,6 +808,7 @@ describe("wave 3 commands", () => {
 			expect(session._switchedTo).toBeUndefined();
 			expect(session._movedFromEmptySessionFile).toBeUndefined();
 			expect(reloadForCwd).toHaveBeenCalledWith(targetDir);
+			expect(lcmRebinds).toBe(1);
 			expect(configNotified).toBe(1);
 			expect(output[0]).toContain(`Moved to ${targetDir}.`);
 		} finally {
