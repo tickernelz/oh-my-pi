@@ -28,24 +28,39 @@ describe("createAgentSession cwd after /move", () => {
 		}
 	});
 
-	it("runs tools from the moved session directory", async () => {
+	it("uses the configured summary width and destination LCM settings after move", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-move-cwd-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwdA = path.join(tempDir, "cwd-a");
 		const cwdB = path.join(tempDir, "cwd-b");
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(cwdB, { recursive: true });
+		fs.mkdirSync(path.join(cwdA, ".omp"), { recursive: true });
+		fs.mkdirSync(path.join(cwdB, ".omp"), { recursive: true });
+		fs.writeFileSync(
+			path.join(cwdA, ".omp", "config.yml"),
+			"context:\n  engine: lossless\n  lossless:\n    summaryModel: source/model\n    maxConcurrentSummaries: 1\n",
+		);
+		fs.writeFileSync(
+			path.join(cwdB, ".omp", "config.yml"),
+			"context:\n  engine: lossless\n  lossless:\n    summaryModel: destination/model\n    maxConcurrentSummaries: 4\n",
+		);
+		const settings = await Settings.loadIsolated({
+			cwd: cwdA,
+			agentDir: tempDir,
+			overrides: {
+				"async.enabled": false,
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+			},
+		});
 
 		const sessionManager = SessionManager.create(cwdA, path.join(tempDir, "sessions"));
 		const { session } = await createAgentSession({
 			cwd: cwdA,
 			agentDir: tempDir,
 			sessionManager,
-			settings: Settings.isolated({
-				"async.enabled": false,
-				"bash.autoBackground.enabled": false,
-				"bashInterceptor.enabled": false,
-			}),
+			settings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -58,13 +73,62 @@ describe("createAgentSession cwd after /move", () => {
 		});
 
 		try {
-			await sessionManager.moveTo(cwdB);
+			const sourceStatus = await session.lcmStatus();
+			expect(sourceStatus.runtime).toMatchObject({
+				summaryModelSelector: "source/model",
+				summaryWorkers: { limit: 1 },
+			});
+			await session.moveSession(cwdB);
+			await settings.reloadForCwd(cwdB);
+			await session.refreshLcmSettingsAndRebind();
+			const destinationStatus = await session.lcmStatus();
+			expect(destinationStatus.runtime).toMatchObject({
+				summaryModelSelector: "destination/model",
+				summaryWorkers: { limit: 4 },
+			});
 
 			const bashTool = session.getToolByName("bash");
 			if (!bashTool) throw new Error("Expected bash tool");
 			const result = await bashTool.execute("pwd-after-move", { command: "pwd" });
 
 			expect(textContent(result)).toContain(cwdB);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("reports the normalized worker limit while lossless context is disabled", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-native-lcm-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "cwd");
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated({
+				"async.enabled": false,
+				"context.engine": "native",
+				"context.lossless.maxConcurrentSummaries": 99,
+			}),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: [],
+		});
+
+		try {
+			expect(await session.lcmStatus()).toMatchObject({
+				runtime: {
+					phase: "disabled",
+					summaryWorkers: { active: 0, limit: 4 },
+				},
+			});
 		} finally {
 			await session.dispose();
 		}

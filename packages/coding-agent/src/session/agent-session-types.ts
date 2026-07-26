@@ -152,7 +152,7 @@ export interface AgentSessionConfig {
 	/** Extension/steering transform used only by AgentSession-owned side requests. */
 	sideTransformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Lossless Context configuration pinned for this AgentSession; absent keeps native context. */
-	lcm?: Pick<SessionLcmOptions, "agentDir" | "summaryModel" | "registerProject">;
+	lcm?: Pick<SessionLcmOptions, "agentDir" | "summaryModel" | "maxConcurrentSummaries" | "registerProject">;
 	/** Provider request transform applied after message conversion. */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 	/** Stream wrapper for side-channel requests. */

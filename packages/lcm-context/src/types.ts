@@ -144,6 +144,7 @@ export interface SummaryJob {
 	jobId: string;
 	leaseToken: string;
 	leaseExpiresAt: number;
+	queueClass: "preferred" | "fallback";
 	kind: "leaf" | "condensed";
 	level: number;
 	inputs: readonly SummaryJobInput[];
@@ -159,8 +160,11 @@ export interface ClaimSummaryJobsOptions {
 	workerId: string;
 	leaseMs: number;
 	limit: number;
-	/** Hard output ceiling requested from the completion callback. */
+	/** Hard output ceiling requested from the completion provider. */
 	maxOutputTokens: number;
+	preferredScope?: ContextScope;
+	/** Defaults to true to preserve project-wide draining when no scope is supplied. */
+	allowFallback?: boolean;
 }
 
 export interface SummaryCompletion {
@@ -171,25 +175,11 @@ export interface SummaryCompletion {
 	provenance?: SummaryAttemptProvenance;
 }
 
-export type SummaryCompletionCallback = (job: SummaryJob) => Promise<SummaryCompletion>;
-
 export type CompleteSummaryJobResult =
 	| { accepted: true; summaryId: string }
 	| { accepted: false; reason: "lease_lost" | "stale" }
 	| { accepted: false; reason: "escalated"; stage: SummaryStage }
 	| { accepted: false; reason: "deterministic_failed" };
-
-export interface RunSummaryJobsOptions extends ClaimSummaryJobsOptions {
-	retryDelayMs: number;
-}
-
-export interface RunSummaryJobsResult {
-	claimed: number;
-	completed: number;
-	failed: number;
-	stale: number;
-	escalated: number;
-}
 
 export interface SearchRequest extends ContextScope {
 	query: string;
@@ -325,8 +315,14 @@ export interface LcmContext extends Disposable {
 	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult;
 	project(request: ProjectionRequest): ContextProjection;
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[];
-	nextSummaryJobDelayMs(): number | null;
+	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback?: boolean): number | null;
+	summaryJobFailures(preferredScope?: ContextScope): readonly {
+		jobId: string;
+		availableAt: number;
+		queueClass: "preferred" | "fallback";
+	}[];
 	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean;
+	releaseSummaryJob(jobId: string, leaseToken: string): boolean;
 	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult;
 	failSummaryJob(
 		jobId: string,
@@ -335,7 +331,6 @@ export interface LcmContext extends Disposable {
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
 	): boolean;
-	runSummaryJobs(options: RunSummaryJobsOptions, complete: SummaryCompletionCallback): Promise<RunSummaryJobsResult>;
 	search(request: SearchRequest): SearchHit[];
 	searchProject(request: ProjectSearchRequest): SearchHit[];
 	describe(citation: Citation): SourceDescription | null;

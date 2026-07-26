@@ -142,8 +142,10 @@ describe("Settings", () => {
 
 			expect(settings.get("context.engine")).toBe("native");
 			expect(settings.get("context.lossless.summaryModel")).toBeUndefined();
+			expect(settings.get("context.lossless.maxConcurrentSummaries")).toBe(1);
 			expect(getDefault("context.engine")).toBe("native");
 			expect(getEnumValues("context.engine")).toEqual(["native", "lossless"]);
+			expect(getDefault("context.lossless.maxConcurrentSummaries")).toBe(1);
 		});
 
 		it("defaults provider in-flight request limits to an empty map", async () => {
@@ -339,6 +341,16 @@ describe("Settings", () => {
 
 			const savedSettings = await readSettings();
 			expect(savedSettings.terminal).toEqual({ showProgress: true });
+		});
+
+		it("persists the concurrent summary limit as a number", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.set("context.lossless.maxConcurrentSummaries", 4);
+			await settings.flush();
+
+			expect(settings.get("context.lossless.maxConcurrentSummaries")).toBe(4);
+			expect((await readSettings()).context).toEqual({ lossless: { maxConcurrentSummaries: 4 } });
 		});
 
 		it("filters model allow-list and disabled providers by current path prefix", async () => {

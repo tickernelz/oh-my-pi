@@ -133,7 +133,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Agent",
 		"Git",
 	],
-	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
+	context: ["General", "Lossless LCM", "Compaction", "Rules (TTSR)", "Experimental"],
 	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
@@ -194,6 +194,8 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/** Optional specialized editor rendered by the settings selector. */
+	editor?: "summary-model";
 }
 
 interface UiBoolean extends UiBase {}
@@ -2085,10 +2087,46 @@ export const SETTINGS_SCHEMA = {
 		default: undefined,
 		ui: {
 			tab: "context",
-			group: "General",
+			group: "Lossless LCM",
 			label: "Lossless Summary Model",
 			description: "Background summary model; the absent setting resolves @smol dynamically for each new job",
 			options: "runtime",
+			editor: "summary-model",
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.maxConcurrentSummaries": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Concurrent Summaries",
+			description:
+				"Maximum background LCM summary requests per session; changes apply to new claims while in-flight jobs finish. Use Providers > Max In-Flight Requests to cap aggregate provider traffic.",
+			options: [
+				{
+					value: "1",
+					label: "Serial",
+					description: "One summary at a time; preserves previous behavior.",
+				},
+				{
+					value: "2",
+					label: "Balanced",
+					description: "Recommended canary after verifying provider headroom.",
+				},
+				{
+					value: "3",
+					label: "High",
+					description: "Higher backlog throughput and provider usage.",
+				},
+				{
+					value: "4",
+					label: "Maximum",
+					description: "Maximum supported per-session parallelism.",
+				},
+			],
 			condition: "losslessContextActive",
 		},
 	},
@@ -5438,6 +5476,13 @@ export function getPathsForTab(tab: SettingTab): SettingPath[] {
 		const ui = getUi(path);
 		return ui?.tab === tab;
 	});
+}
+
+/** Canonical project-overridable LCM settings, in schema declaration order. */
+export function getLcmSettingPaths(): SettingPath[] {
+	return (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).filter(
+		path => path === "context.engine" || path.startsWith("context.lossless."),
+	);
 }
 
 /** Get the type of a setting */

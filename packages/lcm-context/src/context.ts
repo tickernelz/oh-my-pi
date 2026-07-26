@@ -24,8 +24,6 @@ import type {
 	RebuildResult,
 	ReconcileOptions,
 	ReconcileResult,
-	RunSummaryJobsOptions,
-	RunSummaryJobsResult,
 	SearchHit,
 	SearchRequest,
 	SourceDescription,
@@ -33,7 +31,6 @@ import type {
 	SourceSnapshot,
 	SummaryAttemptProvenance,
 	SummaryCompletion,
-	SummaryCompletionCallback,
 	SummaryDescription,
 	SummaryExpansion,
 	SummaryExpansionRequest,
@@ -50,6 +47,7 @@ const DEFAULT_LEAF_MAX_SOURCES = 24;
 const DEFAULT_LEAF_MAX_TOKENS = 4_000;
 const DEFAULT_CONDENSE_FAN_IN = 4;
 const MAX_STORED_DIAGNOSTIC_LENGTH = 2_000;
+const SQLITE_OPEN_RETRY_DELAYS_MS = [100, 200, 400] as const;
 
 interface InternalOptions {
 	busyTimeoutMs: number;
@@ -221,10 +219,6 @@ function contentAddress(parts: readonly string[]): string {
 
 function boundedDiagnostic(value: string): string {
 	return value.slice(0, MAX_STORED_DIAGNOSTIC_LENGTH);
-}
-
-function errorName(error: unknown): string {
-	return error instanceof Error ? error.name : "CompletionError";
 }
 
 function normalizeOptions(options: LcmContextOptions): InternalOptions {
@@ -492,6 +486,44 @@ function parseArtifactRefs(serialized: string): string[] {
 		throw new Error("LCM artifact reference record is malformed");
 	}
 	return parsed;
+}
+
+function errorCauseMatches(
+	error: unknown,
+	predicate: (error: { code?: unknown; message?: unknown }) => boolean,
+): boolean {
+	const seen = new Set<object>();
+	let current = error;
+	while (current !== null && typeof current === "object") {
+		if (seen.has(current)) return false;
+		seen.add(current);
+		const candidate = current as { cause?: unknown; code?: unknown; message?: unknown };
+		if (predicate(candidate)) return true;
+		current = candidate.cause;
+	}
+	return false;
+}
+
+export function isLcmSqliteContentionError(error: unknown): boolean {
+	return errorCauseMatches(error, candidate => {
+		if (typeof candidate.code === "string") {
+			return candidate.code.startsWith("SQLITE_BUSY") || candidate.code.startsWith("SQLITE_LOCKED");
+		}
+		return (
+			candidate.code === undefined &&
+			(candidate.message === "database is locked" || candidate.message === "database table is locked")
+		);
+	});
+}
+
+export function isLcmSqliteCorruptionError(error: unknown): boolean {
+	return errorCauseMatches(error, candidate => {
+		const code = candidate.code;
+		return (
+			typeof code === "string" &&
+			(code.startsWith("SQLITE_CORRUPT") || code === "SQLITE_IOERR_CORRUPTFS" || code === "SQLITE_NOTADB")
+		);
+	});
 }
 
 function isMissingFile(error: unknown): boolean {
@@ -1079,11 +1111,35 @@ class SqliteLcmContext implements LcmContext {
 			coveredSourceCount: cursor,
 			freshSourceCount: tail.count,
 			estimatedTokens: usedTokens,
-			pendingJobs: this.#count(
-				"SELECT COUNT(*) AS count FROM summary_jobs WHERE project_id = ? AND status IN ('pending', 'leased', 'failed')",
-				scope.projectId,
-			),
+			pendingJobs: this.#relevantPendingJobCount(scope.projectId, rows, tailStart),
 		};
+	}
+
+	#relevantPendingJobCount(
+		projectId: string,
+		branchRows: readonly Pick<ActiveSourceRow, "source_key" | "atomic_group_id">[],
+		tailStart: number,
+	): number {
+		const rows = this.#db
+			.query<{ job_id: string; source_key: string }, [string]>(
+				`SELECT j.job_id, jl.source_key FROM summary_jobs j
+				 JOIN job_lineage jl ON jl.job_id = j.job_id
+				 WHERE j.project_id = ? AND j.status IN ('pending', 'leased', 'failed')
+				 ORDER BY j.job_id, jl.ordinal`,
+			)
+			.all(projectId);
+		const lineages = new Map<string, string[]>();
+		for (const row of rows) {
+			const lineage = lineages.get(row.job_id);
+			if (lineage) lineage.push(row.source_key);
+			else lineages.set(row.job_id, [row.source_key]);
+		}
+		let count = 0;
+		for (const lineage of lineages.values()) {
+			const start = findAlignedSequence(branchRows, lineage);
+			if (start >= 0 && start + lineage.length <= tailStart) count++;
+		}
+		return count;
 	}
 
 	#summaryCandidates(projectId: string): SummaryCandidate[] {
@@ -1122,24 +1178,63 @@ class SqliteLcmContext implements LcmContext {
 		const leaseMs = assertInteger(options.leaseMs, "leaseMs", 1);
 		const limit = assertInteger(options.limit, "limit", 1);
 		const maxOutputTokens = assertInteger(options.maxOutputTokens, "maxOutputTokens", 1);
+		const preferredScope = options.preferredScope === undefined ? undefined : normalizeScope(options.preferredScope);
+		const allowFallback = options.allowFallback ?? true;
 		const now = this.#options.now();
 		const transaction = this.#db.transaction(() => {
-			const candidateLimit = Math.min(Math.max(limit * 16, limit), 1_000);
+			const preferredBranch = this.#preferredBranchRows(preferredScope);
 			const candidates = this.#db
-				.query<Pick<JobRow, "job_id" | "project_id" | "stage">, [number, number, number]>(
+				.query<Pick<JobRow, "job_id" | "project_id" | "stage">, [number, number]>(
 					`SELECT job_id, project_id, stage FROM summary_jobs
 					 WHERE available_at <= ? AND (
 						status IN ('pending', 'failed') OR
 						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
 					 )
-					 ORDER BY level, created_at, job_id LIMIT ?`,
+					 ORDER BY level, created_at, job_id`,
 				)
-				.all(now, now, candidateLimit);
-			const claimed: SummaryJob[] = [];
+				.all(now, now);
+			const lineages = this.#groupJobLineages(
+				this.#db
+					.query<{ job_id: string; source_key: string }, [number, number]>(
+						`SELECT jl.job_id, jl.source_key
+						 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
+						 WHERE j.available_at <= ? AND (
+							j.status IN ('pending', 'failed') OR
+							(j.status = 'leased' AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at <= ?)
+						 ) ORDER BY jl.job_id, jl.ordinal`,
+					)
+					.all(now, now),
+			);
+			const activeProjects = allowFallback ? this.#activeBranchesByProject() : new Map();
+			const preferred: Array<{
+				candidate: (typeof candidates)[number];
+				lineage: string[];
+				queueClass: "preferred";
+			}> = [];
+			const fallback: Array<{
+				candidate: (typeof candidates)[number];
+				lineage: string[];
+				queueClass: "fallback";
+			}> = [];
 			for (const candidate of candidates) {
+				const lineage = lineages.get(candidate.job_id) ?? [];
+				if (
+					preferredBranch?.projectId === candidate.project_id &&
+					findAlignedSequence(preferredBranch.rows, lineage) >= 0
+				) {
+					preferred.push({ candidate, lineage, queueClass: "preferred" });
+				} else if (allowFallback) {
+					fallback.push({ candidate, lineage, queueClass: "fallback" });
+				}
+			}
+
+			const claimed: SummaryJob[] = [];
+			for (const { candidate, lineage, queueClass } of [...preferred, ...fallback]) {
 				if (claimed.length >= limit) break;
-				const lineage = this.#jobLineage(candidate.job_id);
-				if (!this.#lineageActiveSomewhere(candidate.project_id, lineage)) {
+				if (
+					queueClass === "fallback" &&
+					!this.#lineageActiveSomewhere(candidate.project_id, lineage, activeProjects)
+				) {
 					this.#db.run(
 						`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
 							lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
@@ -1194,8 +1289,10 @@ class SqliteLcmContext implements LcmContext {
 					leaseToken,
 					leaseExpiresAt,
 					inputs,
+					lineage.length,
 					inputTokenCount,
 					outputTokenBudget,
+					queueClass,
 				);
 				if (job) claimed.push(job);
 				else {
@@ -1211,20 +1308,49 @@ class SqliteLcmContext implements LcmContext {
 		return transaction.immediate();
 	}
 
-	nextSummaryJobDelayMs(): number | null {
+	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback = true): number | null {
 		this.#assertAvailable();
+		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
+		const preferredBranch = this.#preferredBranchRows(scope);
 		const now = this.#options.now();
-		const row = this.#db
-			.query<{ available_at: number | null }, []>(
-				`SELECT MIN(CASE
-					WHEN status = 'leased' THEN lease_expires_at
-					ELSE available_at
-				 END) AS available_at
-				 FROM summary_jobs
+		const rows = this.#db
+			.query<
+				{
+					job_id: string;
+					project_id: string;
+					status: string;
+					available_at: number;
+					lease_expires_at: number | null;
+				},
+				[]
+			>(
+				`SELECT job_id, project_id, status, available_at, lease_expires_at FROM summary_jobs
 				 WHERE status IN ('pending', 'failed', 'leased')`,
 			)
-			.get();
-		return row?.available_at === null || row?.available_at === undefined ? null : Math.max(0, row.available_at - now);
+			.all();
+		const lineages = this.#groupJobLineages(
+			this.#db
+				.query<{ job_id: string; source_key: string }, []>(
+					`SELECT jl.job_id, jl.source_key
+					 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
+					 WHERE j.status IN ('pending', 'failed', 'leased')
+					 ORDER BY jl.job_id, jl.ordinal`,
+				)
+				.all(),
+		);
+		const activeProjects = allowFallback ? this.#activeBranchesByProject() : new Map();
+		let availableAt: number | null = null;
+		for (const row of rows) {
+			const lineage = lineages.get(row.job_id) ?? [];
+			const isPreferred =
+				preferredBranch?.projectId === row.project_id && findAlignedSequence(preferredBranch.rows, lineage) >= 0;
+			if (!isPreferred) {
+				if (!allowFallback || !this.#lineageActiveSomewhere(row.project_id, lineage, activeProjects)) continue;
+			}
+			const candidateAt = row.status === "leased" ? row.lease_expires_at : row.available_at;
+			if (candidateAt !== null && (availableAt === null || candidateAt < availableAt)) availableAt = candidateAt;
+		}
+		return availableAt === null ? null : Math.max(0, availableAt - now);
 	}
 
 	#loadClaimedJob(
@@ -1232,8 +1358,10 @@ class SqliteLcmContext implements LcmContext {
 		leaseToken: string,
 		leaseExpiresAt: number,
 		inputs: readonly SummaryJobInput[],
+		sourceCount: number,
 		inputTokenCount: number,
 		outputTokenBudget: number,
+		queueClass: SummaryJob["queueClass"],
 	): SummaryJob | null {
 		const job = this.#db
 			.query<Pick<JobRow, "job_id" | "level" | "stage" | "transport_retry_count">, [string]>(
@@ -1245,10 +1373,11 @@ class SqliteLcmContext implements LcmContext {
 			jobId,
 			leaseToken,
 			leaseExpiresAt,
+			queueClass,
 			kind: job.level === 0 ? "leaf" : "condensed",
 			level: job.level,
 			inputs,
-			sourceCount: this.#jobLineage(jobId).length,
+			sourceCount,
 			inputTokenCount,
 			outputTokenBudget,
 			stage: job.stage,
@@ -1294,6 +1423,41 @@ class SqliteLcmContext implements LcmContext {
 		return inputs;
 	}
 
+	#groupJobLineages(rows: readonly { job_id: string; source_key: string }[]): Map<string, string[]> {
+		const lineages = new Map<string, string[]>();
+		for (const row of rows) {
+			const lineage = lineages.get(row.job_id);
+			if (lineage) lineage.push(row.source_key);
+			else lineages.set(row.job_id, [row.source_key]);
+		}
+		return lineages;
+	}
+
+	#activeBranchesByProject(): Map<string, Map<number, Array<{ source_key: string; atomic_group_id: string | null }>>> {
+		const rows = this.#db
+			.query<{ project_id: string; branch_row_id: number; source_key: string; atomic_group_id: string | null }, []>(
+				`SELECT b.project_id, bs.branch_row_id, bs.source_key, bs.atomic_group_id
+				 FROM branch_sources bs JOIN branches b ON b.id = bs.branch_row_id
+				 WHERE bs.active = 1 ORDER BY b.project_id, bs.branch_row_id, bs.position`,
+			)
+			.all();
+		const projects = new Map<string, Map<number, Array<{ source_key: string; atomic_group_id: string | null }>>>();
+		for (const row of rows) {
+			let branches = projects.get(row.project_id);
+			if (!branches) {
+				branches = new Map();
+				projects.set(row.project_id, branches);
+			}
+			let branch = branches.get(row.branch_row_id);
+			if (!branch) {
+				branch = [];
+				branches.set(row.branch_row_id, branch);
+			}
+			branch.push({ source_key: row.source_key, atomic_group_id: row.atomic_group_id });
+		}
+		return projects;
+	}
+
 	#jobLineage(jobId: string): string[] {
 		return this.#db
 			.query<{ source_key: string }, [string]>(
@@ -1303,26 +1467,72 @@ class SqliteLcmContext implements LcmContext {
 			.map(row => row.source_key);
 	}
 
-	#lineageActiveSomewhere(projectId: string, lineage: readonly string[]): boolean {
-		if (lineage.length === 0) return false;
-		const rows = this.#db
-			.query<{ branch_row_id: number; source_key: string; atomic_group_id: string | null }, [string]>(
-				`SELECT bs.branch_row_id, bs.source_key, bs.atomic_group_id
-				 FROM branch_sources bs JOIN branches b ON b.id = bs.branch_row_id
-				 WHERE b.project_id = ? AND bs.active = 1 ORDER BY bs.branch_row_id, bs.position`,
+	#preferredBranchRows(scope?: ContextScope): { projectId: string; rows: CurrentSourceRow[] } | null {
+		if (!scope) return null;
+		const branch = this.#db
+			.query<Pick<BranchRow, "id">, [string, string, string]>(
+				"SELECT id FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
 			)
-			.all(projectId);
-		let branchId = -1;
-		let sequence: Array<{ source_key: string; atomic_group_id: string | null }> = [];
-		for (const row of rows) {
-			if (branchId !== row.branch_row_id) {
-				if (findAlignedSequence(sequence, lineage) >= 0) return true;
-				branchId = row.branch_row_id;
-				sequence = [];
-			}
-			sequence.push({ source_key: row.source_key, atomic_group_id: row.atomic_group_id });
+			.get(scope.projectId, scope.sessionId, scope.branchId);
+		return branch ? { projectId: scope.projectId, rows: this.#activeRows(branch.id) } : null;
+	}
+
+	#lineageActiveSomewhere(
+		projectId: string,
+		lineage: readonly string[],
+		projects: ReadonlyMap<
+			string,
+			ReadonlyMap<number, readonly { source_key: string; atomic_group_id: string | null }[]>
+		> = this.#activeBranchesByProject(),
+	): boolean {
+		if (lineage.length === 0) return false;
+		for (const branch of projects.get(projectId)?.values() ?? []) {
+			if (findAlignedSequence(branch, lineage) >= 0) return true;
 		}
-		return findAlignedSequence(sequence, lineage) >= 0;
+		return false;
+	}
+
+	summaryJobFailures(preferredScope?: ContextScope): readonly {
+		jobId: string;
+		availableAt: number;
+		queueClass: "preferred" | "fallback";
+	}[] {
+		this.#assertAvailable();
+		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
+		const preferredBranch = this.#preferredBranchRows(scope);
+		const rows = this.#db
+			.query<{ job_id: string; project_id: string; available_at: number }, []>(
+				`SELECT job_id, project_id, available_at FROM summary_jobs
+				 WHERE status = 'failed' ORDER BY available_at, job_id`,
+			)
+			.all();
+		const lineages = this.#groupJobLineages(
+			this.#db
+				.query<{ job_id: string; source_key: string }, []>(
+					`SELECT jl.job_id, jl.source_key
+					 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
+					 WHERE j.status = 'failed' ORDER BY jl.job_id, jl.ordinal`,
+				)
+				.all(),
+		);
+		const activeProjects = this.#activeBranchesByProject();
+		const failures: Array<{
+			jobId: string;
+			availableAt: number;
+			queueClass: "preferred" | "fallback";
+		}> = [];
+		for (const row of rows) {
+			const lineage = lineages.get(row.job_id) ?? [];
+			const isPreferred =
+				preferredBranch?.projectId === row.project_id && findAlignedSequence(preferredBranch.rows, lineage) >= 0;
+			if (!isPreferred && !this.#lineageActiveSomewhere(row.project_id, lineage, activeProjects)) continue;
+			failures.push({
+				jobId: row.job_id,
+				availableAt: row.available_at,
+				queueClass: isPreferred ? "preferred" : "fallback",
+			});
+		}
+		return failures;
 	}
 
 	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean {
@@ -1335,6 +1545,21 @@ class SqliteLcmContext implements LcmContext {
 			`UPDATE summary_jobs SET lease_expires_at = ?, updated_at = ?
 			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
 			[now + leaseMs, now, jobId, leaseToken, now],
+		);
+		return Number(result.changes) > 0;
+	}
+
+	releaseSummaryJob(jobId: string, leaseToken: string): boolean {
+		this.#assertAvailable();
+		assertIdentifier(jobId, "jobId");
+		assertIdentifier(leaseToken, "leaseToken");
+		const now = this.#options.now();
+		const result = this.#db.run(
+			`UPDATE summary_jobs SET status = 'pending', worker_id = NULL, lease_token = NULL,
+				lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+				available_at = ?, updated_at = ?
+			 WHERE job_id = ? AND status = 'leased' AND lease_token = ?`,
+			[now, now, jobId, leaseToken],
 		);
 		return Number(result.changes) > 0;
 	}
@@ -1607,35 +1832,6 @@ class SqliteLcmContext implements LcmContext {
 			],
 		);
 		return Number(result.changes) > 0;
-	}
-
-	async runSummaryJobs(
-		options: RunSummaryJobsOptions,
-		complete: SummaryCompletionCallback,
-	): Promise<RunSummaryJobsResult> {
-		assertInteger(options.retryDelayMs, "retryDelayMs", 0);
-		const jobs = this.claimSummaryJobs(options);
-		const result: RunSummaryJobsResult = {
-			claimed: jobs.length,
-			completed: 0,
-			failed: 0,
-			stale: 0,
-			escalated: 0,
-		};
-		for (const job of jobs) {
-			try {
-				const completion = await complete(job);
-				const accepted = this.completeSummaryJob(job.jobId, job.leaseToken, completion);
-				if (accepted.accepted) result.completed++;
-				else if (accepted.reason === "escalated") result.escalated++;
-				else if (accepted.reason === "deterministic_failed") result.failed++;
-				else result.stale++;
-			} catch (error) {
-				if (this.failSummaryJob(job.jobId, job.leaseToken, errorName(error), options.retryDelayMs)) result.failed++;
-				else result.stale++;
-			}
-		}
-		return result;
 	}
 
 	search(request: SearchRequest): SearchHit[] {
@@ -2237,16 +2433,33 @@ function createSqliteLcmContext(dbPath: string, options: InternalOptions): Sqlit
 	}
 }
 
+async function createSqliteLcmContextWithRetry(dbPath: string, options: InternalOptions): Promise<SqliteLcmContext> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return createSqliteLcmContext(dbPath, options);
+		} catch (error) {
+			if (!isLcmSqliteContentionError(error) || attempt >= SQLITE_OPEN_RETRY_DELAYS_MS.length) throw error;
+			await Bun.sleep(SQLITE_OPEN_RETRY_DELAYS_MS[attempt]!);
+		}
+	}
+}
+
 export async function openLcmContext(options: LcmContextOptions): Promise<LcmContext> {
 	const normalized = normalizeOptions(options);
 	await prepareDatabaseParent(options.dbPath);
 	try {
-		return createSqliteLcmContext(options.dbPath, normalized);
+		return await createSqliteLcmContextWithRetry(options.dbPath, normalized);
 	} catch (error) {
-		if (!options.recoverCorrupt || options.dbPath === ":memory:" || error instanceof UnsupportedLcmSchemaError)
+		if (
+			!options.recoverCorrupt ||
+			options.dbPath === ":memory:" ||
+			error instanceof UnsupportedLcmSchemaError ||
+			!isLcmSqliteCorruptionError(error)
+		) {
 			throw error;
+		}
 		const quarantinePath = await quarantineDatabaseFiles(options.dbPath, normalized.now());
-		const context = createSqliteLcmContext(options.dbPath, normalized);
+		const context = await createSqliteLcmContextWithRetry(options.dbPath, normalized);
 		context.recordRecovery(quarantinePath, String(error));
 		return context;
 	}

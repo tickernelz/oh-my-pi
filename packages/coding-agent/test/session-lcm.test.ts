@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	Citation,
+	ClaimSummaryJobsOptions,
+	CompleteSummaryJobResult,
 	ContextProjection,
+	ContextScope,
 	FileDescription,
 	FileReference,
 	LcmContext,
@@ -17,6 +20,7 @@ import type {
 	SearchRequest,
 	SourceDescription,
 	SourceSnapshot,
+	SummaryAttemptProvenance,
 	SummaryCompletion,
 	SummaryDescription,
 	SummaryExpansion,
@@ -25,7 +29,9 @@ import type {
 	SummaryReference,
 } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import {
+	LcmCompletionError,
 	type LcmCompletionRequest,
 	SessionLcm,
 	type SessionLcmOptions,
@@ -38,15 +44,40 @@ class FakeLcmContext implements LcmContext {
 	closed = false;
 	failedError: string | undefined;
 	queuedJobs = 0;
+	relevantPendingJobs: number | undefined;
+	reconcileAttempts = 0;
+	reconcileErrors: unknown[] = [];
 	reconcileOptions: Array<ReconcileOptions | undefined> = [];
 	nextDelayMs: number | null = null;
 	deferredClaims = 0;
+	claimErrors: unknown[] = [];
+	releaseErrors: unknown[] = [];
 	jobs: SummaryJob[] = [];
+	leaseSequence = 0;
+	readonly leasedJobs = new Map<string, SummaryJob>();
+	readonly failureRecords = new Map<
+		string,
+		{ jobId: string; availableAt: number; queueClass: SummaryJob["queueClass"] }
+	>();
+	readonly claimCalls: ClaimSummaryJobsOptions[] = [];
+	readonly delayCalls: Array<{ preferredScope: ContextScope | undefined; allowFallback: boolean }> = [];
+	readonly releaseCalls: Array<{ jobId: string; leaseToken: string; accepted: boolean }> = [];
+	readonly failureCalls: Array<{
+		jobId: string;
+		leaseToken: string;
+		redactedError: string;
+		retryDelayMs: number;
+		provenance: SummaryAttemptProvenance | undefined;
+	}> = [];
+	readonly completedJobIds = new Set<string>();
 	readonly summaryCompleted = Promise.withResolvers<void>();
 	readonly summaryFailed = Promise.withResolvers<void>();
 	readonly delayRequested = Promise.withResolvers<void>();
+	readonly failureRecordsRequested = Promise.withResolvers<void>();
 	lastCompletion: SummaryCompletion | undefined;
 	job: SummaryJob | undefined;
+	now = 1_000_000;
+	maxLeased = 0;
 	projectImpl: (request: ProjectionRequest, snapshot: SourceSnapshot) => ContextProjection = (_request, snapshot) => ({
 		revision: 1,
 		ready: false,
@@ -58,15 +89,29 @@ class FakeLcmContext implements LcmContext {
 		coveredSourceCount: 0,
 		freshSourceCount: snapshot.entries.length,
 		estimatedTokens: 0,
-		pendingJobs: this.queuedJobs,
+		pendingJobs: this.relevantPendingJobs ?? this.queuedJobs,
 	});
 
 	[Symbol.dispose](): void {
 		this.close();
 	}
 
+	queueJobs(...jobs: SummaryJob[]): void {
+		this.jobs.push(...jobs);
+		this.queuedJobs += jobs.length;
+		this.relevantPendingJobs ??= 0;
+		this.relevantPendingJobs += jobs.filter(job => job.queueClass === "preferred").length;
+	}
+
+	seedFailure(jobId: string, availableAt: number, queueClass: SummaryJob["queueClass"]): void {
+		this.failureRecords.set(jobId, { jobId, availableAt, queueClass });
+	}
+
 	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult {
+		this.reconcileAttempts++;
 		this.reconcileOptions.push(options);
+		const error = this.reconcileErrors.shift();
+		if (error !== undefined) throw error;
 		this.snapshots.push(snapshot);
 		return {
 			changed: true,
@@ -83,42 +128,113 @@ class FakeLcmContext implements LcmContext {
 		return this.projectImpl(request, this.snapshots.at(-1)!);
 	}
 
-	claimSummaryJobs(): SummaryJob[] {
+	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[] {
+		this.claimCalls.push(options);
+		const error = this.claimErrors.shift();
+		if (error !== undefined) throw error;
 		if (this.deferredClaims > 0) {
 			this.deferredClaims--;
 			return [];
 		}
-		const job = this.job ?? this.jobs.shift();
-		this.job = undefined;
-		return job ? [job] : [];
+		if (this.job) {
+			this.jobs.unshift(this.job);
+			this.job = undefined;
+		}
+		let index = this.jobs.findIndex(
+			job =>
+				job.queueClass === "preferred" && (this.failureRecords.get(job.jobId)?.availableAt ?? this.now) <= this.now,
+		);
+		if (index < 0 && options.allowFallback !== false) {
+			index = this.jobs.findIndex(
+				job =>
+					job.queueClass === "fallback" &&
+					(this.failureRecords.get(job.jobId)?.availableAt ?? this.now) <= this.now,
+			);
+		}
+		if (index < 0) return [];
+		const [queuedJob] = this.jobs.splice(index, 1);
+		if (!queuedJob) return [];
+		const job = {
+			...queuedJob,
+			leaseToken: `lease-${queuedJob.jobId}-${++this.leaseSequence}`,
+			leaseExpiresAt: this.now + options.leaseMs,
+		};
+		this.failureRecords.delete(job.jobId);
+		this.leasedJobs.set(job.jobId, job);
+		this.maxLeased = Math.max(this.maxLeased, this.leasedJobs.size);
+		return [job];
 	}
 
-	nextSummaryJobDelayMs(): number | null {
+	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback = true): number | null {
+		this.delayCalls.push({ preferredScope, allowFallback });
 		this.delayRequested.resolve();
-		return this.nextDelayMs;
+		if (this.nextDelayMs !== null) return this.nextDelayMs;
+		const delays: number[] = [];
+		for (const job of [...(this.job ? [this.job] : []), ...this.jobs]) {
+			if (job.queueClass === "fallback" && !allowFallback) continue;
+			delays.push(Math.max(0, (this.failureRecords.get(job.jobId)?.availableAt ?? this.now) - this.now));
+		}
+		for (const failure of this.failureRecords.values()) {
+			if (failure.queueClass === "preferred" || allowFallback) {
+				delays.push(Math.max(0, failure.availableAt - this.now));
+			}
+		}
+		return delays.length === 0 ? null : Math.min(...delays);
 	}
 
-	extendSummaryJob(): boolean {
+	summaryJobFailures() {
+		this.failureRecordsRequested.resolve();
+		return [...this.failureRecords.values()];
+	}
+
+	extendSummaryJob(jobId: string, leaseToken: string): boolean {
+		return this.leasedJobs.get(jobId)?.leaseToken === leaseToken;
+	}
+
+	releaseSummaryJob(jobId: string, leaseToken: string): boolean {
+		const error = this.releaseErrors.shift();
+		if (error !== undefined) throw error;
+		const leased = this.leasedJobs.get(jobId);
+		const accepted = leased?.leaseToken === leaseToken;
+		this.releaseCalls.push({ jobId, leaseToken, accepted });
+		if (!accepted || !leased) return false;
+		this.leasedJobs.delete(jobId);
+		this.jobs.unshift(leased);
 		return true;
 	}
 
-	completeSummaryJob(_jobId: string, _leaseToken: string, completion: SummaryCompletion) {
+	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult {
+		const leased = this.leasedJobs.get(jobId);
+		if (leased?.leaseToken !== leaseToken) return { accepted: false, reason: "lease_lost" };
+		this.leasedJobs.delete(jobId);
+		this.failureRecords.delete(jobId);
+		this.completedJobIds.add(jobId);
 		this.lastCompletion = completion;
 		this.queuedJobs = Math.max(0, this.queuedJobs - 1);
+		if (this.relevantPendingJobs !== undefined && leased.queueClass === "preferred") {
+			this.relevantPendingJobs = Math.max(0, this.relevantPendingJobs - 1);
+		}
 		this.nextDelayMs = null;
 		this.summaryCompleted.resolve();
-		return { accepted: true as const, summaryId: "summary-1" };
+		return { accepted: true, summaryId: `summary-${jobId}` };
 	}
 
-	failSummaryJob(_jobId: string, _leaseToken: string, redactedError: string): boolean {
+	failSummaryJob(
+		jobId: string,
+		leaseToken: string,
+		redactedError: string,
+		retryDelayMs: number,
+		provenance?: SummaryAttemptProvenance,
+	): boolean {
+		const leased = this.leasedJobs.get(jobId);
+		if (leased?.leaseToken !== leaseToken) return false;
+		this.leasedJobs.delete(jobId);
+		this.jobs.push(leased);
 		this.failedError = redactedError;
+		this.failureCalls.push({ jobId, leaseToken, redactedError, retryDelayMs, provenance });
+		this.seedFailure(jobId, this.now + retryDelayMs, leased.queueClass);
 		this.summaryFailed.resolve();
-		this.nextDelayMs = 30_000;
 		return true;
-	}
-
-	async runSummaryJobs() {
-		return { claimed: 0, completed: 0, failed: 0, stale: 0, escalated: 0 };
 	}
 
 	search(_request: SearchRequest): SearchHit[] {
@@ -146,6 +262,9 @@ class FakeLcmContext implements LcmContext {
 	}
 
 	status(): LcmStatus {
+		const pending = [...(this.job ? [this.job] : []), ...this.jobs].filter(
+			job => !this.failureRecords.has(job.jobId),
+		).length;
 		return {
 			dbPath: "/secret/context.sqlite",
 			schemaVersion: 5,
@@ -156,9 +275,15 @@ class FakeLcmContext implements LcmContext {
 			branches: 1,
 			activeSources: this.snapshots.at(-1)?.entries.length ?? 0,
 			tombstones: 0,
-			leafSummaries: 0,
+			leafSummaries: this.completedJobIds.size,
 			condensedSummaries: 0,
-			jobs: { pending: 0, leased: 0, failed: 0, completed: 0, obsolete: 0 },
+			jobs: {
+				pending,
+				leased: this.leasedJobs.size,
+				failed: this.failureRecords.size,
+				completed: this.completedJobIds.size,
+				obsolete: 0,
+			},
 		};
 	}
 
@@ -173,12 +298,19 @@ class FakeLcmContext implements LcmContext {
 		return {
 			branches: snapshots.length,
 			activeSources: snapshots.reduce((total, snapshot) => total + snapshot.entries.length, 0),
-			queuedJobs: 0,
+			queuedJobs: this.queuedJobs,
 		};
 	}
 
 	purge() {
-		return { tombstones: 0, jobs: 0, summaries: 0, sourceContents: 0, files: 0 };
+		const jobs = this.queuedJobs;
+		this.jobs = [];
+		this.job = undefined;
+		this.leasedJobs.clear();
+		this.failureRecords.clear();
+		this.queuedJobs = 0;
+		this.relevantPendingJobs = 0;
+		return { tombstones: 0, jobs, summaries: 0, sourceContents: 0, files: 0 };
 	}
 
 	close(): void {
@@ -200,6 +332,7 @@ function createHarness(
 	}),
 	hardWaitMs = 20,
 	projectRoot?: string,
+	maxConcurrentSummaries = 1,
 ) {
 	const complete = vi.fn(async (_request: LcmCompletionRequest) => "redacted summary");
 	const openContext = vi.fn(async () => context as LcmContext);
@@ -216,6 +349,7 @@ function createHarness(
 		},
 		{
 			summaryModel: "@smol",
+			maxConcurrentSummaries,
 			registerProject,
 			dependencies: {
 				openContext,
@@ -228,6 +362,7 @@ function createHarness(
 					};
 				},
 				hardWaitMs,
+				now: () => context.now,
 			},
 		},
 	);
@@ -240,11 +375,15 @@ function appendUser(manager: SessionManager, text: string, timestamp: number): A
 	return message;
 }
 
-function summaryJob(jobId: string): SummaryJob {
+function summaryJob(
+	jobId: string,
+	overrides: Partial<Pick<SummaryJob, "queueClass" | "transportRetryCount">> = {},
+): SummaryJob {
 	return {
 		jobId,
 		leaseToken: `lease-${jobId}`,
 		leaseExpiresAt: Date.now() + 60_000,
+		queueClass: overrides.queueClass ?? "preferred",
 		kind: "leaf",
 		level: 0,
 		inputs: [{ kind: "source", id: `source-${jobId}`, redactedText: "safe historical facts", tokenCount: 8 }],
@@ -253,11 +392,41 @@ function summaryJob(jobId: string): SummaryJob {
 		outputTokenBudget: 4,
 		stage: "normal",
 		strategy: "preserve_details",
-		transportRetryCount: 0,
+		transportRetryCount: overrides.transportRetryCount ?? 0,
 	};
 }
 
+function softProjectionLimits() {
+	return {
+		sourceTokens: 90,
+		softThresholdTokens: 80,
+		hardThresholdTokens: 100,
+		tokenBudget: 80,
+		freshTail: { maxSources: 8, maxTokens: 40 },
+	};
+}
+
+async function settleUntil(predicate: () => boolean, detail: string): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (predicate()) return;
+		await Promise.resolve();
+	}
+	throw new Error(`Scheduler did not settle: ${detail}`);
+}
+
+async function flushScheduler(): Promise<void> {
+	for (let attempt = 0; attempt < 20; attempt++) await Promise.resolve();
+}
+
 describe("SessionLcm", () => {
+	it("normalizes fractional provider retry hints and caps malformed long delays", () => {
+		expect(new LcmCompletionError("fractional", { retryAfterMs: 34_074.224 }).retryAfterMs).toBe(34_075);
+		expect(new LcmCompletionError("oversized", { retryAfterMs: Number.MAX_VALUE }).retryAfterMs).toBe(
+			24 * 60 * 60_000,
+		);
+		expect(new LcmCompletionError("invalid", { retryAfterMs: Number.NaN }).retryAfterMs).toBeUndefined();
+	});
+
 	it("returns the exact native input below soft without opening the derived store", async () => {
 		const manager = SessionManager.inMemory("/below-soft");
 		appendUser(manager, "small", 1);
@@ -278,29 +447,252 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
-	it("schedules only above soft and returns native without waiting", async () => {
+	it("returns soft-threshold foreground work before a held summary completes", async () => {
 		const manager = SessionManager.inMemory("/soft-background");
 		appendUser(manager, "growing history", 1);
 		const context = new FakeLcmContext();
-		context.queuedJobs = 1;
-		context.job = summaryJob("soft");
-		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: 90,
-			softThresholdTokens: 80,
-			hardThresholdTokens: 100,
-			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
-		}));
-		const completed = context.summaryCompleted.promise;
+		context.queueJobs(summaryJob("soft"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const completionGate = Promise.withResolvers<void>();
+		const completionStarted = Promise.withResolvers<void>();
+		complete.mockImplementation(async () => {
+			completionStarted.resolve();
+			await completionGate.promise;
+			return "tiny";
+		});
 		const input = manager.buildSessionContext().messages;
 		const result = await lcm.project(input);
 		expect(result.messages).toBe(input);
-		await completed;
+		expect(result.owned).toBe(false);
+		await completionStarted.promise;
+		expect(context.completedJobIds.size).toBe(0);
 		expect(context.reconcileOptions[0]?.summarize).toEqual({
 			tokenBudget: 80,
 			freshTail: { maxSources: 8, maxTokens: 40 },
 		});
-		expect(complete).toHaveBeenCalledTimes(1);
+		completionGate.resolve();
+		await context.summaryCompleted.promise;
+		await lcm.close();
+	});
+
+	it("keeps width one strictly serial and claims one durable job at a time", async () => {
+		const manager = SessionManager.inMemory("/serial-pool");
+		appendUser(manager, "serial backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("serial-1"), summaryJob("serial-2"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const starts: number[] = [];
+		let active = 0;
+		let peak = 0;
+		complete.mockImplementation(async () => {
+			const index = starts.length;
+			starts.push(index);
+			active++;
+			peak = Math.max(peak, active);
+			await gates[index]!.promise;
+			active--;
+			return `summary-${index}`;
+		});
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(() => starts.length === 1, "first serial worker");
+		await flushScheduler();
+		expect(starts).toHaveLength(1);
+		expect(context.maxLeased).toBe(1);
+		gates[0]!.resolve();
+		await settleUntil(() => starts.length === 2, "second serial worker");
+		gates[1]!.resolve();
+		await settleUntil(() => context.completedJobIds.size === 2, "serial backlog completion");
+		expect(peak).toBe(1);
+		expect(context.claimCalls.every(call => call.limit === 1)).toBe(true);
+		await lcm.close();
+	});
+
+	it("runs width two in parallel without leasing or dispatching a third job", async () => {
+		const manager = SessionManager.inMemory("/bounded-pool");
+		appendUser(manager, "parallel backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(
+			summaryJob("parallel-1"),
+			summaryJob("parallel-2"),
+			summaryJob("parallel-3"),
+			summaryJob("parallel-4"),
+		);
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			2,
+		);
+		const gates = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+		const starts: number[] = [];
+		let active = 0;
+		let peak = 0;
+		complete.mockImplementation(async () => {
+			const index = starts.length;
+			starts.push(index);
+			active++;
+			peak = Math.max(peak, active);
+			await gates[index]!.promise;
+			active--;
+			return `summary-${index}`;
+		});
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(() => starts.length === 2, "two parallel workers");
+		await flushScheduler();
+		expect(starts).toHaveLength(2);
+		expect(context.leasedJobs.size).toBe(2);
+		gates[0]!.resolve();
+		await settleUntil(() => starts.length === 3, "parallel refill after first settlement");
+		gates[1]!.resolve();
+		await settleUntil(() => starts.length === 4, "parallel refill after second settlement");
+		gates[2]!.resolve();
+		gates[3]!.resolve();
+		await settleUntil(() => context.completedJobIds.size === 4, "parallel backlog completion");
+		expect(peak).toBe(2);
+		expect(context.maxLeased).toBe(2);
+		expect(context.claimCalls.every(call => call.limit === 1)).toBe(true);
+		await lcm.close();
+	});
+
+	it("applies live width increases and decreases only to future claims", async () => {
+		const manager = SessionManager.inMemory("/live-resize");
+		appendUser(manager, "resize backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("resize-1"), summaryJob("resize-2"), summaryJob("resize-3"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const gates = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+		const signals: AbortSignal[] = [];
+		complete.mockImplementation(async request => {
+			const index = signals.length;
+			signals.push(request.signal!);
+			await gates[index]!.promise;
+			return `summary-${index}`;
+		});
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(() => signals.length === 1, "initial width-one worker");
+		lcm.configure({ summaryModel: "@smol", maxConcurrentSummaries: 2 });
+		await settleUntil(() => signals.length === 2, "worker added after width increase");
+		lcm.configure({ summaryModel: "@smol", maxConcurrentSummaries: 1 });
+		expect(signals.map(signal => signal.aborted)).toEqual([false, false]);
+		gates[0]!.resolve();
+		await settleUntil(() => context.completedJobIds.has("resize-1"), "first resize worker settlement");
+		await flushScheduler();
+		expect(signals).toHaveLength(2);
+		expect(signals[1]!.aborted).toBe(false);
+		gates[1]!.resolve();
+		await settleUntil(() => signals.length === 3, "refill after active count reaches reduced width");
+		gates[2]!.resolve();
+		await settleUntil(() => context.completedJobIds.size === 3, "resized backlog completion");
+		expect(context.maxLeased).toBe(2);
+		await lcm.close();
+	});
+
+	for (const lifecycle of ["rebind", "close"] as const) {
+		it(`${lifecycle} aborts active summaries, awaits finalizers, and releases the captured lease`, async () => {
+			const manager = SessionManager.inMemory(`/lifecycle-${lifecycle}`);
+			appendUser(manager, "held summary", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob(`lifecycle-${lifecycle}`));
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			complete.mockImplementation(request => {
+				const deferred = Promise.withResolvers<string>();
+				const signal = request.signal!;
+				const rejectAbort = () => deferred.reject(new AIError.AbortError("test lifecycle abort"));
+				if (signal.aborted) rejectAbort();
+				else signal.addEventListener("abort", rejectAbort, { once: true });
+				return deferred.promise;
+			});
+
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => context.leasedJobs.size === 1, `${lifecycle} active lease`);
+			const captured = [...context.leasedJobs.values()][0]!;
+			if (lifecycle === "rebind") await lcm.rebind();
+			else await lcm.close();
+			expect(context.releaseCalls).toContainEqual({
+				jobId: captured.jobId,
+				leaseToken: captured.leaseToken,
+				accepted: true,
+			});
+			expect(context.leasedJobs.size).toBe(0);
+			expect(context.failureCalls).toHaveLength(0);
+			if (lifecycle === "rebind") await lcm.close();
+		});
+	}
+
+	for (const lifecycle of ["rebind", "close"] as const) {
+		it(`${lifecycle} surfaces a durable release failure instead of closing the live store early`, async () => {
+			const manager = SessionManager.inMemory(`/release-failure-${lifecycle}`);
+			appendUser(manager, "held summary", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob(`release-failure-${lifecycle}`));
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			const deferred = Promise.withResolvers<string>();
+			complete.mockImplementation(request => {
+				const signal = request.signal!;
+				const rejectAbort = () => deferred.reject(new AIError.AbortError("release failure abort"));
+				if (signal.aborted) rejectAbort();
+				else signal.addEventListener("abort", rejectAbort, { once: true });
+				return deferred.promise;
+			});
+
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => context.leasedJobs.size === 1, "leased job before release failure");
+			const releaseError = new Error("release transaction failed");
+			context.releaseErrors.push(releaseError);
+			const caught = await lcm[lifecycle]().catch(error => error);
+
+			expect(caught).toBe(releaseError);
+			expect(context.closed).toBe(lifecycle === "close");
+			if (lifecycle === "rebind") await lcm.close();
+		});
+	}
+
+	it("releases structural aborts without backoff and fences a later owner from the stale token", async () => {
+		const manager = SessionManager.inMemory("/structural-abort");
+		appendUser(manager, "abort me", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("structural-abort"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		complete.mockRejectedValueOnce(new AIError.AbortError("provider-local cancellation"));
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(() => context.releaseCalls.length === 1, "abort release finalizer");
+		const firstRelease = context.releaseCalls[0]!;
+		expect(firstRelease).toMatchObject({ jobId: "structural-abort", accepted: true });
+		expect(context.failureCalls).toHaveLength(0);
+		expect(context.failureRecords.size).toBe(0);
+
+		const held = Promise.withResolvers<string>();
+		complete.mockImplementation(request => {
+			const signal = request.signal!;
+			const rejectAbort = () => held.reject(new AIError.AbortError("reclaimed job aborted"));
+			if (signal.aborted) rejectAbort();
+			else signal.addEventListener("abort", rejectAbort, { once: true });
+			return held.promise;
+		});
+		await flushScheduler();
+		const status = await lcm.status();
+		await settleUntil(() => context.leasedJobs.size === 1, "reclaimed structural-abort job");
+		const reclaimed = context.leasedJobs.get("structural-abort")!;
+		expect(reclaimed.leaseToken).not.toBe(firstRelease.leaseToken);
+		expect(context.releaseSummaryJob(reclaimed.jobId, firstRelease.leaseToken)).toBe(false);
+		expect(context.leasedJobs.get(reclaimed.jobId)?.leaseToken).toBe(reclaimed.leaseToken);
+		expect(status.runtime.summaryBackoff).toBeUndefined();
+		expect(status.store?.jobs.failed).toBe(0);
+		await lcm.rebind();
+		expect(context.releaseCalls.at(-1)).toEqual({
+			jobId: reclaimed.jobId,
+			leaseToken: reclaimed.leaseToken,
+			accepted: true,
+		});
 		await lcm.close();
 	});
 
@@ -308,17 +700,10 @@ describe("SessionLcm", () => {
 		const manager = SessionManager.inMemory("/delayed-retry");
 		appendUser(manager, "retryable history", 1);
 		const context = new FakeLcmContext();
-		context.queuedJobs = 1;
-		context.job = summaryJob("delayed");
+		context.queueJobs(summaryJob("delayed"));
 		context.deferredClaims = 1;
 		context.nextDelayMs = 1;
-		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: 90,
-			softThresholdTokens: 80,
-			hardThresholdTokens: 100,
-			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
-		}));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
 		await lcm.project(manager.buildSessionContext().messages);
 		await context.delayRequested.promise;
 		await context.summaryCompleted.promise;
@@ -330,16 +715,9 @@ describe("SessionLcm", () => {
 		const manager = SessionManager.inMemory("/selector-capture");
 		appendUser(manager, "two jobs", 1);
 		const context = new FakeLcmContext();
-		context.queuedJobs = 2;
-		context.jobs.push(summaryJob("first"), summaryJob("second"));
-		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: 90,
-			softThresholdTokens: 80,
-			hardThresholdTokens: 100,
-			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
-		}));
-		lcm.setSummaryModel(undefined);
+		context.queueJobs(summaryJob("first"), summaryJob("second"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		lcm.configure({ summaryModel: undefined });
 		const first = Promise.withResolvers<void>();
 		const firstCalled = Promise.withResolvers<void>();
 		const secondCalled = Promise.withResolvers<void>();
@@ -355,10 +733,231 @@ describe("SessionLcm", () => {
 		});
 		await lcm.project(manager.buildSessionContext().messages);
 		await firstCalled.promise;
-		lcm.setSummaryModel("@next");
+		lcm.configure({ summaryModel: "@next" });
 		first.resolve();
 		await secondCalled.promise;
 		expect(selectors).toEqual(["@smol", "@next"]);
+		await settleUntil(() => context.completedJobIds.size === 2, "selector-capture completions");
+		await lcm.close();
+	});
+
+	it("hydrates durable preferred and fallback failures and prunes peer-completed records", async () => {
+		const manager = SessionManager.inMemory("/durable-failure-hydration");
+		appendUser(manager, "durable failures", 1);
+		const context = new FakeLcmContext();
+		context.seedFailure("preferred-failure", context.now + 10_000, "preferred");
+		context.seedFailure("fallback-failure", context.now + 20_000, "fallback");
+		const { lcm } = createHarness(manager, context);
+
+		const hydrated = await lcm.status();
+		expect(hydrated.runtime.phase).toBe("degraded");
+		expect(hydrated.runtime.summaryBackoff).toEqual({
+			preferred: context.now + 10_000,
+			fallback: context.now + 20_000,
+		});
+		expect(hydrated.runtime.retryAt).toBe(context.now + 20_000);
+
+		context.failureRecords.delete("preferred-failure");
+		const preferredPruned = await lcm.status();
+		expect(preferredPruned.runtime.summaryBackoff).toEqual({ fallback: context.now + 20_000 });
+		context.failureRecords.delete("fallback-failure");
+		const allPruned = await lcm.status();
+		expect(allPruned.runtime.summaryBackoff).toBeUndefined();
+		expect(allPruned.runtime.retryAt).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("lets a durable preferred failure gate both preferred and fallback claims", async () => {
+		const manager = SessionManager.inMemory("/preferred-failure-gate");
+		appendUser(manager, "gated backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("blocked-preferred"), summaryJob("blocked-fallback", { queueClass: "fallback" }));
+		context.seedFailure("blocked-preferred", context.now + 50_000, "preferred");
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			2,
+		);
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await context.failureRecordsRequested.promise;
+		await flushScheduler();
+		expect(context.claimCalls).toHaveLength(0);
+		expect(complete).not.toHaveBeenCalled();
+		expect(context.leasedJobs.size).toBe(0);
+		await lcm.close();
+	});
+
+	it("allows newly relevant preferred work to bypass fallback failure backoff", async () => {
+		const manager = SessionManager.inMemory("/fallback-bypass");
+		appendUser(manager, "initial history", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("delayed-fallback", { queueClass: "fallback" }));
+		context.seedFailure("delayed-fallback", context.now + 50_000, "fallback");
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			2,
+		);
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await context.delayRequested.promise;
+		await flushScheduler();
+		expect(complete).not.toHaveBeenCalled();
+
+		context.queueJobs(summaryJob("new-preferred"));
+		appendUser(manager, "new relevant history", 2);
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(() => context.completedJobIds.has("new-preferred"), "preferred bypass completion");
+		expect(context.completedJobIds.has("delayed-fallback")).toBe(false);
+		expect(context.failureRecords.get("delayed-fallback")).toMatchObject({ queueClass: "fallback" });
+		expect(complete).toHaveBeenCalledTimes(1);
+		expect(complete.mock.calls[0]![0].prompt).toContain("source-new-preferred");
+		await lcm.close();
+	});
+
+	it("keeps one provider failure visible after its sibling succeeds", async () => {
+		const manager = SessionManager.inMemory("/sibling-failure");
+		appendUser(manager, "sibling jobs", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("failing-sibling"), summaryJob("successful-sibling"));
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			2,
+		);
+		const successGate = Promise.withResolvers<void>();
+		const successStarted = Promise.withResolvers<void>();
+		complete.mockImplementation(async request => {
+			if (request.prompt.includes("source-failing-sibling")) {
+				throw new LcmCompletionError("bounded provider failure", { provider: "test" });
+			}
+			successStarted.resolve();
+			await successGate.promise;
+			return "successful sibling";
+		});
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await Promise.all([context.summaryFailed.promise, successStarted.promise]);
+		successGate.resolve();
+		await settleUntil(() => context.completedJobIds.has("successful-sibling"), "successful sibling settlement");
+		const status = await lcm.status();
+		expect(context.completedJobIds.has("failing-sibling")).toBe(false);
+		expect(context.failureRecords.get("failing-sibling")).toEqual({
+			jobId: "failing-sibling",
+			availableAt: context.now + 30_000,
+			queueClass: "preferred",
+		});
+		expect(status.runtime.summaryBackoff).toEqual({ preferred: context.now + 30_000 });
+		expect(status.runtime.lastFailureCategory).toBe("provider");
+		await lcm.close();
+	});
+
+	it("uses the larger retry hint or capped exponential transport delay", async () => {
+		const cases = [
+			{ retry: 0, hint: 45_000, expected: 45_000 },
+			{ retry: 3, hint: undefined, expected: 240_000 },
+			{ retry: 9, hint: undefined, expected: 300_000 },
+		] as const;
+		for (const testCase of cases) {
+			const manager = SessionManager.inMemory(`/retry-delay-${testCase.retry}`);
+			appendUser(manager, "retry job", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob(`retry-${testCase.retry}`, { transportRetryCount: testCase.retry }));
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			complete.mockRejectedValue(
+				new LcmCompletionError("retryable", {
+					provider: "test",
+					...(testCase.hint === undefined ? {} : { retryAfterMs: testCase.hint }),
+				}),
+			);
+
+			await lcm.project(manager.buildSessionContext().messages);
+			await context.summaryFailed.promise;
+			expect(context.failureCalls[0]?.retryDelayMs).toBe(testCase.expected);
+			expect(context.failureRecords.get(`retry-${testCase.retry}`)?.availableAt).toBe(
+				context.now + testCase.expected,
+			);
+			await lcm.close();
+		}
+	});
+
+	it("retries transient SQLite contention before accepting the projection", async () => {
+		const manager = SessionManager.inMemory("/contention-retry");
+		appendUser(manager, "contention", 1);
+		const context = new FakeLcmContext();
+		context.reconcileErrors.push(Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }));
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context, undefined, undefined, undefined, 500);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		expect(result.owned).toBe(true);
+		expect(context.reconcileAttempts).toBe(2);
+		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("fails open without retrying non-contention reconcile errors", async () => {
+		const manager = SessionManager.inMemory("/non-contention-fail-open");
+		appendUser(manager, "store failure", 1);
+		const context = new FakeLcmContext();
+		context.reconcileErrors.push(Object.assign(new Error("disk full"), { code: "SQLITE_FULL" }));
+		const { lcm, complete } = createHarness(manager, context);
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+		expect(result.messages).toBe(input);
+		expect(result.owned).toBe(false);
+		expect(context.reconcileAttempts).toBe(1);
+		expect(complete).not.toHaveBeenCalled();
+		expect(lcm.takePendingFallbackCategory()).toBe("store");
+		await lcm.close();
+	});
+
+	it("reports a quarantined current store even when reconcile cannot inspect it", async () => {
+		const manager = SessionManager.inMemory("/quarantined-status");
+		appendUser(manager, "quarantined", 1);
+		const context = new FakeLcmContext();
+		context.reconcileErrors.push(new Error("LCM store is quarantined"));
+		const baseStatus = context.status.bind(context);
+		context.status = () => ({
+			...baseStatus(),
+			quarantined: true,
+			quarantineReason: "integrity check failed",
+		});
+		const { lcm } = createHarness(manager, context);
+
+		const status = await lcm.status();
+
+		expect(status.runtime.phase).toBe("quarantined");
+		expect(status.store).toMatchObject({ quarantined: true, quarantineReason: "integrity check failed" });
 		await lcm.close();
 	});
 
@@ -417,6 +1016,74 @@ describe("SessionLcm", () => {
 			selectedLevelCounts: { 0: 1 },
 			pendingJobs: 0,
 		});
+		await lcm.rebind();
+		const rebound = await lcm.status();
+		expect(rebound.runtime.phase).toBe("idle");
+		expect(rebound.runtime.lastProjection).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("lets a hard current-branch projection finish while an older fallback sibling is still running", async () => {
+		const manager = SessionManager.inMemory("/hard-preferred-progress");
+		const first = appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("older-fallback", { queueClass: "fallback" }));
+		context.projectImpl = (_request, snapshot) => {
+			const old = snapshot.entries[1]!;
+			const fresh = snapshot.entries.at(-1)!;
+			return {
+				revision: 3,
+				ready: true,
+				historical: [
+					{
+						kind: "summary",
+						summaryId: "summary-current",
+						summaryHandle: "summary_handle_current",
+						level: 0,
+						redactedText: "current branch facts",
+						tokenCount: 3,
+						sourceIds: [old.entryId],
+						citations: [
+							{
+								...snapshot.scope,
+								sourceId: old.entryId,
+								sourceKey: "source-key-current",
+								contentHash: old.contentHash,
+								position: 1,
+							},
+						],
+					},
+				],
+				freshTailSourceIds: [fresh.entryId],
+				uncoveredSourceIds: [],
+				sourceTokens: 90,
+				selectedLevelCounts: { 0: 1 },
+				coveredSourceCount: 1,
+				freshSourceCount: 1,
+				estimatedTokens: 14,
+				pendingJobs: context.relevantPendingJobs ?? 0,
+			};
+		};
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, undefined, 200, undefined, 2);
+		const fallbackGate = Promise.withResolvers<void>();
+		complete.mockImplementation(async request => {
+			if (request.prompt.includes("source-older-fallback")) await fallbackGate.promise;
+			return "redacted summary";
+		});
+
+		await lcm.status();
+		await settleUntil(() => context.leasedJobs.has("older-fallback"), "older fallback dispatch");
+		context.queueJobs(summaryJob("new-preferred"));
+		const result = await lcm.project(manager.buildSessionContext().messages);
+
+		expect(result.owned).toBe(true);
+		expect(result.messages[0]).toBe(first);
+		expect(context.completedJobIds.has("new-preferred")).toBe(true);
+		expect(context.leasedJobs.has("older-fallback")).toBe(true);
+		fallbackGate.resolve();
+		await settleUntil(() => context.completedJobIds.has("older-fallback"), "older fallback completion");
 		await lcm.close();
 	});
 
@@ -868,12 +1535,13 @@ describe("SessionLcm", () => {
 		appendUser(manager, "first", 1);
 		const context = new FakeLcmContext();
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, undefined, 5);
-		context.queuedJobs = 1;
-		context.job = {
+		context.queueJobs({
 			...summaryJob("failure"),
 			inputs: [{ kind: "source", id: "source-1", redactedText: "safe", tokenCount: 8 }],
-		};
-		complete.mockRejectedValueOnce(new Error("raw-secret summary failed"));
+		});
+		complete.mockRejectedValueOnce(
+			new LcmCompletionError("raw-secret summary failed", { provider: "test-provider" }),
+		);
 		const input = manager.buildSessionContext().messages;
 		const output = await lcm.project(input);
 		expect(output.messages).toBe(input);

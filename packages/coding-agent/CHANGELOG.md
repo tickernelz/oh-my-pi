@@ -21,6 +21,8 @@
 - Replaced upstream self-update and install publication paths with authenticated private-fork prereleases: compiled binaries report exact upstream/downstream/LCM provenance, verify a pinned Ed25519 signature over `SHA256SUMS`, and preserve the current executable on every verification failure.
 - Private release checks and downloads now authenticate with `GH_TOKEN`, `GITHUB_TOKEN`, or the existing GitHub CLI login; bootstrap guidance uses `gh api` so a private repository never depends on inaccessible raw URLs.
 - Project `.omp/config.yml` now applies only supported project-scoped model roles, autocomplete display limits, Lossless context selection, and garbage-collection controls, while normal project `settings.json` providers retain their existing precedence; all four LCM retrieval tools now have discoverable `omp://` documentation.
+- Lossless summary backlogs now drain through a live-resizable bounded worker pool (serial by default, up to four workers) while preserving provider limits, current-branch readiness, durable retry backoff, fail-open deadlines, and safe rebind/disposal finalization.
+- Every canonical Lossless setting is now discovered from the settings schema, including an authenticated summary-model picker and live concurrency control; `/lcm status` now reports worker capacity, project-wide queue health, current-branch readiness, and durable backoff.
 
 ## [17.1.3] - 2026-07-24
 

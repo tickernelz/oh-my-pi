@@ -3155,6 +3155,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? {
 							agentDir,
 							summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
+							maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
 							registerProject: async (project, journal) => {
 								await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
 							},

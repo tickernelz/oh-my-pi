@@ -38,18 +38,19 @@ describe("SelectorController prompt-affecting settings", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
-	it("forwards the effective summary selector to the active LCM", () => {
-		const setLcmSummaryModel = vi.fn();
+	it("refreshes every live lossless setting while leaving the engine reload-bound", () => {
+		const refreshLcmSettings = vi.fn();
 		const ctx = {
-			session: { setLcmSummaryModel },
+			session: { refreshLcmSettings },
 		} as unknown as InteractiveModeContext;
 		const controller = new SelectorController(ctx);
 
 		controller.handleSettingChange("context.lossless.summaryModel", "custom/summary");
-		controller.handleSettingChange("context.lossless.summaryModel", undefined);
+		controller.handleSettingChange("context.lossless.maxConcurrentSummaries", 3);
+		controller.handleSettingChange("context.lossless.futureSetting", true);
+		controller.handleSettingChange("context.engine", "native");
 
-		expect(setLcmSummaryModel).toHaveBeenNthCalledWith(1, "custom/summary");
-		expect(setLcmSummaryModel).toHaveBeenNthCalledWith(2, undefined);
+		expect(refreshLcmSettings).toHaveBeenCalledTimes(3);
 	});
 
 	it("gives the summary picker the full authenticated inventory without widening the cycling scope", async () => {

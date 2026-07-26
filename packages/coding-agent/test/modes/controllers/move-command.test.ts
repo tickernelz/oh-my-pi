@@ -8,11 +8,16 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 
 function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void>) {
 	const state = { cwd: sourceDir, movedTo: undefined as string | undefined };
+	const events: string[] = [];
 	const present = vi.fn();
 	const applyCwdChange = vi.fn(async (cwd: string) => {
 		expect(state.cwd).toBe(cwd);
+		events.push("settings.reloadForCwd");
+		await Promise.resolve();
+		events.push("refreshLcmSettingsAndRebind");
 	});
 	const moveSession = vi.fn(async (cwd: string) => {
+		events.push("manager-move");
 		state.cwd = cwd;
 		state.movedTo = cwd;
 	});
@@ -30,12 +35,14 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		showError: vi.fn(),
 		showWarning: vi.fn(),
 		applyCwdChange,
-		updateEditorBorderColor: vi.fn(),
+		updateEditorBorderColor: vi.fn(() => {
+			events.push("post-rebind-ui");
+		}),
 		reloadTodos: vi.fn(async () => {}),
 		ui: { requestRender: vi.fn() },
 		present,
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present };
+	return { ctx, state, present, events };
 }
 
 describe("CommandController /move", () => {
@@ -45,16 +52,22 @@ describe("CommandController /move", () => {
 		setThemeInstance(theme);
 	});
 
-	it("relocates the active session before re-scoping cwd-derived state", async () => {
+	it("moves the manager before destination settings reload and awaited LCM rebind", async () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		try {
-			const { ctx, state, present } = createMoveContext(sourceDir);
+			const { ctx, state, present, events } = createMoveContext(sourceDir);
 			const controller = new CommandController(ctx);
 
 			await controller.handleMoveCommand(targetDir);
 
 			expect(state.movedTo).toBe(targetDir);
+			expect(events).toEqual([
+				"manager-move",
+				"settings.reloadForCwd",
+				"refreshLcmSettingsAndRebind",
+				"post-rebind-ui",
+			]);
 			expect(ctx.sessionManager.dropSession).not.toHaveBeenCalled();
 			expect(ctx.applyCwdChange).toHaveBeenCalledWith(targetDir);
 			expect(ctx.updateEditorBorderColor).toHaveBeenCalled();

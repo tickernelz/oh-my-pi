@@ -1,10 +1,19 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type ContextScope, type LcmContext, openLcmContext, type SourceEntry, type SourceSnapshot } from "../src";
-import { initializeLcmSchema, summaryHandleForInput } from "../src/schema";
+import { pathToFileURL } from "node:url";
+import {
+	type ContextScope,
+	isLcmSqliteContentionError,
+	isLcmSqliteCorruptionError,
+	type LcmContext,
+	openLcmContext,
+	type SourceEntry,
+	type SourceSnapshot,
+} from "../src";
+import { initializeLcmSchema, summaryHandleForInput, UnsupportedLcmSchemaError } from "../src/schema";
 
 const MAIN: ContextScope = { projectId: "project", sessionId: "session", branchId: "main" };
 
@@ -53,19 +62,57 @@ function snapshot(scope: ContextScope, entries: readonly SourceEntry[]): SourceS
 	return { scope, entries };
 }
 
-async function completeEveryJob(context: LcmContext): Promise<void> {
-	for (let round = 0; round < 20; round++) {
-		const result = await context.runSummaryJobs(
-			{ workerId: "summarizer", leaseMs: 60_000, limit: 100, retryDelayMs: 0, maxOutputTokens: 100 },
-			async job => ({
-				redactedText: `s${job.level}`,
-				tokenCount: 1,
-			}),
-		);
-		if (result.claimed === 0) return;
+function completeEveryJob(context: LcmContext): void {
+	for (let round = 0; round < 100; round++) {
+		const [job] = context.claimSummaryJobs({
+			workerId: "summarizer",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		if (!job) return;
+		const result = context.completeSummaryJob(job.jobId, job.leaseToken, {
+			redactedText: `s${job.level}`,
+			tokenCount: 1,
+		});
+		if (!result.accepted && result.reason === "lease_lost") throw new Error("summary helper lost its lease");
 	}
 	throw new Error("summary hierarchy did not settle");
 }
+
+function sqliteError(code: string, message = code): Error & { code: string } {
+	return Object.assign(new Error(message), { code });
+}
+
+describe("LCM SQLite error classification", () => {
+	test("recognizes contention codes, canonical codeless messages, and wrapped causes", () => {
+		expect(isLcmSqliteContentionError(sqliteError("SQLITE_BUSY"))).toBe(true);
+		expect(isLcmSqliteContentionError(sqliteError("SQLITE_BUSY_RECOVERY"))).toBe(true);
+		expect(isLcmSqliteContentionError(sqliteError("SQLITE_LOCKED_SHAREDCACHE"))).toBe(true);
+		expect(isLcmSqliteContentionError(new Error("database is locked"))).toBe(true);
+		expect(isLcmSqliteContentionError(new Error("database table is locked"))).toBe(true);
+		expect(isLcmSqliteContentionError(new Error("outer", { cause: sqliteError("SQLITE_BUSY_SNAPSHOT") }))).toBe(true);
+	});
+
+	test("rejects non-contention codes even when their message resembles a lock", () => {
+		expect(isLcmSqliteContentionError(sqliteError("SQLITE_FULL", "database is locked"))).toBe(false);
+		expect(isLcmSqliteContentionError(sqliteError("SQLITE_IOERR"))).toBe(false);
+		expect(isLcmSqliteContentionError(sqliteError("EACCES"))).toBe(false);
+		expect(isLcmSqliteContentionError(new Error("unknown sqlite failure"))).toBe(false);
+		expect(isLcmSqliteContentionError(null)).toBe(false);
+	});
+
+	test("recognizes only explicit corruption codes through the cause chain", () => {
+		for (const code of ["SQLITE_CORRUPT", "SQLITE_CORRUPT_VTAB", "SQLITE_IOERR_CORRUPTFS", "SQLITE_NOTADB"]) {
+			expect(isLcmSqliteCorruptionError(sqliteError(code))).toBe(true);
+		}
+		expect(isLcmSqliteCorruptionError(new Error("outer", { cause: sqliteError("SQLITE_NOTADB") }))).toBe(true);
+		for (const code of ["SQLITE_FULL", "SQLITE_IOERR", "SQLITE_CANTOPEN", "EACCES"]) {
+			expect(isLcmSqliteCorruptionError(sqliteError(code))).toBe(false);
+		}
+		expect(isLcmSqliteCorruptionError(new Error("file is not a database"))).toBe(false);
+	});
+});
 
 describe("LCM context contracts", () => {
 	let tempDir = "";
@@ -86,6 +133,7 @@ describe("LCM context contracts", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		context?.close();
 		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 	});
@@ -216,15 +264,145 @@ describe("LCM context contracts", () => {
 		}
 	});
 
-	test("a completion callback failure leaves its job retryable without corrupting committed sources", async () => {
-		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "durable source")]));
-		const crashed = await context.runSummaryJobs(
-			{ workerId: "crashing-worker", leaseMs: 1_000, limit: 1, retryDelayMs: 50, maxOutputTokens: 100 },
-			async () => {
-				throw new Error("simulated process exit");
-			},
+	test("independent processes atomically migrate one fresh store without quarantine", async () => {
+		const migrationPath = path.join(tempDir, "concurrent-migration.db");
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/index.ts")).href;
+		const script = `
+			import { openLcmContext } from ${JSON.stringify(moduleUrl)};
+			console.log("ready");
+			await Bun.stdin.text();
+			const context = await openLcmContext({ dbPath: Bun.env.LCM_DB_PATH, recoverCorrupt: true });
+			context.close();
+		`;
+		const children = Array.from({ length: 2 }, () =>
+			Bun.spawn([process.execPath, "--eval", script], {
+				env: { ...process.env, LCM_DB_PATH: migrationPath },
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
 		);
-		expect(crashed).toEqual({ claimed: 1, completed: 0, failed: 1, stale: 0, escalated: 0 });
+		const ready = await Promise.all(
+			children.map(async child => {
+				const reader = child.stdout.getReader();
+				const chunk = await reader.read();
+				reader.releaseLock();
+				return new TextDecoder().decode(chunk.value).trim();
+			}),
+		);
+		expect(ready).toEqual(["ready", "ready"]);
+		for (const child of children) {
+			child.stdin.write("start");
+			child.stdin.end();
+		}
+		const results = await Promise.all(
+			children.map(async child => ({
+				exitCode: await child.exited,
+				stderr: await new Response(child.stderr).text(),
+			})),
+		);
+		expect(results.map(result => result.exitCode)).toEqual([0, 0]);
+		expect(results.map(result => result.stderr)).toEqual(["", ""]);
+
+		const observer = new Database(migrationPath);
+		try {
+			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(0);
+			expect(
+				observer
+					.query<{ last_recovery_path: string | null }, []>("SELECT last_recovery_path FROM store_state")
+					.get()?.last_recovery_path,
+			).toBeNull();
+		} finally {
+			observer.close();
+		}
+		expect((await fs.readdir(tempDir)).some(file => file.startsWith("concurrent-migration.db.quarantine-"))).toBe(
+			false,
+		);
+	});
+
+	test("exhausted SQLite contention preserves the original store without quarantine", async () => {
+		const lockedPath = path.join(tempDir, "locked.db");
+		const blocker = new Database(lockedPath);
+		initializeLcmSchema(blocker, 0);
+		blocker.run("BEGIN IMMEDIATE");
+		const sleep = vi.spyOn(Bun, "sleep").mockResolvedValue(undefined);
+		let sleepCalls = 0;
+		let failure: unknown;
+		try {
+			await openLcmContext({ dbPath: lockedPath, busyTimeoutMs: 0, recoverCorrupt: true });
+		} catch (error) {
+			failure = error;
+		} finally {
+			blocker.run("ROLLBACK");
+			blocker.close();
+			sleepCalls = sleep.mock.calls.length;
+			sleep.mockRestore();
+		}
+		expect(isLcmSqliteContentionError(failure)).toBe(true);
+		expect(sleepCalls).toBe(3);
+		expect((await fs.readdir(tempDir)).some(file => file.startsWith("locked.db.quarantine-"))).toBe(false);
+		const observer = new Database(lockedPath);
+		try {
+			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("recoverCorrupt quarantines only a genuinely corrupt SQLite store", async () => {
+		const corruptPath = path.join(tempDir, "corrupt.db");
+		await fs.writeFile(corruptPath, Buffer.alloc(512, 0x78));
+		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		try {
+			expect(recovered.status()).toMatchObject({ schemaVersion: 5, quarantined: false });
+			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
+		} finally {
+			recovered.close();
+		}
+	});
+
+	test("unsupported schemas and invalid paths propagate without quarantine", async () => {
+		const futurePath = path.join(tempDir, "future.db");
+		const future = new Database(futurePath);
+		future.run("PRAGMA user_version = 999");
+		future.close();
+		let unsupported: unknown;
+		try {
+			await openLcmContext({ dbPath: futurePath, recoverCorrupt: true });
+		} catch (error) {
+			unsupported = error;
+		}
+		expect(unsupported).toBeInstanceOf(UnsupportedLcmSchemaError);
+		expect((await fs.readdir(tempDir)).some(file => file.startsWith("future.db.quarantine-"))).toBe(false);
+
+		const directoryPath = path.join(tempDir, "database-directory");
+		await fs.mkdir(directoryPath);
+		let invalidPath: unknown;
+		try {
+			await openLcmContext({ dbPath: directoryPath, recoverCorrupt: true });
+		} catch (error) {
+			invalidPath = error;
+		}
+		expect(invalidPath).toBeDefined();
+		expect(isLcmSqliteCorruptionError(invalidPath)).toBe(false);
+		expect((await fs.readdir(tempDir)).some(file => file.startsWith("database-directory.quarantine-"))).toBe(false);
+	});
+
+	test("a failed completion remains durably retryable without corrupting committed sources", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "durable source")]));
+		const [crashed] = context.claimSummaryJobs({
+			workerId: "crashing-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		expect(crashed).toBeDefined();
+		expect(context.failSummaryJob(crashed!.jobId, crashed!.leaseToken, "CompletionError", 50)).toBe(true);
 		expect(context.status().jobs.failed).toBe(1);
 		now += 50;
 		const retried = context.claimSummaryJobs({
@@ -281,7 +459,7 @@ describe("LCM context contracts", () => {
 			entry(MAIN, "e5", "five", "e4"),
 		];
 		context.reconcile(snapshot(MAIN, sources));
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 10 } });
 		const covered = [...projection.historical.flatMap(item => item.sourceIds), ...projection.freshTailSourceIds];
@@ -298,7 +476,7 @@ describe("LCM context contracts", () => {
 		const first = entry(MAIN, "e1", "identical source content long enough to produce one useful leaf summary");
 		const second = { ...first, entryId: "e2", parentId: first.entryId };
 		context.reconcile(snapshot(MAIN, [first, second]));
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
 		const summaryHandle = projection.historical[0]?.summaryHandle;
@@ -324,7 +502,7 @@ describe("LCM context contracts", () => {
 			entry(MAIN, "e5", "newest user follow-up", "e4"),
 		];
 		context.reconcile(snapshot(MAIN, sources));
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 2, maxTokens: 100 } });
 		const historicalIds = projection.historical.flatMap(item => item.sourceIds);
@@ -342,7 +520,7 @@ describe("LCM context contracts", () => {
 			entry(MAIN, "e4", "main four", "e3"),
 		];
 		context.reconcile(snapshot(MAIN, mainSources));
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const fork = { ...MAIN, branchId: "fork" };
 		const forkSources = [
@@ -353,7 +531,7 @@ describe("LCM context contracts", () => {
 		];
 		const reconciled = context.reconcile(snapshot(fork, forkSources));
 		expect(reconciled.reusedSummaries).toBeGreaterThan(0);
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const mainProjection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
 		const forkProjection = context.project({ ...fork, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
@@ -368,7 +546,7 @@ describe("LCM context contracts", () => {
 			entry(MAIN, "e3", "third shared source closes the alternate branch group", "e2"),
 		];
 		context.reconcile(snapshot(MAIN, mainSources));
-		await completeEveryJob(context);
+		completeEveryJob(context);
 
 		const fork = { ...MAIN, branchId: "grouped-fork" };
 		context.reconcile(
@@ -382,6 +560,208 @@ describe("LCM context contracts", () => {
 		expect(projection.freshTailSourceIds).toEqual(["e2", "e3"]);
 		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual([]);
 		expect(projection.uncoveredSourceIds).toEqual(["e1"]);
+	});
+
+	test("projection pendingJobs counts only current-branch historical work while status stays project-wide", () => {
+		const fork = { ...MAIN, branchId: "pending-fork" };
+		context.reconcile(
+			snapshot(MAIN, [
+				entry(MAIN, "m1", "main historical source one long enough to summarize"),
+				entry(MAIN, "m2", "main historical source two long enough to summarize", "m1"),
+			]),
+		);
+		context.reconcile(
+			snapshot(fork, [
+				entry(fork, "f1", "fork historical source one long enough to summarize"),
+				entry(fork, "f2", "fork historical source two long enough to summarize", "f1"),
+			]),
+		);
+
+		const historical = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 0, maxTokens: 0 },
+		});
+		expect(historical.pendingJobs).toBe(1);
+		expect(context.status().jobs.pending).toBe(2);
+		expect(
+			context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 2, maxTokens: 100 } }).pendingJobs,
+		).toBe(0);
+
+		const [preferred] = context.claimSummaryJobs({
+			workerId: "main-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(preferred?.queueClass).toBe("preferred");
+		expect(
+			context.completeSummaryJob(preferred!.jobId, preferred!.leaseToken, {
+				redactedText: "main summary",
+				tokenCount: 1,
+			}),
+		).toMatchObject({ accepted: true });
+		const ready = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 0, maxTokens: 0 },
+		});
+		expect(ready).toMatchObject({ ready: true, pendingJobs: 0 });
+		expect(context.status().jobs.pending).toBe(1);
+	});
+
+	test("preferred-only claims exclude fallback and allowed fallback fills remaining capacity", () => {
+		const fork = { ...MAIN, branchId: "claim-fork" };
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "p1", "preferred branch work long enough to summarize")]));
+		context.reconcile(snapshot(fork, [entry(fork, "f1", "fallback branch work long enough to summarize")]));
+
+		const preferredOnly = context.claimSummaryJobs({
+			workerId: "preferred-only",
+			leaseMs: 1_000,
+			limit: 2,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(preferredOnly).toHaveLength(1);
+		expect(preferredOnly[0]?.queueClass).toBe("preferred");
+		expect(context.releaseSummaryJob(preferredOnly[0]!.jobId, preferredOnly[0]!.leaseToken)).toBe(true);
+
+		const mixed = context.claimSummaryJobs({
+			workerId: "mixed",
+			leaseMs: 1_000,
+			limit: 2,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: true,
+		});
+		expect(mixed.map(job => job.queueClass)).toEqual(["preferred", "fallback"]);
+	});
+
+	test("only a full atomically aligned active-branch lineage is preferred", () => {
+		const origin = { ...MAIN, branchId: "lineage-origin" };
+		const sharedOne = "shared source one long enough to summarize";
+		const sharedTwo = "shared source two long enough to summarize";
+		context.reconcile(snapshot(origin, [entry(origin, "e1", sharedOne), entry(origin, "e2", sharedTwo, "e1")]));
+		context.reconcile(
+			snapshot(MAIN, [
+				entry(MAIN, "e1", sharedOne),
+				entry(MAIN, "e2", sharedTwo, "e1", "tool-turn"),
+				entry(MAIN, "e3", "tool result completing the atomic unit", "e2", "tool-turn"),
+			]),
+			{ summarize: false },
+		);
+		expect(
+			context.claimSummaryJobs({
+				workerId: "preferred-only",
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			}),
+		).toEqual([]);
+		const [fallback] = context.claimSummaryJobs({
+			workerId: "fallback-allowed",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: true,
+		});
+		expect(fallback?.queueClass).toBe("fallback");
+	});
+
+	test("durable failure classes and scope-aware delays survive reopen and prune after completion", async () => {
+		const fork = { ...MAIN, branchId: "failure-fork" };
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "p1", "preferred failure input long enough to summarize")]));
+		context.reconcile(snapshot(fork, [entry(fork, "f1", "fallback failure input long enough to summarize")]));
+		const [preferred] = context.claimSummaryJobs({
+			workerId: "preferred-failure",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(context.failSummaryJob(preferred!.jobId, preferred!.leaseToken, "ProviderError", 100)).toBe(true);
+		const [fallback] = context.claimSummaryJobs({
+			workerId: "fallback-failure",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: true,
+		});
+		expect(fallback?.queueClass).toBe("fallback");
+		expect(context.failSummaryJob(fallback!.jobId, fallback!.leaseToken, "ProviderError", 0)).toBe(true);
+
+		context.close();
+		context = await openLcmContext({
+			dbPath,
+			leafChunk: { maxSources: 2, maxTokens: 10_000 },
+			condenseFanIn: 2,
+			tombstoneRetentionMs: 100,
+			now: () => now,
+		});
+		const failures = context.summaryJobFailures(MAIN);
+		expect(failures.find(failure => failure.queueClass === "preferred")).toMatchObject({
+			jobId: preferred!.jobId,
+			availableAt: now + 100,
+		});
+		expect(failures.find(failure => failure.queueClass === "fallback")).toMatchObject({
+			jobId: fallback!.jobId,
+			availableAt: now,
+		});
+		expect(context.nextSummaryJobDelayMs(MAIN, false)).toBe(100);
+		expect(context.nextSummaryJobDelayMs(MAIN, true)).toBe(0);
+
+		now += 100;
+		const [retry] = context.claimSummaryJobs({
+			workerId: "preferred-retry",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(
+			context.completeSummaryJob(retry!.jobId, retry!.leaseToken, { redactedText: "recovered", tokenCount: 1 }),
+		).toMatchObject({ accepted: true });
+		expect(context.summaryJobFailures(MAIN)).toEqual([
+			{ jobId: fallback!.jobId, availableAt: now - 100, queueClass: "fallback" },
+		]);
+	});
+
+	test("release accepts an expired matching token but rejects a replaced owner", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "release input long enough to summarize")]));
+		const [expired] = context.claimSummaryJobs({
+			workerId: "worker-a",
+			leaseMs: 100,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		now += 101;
+		expect(context.releaseSummaryJob(expired!.jobId, expired!.leaseToken)).toBe(true);
+		const [replaced] = context.claimSummaryJobs({
+			workerId: "worker-b",
+			leaseMs: 100,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		now += 101;
+		const [owner] = context.claimSummaryJobs({
+			workerId: "worker-c",
+			leaseMs: 100,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		expect(owner?.leaseToken).not.toBe(replaced?.leaseToken);
+		expect(context.releaseSummaryJob(replaced!.jobId, replaced!.leaseToken)).toBe(false);
+		expect(context.releaseSummaryJob(owner!.jobId, owner!.leaseToken)).toBe(true);
+		expect(context.status().jobs.pending).toBe(1);
 	});
 
 	test("leases are exclusive, reclaimable, and reject an expired owner's result", () => {
@@ -495,7 +875,7 @@ describe("LCM context contracts", () => {
 			artifactRefs: ["artifact://e1"],
 		});
 
-		await completeEveryJob(context);
+		completeEveryJob(context);
 		const summaryHit = context.search({ ...MAIN, query: "s0" }).find(hit => hit.kind === "summary");
 		expect(summaryHit?.citations.map(citation => citation.sourceId)).toEqual(["e1"]);
 	});
@@ -529,7 +909,7 @@ describe("LCM context contracts", () => {
 				.find(hit => hit.kind === "source")
 				?.citations.every(citation => citation.projectId === other.projectId),
 		).toBe(true);
-		await completeEveryJob(context);
+		completeEveryJob(context);
 		const summary = context
 			.searchProject({ projectId: MAIN.projectId, query: "s0" })
 			.find(hit => hit.kind === "summary");

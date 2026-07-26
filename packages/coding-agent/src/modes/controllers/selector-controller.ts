@@ -415,6 +415,11 @@ export class SelectorController {
 			return;
 		}
 
+		if (id.startsWith("context.lossless.")) {
+			this.ctx.session.refreshLcmSettings();
+			return;
+		}
+
 		switch (id) {
 			// Session-managed settings (not in SettingsManager)
 			case "autoCompact":
@@ -450,9 +455,6 @@ export class SelectorController {
 				void this.ctx.session.applyMemoryBackend().catch(err => {
 					this.ctx.showError(`Failed to apply memory backend: ${err}`);
 				});
-				break;
-			case "context.lossless.summaryModel":
-				this.ctx.session.setLcmSummaryModel(typeof value === "string" ? value : undefined);
 				break;
 
 			case "autocompleteMaxVisible":

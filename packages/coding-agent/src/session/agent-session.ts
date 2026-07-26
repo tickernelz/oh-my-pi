@@ -83,11 +83,13 @@ import {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	escapeXmlText,
+	extractRetryHint,
 	formatDuration,
 	getAgentDbPath,
 	getInstallId,
@@ -319,10 +321,12 @@ import { formatSessionDumpText } from "./session-dump-format";
 import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
+	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmProjectionLimits,
 	type LcmPublicStatus,
 	normalizeLcmBranch,
+	normalizeLcmMaxConcurrentSummaries,
 	SessionLcm,
 	type SessionLcmJournal,
 } from "./session-lcm";
@@ -354,6 +358,18 @@ import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
+
+function isStructuralLcmAbortError(error: unknown): boolean {
+	const seen = new Set<object>();
+	let current = error;
+	while (current && typeof current === "object" && !seen.has(current)) {
+		seen.add(current);
+		const errorId = "errorId" in current && typeof current.errorId === "number" ? current.errorId : undefined;
+		if (current instanceof AIError.AbortError || AIError.is(errorId, AIError.Flag.Abort)) return true;
+		current = "cause" in current ? current.cause : undefined;
+	}
+	return false;
+}
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -4173,6 +4189,7 @@ export class AgentSession {
 	}
 
 	async #rebindLcm(): Promise<void> {
+		this.refreshLcmSettings();
 		try {
 			await this.#lcm?.rebind();
 		} catch (error) {
@@ -4184,12 +4201,31 @@ export class AgentSession {
 		return this.#lcm?.enabled === true;
 	}
 
-	setLcmSummaryModel(selector: string | undefined): void {
-		this.#lcm?.setSummaryModel(selector);
+	refreshLcmSettings(): void {
+		this.#lcm?.configure({
+			summaryModel: this.settings.get("context.lossless.summaryModel"),
+			maxConcurrentSummaries: this.settings.get("context.lossless.maxConcurrentSummaries"),
+		});
+	}
+
+	async refreshLcmSettingsAndRebind(): Promise<void> {
+		await this.#rebindLcm();
 	}
 
 	async lcmStatus(): Promise<LcmPublicStatus> {
-		const status = this.#lcm ? await this.#lcm.status() : { runtime: { phase: "disabled" as const } };
+		const status: LcmPublicStatus = this.#lcm
+			? await this.#lcm.status()
+			: {
+					runtime: {
+						phase: "disabled",
+						summaryWorkers: {
+							active: 0,
+							limit: normalizeLcmMaxConcurrentSummaries(
+								this.settings.get("context.lossless.maxConcurrentSummaries"),
+							),
+						},
+					},
+				};
 		const selector = status.runtime.summaryModelSelector;
 		if (!selector || status.runtime.resolvedSummaryModel) return status;
 		const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
@@ -4269,23 +4305,44 @@ export class AgentSession {
 				},
 				model.provider,
 			);
-			const response = await instrumentedCompleteSimple(
-				model,
-				{
-					systemPrompt: [systemPrompt],
-					messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
-					tools: [],
-				},
-				options,
-				{
-					telemetry: resolveTelemetry(this.agent.telemetry, affinitySessionId),
-					oneshotKind: request.oneshotKind,
-					completeImpl: async (requestModel, requestContext, requestOptions) => {
-						const stream = await this.#sideStreamFn(requestModel, requestContext, requestOptions);
-						return stream.result();
+			let response: AssistantMessage;
+			try {
+				response = await instrumentedCompleteSimple(
+					model,
+					{
+						systemPrompt: [systemPrompt],
+						messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+						tools: [],
 					},
-				},
-			);
+					options,
+					{
+						telemetry: resolveTelemetry(this.agent.telemetry, affinitySessionId),
+						oneshotKind: request.oneshotKind,
+						completeImpl: async (requestModel, requestContext, requestOptions) => {
+							const stream = await this.#sideStreamFn(requestModel, requestContext, requestOptions);
+							return stream.result();
+						},
+					},
+				);
+			} catch (error) {
+				if (isStructuralLcmAbortError(error)) throw error;
+				const label = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				const headerHint = getRetryAfterMsFromHeaders(getHeadersFromError(error));
+				const textHint = extractRetryHint(undefined, label);
+				const retryAfterMs =
+					headerHint === undefined
+						? textHint
+						: textHint === undefined
+							? headerHint
+							: Math.max(headerHint, textHint);
+				const safeLabel = this.#obfuscator?.hasSecrets()
+					? (this.#obfuscateTextForProvider(label) ?? "LCM completion failed")
+					: "LCM completion failed";
+				throw new LcmCompletionError(safeLabel, {
+					provider: model.provider,
+					retryAfterMs,
+				});
+			}
 			if (response.provider === "opencode-go") {
 				this.#modelRegistry.authStorage.recordUsageCost(response.provider, response.usage.cost.total, {
 					sessionId: affinitySessionId,
@@ -4305,8 +4362,21 @@ export class AgentSession {
 				},
 				costUsd: response.usage.cost.total,
 			});
-			if (response.stopReason === "error") throw new Error(response.errorMessage ?? "LCM completion failed");
-			if (response.stopReason === "aborted") throw new Error("LCM completion aborted");
+			if (response.stopReason === "aborted" || AIError.is(response.errorId, AIError.Flag.Abort)) {
+				throw request.signal?.reason instanceof Error
+					? request.signal.reason
+					: new AIError.AbortError("LCM completion aborted");
+			}
+			if (response.stopReason === "error") {
+				const message = response.errorMessage ?? "LCM completion failed";
+				const safeMessage = this.#obfuscator?.hasSecrets()
+					? (this.#obfuscateTextForProvider(message) ?? "LCM completion failed")
+					: "LCM completion failed";
+				throw new LcmCompletionError(safeMessage, {
+					provider: model.provider,
+					retryAfterMs: extractRetryHint(undefined, message),
+				});
+			}
 			const text = extractTextContent(response).trim();
 			if (!text) throw new Error("LCM completion returned no text");
 			// Never deobfuscate derived output: re-apply the boundary so summary and
@@ -6311,7 +6381,6 @@ export class AgentSession {
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
-		await this.#rebindLcm();
 	}
 
 	// =========================================================================
@@ -7126,6 +7195,7 @@ export class AgentSession {
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
+		const previousCwd = this.sessionManager.getCwd();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
@@ -7203,6 +7273,7 @@ export class AgentSession {
 			}
 			this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
+			await this.settings.reloadForCwd(this.sessionManager.getCwd());
 			await this.#rebindLcm();
 
 			let sessionContext = this.buildDisplaySessionContext();
@@ -7358,6 +7429,14 @@ export class AgentSession {
 			this.#todo.syncFromBranch();
 			this.#advisors.resetAllRuntimes();
 			this.#reconnectToAgent();
+			try {
+				await this.settings.reloadForCwd(previousCwd);
+			} catch (reloadError) {
+				logger.warn("Failed to restore settings after session switch rollback", {
+					cwd: previousCwd,
+					error: String(reloadError),
+				});
+			}
 			await this.#rebindLcm();
 			try {
 				await this.#sessionSwitchReconciler?.();

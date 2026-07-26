@@ -67,6 +67,8 @@ function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
 	return {
 		runtime: {
 			phase,
+			summaryWorkers:
+				phase === "disabled" ? { active: 0, limit: 0 } : { active: phase === "active" ? 2 : 0, limit: 4 },
 			...(withoutStore ? {} : { summaryModelSelector: "@smol", resolvedSummaryModel: "provider/model" }),
 			...(phase === "active"
 				? {
@@ -79,10 +81,18 @@ function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
 							estimatedTokens: 4_000,
 							pendingJobs: 2,
 						},
+						summaryBackoff: { fallback: 1_900_000_000_000 },
+						lastFailureCategory: "provider" as const,
 						retryAt: 1_900_000_000_000,
 					}
 				: {}),
-			...(phase === "degraded" ? { lastFailureCategory: "provider" as const } : {}),
+			...(phase === "degraded"
+				? {
+						summaryBackoff: { preferred: 1_900_000_000_000 },
+						lastFailureCategory: "provider" as const,
+						retryAt: 1_900_000_000_000,
+					}
+				: {}),
 		},
 		...(withoutStore
 			? {}
@@ -218,7 +228,7 @@ describe("/lcm slash command", () => {
 		]);
 	});
 
-	it("distinguishes every public runtime phase and renders active diagnostics", async () => {
+	it("distinguishes every public runtime phase and preserves quarantine output", async () => {
 		for (const phase of [
 			"disabled",
 			"uninitialized",
@@ -233,21 +243,6 @@ describe("/lcm slash command", () => {
 			expect(harness.output[0]).toContain(`LCM status: ${phase.toUpperCase()}`);
 		}
 
-		const active = createRuntime(agentDir, { status: statusFor("active") });
-		await executeAcpBuiltinSlashCommand("/lcm status", active.runtime);
-		expect(active.output[0]).toContain("session JSONL is authoritative");
-		expect(active.output[0]).toContain("SQLite WAL: enabled; schema: 5");
-		expect(active.output[0]).toContain("Summary model: @smol -> provider/model");
-		expect(active.output[0]).toContain("DAG: depth 3, 3 selected nodes, 6 covered sources, 3 fresh sources");
-		expect(active.output[0]).toContain("Estimated tokens: 12000 -> 4000");
-		expect(active.output[0]).toContain("2 pending, 1 running, 1 failed");
-		expect(active.output[0]).toContain("backoff until: 2030-03-17T17:46:40.000Z");
-
-		const degraded = createRuntime(agentDir, { status: statusFor("degraded") });
-		await executeAcpBuiltinSlashCommand("/lcm status", degraded.runtime);
-		expect(degraded.output[0]).toContain("Last fallback: provider");
-		expect(degraded.output[0]).toContain("native compaction remains active");
-
 		const quarantined = createRuntime(agentDir, { status: statusFor("quarantined") });
 		await executeAcpBuiltinSlashCommand("/lcm status", quarantined.runtime);
 		expect(quarantined.output[0]).toContain("Derived store is quarantined");
@@ -255,10 +250,61 @@ describe("/lcm slash command", () => {
 		expect(quarantined.output[0]).not.toContain("top-secret");
 	});
 
+	it("renders disabled workers and an unopened project exactly", async () => {
+		const harness = createRuntime(agentDir, { status: statusFor("disabled"), enabled: false });
+		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+
+		expect(harness.output).toEqual([
+			[
+				"LCM status: DISABLED",
+				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
+				"Workers: 0/0 active",
+				"SQLite WAL: not initialized",
+				"Project jobs: not initialized",
+				"Backoff: preferred until none; fallback until none",
+				"DAG: no fitted projection yet",
+			].join("\n"),
+		]);
+	});
+
+	it("renders preferred-model backoff while DEGRADED", async () => {
+		const harness = createRuntime(agentDir, { status: statusFor("degraded") });
+		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+
+		expect(harness.output[0]).toContain("LCM status: DEGRADED");
+		expect(harness.output[0]).toContain("Workers: 0/4 active");
+		expect(harness.output[0]).toContain("Project jobs: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete");
+		expect(harness.output[0]).toContain("Backoff: preferred until 2030-03-17T17:46:40.000Z; fallback until none");
+		expect(harness.output[0]).toContain("Lossless projection is degraded; native compaction remains active.");
+	});
+
+	it("keeps a fitted fallback failure ACTIVE and renders exact status lines", async () => {
+		const harness = createRuntime(agentDir, { status: statusFor("active") });
+		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+
+		expect(harness.output).toEqual([
+			[
+				"LCM status: ACTIVE",
+				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
+				"Summary model: @smol -> provider/model",
+				"Workers: 2/4 active",
+				"SQLite WAL: enabled; schema: 5",
+				"Store: 2 branches, 9 active sources, 1 retained tombstones, 3 summary nodes",
+				"Project jobs: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
+				"Backoff: preferred until none; fallback until 2030-03-17T17:46:40.000Z",
+				"DAG: depth 3, 3 selected nodes, 6 covered sources, 3 fresh sources",
+				"Estimated tokens: 12000 -> 4000",
+				"Current branch: revision 7; 2 relevant jobs pending",
+				"Last fallback: provider",
+			].join("\n"),
+		]);
+	});
+
 	it("keeps status, doctor, and failure output path- and secret-safe", async () => {
 		const unsafe = statusFor("quarantined");
 		unsafe.runtime.summaryModelSelector = "token=top-secret";
 		unsafe.runtime.resolvedSummaryModel = "C:\\private\\secret";
+		unsafe.runtime.summaryBackoff = { preferred: "token=top-secret" as unknown as number };
 		unsafe.store!.recoveredFrom = "/private/recovered.sqlite?token=top-secret";
 		const harness = createRuntime(agentDir, { status: unsafe });
 		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
@@ -271,6 +317,7 @@ describe("/lcm slash command", () => {
 			expect(text).not.toContain("top-secret");
 		}
 		expect(harness.output[0]).toContain("Summary model: [redacted] -> [redacted]");
+		expect(harness.output[0]).toContain("Backoff: preferred until none; fallback until none");
 		expect(harness.output[1]).toContain("attention required");
 		expect(harness.output[2]).toContain("Native context remains available");
 	});

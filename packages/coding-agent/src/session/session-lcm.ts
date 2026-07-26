@@ -12,8 +12,9 @@ import type {
 	SourceSnapshot,
 	SummaryJob,
 } from "@oh-my-pi/lcm-context";
-import { openLcmContext } from "@oh-my-pi/lcm-context";
+import { isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 
 export type {
 	Citation,
@@ -52,13 +53,37 @@ import { sessionMessagePersistenceKey } from "./turn-persistence";
 
 const SUMMARY_LEASE_MS = 10 * 60_000;
 const SUMMARY_RETRY_DELAY_MS = 30_000;
+/** Longest provider-requested delay retained by the durable summary scheduler. */
+const SUMMARY_RETRY_AFTER_MAX_MS = 24 * 60 * 60_000;
 const SUMMARY_MAX_OUTPUT_TOKENS = 2_048;
-const SUMMARY_CLAIM_LIMIT = 1;
 const HARD_PROJECTION_WAIT_MS = 30_000;
+const SQLITE_CONTENTION_DELAYS_MS = [100, 200, 400] as const;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 const ARTIFACT_REF_PATTERN = /(?:artifact:\/\/\d+|blob:sha256:[a-f0-9]{64})/g;
 
 export type LcmRuntimePhase = "disabled" | "uninitialized" | "idle" | "warming" | "active" | "degraded" | "quarantined";
+export class LcmCompletionError extends Error {
+	readonly provider: string | undefined;
+	readonly retryAfterMs: number | undefined;
+
+	constructor(message: string, options: { provider?: string; retryAfterMs?: number }) {
+		super(message.slice(0, 2_048));
+		this.name = "LcmCompletionError";
+		this.provider = options.provider?.slice(0, 128);
+		const retryAfterMs = options.retryAfterMs;
+		this.retryAfterMs =
+			typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+				? Math.min(SUMMARY_RETRY_AFTER_MAX_MS, Math.ceil(retryAfterMs))
+				: undefined;
+	}
+}
+
+export function normalizeLcmMaxConcurrentSummaries(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
+		? Math.max(1, Math.min(4, value))
+		: 1;
+}
 
 export interface LcmProjectionAggregate {
 	revision: number;
@@ -72,6 +97,8 @@ export interface LcmProjectionAggregate {
 
 export interface LcmRuntimeStatus {
 	phase: LcmRuntimePhase;
+	summaryWorkers: { active: number; limit: number };
+	summaryBackoff?: { preferred?: number; fallback?: number };
 	summaryModelSelector?: string;
 	resolvedSummaryModel?: string;
 	lastProjection?: LcmProjectionAggregate;
@@ -141,6 +168,7 @@ export interface SessionLcmDependencies {
 export interface SessionLcmOptions {
 	agentDir?: string;
 	summaryModel?: string;
+	maxConcurrentSummaries?: number;
 	registerProject?: (project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>;
 	dependencies?: SessionLcmDependencies;
 }
@@ -184,6 +212,21 @@ interface ProjectionCheck {
 	result: ProjectAttempt;
 	projection?: ContextProjection;
 	terminal?: LcmFallbackCategory;
+}
+
+type SummaryQueueClass = SummaryJob["queueClass"];
+
+type SummaryWorkerOutcome =
+	| {
+			status: "completed" | "escalated" | "stale" | "lease_lost" | "unfit" | "aborted";
+			jobId: string;
+			queueClass: SummaryQueueClass;
+	  }
+	| { status: "provider_failed"; jobId: string; queueClass: SummaryQueueClass; retryAt: number }
+	| { status: "store_failed"; jobId: string; queueClass: SummaryQueueClass; error: unknown };
+
+interface ProjectionRequest {
+	limits: LcmProjectionLimits;
 }
 
 function collectArtifactRefs(value: unknown, refs: Set<string>, depth = 0): void {
@@ -486,6 +529,18 @@ function errorLabel(error: unknown): string {
 	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
+function isStructuredAbortError(error: unknown): boolean {
+	const seen = new Set<object>();
+	let current = error;
+	while (current && typeof current === "object" && !seen.has(current)) {
+		seen.add(current);
+		const errorId = "errorId" in current && typeof current.errorId === "number" ? current.errorId : undefined;
+		if (AIError.is(errorId, AIError.Flag.Abort)) return true;
+		current = "cause" in current ? current.cause : undefined;
+	}
+	return false;
+}
+
 function projectionAggregate(projection: ContextProjection): LcmProjectionAggregate {
 	return {
 		revision: projection.revision,
@@ -625,6 +680,7 @@ export class SessionLcm {
 	readonly #host: SessionLcmHost;
 	readonly #agentDir: string | undefined;
 	#summaryModel: string | undefined;
+	#maxConcurrentSummaries: number;
 	readonly #openContext: typeof openLcmContext;
 	readonly #resolveProject: typeof resolveLcmProject;
 	readonly #registerProject:
@@ -647,6 +703,14 @@ export class SessionLcm {
 	#pendingReconcileSummarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> | undefined;
 	#summaryTask: Promise<void> | undefined;
 	#summaryAbortController: AbortController | undefined;
+	#summaryRestartRequested = false;
+	#deferReconcileUntilSummarySettles = false;
+	#summaryRetryDeferred = false;
+	readonly #activeSummaryJobs = new Map<string, Promise<SummaryWorkerOutcome>>();
+	#summaryCapacitySignal = Promise.withResolvers<void>();
+	#summaryProgressVersion = 0;
+	#summaryProgressSignal = Promise.withResolvers<void>();
+	#lastProjectionRequest: ProjectionRequest | undefined;
 	#summaryWakeTimer: NodeJS.Timeout | undefined;
 	#summaryWakeAt: number | undefined;
 	#summaryWakeTask: Promise<void> | undefined;
@@ -660,11 +724,14 @@ export class SessionLcm {
 	#pendingFallbackCategory: LcmFallbackCategory | undefined;
 	#retryAt: number | undefined;
 	#resolvedSummaryModel: string | undefined;
+	readonly #preferredFailures = new Map<string, number>();
+	readonly #fallbackFailures = new Map<string, number>();
 
 	constructor(host: SessionLcmHost, options: SessionLcmOptions) {
 		this.#host = host;
 		this.#agentDir = options.agentDir;
 		this.#summaryModel = options.summaryModel?.trim() || undefined;
+		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
 		this.#openContext = options.dependencies?.openContext ?? openLcmContext;
 		this.#resolveProject = options.dependencies?.resolveProject ?? resolveLcmProject;
 		this.#registerProject = options.registerProject;
@@ -680,10 +747,13 @@ export class SessionLcm {
 		return !this.#disposed;
 	}
 
-	setSummaryModel(selector: string | undefined): void {
-		const next = selector?.trim() || undefined;
-		if (next !== this.#summaryModel) this.#resolvedSummaryModel = undefined;
-		this.#summaryModel = next;
+	configure(options: Pick<SessionLcmOptions, "summaryModel" | "maxConcurrentSummaries">): void {
+		const nextModel = options.summaryModel?.trim() || undefined;
+		if (nextModel !== this.#summaryModel) this.#resolvedSummaryModel = undefined;
+		this.#summaryModel = nextModel;
+		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
+		this.#signalSummaryCapacity();
+		if (this.#context) this.#startSummaryJobs();
 	}
 
 	takePendingFallbackCategory(): LcmFallbackCategory | undefined {
@@ -693,8 +763,19 @@ export class SessionLcm {
 	}
 
 	#runtimeStatus(): LcmRuntimeStatus {
+		const preferred = this.#maxFailureDeadline(this.#preferredFailures);
+		const fallback = this.#maxFailureDeadline(this.#fallbackFailures);
 		return {
 			phase: this.#runtimePhase,
+			summaryWorkers: { active: this.#activeSummaryJobs.size, limit: this.#maxConcurrentSummaries },
+			...(preferred === undefined && fallback === undefined
+				? {}
+				: {
+						summaryBackoff: {
+							...(preferred === undefined ? {} : { preferred }),
+							...(fallback === undefined ? {} : { fallback }),
+						},
+					}),
 			summaryModelSelector: this.#summaryModel?.trim() || "@smol",
 			...(this.#resolvedSummaryModel ? { resolvedSummaryModel: this.#resolvedSummaryModel } : {}),
 			...(this.#lastProjection ? { lastProjection: this.#lastProjection } : {}),
@@ -747,11 +828,54 @@ export class SessionLcm {
 
 	#noteProjection(projection: ContextProjection, active: boolean): void {
 		this.#lastProjection = projectionAggregate(projection);
-		this.#runtimePhase = active ? "active" : "warming";
-		if (active) {
+		this.#runtimePhase = active ? "active" : this.#preferredFailures.size > 0 ? "degraded" : "warming";
+		if (!active) return;
+		this.#pendingFallbackCategory = undefined;
+		if (this.#preferredFailures.size === 0 && this.#fallbackFailures.size === 0) {
 			this.#lastFailureCategory = undefined;
-			this.#pendingFallbackCategory = undefined;
 			this.#retryAt = undefined;
+		}
+	}
+
+	#signalSummaryCapacity(): void {
+		const signal = this.#summaryCapacitySignal;
+		this.#summaryCapacitySignal = Promise.withResolvers<void>();
+		signal.resolve();
+	}
+
+	#signalSummaryProgress(): void {
+		this.#summaryProgressVersion++;
+		const signal = this.#summaryProgressSignal;
+		this.#summaryProgressSignal = Promise.withResolvers<void>();
+		signal.resolve();
+	}
+
+	#maxFailureDeadline(failures: ReadonlyMap<string, number>): number | undefined {
+		let deadline: number | undefined;
+		for (const value of failures.values()) deadline = deadline === undefined ? value : Math.max(deadline, value);
+		return deadline;
+	}
+
+	#syncSummaryFailures(context: LcmContext): void {
+		const failures = context.summaryJobFailures(this.#activeBranch?.snapshot.scope);
+		this.#preferredFailures.clear();
+		this.#fallbackFailures.clear();
+		for (const failure of failures) {
+			(failure.queueClass === "preferred" ? this.#preferredFailures : this.#fallbackFailures).set(
+				failure.jobId,
+				failure.availableAt,
+			);
+		}
+		const preferred = this.#maxFailureDeadline(this.#preferredFailures);
+		const fallback = this.#maxFailureDeadline(this.#fallbackFailures);
+		this.#retryAt =
+			preferred === undefined ? fallback : fallback === undefined ? preferred : Math.max(preferred, fallback);
+		if (preferred !== undefined || fallback !== undefined) {
+			this.#lastFailureCategory = "provider";
+			if (preferred !== undefined && this.#runtimePhase !== "active") this.#runtimePhase = "degraded";
+		} else if (this.#lastFailureCategory === "provider") {
+			this.#lastFailureCategory = undefined;
+			if (this.#runtimePhase === "degraded") this.#runtimePhase = "warming";
 		}
 	}
 
@@ -765,8 +889,9 @@ export class SessionLcm {
 	}
 
 	#scheduleSummaryWake(context: LcmContext, generation: number, delayMs: number): void {
-		const delay = Math.max(1, delayMs);
-		const wakeAt = this.#now() + delay;
+		const requestedDelay = Math.max(1, delayMs);
+		const delay = Math.min(requestedDelay, MAX_TIMER_DELAY_MS);
+		const wakeAt = this.#now() + requestedDelay;
 		if (this.#summaryWakeAt !== undefined && this.#summaryWakeAt <= wakeAt) return;
 		this.#clearSummaryWake();
 		this.#summaryWakeAt = wakeAt;
@@ -805,7 +930,18 @@ export class SessionLcm {
 	}
 
 	#enqueue<T>(operation: () => Promise<T> | T): Promise<T> {
-		const result = this.#operationTail.then(operation, operation);
+		const run = async (): Promise<T> => {
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await operation();
+				} catch (error) {
+					const delay = SQLITE_CONTENTION_DELAYS_MS[attempt];
+					if (!isLcmSqliteContentionError(error) || delay === undefined) throw error;
+					await Bun.sleep(delay);
+				}
+			}
+		};
+		const result = this.#operationTail.then(run, run);
 		this.#operationTail = result.then(
 			() => undefined,
 			() => undefined,
@@ -813,9 +949,31 @@ export class SessionLcm {
 		return result;
 	}
 
-	async #ensureOpen(): Promise<LcmContext | undefined> {
+	async #ensureOpen(
+		deferredSummarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> = false,
+	): Promise<LcmContext | undefined> {
 		if (this.#disposed) return undefined;
 		const cwd = this.#host.sessionManager.getCwd();
+		if (this.#context && this.#boundCwd !== undefined && this.#boundCwd !== cwd && this.#summaryTask) {
+			this.#summaryRestartRequested = false;
+			this.#summaryAbortController?.abort("LCM store binding changed");
+			this.#clearSummaryWake();
+			this.#dirty = true;
+			if (!this.#deferReconcileUntilSummarySettles) {
+				this.#deferReconcileUntilSummarySettles = true;
+				const drain = this.#summaryTask;
+				const settled = (): void => {
+					if (!this.#deferReconcileUntilSummarySettles) return;
+					this.#deferReconcileUntilSummarySettles = false;
+					if (!this.#disposed && this.#context && this.#boundCwd !== this.#host.sessionManager.getCwd()) {
+						const summarize = this.#pendingReconcileSummarize ?? deferredSummarize;
+						void this.#requestReconcile(false, summarize);
+					}
+				};
+				void drain.then(settled, settled);
+			}
+			return undefined;
+		}
 		if (this.#boundCwd !== undefined && this.#boundCwd !== cwd) this.#clearActiveBranch();
 		if (this.#context && this.#boundCwd === cwd) {
 			if (this.#project) await this.#registerJournalHint(this.#project);
@@ -838,12 +996,19 @@ export class SessionLcm {
 			return undefined;
 		}
 
+		const projectChanged = this.#project !== undefined && this.#project.projectId !== project.projectId;
 		if (this.#context) {
-			this.#summaryAbortController?.abort("LCM store binding changed");
 			this.#clearSummaryWake();
 			this.#context.close();
 			this.#context = undefined;
 			this.#clearActiveBranch();
+		}
+		if (projectChanged) {
+			this.#preferredFailures.clear();
+			this.#fallbackFailures.clear();
+			this.#retryAt = undefined;
+			if (this.#lastFailureCategory === "provider") this.#lastFailureCategory = undefined;
+			this.#resolvedSummaryModel = undefined;
 		}
 
 		let context: LcmContext;
@@ -876,6 +1041,19 @@ export class SessionLcm {
 		);
 	}
 
+	#projectForScheduling(context: LcmContext): ContextProjection | undefined {
+		const request = this.#lastProjectionRequest;
+		const scope = this.#activeBranch?.snapshot.scope;
+		if (!request || !scope) return undefined;
+		const projection = context.project({
+			...scope,
+			tokenBudget: request.limits.tokenBudget,
+			freshTail: request.limits.freshTail,
+		});
+		this.#lastProjection = projectionAggregate(projection);
+		return projection;
+	}
+
 	async #drainReconcile(open: boolean): Promise<boolean> {
 		let reconciled = false;
 		while (this.#dirty && !this.#disposed) {
@@ -883,9 +1061,18 @@ export class SessionLcm {
 			const summarize = this.#pendingReconcileSummarize ?? false;
 			this.#pendingReconcileSummarize = undefined;
 			this.#dirty = false;
-			const context = await this.#ensureOpen();
+			const context = await this.#ensureOpen(summarize);
 			const project = this.#project;
-			if (!context || !project) return false;
+			if (!context || !project) {
+				if (
+					this.#deferReconcileUntilSummarySettles &&
+					summarize !== false &&
+					(this.#pendingReconcileSummarize === undefined || this.#pendingReconcileSummarize === false)
+				) {
+					this.#pendingReconcileSummarize = summarize;
+				}
+				return false;
+			}
 			const generation = this.#generation;
 			try {
 				const normalized = this.#normalizeActiveBranch(project);
@@ -896,14 +1083,49 @@ export class SessionLcm {
 					this.#dirty = true;
 					continue;
 				}
-				const result = context.reconcile(normalized.snapshot, { summarize });
+				context.reconcile(normalized.snapshot, { summarize });
 				this.#activateBranch(normalized);
+				this.#syncSummaryFailures(context);
 				reconciled = true;
-				if (summarize !== false && result.queuedJobs > 0) {
+				const scope = normalized.snapshot.scope;
+				const projection =
+					summarize === false
+						? this.#projectForScheduling(context)
+						: context.project({ ...scope, tokenBudget: summarize.tokenBudget, freshTail: summarize.freshTail });
+				if (projection) {
+					this.#lastProjection = projectionAggregate(projection);
+					if (this.#runtimePhase !== "active") {
+						this.#runtimePhase = this.#preferredFailures.size > 0 ? "degraded" : "warming";
+					}
+				}
+				const allowFallback = projection === undefined || projection.pendingJobs === 0;
+				const preferredRetryAt = this.#maxFailureDeadline(this.#preferredFailures);
+				const fallbackRetryAt = this.#maxFailureDeadline(this.#fallbackFailures);
+				if (preferredRetryAt !== undefined && preferredRetryAt > this.#now()) {
+					this.#scheduleSummaryWake(context, generation, preferredRetryAt - this.#now());
+					continue;
+				}
+				const fallbackBlocked = allowFallback && fallbackRetryAt !== undefined && fallbackRetryAt > this.#now();
+				const effectiveAllowFallback = allowFallback && !fallbackBlocked;
+				const delayMs = context.nextSummaryJobDelayMs(scope, effectiveAllowFallback);
+				if (
+					this.#runtimePhase !== "active" &&
+					this.#preferredFailures.size === 0 &&
+					(delayMs !== null || fallbackBlocked)
+				) {
 					this.#runtimePhase = "warming";
-					this.#startSummaryJobs();
+				}
+				if (delayMs === 0) this.#startSummaryJobs();
+				else if (delayMs !== null) this.#scheduleSummaryWake(context, generation, delayMs);
+				else if (fallbackBlocked && fallbackRetryAt !== undefined) {
+					this.#scheduleSummaryWake(context, generation, fallbackRetryAt - this.#now());
 				}
 			} catch (error) {
+				if (isLcmSqliteContentionError(error)) {
+					this.#dirty = true;
+					if (summarize !== false) this.#pendingReconcileSummarize = summarize;
+					throw error;
+				}
 				logger.warn("LCM reconcile failed; using native context", { error: errorLabel(error) });
 				this.#noteFailure("store");
 				this.#clearActiveBranch();
@@ -926,20 +1148,35 @@ export class SessionLcm {
 
 		const task = this.#enqueue(() => this.#drainReconcile(open));
 		this.#reconcileTask = task;
-		const settled = (): void => {
+		const settled = (resumeDirty: boolean): void => {
 			if (this.#reconcileTask !== task) return;
 			this.#reconcileTask = undefined;
 			const next = this.#pendingReconcileSummarize ?? summarize;
-			if (this.#dirty && this.#context && !this.#disposed) {
+			if (
+				resumeDirty &&
+				!this.#deferReconcileUntilSummarySettles &&
+				this.#dirty &&
+				this.#context &&
+				!this.#disposed
+			) {
 				void this.#requestReconcile(false, next);
 			}
 		};
-		void task.then(settled, settled);
+		void task.then(
+			() => settled(true),
+			() => settled(false),
+		);
 		return task;
 	}
 
 	#startSummaryJobs(): void {
-		if (this.#disposed || this.#summaryTask || !this.#context) return;
+		if (this.#disposed || !this.#context) return;
+		if (this.#summaryTask) {
+			this.#summaryRestartRequested = true;
+			this.#signalSummaryCapacity();
+			return;
+		}
+		this.#summaryRestartRequested = false;
 		this.#clearSummaryWake();
 		const context = this.#context;
 		const generation = this.#generation;
@@ -947,15 +1184,32 @@ export class SessionLcm {
 		this.#summaryAbortController = controller;
 		const task = this.#runSummaryJobs(context, generation, controller.signal);
 		this.#summaryTask = task;
+		const clear = (): boolean => {
+			if (this.#summaryTask !== task) return false;
+			this.#summaryTask = undefined;
+			if (this.#summaryAbortController === controller) this.#summaryAbortController = undefined;
+			const restart = this.#summaryRestartRequested;
+			this.#summaryRestartRequested = false;
+			return restart;
+		};
 		void task.then(
 			() => {
-				if (this.#summaryTask === task) this.#summaryTask = undefined;
-				if (this.#summaryAbortController === controller) this.#summaryAbortController = undefined;
+				const restart = clear();
+				if (
+					restart &&
+					!this.#disposed &&
+					generation === this.#generation &&
+					context === this.#context &&
+					!this.#deferReconcileUntilSummarySettles &&
+					this.#boundCwd === this.#host.sessionManager.getCwd() &&
+					!this.#summaryWakeTask
+				) {
+					this.#startSummaryJobs();
+				}
 			},
 			error => {
-				if (this.#summaryTask === task) this.#summaryTask = undefined;
-				if (this.#summaryAbortController === controller) this.#summaryAbortController = undefined;
-				if (!controller.signal.aborted && !this.#disposed) {
+				clear();
+				if (!this.#disposed && generation === this.#generation && context === this.#context) {
 					this.#noteFailure("store");
 					logger.warn("LCM summary worker failed", { error: errorLabel(error) });
 				}
@@ -964,23 +1218,223 @@ export class SessionLcm {
 	}
 
 	async #runSummaryJobs(context: LcmContext, generation: number, signal: AbortSignal): Promise<void> {
-		while (!signal.aborted && !this.#disposed && generation === this.#generation && context === this.#context) {
-			const claimed = await this.#enqueue(() => {
-				const job = context.claimSummaryJobs({
-					workerId: this.#workerId,
-					leaseMs: SUMMARY_LEASE_MS,
-					limit: SUMMARY_CLAIM_LIMIT,
-					maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
-				})[0];
-				return { job, delayMs: job ? null : context.nextSummaryJobDelayMs() };
+		const settled: SummaryWorkerOutcome[] = [];
+		let providerFailureObserved = false;
+		let abortObserved = false;
+		let storeError: unknown;
+		let preferredExhaustedWithoutProjection = false;
+		let preferredWorkObserved = false;
+		const isCurrent = (): boolean =>
+			!signal.aborted && !this.#disposed && generation === this.#generation && context === this.#context;
+
+		const startJob = (job: SummaryJob, summaryModel: string): void => {
+			const task = this.#runSummaryJob(context, job, summaryModel, generation, signal).catch(
+				(error): SummaryWorkerOutcome => ({
+					status: "store_failed",
+					jobId: job.jobId,
+					queueClass: job.queueClass,
+					error,
+				}),
+			);
+			this.#activeSummaryJobs.set(job.jobId, task);
+			void task.then(outcome => {
+				settled.push(outcome);
+				this.#signalSummaryProgress();
 			});
-			if (!claimed.job) {
-				if (claimed.delayMs !== null) this.#scheduleSummaryWake(context, generation, claimed.delayMs);
+		};
+
+		while (isCurrent()) {
+			if (settled.length > 0) {
+				await Promise.resolve();
+				const batch = settled.splice(0);
+				for (const outcome of batch) {
+					this.#activeSummaryJobs.delete(outcome.jobId);
+					switch (outcome.status) {
+						case "provider_failed":
+							providerFailureObserved = true;
+							break;
+						case "store_failed":
+							storeError ??= outcome.error;
+							break;
+						case "aborted":
+							abortObserved = true;
+							break;
+						case "unfit":
+							if (outcome.queueClass === "preferred" || this.#runtimePhase !== "active") {
+								this.#noteFailure("unfit");
+							}
+							break;
+						case "completed":
+						case "escalated":
+							if (this.#runtimePhase !== "active") this.#runtimePhase = "warming";
+							break;
+					}
+				}
+				try {
+					await this.#enqueue(() => this.#syncSummaryFailures(context));
+				} catch (error) {
+					storeError ??= error;
+				}
+			}
+
+			if (storeError !== undefined) this.#summaryAbortController?.abort("LCM summary store failure");
+			if (storeError !== undefined || providerFailureObserved || abortObserved) {
+				if (this.#activeSummaryJobs.size > 0) {
+					await Promise.race(this.#activeSummaryJobs.values());
+					continue;
+				}
+				if (storeError !== undefined) throw storeError;
+				if (abortObserved) {
+					this.#summaryRetryDeferred = true;
+					this.#summaryRestartRequested = false;
+					this.#noteFailure("provider");
+					return;
+				}
+				if (!isCurrent()) return;
+
+				providerFailureObserved = false;
+				const projection = await this.#enqueue(() => this.#projectForScheduling(context));
+				const preferredRetryAt = this.#maxFailureDeadline(this.#preferredFailures);
+				if (preferredRetryAt !== undefined && preferredRetryAt > this.#now()) {
+					this.#scheduleSummaryWake(context, generation, preferredRetryAt - this.#now());
+					return;
+				}
+				const fallbackRetryAt = this.#maxFailureDeadline(this.#fallbackFailures);
+				if (
+					fallbackRetryAt !== undefined &&
+					fallbackRetryAt > this.#now() &&
+					(projection ? projection.pendingJobs === 0 : this.#activeBranch === undefined)
+				) {
+					this.#scheduleSummaryWake(context, generation, fallbackRetryAt - this.#now());
+					return;
+				}
+			}
+
+			let blockedWakeMs: number | null = null;
+			while (isCurrent() && this.#activeSummaryJobs.size < this.#maxConcurrentSummaries) {
+				let claimed: {
+					job: SummaryJob | undefined;
+					summaryModel: string;
+					delayMs: number | null;
+					preferredOnly: boolean;
+					cancelled?: boolean;
+					handoff?: boolean;
+				};
+				try {
+					claimed = await this.#enqueue(() => {
+						if (
+							!isCurrent() ||
+							this.#activeSummaryJobs.size >= this.#maxConcurrentSummaries ||
+							settled.length > 0
+						) {
+							return {
+								job: undefined,
+								summaryModel: "",
+								delayMs: null,
+								preferredOnly: false,
+								cancelled: true,
+							};
+						}
+						const scope = this.#activeBranch?.snapshot.scope;
+						const projection = this.#projectForScheduling(context);
+						if (projection?.pendingJobs && projection.pendingJobs > 0) preferredWorkObserved = true;
+						if (projection?.pendingJobs === 0 && preferredWorkObserved) {
+							this.#summaryRestartRequested = true;
+							return {
+								job: undefined,
+								summaryModel: "",
+								delayMs: null,
+								preferredOnly: false,
+								handoff: true,
+							};
+						}
+						const allowFallback = projection
+							? projection.pendingJobs === 0
+							: scope === undefined || preferredExhaustedWithoutProjection;
+						const preferredRetryAt = this.#maxFailureDeadline(this.#preferredFailures);
+						if (preferredRetryAt !== undefined && preferredRetryAt > this.#now()) {
+							return {
+								job: undefined,
+								summaryModel: "",
+								delayMs: preferredRetryAt - this.#now(),
+								preferredOnly: !allowFallback,
+							};
+						}
+						const fallbackRetryAt = this.#maxFailureDeadline(this.#fallbackFailures);
+						const fallbackBlocked =
+							allowFallback && fallbackRetryAt !== undefined && fallbackRetryAt > this.#now();
+						const effectiveAllowFallback = allowFallback && !fallbackBlocked;
+						const job = context.claimSummaryJobs({
+							workerId: this.#workerId,
+							leaseMs: SUMMARY_LEASE_MS,
+							limit: 1,
+							maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
+							...(scope ? { preferredScope: scope } : {}),
+							allowFallback: effectiveAllowFallback,
+						})[0];
+						const delayMs = job
+							? null
+							: (context.nextSummaryJobDelayMs(scope, effectiveAllowFallback) ??
+								(fallbackBlocked && fallbackRetryAt !== undefined ? fallbackRetryAt - this.#now() : null));
+						return {
+							job,
+							summaryModel: this.#summaryModel?.trim() || "@smol",
+							delayMs,
+							preferredOnly: !allowFallback,
+						};
+					});
+				} catch (error) {
+					storeError ??= error;
+					this.#summaryAbortController?.abort("LCM summary store failure");
+					break;
+				}
+				if (
+					claimed.job &&
+					(!isCurrent() || this.#activeSummaryJobs.size >= this.#maxConcurrentSummaries || settled.length > 0)
+				) {
+					try {
+						await this.#enqueue(() => context.releaseSummaryJob(claimed.job!.jobId, claimed.job!.leaseToken));
+					} catch (error) {
+						storeError ??= error;
+						this.#summaryAbortController?.abort("LCM summary store failure");
+					}
+					break;
+				}
+				if (!claimed.job) {
+					if (claimed.cancelled || claimed.handoff) break;
+					if (claimed.preferredOnly && claimed.delayMs === null && this.#activeSummaryJobs.size === 0) {
+						preferredExhaustedWithoutProjection = true;
+						continue;
+					}
+					blockedWakeMs = claimed.delayMs;
+					break;
+				}
+				if (claimed.job.queueClass === "preferred") preferredExhaustedWithoutProjection = false;
+				startJob(claimed.job, claimed.summaryModel);
+			}
+
+			if (storeError !== undefined) {
+				this.#summaryAbortController?.abort("LCM summary store failure");
+				await Promise.all(this.#activeSummaryJobs.values());
+				this.#activeSummaryJobs.clear();
+				throw storeError;
+			}
+			if (this.#activeSummaryJobs.size === 0) {
+				if (blockedWakeMs !== null) this.#scheduleSummaryWake(context, generation, blockedWakeMs);
 				return;
 			}
-			const summaryModel = this.#summaryModel?.trim() || "@smol";
-			await this.#runSummaryJob(context, claimed.job, summaryModel, generation, signal);
+			const capacity = this.#summaryCapacitySignal.promise;
+			await Promise.race([...this.#activeSummaryJobs.values(), capacity]);
 		}
+
+		const remaining = await Promise.all(this.#activeSummaryJobs.values());
+		this.#activeSummaryJobs.clear();
+		if (storeError !== undefined) throw storeError;
+		const failed = remaining.find(
+			(outcome): outcome is Extract<SummaryWorkerOutcome, { status: "store_failed" }> =>
+				outcome.status === "store_failed",
+		);
+		if (failed) throw failed.error;
 	}
 
 	async #runSummaryJob(
@@ -989,136 +1443,195 @@ export class SessionLcm {
 		summaryModel: string,
 		generation: number,
 		signal: AbortSignal,
-	): Promise<void> {
+	): Promise<SummaryWorkerOutcome> {
+		const base = { jobId: job.jobId, queueClass: job.queueClass };
 		const jobController = new AbortController();
 		const jobSignal = AbortSignal.any([signal, jobController.signal]);
+		let leaseLost = false;
+		let renewalError: unknown;
+		let renewalTask: Promise<void> | undefined;
+		let terminal = false;
 		const renewLease = setInterval(
 			() => {
-				if (jobSignal.aborted || this.#disposed || generation !== this.#generation || context !== this.#context) {
-					jobController.abort("LCM summary lease owner changed");
-					return;
-				}
-				void this.#enqueue(() => {
+				if (renewalTask || jobSignal.aborted) return;
+				renewalTask = this.#enqueue(() => {
 					if (
 						jobSignal.aborted ||
 						this.#disposed ||
 						generation !== this.#generation ||
 						context !== this.#context
 					) {
-						return false;
+						return undefined;
 					}
-					const extended = context.extendSummaryJob(job.jobId, job.leaseToken, SUMMARY_LEASE_MS);
-					if (!extended) jobController.abort("LCM summary lease lost");
-					return extended;
-				}).catch(error => {
-					logger.debug("LCM summary lease renewal failed", { error: errorLabel(error) });
-					jobController.abort("LCM summary lease renewal failed");
-				});
+					return context.extendSummaryJob(job.jobId, job.leaseToken, SUMMARY_LEASE_MS);
+				})
+					.then(extended => {
+						if (extended === false) {
+							leaseLost = true;
+							jobController.abort("LCM summary lease lost");
+						}
+					})
+					.catch(error => {
+						renewalError = error;
+						jobController.abort("LCM summary lease renewal failed");
+					})
+					.finally(() => {
+						renewalTask = undefined;
+					});
 			},
 			Math.floor(SUMMARY_LEASE_MS / 2),
 		);
 
+		let outcome: SummaryWorkerOutcome;
 		try {
-			let redactedText: string;
-			let promptHash: string;
-			let resolvedModel: string | undefined;
-			if (job.stage === "deterministic") {
-				redactedText = deterministicSummary(job);
-				promptHash = summaryPromptHash(
-					"deterministic_truncate:v1",
-					job.inputs.map(input => `${input.kind}:${input.id}`).join("\n"),
-				);
-			} else {
-				const systemPrompt = prompt.render(lcmSummarySystemPrompt);
-				const strategyInstructions =
-					job.stage === "aggressive"
-						? "Use terse bullet points. Keep only essential facts, current state, constraints, errors, and next actions."
-						: "Preserve concrete details and causal context while removing repetition and conversational filler.";
-				const userPrompt = prompt.render(lcmSummaryUserPrompt, {
-					maxOutputTokens: job.outputTokenBudget,
-					strategy: job.strategy,
-					strategyInstructions,
-					inputs: job.inputs.map(input => ({ kind: input.kind, id: input.id, text: input.redactedText })),
-				});
-				promptHash = summaryPromptHash(systemPrompt, userPrompt);
-				let output: string;
-				try {
-					output = await this.#host.complete({
-						systemPrompt,
-						prompt: userPrompt,
+			outcome = await (async (): Promise<SummaryWorkerOutcome> => {
+				let redactedText: string;
+				let promptHash: string;
+				let resolvedModel: string | undefined;
+				if (job.stage === "deterministic") {
+					redactedText = deterministicSummary(job);
+					promptHash = summaryPromptHash(
+						"deterministic_truncate:v1",
+						job.inputs.map(input => `${input.kind}:${input.id}`).join("\n"),
+					);
+				} else {
+					const systemPrompt = prompt.render(lcmSummarySystemPrompt);
+					const strategyInstructions =
+						job.stage === "aggressive"
+							? "Use terse bullet points. Keep only essential facts, current state, constraints, errors, and next actions."
+							: "Preserve concrete details and causal context while removing repetition and conversational filler.";
+					const userPrompt = prompt.render(lcmSummaryUserPrompt, {
 						maxOutputTokens: job.outputTokenBudget,
-						oneshotKind: "lcm_summary",
-						modelSelector: summaryModel,
-						signal: jobSignal,
-						onResolvedModel: model => {
-							resolvedModel = model;
-							this.#resolvedSummaryModel = model;
-						},
-					});
-				} catch (error) {
-					if (this.#disposed || jobSignal.aborted || generation !== this.#generation || context !== this.#context)
-						return;
-					const provenance = {
-						promptHash,
-						modelSelector: summaryModel,
-						...(resolvedModel ? { resolvedModel } : {}),
 						strategy: job.strategy,
-					};
-					const failed = await this.#enqueue(() =>
-						context.failSummaryJob(
-							job.jobId,
-							job.leaseToken,
-							this.#redact(errorLabel(error)),
-							SUMMARY_RETRY_DELAY_MS,
-							provenance,
-						),
-					);
-					if (failed) this.#noteFailure("provider", this.#now() + SUMMARY_RETRY_DELAY_MS);
-					return;
-				}
-				redactedText = this.#redact(output).trim();
-				if (!redactedText) {
-					const failed = await this.#enqueue(() =>
-						context.failSummaryJob(
-							job.jobId,
-							job.leaseToken,
-							"Summary completion returned no text",
-							SUMMARY_RETRY_DELAY_MS,
-							{
-								promptHash,
-								modelSelector: summaryModel,
-								...(resolvedModel ? { resolvedModel } : {}),
-								strategy: job.strategy,
+						strategyInstructions,
+						inputs: job.inputs.map(input => ({ kind: input.kind, id: input.id, text: input.redactedText })),
+					});
+					promptHash = summaryPromptHash(systemPrompt, userPrompt);
+					let output: string;
+					try {
+						output = await this.#host.complete({
+							systemPrompt,
+							prompt: userPrompt,
+							maxOutputTokens: job.outputTokenBudget,
+							oneshotKind: "lcm_summary",
+							modelSelector: summaryModel,
+							signal: jobSignal,
+							onResolvedModel: model => {
+								resolvedModel = model;
+								this.#resolvedSummaryModel = model;
 							},
-						),
-					);
-					if (failed) this.#noteFailure("provider", this.#now() + SUMMARY_RETRY_DELAY_MS);
-					return;
+						});
+					} catch (error) {
+						if (renewalError !== undefined) return { status: "store_failed", ...base, error: renewalError };
+						if (leaseLost) return { status: "lease_lost", ...base };
+						if (
+							this.#disposed ||
+							jobSignal.aborted ||
+							generation !== this.#generation ||
+							context !== this.#context ||
+							(!(error instanceof LcmCompletionError) && isStructuredAbortError(error))
+						) {
+							return { status: "aborted", ...base };
+						}
+						const retryAfterMs = error instanceof LcmCompletionError ? (error.retryAfterMs ?? 0) : 0;
+						const failureAt = this.#now();
+						const retryDelayMs = Math.min(
+							Number.MAX_SAFE_INTEGER - failureAt,
+							Math.max(
+								retryAfterMs,
+								Math.min(300_000, SUMMARY_RETRY_DELAY_MS * 2 ** Math.min(job.transportRetryCount, 4)),
+							),
+						);
+						const provenance = {
+							promptHash,
+							modelSelector: summaryModel,
+							...(resolvedModel ? { resolvedModel } : {}),
+							strategy: job.strategy,
+						};
+						const failed = await this.#enqueue(() =>
+							context.failSummaryJob(
+								job.jobId,
+								job.leaseToken,
+								error instanceof LcmCompletionError ? this.#redact(error.message) : "Summary completion failed",
+								retryDelayMs,
+								provenance,
+							),
+						);
+						if (!failed) return { status: "stale", ...base };
+						terminal = true;
+						return { status: "provider_failed", ...base, retryAt: failureAt + retryDelayMs };
+					}
+					redactedText = this.#redact(output).trim();
+					if (!redactedText) {
+						const retryDelayMs = Math.min(
+							300_000,
+							SUMMARY_RETRY_DELAY_MS * 2 ** Math.min(job.transportRetryCount, 4),
+						);
+						const failed = await this.#enqueue(() =>
+							context.failSummaryJob(
+								job.jobId,
+								job.leaseToken,
+								"Summary completion returned no text",
+								retryDelayMs,
+								{
+									promptHash,
+									modelSelector: summaryModel,
+									...(resolvedModel ? { resolvedModel } : {}),
+									strategy: job.strategy,
+								},
+							),
+						);
+						if (!failed) return { status: "stale", ...base };
+						terminal = true;
+						return { status: "provider_failed", ...base, retryAt: this.#now() + retryDelayMs };
+					}
 				}
-			}
 
-			if (jobSignal.aborted || this.#disposed || generation !== this.#generation || context !== this.#context)
-				return;
-			const provenance = {
-				promptHash,
-				...(job.stage === "deterministic" ? {} : { modelSelector: summaryModel }),
-				...(resolvedModel ? { resolvedModel } : {}),
-				strategy: job.strategy,
-			};
-			const result = await this.#enqueue(() =>
-				context.completeSummaryJob(job.jobId, job.leaseToken, { redactedText, provenance }),
-			);
-			if (!result.accepted && result.reason === "deterministic_failed") {
-				this.#noteFailure("unfit");
-			} else if (result.accepted || result.reason === "escalated") {
-				this.#retryAt = undefined;
-				if (this.#lastFailureCategory === "provider") this.#lastFailureCategory = undefined;
-				this.#runtimePhase = "warming";
-			}
+				if (renewalError !== undefined) return { status: "store_failed", ...base, error: renewalError };
+				if (leaseLost) return { status: "lease_lost", ...base };
+				if (jobSignal.aborted || this.#disposed || generation !== this.#generation || context !== this.#context) {
+					return { status: "aborted", ...base };
+				}
+				const provenance = {
+					promptHash,
+					...(job.stage === "deterministic" ? {} : { modelSelector: summaryModel }),
+					...(resolvedModel ? { resolvedModel } : {}),
+					strategy: job.strategy,
+				};
+				const result = await this.#enqueue(() =>
+					context.completeSummaryJob(job.jobId, job.leaseToken, { redactedText, provenance }),
+				);
+				if (result.accepted) {
+					terminal = true;
+					return { status: "completed", ...base };
+				}
+				if (result.reason === "escalated") {
+					terminal = true;
+					return { status: "escalated", ...base };
+				}
+				if (result.reason === "deterministic_failed") {
+					terminal = true;
+					return { status: "unfit", ...base };
+				}
+				return { status: "stale", ...base };
+			})();
+		} catch (error) {
+			outcome = { status: "store_failed", ...base, error };
 		} finally {
 			clearInterval(renewLease);
+			await renewalTask;
 			jobController.abort("LCM summary completion settled");
+			if (renewalError !== undefined) outcome = { status: "store_failed", ...base, error: renewalError };
+			else if (leaseLost && !terminal) outcome = { status: "lease_lost", ...base };
+			if (!terminal) {
+				try {
+					await this.#enqueue(() => context.releaseSummaryJob(job.jobId, job.leaseToken));
+				} catch (error) {
+					outcome = { status: "store_failed", ...base, error };
+				}
+			}
 		}
+		return outcome;
 	}
 
 	#projectCurrent(messages: readonly AgentMessage[], limits: LcmProjectionLimits): ProjectionCheck {
@@ -1132,7 +1645,9 @@ export class SessionLcm {
 			freshTail: limits.freshTail,
 		});
 		this.#noteProjection(projection, false);
-		if (projection.pendingJobs > 0 && !this.#summaryTask && !this.#summaryWakeTask) this.#startSummaryJobs();
+		if (projection.pendingJobs > 0 && !this.#summaryRetryDeferred && !this.#summaryTask && !this.#summaryWakeTask) {
+			this.#startSummaryJobs();
+		}
 		if (projection.pendingJobs > 0) return { result: native, projection };
 		if (!projection.ready || projection.uncoveredSourceIds.length > 0) {
 			return {
@@ -1144,6 +1659,7 @@ export class SessionLcm {
 
 		if (projection.historical.length === 0) {
 			if (!this.#host.projectionFits(messages)) return { result: native, projection, terminal: "unfit" };
+			this.#noteProjection(projection, true);
 			return { result: { messages: messages as AgentMessage[], owned: true, projection }, projection };
 		}
 
@@ -1195,7 +1711,9 @@ export class SessionLcm {
 			return native;
 		}
 
-		this.#runtimePhase = "warming";
+		this.#summaryRetryDeferred = false;
+		this.#lastProjectionRequest = { limits };
+		if (this.#runtimePhase !== "active") this.#runtimePhase = "warming";
 		const reconcile = this.#requestReconcile(true, {
 			tokenBudget: limits.tokenBudget,
 			freshTail: limits.freshTail,
@@ -1219,17 +1737,21 @@ export class SessionLcm {
 			}
 
 			while (!signal?.aborted) {
+				const progressVersion = this.#summaryProgressVersion;
+				const settlement = this.#summaryProgressSignal.promise;
 				const check = await this.#enqueue(() => this.#projectCurrent(messages, limits));
 				if (check.result.owned) return check.result;
 				if (check.terminal) {
 					this.#failOpen(check.terminal);
 					return native;
 				}
-				const progress = this.#summaryTask ?? this.#summaryWakeTask;
-				if (!progress) {
+				if (progressVersion !== this.#summaryProgressVersion) continue;
+				const background = this.#summaryTask ?? this.#summaryWakeTask;
+				if (!background) {
 					this.#failOpen(this.#lastFailureCategory ?? "unfit");
 					return native;
 				}
+				const progress = Promise.race([background, settlement]);
 				if (!(await this.#waitWithinDeadline(progress, signal, deadline))) {
 					if (!signal?.aborted) this.#failOpen(this.#lastFailureCategory === "provider" ? "provider" : "deadline");
 					return native;
@@ -1258,19 +1780,33 @@ export class SessionLcm {
 		if (this.#disposed) return;
 		this.#generation++;
 		this.#dirty = true;
+		this.#summaryRestartRequested = false;
+		this.#deferReconcileUntilSummarySettles = false;
+		this.#summaryRetryDeferred = false;
+		this.#lastProjectionRequest = undefined;
+		this.#lastProjection = undefined;
+		this.#runtimePhase = "idle";
 		this.#clearActiveBranch();
+		const drain = this.#summaryTask;
 		this.#summaryAbortController?.abort("LCM session binding changed");
+		this.#signalSummaryCapacity();
 		this.#clearSummaryWake();
+		try {
+			await drain;
+		} catch (error) {
+			this.#noteFailure("store");
+			throw error;
+		}
 	}
 
 	async status(): Promise<LcmPublicStatus> {
 		await this.#requestReconcile(true);
 		return this.#enqueue(() => {
 			const context = this.#context;
-			if (!context) {
-				this.#noteFailure("store");
+			if (!context || this.#boundCwd !== this.#host.sessionManager.getCwd()) {
 				return { runtime: this.#runtimeStatus() };
 			}
+			this.#syncSummaryFailures(context);
 			const { dbPath: _dbPath, ...store } = context.status();
 			if (store.quarantined) this.#runtimePhase = "quarantined";
 			return { runtime: this.#runtimeStatus(), store };
@@ -1291,6 +1827,7 @@ export class SessionLcm {
 				const normalized = this.#normalizeActiveBranch(project);
 				const result = context.rebuild([normalized.snapshot]);
 				this.#activateBranch(normalized);
+				this.#syncSummaryFailures(context);
 				this.#dirty = false;
 				if (result.queuedJobs > 0) this.#startSummaryJobs();
 				return result;
@@ -1329,6 +1866,7 @@ export class SessionLcm {
 				);
 				if (activeRebuilt) this.#activateBranch(active);
 				else this.#clearActiveBranch();
+				this.#syncSummaryFailures(context);
 				this.#dirty = !activeRebuilt;
 				if (result.queuedJobs > 0) this.#startSummaryJobs();
 				return result;
@@ -1470,9 +2008,13 @@ export class SessionLcm {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#generation++;
+		this.#summaryRestartRequested = false;
+		this.#deferReconcileUntilSummarySettles = false;
+		this.#summaryRetryDeferred = false;
 		this.#unsubscribeDurableEntries?.();
 		this.#unsubscribeDurableEntries = undefined;
 		this.#summaryAbortController?.abort();
+		this.#signalSummaryCapacity();
 		this.#clearSummaryWake();
 		this.#clearActiveBranch();
 	}
@@ -1481,12 +2023,19 @@ export class SessionLcm {
 		if (this.#closeTask) return this.#closeTask;
 		this.beginDispose();
 		this.#closeTask = (async () => {
-			await this.#summaryTask?.catch(() => undefined);
+			let summaryError: unknown;
+			try {
+				await this.#summaryTask;
+			} catch (error) {
+				summaryError = error;
+				logger.warn("LCM summary finalizer failed during close", { error: errorLabel(error) });
+			}
 			await this.#operationTail;
 			this.#context?.close();
 			this.#context = undefined;
 			this.#project = undefined;
 			this.#clearActiveBranch();
+			if (summaryError !== undefined) throw summaryError;
 		})();
 		return this.#closeTask;
 	}

@@ -59,6 +59,10 @@ function focusSummaryModel(selector: SettingsSelectorComponent): void {
 	for (const char of "lossless summary model") selector.handleInput(char);
 	expect(selector.render(120).join("\n")).toContain("Lossless Summary Model");
 }
+function focusConcurrentSummaries(selector: SettingsSelectorComponent): void {
+	for (const char of "concurrent summaries") selector.handleInput(char);
+	expect(selector.render(120).join("\n")).toContain("Concurrent Summaries");
+}
 
 function plainLines(selector: SettingsSelectorComponent, width: number): string[] {
 	return selector.render(width).map(line => Bun.stripANSI(line));
@@ -202,5 +206,21 @@ describe("lossless summary model settings picker", () => {
 		} finally {
 			await initTheme(false, "unicode");
 		}
+	});
+	it("repairs a malformed string concurrency value through the schema-typed submenu", () => {
+		const path = "context.lossless.maxConcurrentSummaries" as const;
+		settings.set(path, "2" as never);
+		const changes: Array<[SettingPath, unknown]> = [];
+		const selector = createSelector(MODELS, (changedPath, value) => changes.push([changedPath, value]));
+		focusConcurrentSummaries(selector);
+
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		expect(settings.get(path)).toBe(4);
+		expect(typeof settings.get(path)).toBe("number");
+		expect(changes.at(-1)).toEqual([path, 4]);
 	});
 });

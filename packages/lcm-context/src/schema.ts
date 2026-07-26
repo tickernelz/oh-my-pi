@@ -381,17 +381,17 @@ export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {
 	db.run("PRAGMA foreign_keys = ON");
 	db.run("PRAGMA secure_delete = ON");
 
-	const row = db.query<{ user_version: number }, []>("PRAGMA user_version").get();
-	const foundVersion = row?.user_version ?? 0;
-	if (foundVersion > LCM_SCHEMA_VERSION) throw new UnsupportedLcmSchemaError(foundVersion);
+	const apply = db.transaction(() => {
+		const row = db.query<{ user_version: number }, []>("PRAGMA user_version").get();
+		const foundVersion = row?.user_version ?? 0;
+		if (foundVersion > LCM_SCHEMA_VERSION) throw new UnsupportedLcmSchemaError(foundVersion);
 
-	for (let version = foundVersion + 1; version <= LCM_SCHEMA_VERSION; version++) {
-		const migrate = MIGRATIONS[version - 1];
-		if (!migrate) throw new Error(`Missing LCM schema migration ${version}`);
-		const apply = db.transaction(() => {
+		for (let version = foundVersion + 1; version <= LCM_SCHEMA_VERSION; version++) {
+			const migrate = MIGRATIONS[version - 1];
+			if (!migrate) throw new Error(`Missing LCM schema migration ${version}`);
 			migrate(db);
 			db.run(`PRAGMA user_version = ${version}`);
-		});
-		apply.immediate();
-	}
+		}
+	});
+	apply.immediate();
 }

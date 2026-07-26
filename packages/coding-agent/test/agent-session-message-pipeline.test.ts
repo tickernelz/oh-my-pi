@@ -18,6 +18,7 @@ import {
 	type SimpleStreamOptions,
 	type TextContent,
 } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -34,7 +35,9 @@ import {
 	createHistoricalContextMessage,
 	wrapSteeringForModel,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { LcmCompletionError } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -85,6 +88,39 @@ async function withNativeDialectEnv<T>(fn: () => Promise<T>): Promise<T> {
 
 describe("AgentSession message pipeline", () => {
 	const sessions: AgentSession[] = [];
+
+	function createLcmCompletionSession(sideStreamFn: StreamFn, obfuscator?: SecretObfuscator): AgentSession {
+		const model = buildModel({
+			id: "lcm-completion-model",
+			name: "LCM Completion Model",
+			api: "anthropic",
+			provider: "test-lcm-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory("/lcm-completion-test"),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				modelRoles: { smol: "lcm-completion-model" },
+			}),
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn,
+			obfuscator,
+			lcm: { agentDir: "/lcm-completion-test" },
+		});
+		sessions.push(session);
+		return session;
+	}
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
@@ -1361,6 +1397,199 @@ describe("AgentSession message pipeline", () => {
 			costUsd: 1.25,
 		});
 		expect(manager.getBranch()).toHaveLength(0);
+	});
+
+	it("wraps rejected LCM provider errors with bounded scheduling metadata and no raw error object", async () => {
+		const providerError = Object.assign(new Error("upstream body says try again in 45s; credential=raw-secret"), {
+			headers: new Headers({ "retry-after-ms": "60000" }),
+		});
+		const sideStreamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.fail(providerError));
+			return stream;
+		};
+		const session = createLcmCompletionSession(sideStreamFn);
+
+		const caught = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+
+		expect(caught).toBeInstanceOf(LcmCompletionError);
+		const error = caught as LcmCompletionError & { cause?: unknown; headers?: unknown };
+		expect(error.provider).toBe("test-lcm-provider");
+		expect(error.retryAfterMs).toBe(60_000);
+		expect(error.message).toBe("LCM completion failed");
+		expect(error.cause).toBeUndefined();
+		expect(error.headers).toBeUndefined();
+	});
+
+	it("obfuscates returned LCM provider errors and preserves parsed retry metadata", async () => {
+		const secret = "LCM_PROVIDER_SECRET_123456";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const sideStreamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const error = createAssistantMessage("");
+				error.content = [];
+				error.stopReason = "error";
+				error.errorMessage = `Rate limited; try again in 45s; token=${secret}`;
+				stream.push({ type: "error", reason: "error", error });
+			});
+			return stream;
+		};
+		const session = createLcmCompletionSession(sideStreamFn, obfuscator);
+
+		const caught = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+
+		expect(caught).toBeInstanceOf(LcmCompletionError);
+		const error = caught as LcmCompletionError;
+		expect(error.provider).toBe("test-lcm-provider");
+		expect(error.retryAfterMs).toBe(45_000);
+		expect(error.message).toContain(obfuscator.obfuscate(secret));
+		expect(error.message).not.toContain(secret);
+	});
+
+	it("preserves structural aborts from rejected and returned LCM streams", async () => {
+		const rejectedAbort = new Error("wrapped provider cancellation", {
+			cause: new AIError.AbortError("provider-local abort"),
+		});
+		const rejectedSession = createLcmCompletionSession(() => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.fail(rejectedAbort));
+			return stream;
+		});
+		const rejected = await rejectedSession
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+		expect(rejected).toBe(rejectedAbort);
+
+		const controller = new AbortController();
+		const returnedAbort = new AIError.AbortError("caller cancelled summary");
+		const returnedSession = createLcmCompletionSession(() => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const aborted = createAssistantMessage("");
+				aborted.content = [];
+				aborted.stopReason = "aborted";
+				controller.abort(returnedAbort);
+				stream.push({ type: "error", reason: "aborted", error: aborted });
+			});
+			return stream;
+		});
+		const returned = await returnedSession
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+				signal: controller.signal,
+			})
+			.catch(error => error);
+		expect(returned).toBe(returnedAbort);
+		expect(AIError.is(AIError.classify(returned), AIError.Flag.Abort)).toBe(true);
+	});
+
+	it("routes concurrent LCM completions through the shared provider in-flight limiter", async () => {
+		const suffix = crypto.randomUUID();
+		const api = `test-lcm-provider-limiter-${suffix}`;
+		const provider = `test-lcm-provider-limiter-${suffix}`;
+		let starts = 0;
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		registerCustomApi(api, () => {
+			starts++;
+			const stream = new AssistantMessageEventStream();
+			if (starts === 1) {
+				firstStarted.resolve();
+				void releaseFirst.promise.then(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("summary") });
+				});
+			} else {
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+			}
+			return stream;
+		});
+		const model = buildModel({
+			id: "limited-lcm-model",
+			name: "Limited LCM Model",
+			api,
+			provider,
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"providers.maxInFlightRequests": { [provider]: 1 },
+			modelRoles: { smol: "limited-lcm-model" },
+		});
+		const settingsAwareStreamFn = createSettingsAwareStreamFn(settings);
+		const secondEnteredLimiter = Promise.withResolvers<void>();
+		let sideCalls = 0;
+		const sideStreamFn: StreamFn = (streamModel, context, options) => {
+			const stream = settingsAwareStreamFn(streamModel, context, options);
+			sideCalls++;
+			if (sideCalls === 2) secondEnteredLimiter.resolve();
+			return stream;
+		};
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory("/lcm-limiter-test"),
+			settings,
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn,
+			lcm: { agentDir: "/lcm-limiter-test" },
+		});
+		sessions.push(session);
+		const request = {
+			systemPrompt: "system",
+			prompt: "prompt",
+			oneshotKind: "lcm_summary" as const,
+			maxOutputTokens: 128,
+		};
+		const first = session.lcmComplete(request);
+		await firstStarted.promise;
+		const controller = new AbortController();
+		const queuedAbort = new AIError.AbortError("cancel queued LCM completion");
+		const second = session.lcmComplete({ ...request, signal: controller.signal });
+		try {
+			await secondEnteredLimiter.promise;
+			controller.abort(queuedAbort);
+			expect(await second.catch(error => error)).toBe(queuedAbort);
+			expect(starts).toBe(1);
+			releaseFirst.resolve();
+			expect(await first).toBe("summary");
+		} finally {
+			releaseFirst.resolve();
+			controller.abort(queuedAbort);
+			await Promise.allSettled([first, second]);
+		}
 	});
 
 	it("runs LCM before extensions only on the primary provider path", async () => {

@@ -1073,7 +1073,7 @@ export class SettingsSelectorComponent implements Component {
 					id: def.path,
 					label: def.label,
 					description: def.description,
-					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
+					currentValue: this.#getSubmenuCurrentValue(def, currentValue),
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 					changed,
 				});
@@ -1114,8 +1114,8 @@ export class SettingsSelectorComponent implements Component {
 	#applyProvenance(def: SettingDef, item: SettingItem): SettingItem {
 		const provenance = settings.getSettingProvenance(def.path);
 		let description = item.description ?? def.description;
-		if (def.path === "context.lossless.summaryModel") {
-			const state = this.#summaryModelState(settings.get(def.path));
+		if (def.editor === "summary-model") {
+			const state = this.#summaryModelState(def.path, settings.get(def.path));
 			if (state.stale) {
 				description += ` Saved selector ${state.storedSelector || "(empty)"} is unavailable.`;
 			}
@@ -1146,13 +1146,16 @@ export class SettingsSelectorComponent implements Component {
 		};
 	}
 
-	#summaryModelState(value: unknown): {
+	#summaryModelState(
+		path: SettingPath,
+		value: unknown,
+	): {
 		storedSelector: string | undefined;
 		resolvedSelector: string | undefined;
 		usesDefault: boolean;
 		stale: boolean;
 	} {
-		const provenance = settings.getSettingProvenance("context.lossless.summaryModel");
+		const provenance = settings.getSettingProvenance(path);
 		const storedSelector = typeof value === "string" ? value : undefined;
 		const configuredSelector = storedSelector?.trim();
 		const usesDefault = provenance === "default" || !configuredSelector;
@@ -1190,26 +1193,29 @@ export class SettingsSelectorComponent implements Component {
 		return !Object.is(currentValue, defaultValue);
 	}
 
-	#getSubmenuCurrentValue(path: SettingPath, value: unknown): string {
+	#getSubmenuCurrentValue(def: SettingDef & { type: "submenu" }, value: unknown): string {
 		const rawValue = String(value ?? "");
-		if (path === "context.lossless.summaryModel") {
-			const state = this.#summaryModelState(value);
+		if (def.editor === "summary-model") {
+			const state = this.#summaryModelState(def.path, value);
 			if (state.usesDefault) return "@smol (default)";
 			const display = state.storedSelector?.trim() ?? "";
 			return state.stale ? `${display} (unavailable)` : display;
 		}
-		if (path === "compaction.thresholdPercent" && (rawValue === "-1" || rawValue === "")) {
+		if (def.path === "compaction.thresholdPercent" && (rawValue === "-1" || rawValue === "")) {
 			return "default";
 		}
-		if (path === "compaction.thresholdTokens" && (rawValue === "-1" || rawValue === "")) {
+		if (def.path === "compaction.thresholdTokens" && (rawValue === "-1" || rawValue === "")) {
 			return "default";
 		}
 		return rawValue;
 	}
 
-	#createSummaryModelSubmenu(done: (value?: string) => void): Component {
-		const path = "context.lossless.summaryModel" as const;
-		const state = this.#summaryModelState(settings.get(path));
+	#createSummaryModelSubmenu(def: SettingDef & { type: "submenu" }, done: (value?: string) => void): Component {
+		const path = def.path;
+		if (path !== "context.lossless.summaryModel") {
+			throw new Error(`Unsupported summary-model setting: ${path}`);
+		}
+		const state = this.#summaryModelState(path, settings.get(path));
 		return new SummaryModelSubmenu({
 			settings,
 			models: this.context.summaryModels,
@@ -1220,7 +1226,7 @@ export class SettingsSelectorComponent implements Component {
 				settings.unset(path);
 				const next = settings.get(path);
 				this.callbacks.onChange(path, next);
-				done(this.#getSubmenuCurrentValue(path, next));
+				done(this.#getSubmenuCurrentValue(def, next));
 			},
 			onPick: selector => {
 				settings.set(path, selector);
@@ -1239,7 +1245,7 @@ export class SettingsSelectorComponent implements Component {
 		currentValue: string,
 		done: (value?: string) => void,
 	): Component {
-		if (def.path === "context.lossless.summaryModel") return this.#createSummaryModelSubmenu(done);
+		if (def.editor === "summary-model") return this.#createSummaryModelSubmenu(def, done);
 		let options = def.options;
 
 		// Special case: inject runtime options for thinking level
@@ -1318,8 +1324,9 @@ export class SettingsSelectorComponent implements Component {
 			currentValue,
 			value => {
 				this.#setSettingValue(def.path, value);
-				this.callbacks.onChange(def.path, value);
-				done(value);
+				const persisted = settings.get(def.path);
+				this.callbacks.onChange(def.path, persisted);
+				done(this.#getSubmenuCurrentValue(def, persisted));
 			},
 			() => {
 				onPreviewCancel?.();
@@ -1420,7 +1427,6 @@ export class SettingsSelectorComponent implements Component {
 	 * Set a setting value, handling type conversion.
 	 */
 	#setSettingValue(path: SettingPath, value: string): void {
-		const currentValue = settings.get(path);
 		const schemaType = getType(path);
 		if (path === "compaction.thresholdPercent" && value === "default") {
 			settings.set(path, -1 as never);
@@ -1440,9 +1446,9 @@ export class SettingsSelectorComponent implements Component {
 				parsed = validateProviderMaxInFlightRequests(parsed);
 			}
 			settings.set(path, parsed as never);
-		} else if (typeof currentValue === "number") {
+		} else if (schemaType === "number") {
 			settings.set(path, Number(value) as never);
-		} else if (typeof currentValue === "boolean") {
+		} else if (schemaType === "boolean") {
 			settings.set(path, (value === "true") as never);
 		} else {
 			settings.set(path, value as never);

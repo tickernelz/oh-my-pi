@@ -43,6 +43,7 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	getLcmSettingPaths,
 	SETTINGS_SCHEMA,
 	type SettingPath,
 	type SettingValue,
@@ -1171,8 +1172,7 @@ export class Settings {
 				for (const settingPath of [
 					"modelRoles",
 					"autocompleteMaxVisible",
-					"context.engine",
-					"context.lossless.summaryModel",
+					...getLcmSettingPaths(),
 					"gc.blobs",
 					"gc.archive",
 					"gc.wal",

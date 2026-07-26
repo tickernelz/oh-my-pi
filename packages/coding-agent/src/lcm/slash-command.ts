@@ -82,6 +82,7 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 			`Summary model: ${safeIdentifier(runtime.summaryModelSelector)} -> ${safeIdentifier(runtime.resolvedSummaryModel)}`,
 		);
 	}
+	lines.push(`Workers: ${runtime.summaryWorkers.active}/${runtime.summaryWorkers.limit} active`);
 	if (store) {
 		lines.push(
 			`SQLite WAL: ${store.journalMode.toLowerCase() === "wal" ? "enabled" : "not active"}; schema: ${store.schemaVersion}`,
@@ -90,12 +91,15 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 			`Store: ${store.branches} branches, ${store.activeSources} active sources, ${store.tombstones} retained tombstones, ${store.leafSummaries + store.condensedSummaries} summary nodes`,
 		);
 		lines.push(
-			`Jobs: ${store.jobs.pending} pending, ${store.jobs.leased} running, ${store.jobs.failed} failed, ${store.jobs.completed} completed, ${store.jobs.obsolete} obsolete; backoff until: ${formatBackoff(runtime.retryAt)}`,
+			`Project jobs: ${store.jobs.pending} pending, ${store.jobs.leased} running, ${store.jobs.failed} failed, ${store.jobs.completed} completed, ${store.jobs.obsolete} obsolete`,
 		);
 	} else {
 		lines.push("SQLite WAL: not initialized");
-		lines.push(`Jobs: not initialized; backoff until: ${formatBackoff(runtime.retryAt)}`);
+		lines.push("Project jobs: not initialized");
 	}
+	lines.push(
+		`Backoff: preferred until ${formatBackoff(runtime.summaryBackoff?.preferred)}; fallback until ${formatBackoff(runtime.summaryBackoff?.fallback)}`,
+	);
 	const projection = runtime.lastProjection;
 	if (projection) {
 		const selectedLevels = Object.entries(projection.selectedLevelCounts).filter(([, count]) => count > 0);
@@ -105,7 +109,7 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 			`DAG: depth ${depth}, ${nodes} selected nodes, ${projection.coveredSourceCount} covered sources, ${projection.freshSourceCount} fresh sources`,
 		);
 		lines.push(`Estimated tokens: ${projection.sourceTokens} -> ${projection.estimatedTokens}`);
-		lines.push(`Projection: revision ${projection.revision}; ${projection.pendingJobs} pending jobs`);
+		lines.push(`Current branch: revision ${projection.revision}; ${projection.pendingJobs} relevant jobs pending`);
 	} else {
 		lines.push("DAG: no fitted projection yet");
 	}

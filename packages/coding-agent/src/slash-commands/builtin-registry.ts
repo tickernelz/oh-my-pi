@@ -1889,6 +1889,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			setProjectDir(resolvedPath);
 			await runtime.settings.reloadForCwd(resolvedPath);
+			await runtime.session.refreshLcmSettingsAndRebind();
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
