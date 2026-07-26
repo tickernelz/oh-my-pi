@@ -1,5 +1,5 @@
 import type { Usage } from "@oh-my-pi/pi-ai";
-import type { Component } from "@oh-my-pi/pi-tui";
+import { type Component, Ellipsis, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
 
@@ -78,7 +78,10 @@ const CACHE_INVALIDATION_RULE_WIDTH = 10;
 export class CacheInvalidationMarkerComponent implements Component {
 	#cache?: { width: number; lines: string[] };
 
-	constructor(private readonly info: CacheInvalidation) {}
+	constructor(
+		private readonly info: CacheInvalidation,
+		private readonly padded = true,
+	) {}
 
 	invalidate(): void {
 		this.#cache = undefined;
@@ -89,7 +92,7 @@ export class CacheInvalidationMarkerComponent implements Component {
 		if (this.#cache?.width === width) {
 			return this.#cache.lines;
 		}
-		const lines = ["", this.#divider(width), ""];
+		const lines = this.padded ? ["", this.#divider(width), ""] : [this.#divider(width)];
 		this.#cache = { width, lines };
 		return lines;
 	}
@@ -102,8 +105,8 @@ export class CacheInvalidationMarkerComponent implements Component {
 		const labelWidth = Bun.stringWidth(label, { countAnsiEscapeCodes: false });
 		const ruleWidth = Math.min(CACHE_INVALIDATION_RULE_WIDTH, width - labelWidth - 1);
 		if (ruleWidth < 1) {
-			// Too narrow to frame — emit the bare label.
-			return theme.fg("muted", label);
+			// Too narrow to frame — emit a truncated bare label.
+			return theme.fg("muted", truncateToWidth(label, width, Ellipsis.Ascii));
 		}
 		return `${theme.fg("dim", theme.tree.horizontal.repeat(ruleWidth))} ${theme.fg("muted", label)}`;
 	}

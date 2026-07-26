@@ -137,6 +137,15 @@ describe("Settings", () => {
 			expect(getDefault("startup.showSplash")).toBe(false);
 		});
 
+		it("keeps existing configurations on native context management", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("context.engine")).toBe("native");
+			expect(settings.get("context.lossless.summaryModel")).toBeUndefined();
+			expect(getDefault("context.engine")).toBe("native");
+			expect(getEnumValues("context.engine")).toEqual(["native", "lossless"]);
+		});
+
 		it("defaults provider in-flight request limits to an empty map", async () => {
 			const settings = Settings.isolated();
 			expect(settings.get("providers.maxInFlightRequests")).toEqual({});
@@ -381,6 +390,39 @@ describe("Settings", () => {
 			expect(savedSettings.shellPath).toBe("/bin/zsh");
 			expect(savedSettings.extensions).toEqual(["/path/to/extension.ts"]);
 			expect(savedSettings.theme).toEqual({ dark: "anthracite" });
+		});
+
+		it("unsets a YAML leaf while preserving concurrently edited siblings", async () => {
+			await writeSettings({
+				context: { engine: "lossless", lossless: { retained: "loaded" } },
+				unrelated: { keep: true },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// The save must replay only the deletion against this newer file.
+			await writeSettings({
+				context: { engine: "lossless", lossless: { summaryModel: "old/model", retained: "external" } },
+				unrelated: { keep: true, added: "outside" },
+			});
+			settings.unset("context.lossless.summaryModel");
+			await settings.flush();
+
+			const saved = await readSettings();
+			expect(saved).toEqual({
+				context: { engine: "lossless", lossless: { retained: "external" } },
+				unrelated: { keep: true, added: "outside" },
+			});
+			expect(settings.get("context.lossless.summaryModel")).toBeUndefined();
+		});
+
+		it("prunes only empty ancestors when unsetting a nested leaf", async () => {
+			await writeSettings({ context: { engine: "lossless", lossless: { summaryModel: "old/model" } } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.unset("context.lossless.summaryModel");
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ context: { engine: "lossless" } });
 		});
 
 		it("should let in-memory changes override file changes for same key", async () => {

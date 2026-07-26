@@ -111,14 +111,15 @@ const nativeAndIntegrationPackages = [
 // and is outside every CI TS bucket.
 const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
+// Repo-level script tests. CI's `workspace` bucket runs the merge-gating
+// concurrency, native-build, downstream-release governance, publish dry-run,
+// and .d.ts rewrite contracts. A local full run also exercises release notes
+// and link-omp. (A `ci-test-ts.test.ts` entry used to sit here but the file
+// never existed — bun silently ignores unmatched filters when at least one
+// other filter matches.)
 const repoScriptTests = [
 	"scripts/ci-concurrency.test.ts",
+	"scripts/downstream-release-contract.test.ts",
 	"scripts/ci-build-native.test.ts",
 	"scripts/ci-release-notes.test.ts",
 	"scripts/ci-release-publish.test.ts",
@@ -356,6 +357,7 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 						...onlyFailuresArgs,
 						"scripts/ci-concurrency.test.ts",
 						"scripts/ci-build-native.test.ts",
+						"scripts/downstream-release-contract.test.ts",
 						"scripts/ci-release-publish.test.ts",
 						"scripts/fix-dts-extensions.test.ts",
 					],

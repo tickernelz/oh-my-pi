@@ -12,6 +12,15 @@
 - Fixed the Docker `natives-builder` stage failing to build releases ≥ 17.1.1: the native audio stack added bindgen (miniaudio needs libclang) and a bundled-opus CMake build (needs cmake + make), none of which were installed in the slim builder image.
 - Fixed `omp usage` duplicating org-less legacy accounts as "no usage data" rows whenever any sibling report carried an organization (mixed pools of pre-org-capture rows and fresh org-scoped logins): an org-less account is now covered by its own org-less report, while org-attributed sibling reports still never count as its coverage.
 - `omp usage` revalidates the broker credential snapshot before rendering: live usage reports were previously paired with a disk-cached account list up to an hour old, so a just-completed re-login (org-less row upserted to org-scoped) rendered as a phantom duplicate until the cache expired.
+- Added Lossless Context Management project catalog and explicit current/cross-project retrieval: gated `lcm_search`, `lcm_describe`, `lcm_recall`, and `lcm_cross_project_search` tools; bounded isolated `@smol` recall with redacted handles; and unified `/lcm` status, doctor, explicit current/project rebuild, retention-aware GC, search, describe, and project operations.
+- Added the opt-in native Lossless context engine: per-project SQLite stores reconcile the committed journal, build immutable leased summary DAGs with host-owned side completions, project branch-aware history before extensions, fail open to native compaction, and support lazy project backfill plus settings/onboarding surfaces.
+- Added a transient `historicalContext` message lane that lowers citation-bearing history to untrusted agent-attributed user data for every provider while rejecting it from journals, replication, exports, and share snapshots.
+
+### Changed
+
+- Replaced upstream self-update and install publication paths with authenticated private-fork prereleases: compiled binaries report exact upstream/downstream/LCM provenance, verify a pinned Ed25519 signature over `SHA256SUMS`, and preserve the current executable on every verification failure.
+- Private release checks and downloads now authenticate with `GH_TOKEN`, `GITHUB_TOKEN`, or the existing GitHub CLI login; bootstrap guidance uses `gh api` so a private repository never depends on inaccessible raw URLs.
+- Project `.omp/config.yml` now applies only supported project-scoped model roles, autocomplete display limits, Lossless context selection, and garbage-collection controls, while normal project `settings.json` providers retain their existing precedence; all four LCM retrieval tools now have discoverable `omp://` documentation.
 
 ## [17.1.3] - 2026-07-24
 

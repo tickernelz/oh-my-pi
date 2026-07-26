@@ -934,9 +934,9 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	// Output wire events as JSON; renderer-only projection evidence stays local.
 	session.subscribe(event => {
-		output(event);
+		if (event.type !== "lcm_projection") output(event);
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);

@@ -4,13 +4,16 @@
   "name": "@oh-my-pi/typescript-edit-benchmark",
   "version": "0.0.1",
   "description": "Edit benchmark suite using TypeScript source code mutations",
-  "homepage": "https://omp.sh",
+  "homepage": "https://github.com/tickernelz/oh-my-pi#readme",
   "author": "Can Boluk",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/can1357/oh-my-pi.git",
+    "url": "git+https://github.com/tickernelz/oh-my-pi.git",
     "directory": "packages/typescript-edit-benchmark"
+  },
+  "bugs": {
+    "url": "https://github.com/tickernelz/oh-my-pi/issues"
   },
   "exports": {
     "./*": {

@@ -141,6 +141,31 @@ describe("settings layout", () => {
 		expect(defs[2]?.condition?.()).toBe(true);
 	});
 
+	it("exposes reload-bound lossless context settings from the schema", () => {
+		const defs = getSettingsForTab("context");
+		const engine = defs.find(def => def.path === "context.engine");
+		const summaryModel = defs.find(def => def.path === "context.lossless.summaryModel");
+
+		expect(engine).toMatchObject({
+			type: "enum",
+			label: "Context Engine",
+			group: "General",
+			values: ["native", "lossless"],
+		});
+		expect(engine?.description.toLowerCase()).toContain("reload");
+		expect(summaryModel).toMatchObject({
+			type: "submenu",
+			label: "Lossless Summary Model",
+			group: "General",
+			options: [],
+		});
+		expect(summaryModel?.description).toContain("@smol");
+		expect(summaryModel?.condition?.()).toBe(false);
+
+		Settings.instance.set("context.engine", "lossless");
+		expect(summaryModel?.condition?.()).toBe(true);
+	});
+
 	it("exposes ask.enabled as a boolean under Available Tools", () => {
 		const def = getSettingsForTab("tools").find(def => def.path === "ask.enabled");
 

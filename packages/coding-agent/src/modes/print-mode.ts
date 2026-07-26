@@ -54,6 +54,7 @@ function stripProviderPayload<T extends AgentMessage>(message: T): T {
  *   is printed. The authoritative message follows in `message_end`.
  * - `providerPayload` is transport-native replay state, opaque and useless
  *   outside this process.
+ * - Renderer-only `lcm_projection` evidence stays in memory and is omitted.
  */
 export function printableEvent(event: AgentSessionEvent): unknown {
 	switch (event.type) {
@@ -79,6 +80,8 @@ export function printableEvent(event: AgentSessionEvent): unknown {
 			};
 		case "agent_end":
 			return { ...event, messages: event.messages.map(stripProviderPayload) };
+		case "lcm_projection":
+			return undefined;
 		default:
 			return event;
 	}
@@ -170,9 +173,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				});
 			}
 		}
-		// In JSON mode, output all events
+		// Renderer-only events remain in memory even in JSON mode.
 		if (mode === "json") {
-			process.stdout.write(`${JSON.stringify(printableEvent(event))}\n`);
+			const printable = printableEvent(event);
+			if (printable !== undefined) process.stdout.write(`${JSON.stringify(printable)}\n`);
 		}
 	});
 

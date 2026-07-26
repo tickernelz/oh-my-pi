@@ -9,6 +9,7 @@ import { settings } from "../../config/settings";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
+import { lcmProjectionFingerprint } from "../../modes/components/lcm-projection-marker";
 import {
 	ReadToolGroupComponent,
 	readArgsCollapseIntoGroup,
@@ -43,6 +44,7 @@ import { StreamingRevealController } from "./streaming-reveal";
 import { streamingStringKeysForTool, ToolArgsRevealController } from "./tool-args-reveal";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
+type LcmProjection = Extract<AgentSessionEvent, { type: "lcm_projection" }>["projection"];
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 /**
@@ -107,6 +109,8 @@ export class EventController {
 	// mid-retry blip or the final settle — only the retry lifecycle events
 	// (never deferred) can tell them apart.
 	#retryPending = false;
+	#pendingLcmProjection?: { fingerprint: string; projection: LcmProjection };
+	#lastRenderedLcmProjectionFingerprint?: string;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
@@ -168,6 +172,7 @@ export class EventController {
 			message_start: e => this.#handleMessageStart(e),
 			message_update: e => this.#handleMessageUpdate(e),
 			message_end: e => this.#handleMessageEnd(e),
+			lcm_projection: e => this.#handleLcmProjection(e),
 			tool_execution_start: e => this.#handleToolExecutionStart(e),
 			tool_execution_update: e => this.#handleToolExecutionUpdate(e),
 			tool_execution_end: e => this.#handleToolExecutionEnd(e),
@@ -342,6 +347,8 @@ export class EventController {
 		this.#lastAssistantComponent = undefined;
 		this.#pinnedErrorComponent = undefined;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
+		this.#pendingLcmProjection = undefined;
+		this.#lastRenderedLcmProjectionFingerprint = undefined;
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
 		for (const timer of this.#ircExpiryTimers.values()) {
@@ -429,6 +436,10 @@ export class EventController {
 		this.#resetReadGroup();
 		this.#resolveDisplaceableTodo();
 		this.#lastAssistantComponent = undefined;
+		// A projection belongs only to the response in the turn that produced it.
+		// Keep the last rendered fingerprint across turns for meaningful-boundary
+		// dedupe, but never carry an unconsumed marker into a later turn.
+		this.#pendingLcmProjection = undefined;
 		// Restore the previous turn's inline error in the transcript before dropping
 		// the banner, so the error stays in history once the banner is gone.
 		this.#pinnedErrorComponent?.setErrorPinned(false);
@@ -446,6 +457,13 @@ export class EventController {
 		this.ctx.ensureLoadingAnimation();
 		setTerminalTitleState("working");
 		this.ctx.ui.requestRender();
+	}
+
+	async #handleLcmProjection(event: Extract<AgentSessionEvent, { type: "lcm_projection" }>): Promise<void> {
+		const fingerprint = lcmProjectionFingerprint(event.projection);
+		if (!fingerprint || fingerprint === this.#lastRenderedLcmProjectionFingerprint) return;
+		if (fingerprint === this.#pendingLcmProjection?.fingerprint) return;
+		this.#pendingLcmProjection = { fingerprint, projection: event.projection };
 	}
 
 	async #handleMessageStart(event: Extract<AgentSessionEvent, { type: "message_start" }>): Promise<void> {
@@ -521,6 +539,12 @@ export class EventController {
 		} else if (event.message.role === "assistant") {
 			this.#lastVisibleBlockCount = 0;
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
+			const lcmProjection = this.#pendingLcmProjection;
+			if (lcmProjection) {
+				this.ctx.streamingComponent.setLcmProjection(lcmProjection.projection);
+				this.#lastRenderedLcmProjectionFingerprint = lcmProjection.fingerprint;
+				this.#pendingLcmProjection = undefined;
+			}
 			this.ctx.streamingMessage = event.message;
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
 			this.#streamingReveal.begin(

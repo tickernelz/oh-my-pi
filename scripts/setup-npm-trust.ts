@@ -37,11 +37,12 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { LEAF_TARGETS } from "../packages/natives/scripts/gen-npm-packages.ts";
 import { packages } from "./ci-release-publish.ts";
+import { refuseOfficialChannelPublishing } from "./official-publishing-disabled";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const MIN_NPM = "11.16.0";
 const DEFAULT_WORKFLOW = "ci.yml";
-const FALLBACK_REPO = "can1357/oh-my-pi";
+const FALLBACK_REPO = "tickernelz/oh-my-pi";
 const PLACEHOLDER_VERSION = "0.0.0";
 
 interface NativeLeafTarget {
@@ -314,6 +315,7 @@ function shouldThrottle(first: boolean): boolean {
 type Outcome = "configured" | "already" | "replaced" | "missing" | "failed";
 
 async function main(): Promise<void> {
+	refuseOfficialChannelPublishing("npm trusted-publisher configuration");
 	const opts = parseArgs(process.argv.slice(2));
 
 	const npmVersion = (await $`npm --version`.nothrow().quiet()).stdout.toString().trim();

@@ -1,10 +1,31 @@
-import { Box, type Component, Markdown } from "@oh-my-pi/pi-tui";
+import { Box, type Component, Ellipsis, Markdown, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
-import type { BranchSummaryMessage, CompactionSummaryMessage, CustomMessage } from "../../session/messages";
+import type {
+	BranchSummaryMessage,
+	CompactionSummaryMessage,
+	CustomMessage,
+	LcmFallbackCategory,
+} from "../../session/messages";
 
 interface SummaryDividerOptions {
 	label: () => string;
 	detailMarkdown: () => string;
+}
+
+function lcmFallbackExplanation(category: LcmFallbackCategory): string {
+	switch (category) {
+		case "deadline":
+			return "The bounded LCM projection deadline elapsed, so OMP failed open to native compaction.";
+		case "provider":
+			return "The LCM summary provider was unavailable or failed, so OMP failed open to native compaction.";
+		case "store":
+			return "The derived LCM store could not supply a complete projection, so OMP failed open to native compaction.";
+		case "unfit":
+			return "LCM could not fit a complete historical projection inside the request budget, so OMP failed open to native compaction.";
+		default:
+			category satisfies never;
+			return "OMP failed open to native compaction.";
+	}
 }
 
 class SummaryDividerComponent implements Component {
@@ -47,8 +68,8 @@ class SummaryDividerComponent implements Component {
 		// ` label hint ` framed by rules on both sides.
 		const remaining = width - plainWidth - 2;
 		if (remaining < 4) {
-			// Too narrow for a framed rule — emit the bare label.
-			return theme.fg("muted", label);
+			// Too narrow for a framed rule — emit a truncated bare label.
+			return theme.fg("muted", truncateToWidth(label, width, Ellipsis.Ascii));
 		}
 		const left = Math.floor(remaining / 2);
 		const right = remaining - left;
@@ -84,15 +105,21 @@ class SummaryDividerComponent implements Component {
  */
 export class CompactionSummaryMessageComponent implements Component {
 	#divider: SummaryDividerComponent;
+	#lcmFallback?: LcmFallbackCategory;
 
 	constructor(private readonly message: CompactionSummaryMessage) {
+		const fallback: unknown = this.message.lcmFallback;
+		if (fallback === "deadline" || fallback === "provider" || fallback === "store" || fallback === "unfit") {
+			this.#lcmFallback = fallback;
+		}
 		this.#divider = new SummaryDividerComponent({
 			// A dead-end warning stamped by the progress guard badges the bar;
 			// the full text lives in the ctrl+o detail block below.
-			label: () =>
-				this.message.warning
-					? `${theme.icon.camera} compacted ${theme.fg("warning", theme.icon.warning)}`
-					: `${theme.icon.camera} compacted`,
+			label: () => {
+				const fallback = this.#lcmFallback ? ` ${theme.sep.dot.trim()} LCM fallback: ${this.#lcmFallback}` : "";
+				const warning = this.message.warning ? ` ${theme.fg("warning", theme.icon.warning)}` : "";
+				return `${theme.icon.camera} compacted${fallback}${warning}`;
+			},
 			detailMarkdown: () => this.#detailMarkdown(),
 		});
 	}
@@ -114,8 +141,11 @@ export class CompactionSummaryMessageComponent implements Component {
 		const frameCount = this.message.images?.length ?? 0;
 		const frameNote =
 			frameCount > 0 ? `\n\n_${frameCount} snapcompact frame${frameCount === 1 ? "" : "s"} attached_` : "";
+		const fallbackNote = this.#lcmFallback
+			? `\n\n${theme.icon.warning} **LCM fallback (${this.#lcmFallback}):** ${lcmFallbackExplanation(this.#lcmFallback)}`
+			: "";
 		const warningNote = this.message.warning ? `\n\n${theme.icon.warning} **Warning:** ${this.message.warning}` : "";
-		return `**Compacted from ${tokenStr} tokens**${warningNote}\n\n${this.message.summary}${frameNote}`;
+		return `**Compacted from ${tokenStr} tokens**${fallbackNote}${warningNote}\n\n${this.message.summary}${frameNote}`;
 	}
 }
 

@@ -94,6 +94,49 @@ it("reports overlay provenance for a null tombstone that blocks the global fallb
 	}
 });
 
+it("reports generic setting-leaf provenance across merge precedence", async () => {
+	const root = path.join(os.tmpdir(), `setting-provenance-${Snowflake.next()}`);
+	const agentDir = path.join(root, "agent");
+	const projectDir = path.join(root, "project");
+	const globalOnlyDir = path.join(root, "global-only");
+	const overlayPath = path.join(root, "overlay.yml");
+	const settingPath = "context.lossless.summaryModel" as const;
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.mkdirSync(path.join(projectDir, ".omp"), { recursive: true });
+	fs.mkdirSync(globalOnlyDir, { recursive: true });
+	fs.writeFileSync(path.join(agentDir, "config.yml"), "context:\n  lossless:\n    summaryModel: global/model\n");
+	fs.writeFileSync(
+		path.join(projectDir, ".omp", "config.yml"),
+		"context:\n  lossless:\n    summaryModel: project/model\n",
+	);
+	fs.writeFileSync(overlayPath, "context:\n  lossless:\n    summaryModel: overlay/model\n");
+
+	try {
+		const runtime = await Settings.loadReadOnly({
+			cwd: projectDir,
+			agentDir,
+			configFiles: [overlayPath],
+			overrides: { [settingPath]: "runtime/model" },
+		});
+		expect(runtime.get(settingPath)).toBe("runtime/model");
+		expect(runtime.getSettingProvenance(settingPath)).toBe("runtime");
+
+		runtime.clearOverride(settingPath);
+		expect(runtime.get(settingPath)).toBe("overlay/model");
+		expect(runtime.getSettingProvenance(settingPath)).toBe("overlay");
+
+		const project = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		expect(project.get(settingPath)).toBe("project/model");
+		expect(project.getSettingProvenance(settingPath)).toBe("project");
+
+		const global = await Settings.loadReadOnly({ cwd: globalOnlyDir, agentDir });
+		expect(global.get(settingPath)).toBe("global/model");
+		expect(global.getSettingProvenance(settingPath)).toBe("global");
+		expect(Settings.isolated().getSettingProvenance(settingPath)).toBe("default");
+	} finally {
+		if (fs.existsSync(root)) removeSyncWithRetries(root);
+	}
+});
 describe("Settings.reloadForCwd", () => {
 	let settingsState: SettingsTestState | undefined;
 
@@ -314,6 +357,43 @@ describe("Settings.reloadForCwd", () => {
 
 			expect(settings.getModelRole("default")).toBe("anthropic/native");
 			expect(settings.getProjectModelRole("default")).toBe("anthropic/native");
+			expect(settings.get("compaction.enabled")).toBe(true);
+		});
+
+		it("merges only native context overrides over global settings", async () => {
+			await Bun.write(
+				path.join(agentDir, "config.yml"),
+				YAML.stringify(
+					{
+						context: { engine: "native", lossless: { summaryModel: "global-summary" } },
+					},
+					null,
+					2,
+				),
+			);
+			fs.mkdirSync(path.join(startDir, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(startDir, ".omp", "config.yml"),
+				YAML.stringify({ context: { engine: "lossless" }, compaction: { enabled: false } }, null, 2),
+			);
+			fs.mkdirSync(path.join(bareProject, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(bareProject, ".omp", "config.yml"),
+				YAML.stringify(
+					{ context: { lossless: { summaryModel: "project-summary" } }, compaction: { enabled: false } },
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			expect(settings.get("context.engine")).toBe("lossless");
+			expect(settings.get("context.lossless.summaryModel")).toBe("global-summary");
+			expect(settings.get("compaction.enabled")).toBe(true);
+
+			await settings.reloadForCwd(bareProject);
+			expect(settings.get("context.engine")).toBe("native");
+			expect(settings.get("context.lossless.summaryModel")).toBe("project-summary");
 			expect(settings.get("compaction.enabled")).toBe(true);
 		});
 

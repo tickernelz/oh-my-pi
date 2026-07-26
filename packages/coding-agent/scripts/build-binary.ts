@@ -2,6 +2,7 @@
 
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import { resolveBuildProvenanceFromEnvironment } from "@oh-my-pi/pi-utils/version";
 import { compileCodingAgent } from "./compile-binary";
 
 const packageDir = path.join(import.meta.dir, "..");
@@ -98,6 +99,7 @@ async function main(): Promise<void> {
 				entrypoint: path.join(packageDir, "src", "cli.ts"),
 				outfile: outputPath,
 				transformersVersion,
+				buildProvenance: resolveBuildProvenanceFromEnvironment(),
 				target: crossBuild?.target,
 				skipBuiltinCodesign: shouldAdhocSignDarwinBinary(crossBuild),
 			});

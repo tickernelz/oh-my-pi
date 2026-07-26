@@ -103,9 +103,11 @@ describe("generateFileMentionMessages path resolution", () => {
 		const cwd = await createTempDir();
 		// TTF header begins with a NUL run; auto-reading it as text would leak
 		// control bytes into the conversation (the reported bug).
-		await Bun.write(path.join(cwd, "Silver.ttf"), Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x4f, 0x53]));
+		const fontBytes = Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x4f, 0x53]);
+		const blobBytes = Buffer.from([0x4d, 0x5a, 0xff, 0xfe, 0xc0, 0xc0]);
+		await Bun.write(path.join(cwd, "Silver.ttf"), fontBytes);
 		// A non-NUL invalid-UTF8 blob must be refused too, not just NUL-bearing files.
-		await Bun.write(path.join(cwd, "blob.bin"), Buffer.from([0x4d, 0x5a, 0xff, 0xfe, 0xc0, 0xc0]));
+		await Bun.write(path.join(cwd, "blob.bin"), blobBytes);
 
 		const messages = await generateFileMentionMessages(["Silver.ttf", "blob.bin"], cwd);
 		expect(messages).toHaveLength(1);
@@ -119,5 +121,9 @@ describe("generateFileMentionMessages path resolution", () => {
 			expect(file.content).toContain("binary file");
 			expect(file.content).not.toContain("\u0000");
 		}
+		expect(message.files.map(file => file.contentHash)).toEqual([
+			new Bun.CryptoHasher("sha256").update(fontBytes).digest("hex"),
+			new Bun.CryptoHasher("sha256").update(blobBytes).digest("hex"),
+		]);
 	});
 });

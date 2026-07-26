@@ -150,6 +150,9 @@ export class UiHelpers {
 				this.ctx.chatContainer.addChild(component);
 				break;
 			}
+			case "historicalContext":
+				// Transform-only transient context has no transcript representation.
+				break;
 			case "hookMessage":
 			case "custom": {
 				if (message.display) {
@@ -265,10 +268,18 @@ export class UiHelpers {
 				const cached = options?.reuseSettledComponent
 					? this.ctx.transcriptMessageComponents.get(message)
 					: undefined;
-				const assistantComponent =
-					cached instanceof AssistantMessageComponent
-						? cached
-						: createAssistantMessageComponent(this.ctx, splitAssistantMessageToolTimeline(message).beforeTools);
+				let assistantComponent: AssistantMessageComponent;
+				if (cached instanceof AssistantMessageComponent) {
+					assistantComponent = cached;
+					// Projection evidence is response-scoped and never persisted. Reusing a
+					// settled component must not make replay fabricate the live-only marker.
+					assistantComponent.setLcmProjection(undefined);
+				} else {
+					assistantComponent = createAssistantMessageComponent(
+						this.ctx,
+						splitAssistantMessageToolTimeline(message).beforeTools,
+					);
+				}
 				if (cached !== assistantComponent) {
 					this.ctx.transcriptMessageComponents.set(message, assistantComponent);
 				}

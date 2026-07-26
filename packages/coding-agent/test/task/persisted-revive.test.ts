@@ -43,14 +43,18 @@ function createRevivedSession(activeToolNames: string[][]): AgentSession {
 	} as unknown as AgentSession;
 }
 
-async function createPersistedSession(cwd: string, restrictToolNames?: boolean): Promise<string> {
+async function createPersistedSession(
+	cwd: string,
+	restrictToolNames?: boolean,
+	tools: string[] = ["read", "yield"],
+): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
 	manager.appendSessionInit({
 		systemPrompt: "persisted prompt",
 		task: "persisted task",
-		tools: ["read", "yield"],
+		tools,
 		restrictToolNames,
 	});
 	manager.appendMessage({
@@ -74,7 +78,7 @@ async function createPersistedSession(cwd: string, restrictToolNames?: boolean):
 	return sessionFile;
 }
 
-function createFactory(cwd: string) {
+function createFactory(cwd: string, settings = Settings.isolated()) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -85,7 +89,7 @@ function createFactory(cwd: string) {
 		session: parentSession,
 		authStorage: {} as never,
 		modelRegistry: { authStorage: {} } as ModelRegistry,
-		settings: Settings.isolated(),
+		settings,
 		enableLsp: true,
 	});
 }
@@ -130,6 +134,24 @@ describe("persisted subagent revival", () => {
 		expect(hostileMcpGetTools).not.toHaveBeenCalled();
 		expect(attemptedDiscovery).toEqual([]);
 		expect(activeToolNames).toEqual([["read", "yield"]]);
+	});
+
+	it("does not lend the current Main LCM runtime to a cold-revived child", async () => {
+		const cwd = makeTempDir("@pi-lcm-isolated-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, ["read", "lcm_expand", "yield"]);
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]) } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, Settings.isolated({ "context.engine": "lossless" }))(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(capturedOptions?.toolNames).toContain("lcm_expand");
+		expect(capturedOptions?.parentLcmRuntime).toBeUndefined();
 	});
 
 	it("preserves normal revival capability wiring for contracts without the marker", async () => {

@@ -107,7 +107,7 @@ export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number 
  * Parse an omp changelog marker version into comparable parts.
  */
 export function parseChangelogVersion(version: string | undefined): ChangelogEntry | undefined {
-	const match = version?.match(/^(\d+)\.(\d+)\.(\d+)$/);
+	const match = version?.match(/^(\d+)\.(\d+)\.(\d+)(?:-lcm\.(?:0|[1-9]\d*))?$/);
 	if (!match) {
 		return undefined;
 	}
@@ -169,12 +169,16 @@ export function selectStartupChangelog(
 	currentVersion: string,
 ): StartupChangelogSelection {
 	const parsedLastVersion = parseChangelogVersion(lastVersion);
-	if (!parsedLastVersion) {
+	const parsedCurrentVersion = parseChangelogVersion(currentVersion);
+	if (!parsedLastVersion || !parsedCurrentVersion) {
 		return { markdown: undefined, persistCurrentVersion: true, truncated: false, selectedEntries: 0 };
 	}
 	const markerVersion = lastVersion ?? "";
 	if (markerVersion === currentVersion) {
 		return { markdown: undefined, persistCurrentVersion: false, truncated: false, selectedEntries: 0 };
+	}
+	if (compareVersions(parsedLastVersion, parsedCurrentVersion) === 0) {
+		return { markdown: undefined, persistCurrentVersion: true, truncated: false, selectedEntries: 0 };
 	}
 
 	const newEntries = getNewEntries(entries, markerVersion).slice(0, RECENT_CHANGELOG_ENTRY_LIMIT);

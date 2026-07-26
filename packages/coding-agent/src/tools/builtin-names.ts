@@ -27,6 +27,11 @@ export const BUILTIN_TOOL_NAMES = [
 	"reflect",
 	"learn",
 	"manage_skill",
+	"lcm_search",
+	"lcm_describe",
+	"lcm_recall",
+	"lcm_expand",
+	"lcm_cross_project_search",
 ] as const;
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];

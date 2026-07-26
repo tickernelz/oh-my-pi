@@ -101,6 +101,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	losslessContextActive: () => {
+		try {
+			return Settings.instance.get("context.engine") === "lossless";
+		} catch {
+			return false;
+		}
+	},
 	hindsightActive: () => {
 		try {
 			return Settings.instance.get("memory.backend") === "hindsight";

@@ -725,6 +725,61 @@ class GatedAtomicFailureStorage extends MemorySessionStorage {
 	}
 }
 
+class GatedAtomicNotificationStorage extends MemorySessionStorage {
+	#nextWrite:
+		| {
+				error: Error | undefined;
+				started: PromiseWithResolvers<void>;
+				release: PromiseWithResolvers<void>;
+		  }
+		| undefined;
+	#nextTitleUpdate:
+		| {
+				started: PromiseWithResolvers<void>;
+				release: PromiseWithResolvers<void>;
+		  }
+		| undefined;
+
+	gateNextAtomicWrite(error?: Error): AtomicFailureHandle {
+		if (this.#nextWrite) throw new Error("Atomic write gate already armed");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		this.#nextWrite = { error, started, release };
+		return { started: started.promise, release: release.resolve };
+	}
+
+	gateNextTitleUpdate(): AtomicFailureHandle {
+		if (this.#nextTitleUpdate) throw new Error("Title update gate already armed");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		this.#nextTitleUpdate = { started, release };
+		return { started: started.promise, release: release.resolve };
+	}
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		const write = this.#nextWrite;
+		if (!write) {
+			await super.writeTextAtomic(path, content, options);
+			return;
+		}
+		this.#nextWrite = undefined;
+		write.started.resolve();
+		await write.release.promise;
+		if (write.error) throw write.error;
+		await super.writeTextAtomic(path, content, options);
+	}
+
+	override async updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void> {
+		const gate = this.#nextTitleUpdate;
+		if (gate) {
+			this.#nextTitleUpdate = undefined;
+			gate.started.resolve();
+			await gate.release.promise;
+		}
+		await super.updateSessionTitle(path, update);
+	}
+}
+
 class ScriptedAtomicFailureStorage extends MemorySessionStorage {
 	readonly behaviors: Array<{ commit: boolean; error: Error }> = [];
 
@@ -740,6 +795,65 @@ class ScriptedAtomicFailureStorage extends MemorySessionStorage {
 }
 
 describe("SessionManager atomic entry batches", () => {
+	it("notifies independent observers only after each entry is durable", async () => {
+		const storage = new GatedAtomicNotificationStorage();
+		const manager = SessionManager.create("/cwd", "/sessions", storage);
+		manager.appendCustomEntry("root");
+		await manager.ensureOnDisk();
+
+		const first: string[] = [];
+		const second: string[] = [];
+		const unsubscribeFirst = manager.subscribeToDurableEntries(entry => {
+			first.push(entry.type === "custom" ? entry.customType : entry.type);
+		});
+		manager.subscribeToDurableEntries(() => {
+			throw new Error("observer failed");
+		});
+		manager.subscribeToDurableEntries(entry => {
+			second.push(entry.type === "custom" ? entry.customType : entry.type);
+		});
+
+		manager.appendCustomEntry("ordinary");
+		expect(first).toEqual(["ordinary"]);
+		expect(second).toEqual(["ordinary"]);
+
+		const titleGate = storage.gateNextTitleUpdate();
+		const titleChange = manager.setSessionName("Durable title", "user");
+		await titleGate.started;
+		expect(first).toEqual(["ordinary"]);
+		expect(second).toEqual(["ordinary"]);
+		titleGate.release();
+		await titleChange;
+		expect(first).toEqual(["ordinary", "title_change"]);
+		expect(second).toEqual(["ordinary", "title_change"]);
+
+		const successGate = storage.gateNextAtomicWrite();
+		const committed = manager.appendEntriesAtomically(() => manager.appendCustomEntry("committed"));
+		await successGate.started;
+		expect(first).toEqual(["ordinary", "title_change"]);
+		expect(second).toEqual(["ordinary", "title_change"]);
+		successGate.release();
+		await committed;
+		expect(first).toEqual(["ordinary", "title_change", "committed"]);
+		expect(second).toEqual(["ordinary", "title_change", "committed"]);
+
+		const failureGate = storage.gateNextAtomicWrite(new Error("batch publish failed"));
+		const rolledBack = manager.appendEntriesAtomically(() => manager.appendCustomEntry("rolled-back"));
+		await failureGate.started;
+		expect(first).toEqual(["ordinary", "title_change", "committed"]);
+		expect(second).toEqual(["ordinary", "title_change", "committed"]);
+		failureGate.release();
+		await expect(rolledBack).rejects.toThrow("batch publish failed");
+		expect(first).toEqual(["ordinary", "title_change", "committed"]);
+		expect(second).toEqual(["ordinary", "title_change", "committed"]);
+
+		unsubscribeFirst();
+		await manager.appendEntriesAtomically(() => manager.appendCustomEntry("after-unsubscribe"));
+		expect(first).toEqual(["ordinary", "title_change", "committed"]);
+		expect(second).toEqual(["ordinary", "title_change", "committed", "after-unsubscribe"]);
+		await manager.close();
+	});
+
 	it("restores the exact active branch when an atomic batch publish fails", async () => {
 		const storage = new GatedAtomicFailureStorage();
 		const manager = SessionManager.create("/cwd", "/sessions", storage);

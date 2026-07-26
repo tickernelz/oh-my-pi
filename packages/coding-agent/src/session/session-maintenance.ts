@@ -64,7 +64,7 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import { findCompactMode } from "./compact-modes";
-import { convertToLlm, stripImagesFromMessage } from "./messages";
+import { convertToLlm, type LcmFallbackCategory, stripImagesFromMessage } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	resolveCompactionConfiguredTarget,
@@ -186,6 +186,8 @@ export interface SessionMaintenanceHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	messages(): AgentMessage[];
+	losslessOwnsRequest(messages: AgentMessage[], signal?: AbortSignal): Promise<boolean>;
+	takeLosslessFallbackCategory?(): LcmFallbackCategory | undefined;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -967,6 +969,7 @@ export class SessionMaintenance {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+		if (await this.#host.losslessOwnsRequest([...this.#host.messages(), ...messages])) return;
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
 		// the history at all. The post-turn threshold path already promotes before
@@ -1042,6 +1045,7 @@ export class SessionMaintenance {
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+		if (await this.#host.losslessOwnsRequest(activeMessages, signal)) return;
 
 		// Promote to a larger-context sibling before compacting, mirroring the
 		// pre-prompt (runPrePromptCompactionIfNeeded) and post-turn threshold
@@ -1137,6 +1141,14 @@ export class SessionMaintenance {
 			// MUST keep the only assistant message explaining why the turn
 			// stopped. The branch entry is dropped further down, but only on the
 			// paths that actually schedule a retry/compaction.
+			const losslessOwnsRequest = await this.#host.losslessOwnsRequest(this.#host.messages());
+			if (losslessOwnsRequest) {
+				if (autoContinue) {
+					this.#host.scheduleAgentContinue({ delayMs: 100, generation });
+					return COMPACTION_CHECK_CONTINUATION;
+				}
+				return COMPACTION_CHECK_NONE;
+			}
 			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
 
 			// Try context promotion first - switch to a larger model and retry without compacting
@@ -1238,6 +1250,12 @@ export class SessionMaintenance {
 			logger.warn("response.incomplete with no recovery path (promotion + compaction both unavailable)", {
 				model: `${assistantMessage.provider}/${assistantMessage.model}`,
 			});
+			return COMPACTION_CHECK_NONE;
+		}
+
+		// A ready Lossless projection owns successful automatic-maintenance turns.
+		// Check before native pruning so the authoritative journal stays untouched.
+		if (assistantMessage.stopReason !== "error" && (await this.#host.losslessOwnsRequest(this.#host.messages()))) {
 			return COMPACTION_CHECK_NONE;
 		}
 
@@ -1983,6 +2001,7 @@ export class SessionMaintenance {
 			result.details,
 			false,
 			result.preserveData,
+			staleEntry.lcmFallback,
 		);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
@@ -2614,6 +2633,7 @@ export class SessionMaintenance {
 				return COMPACTION_CHECK_NONE;
 			}
 
+			const lcmFallback = this.#host.takeLosslessFallbackCategory?.();
 			this.#host.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
@@ -2622,6 +2642,7 @@ export class SessionMaintenance {
 				details,
 				fromExtension,
 				preserveData,
+				lcmFallback,
 			);
 			const newEntries = this.#host.sessionManager.getEntries();
 			const sessionContext = this.#host.buildDisplaySessionContext();

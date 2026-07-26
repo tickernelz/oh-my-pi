@@ -4,8 +4,13 @@
  * (rounded corners, sharp tee/cross junctions) and the `border`/`accent` theme
  * colors so all outlined overlays read identically.
  */
-import { padding, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { Ellipsis, padding, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { theme } from "../theme/theme";
+
+/** Match truncation markers to the active symbol preset. */
+function overlayEllipsis(): Ellipsis {
+	return theme.getSymbolPreset() === "ascii" ? Ellipsis.Ascii : Ellipsis.Unicode;
+}
 
 /** Pad or truncate a (possibly ANSI-styled) string to exactly `width` columns. */
 export function fit(text: string, width: number): string {
@@ -13,7 +18,7 @@ export function fit(text: string, width: number): string {
 	const w = visibleWidth(text);
 	if (w === width) return text;
 	if (w < width) return text + padding(width - w);
-	const cut = truncateToWidth(text, width);
+	const cut = truncateToWidth(text, width, overlayEllipsis());
 	const cw = visibleWidth(cut);
 	return cw < width ? cut + padding(width - cw) : cut;
 }
@@ -27,7 +32,7 @@ export function topBorder(width: number, title: string): string {
 	const box = theme.boxRound;
 	const inner = Math.max(0, width - 2);
 	if (!title) return paint(box.topLeft + box.horizontal.repeat(inner) + box.topRight);
-	const shown = truncateToWidth(` ${title} `, Math.max(0, inner - 2));
+	const shown = truncateToWidth(` ${title} `, Math.max(0, inner - 2), overlayEllipsis());
 	const fillWidth = Math.max(0, inner - 1 - visibleWidth(shown));
 	return (
 		paint(box.topLeft + box.horizontal) +
@@ -79,7 +84,7 @@ export function topBorderSplit(width: number, title: string, sidebarWidth: numbe
 	if (!title) {
 		left = paint(box.topLeft + box.horizontal.repeat(leftLen));
 	} else {
-		const shown = truncateToWidth(` ${title} `, Math.max(0, leftLen - 1));
+		const shown = truncateToWidth(` ${title} `, Math.max(0, leftLen - 1), overlayEllipsis());
 		const fillWidth = Math.max(0, leftLen - 1 - visibleWidth(shown));
 		left =
 			paint(box.topLeft + box.horizontal) +

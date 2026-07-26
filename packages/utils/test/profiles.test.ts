@@ -10,6 +10,7 @@ import {
 	getAgentDir,
 	getConfigAgentDirName,
 	getConfigRootDir,
+	getLcmDir,
 	getPythonGatewayDir,
 	getSessionsDir,
 	getStatsDbPath,
@@ -127,6 +128,7 @@ describe("profile directories", () => {
 		expect(getConfigAgentDirName()).toBe(path.join(configDir, "profiles", "work", "agent"));
 		expect(getAgentDir()).toBe(agent);
 		expect(getAgentDbPath()).toBe(path.join(agent, "agent.db"));
+		expect(getLcmDir()).toBe(path.join(agent, "lcm"));
 		expect(getSessionsDir()).toBe(path.join(agent, "sessions"));
 		expect(getStatsDbPath()).toBe(path.join(root, "stats.db"));
 	});
@@ -156,6 +158,7 @@ describe("profile directories", () => {
 
 		expect(getAgentDbPath()).toBe(path.join(process.env.XDG_DATA_HOME, "omp", "profiles", "work", "agent.db"));
 		expect(getSessionsDir()).toBe(path.join(process.env.XDG_DATA_HOME, "omp", "profiles", "work", "sessions"));
+		expect(getLcmDir()).toBe(path.join(process.env.XDG_DATA_HOME, "omp", "profiles", "work", "lcm"));
 		expect(getPythonGatewayDir()).toBe(
 			path.join(process.env.XDG_STATE_HOME, "omp", "profiles", "work", "python-gateway"),
 		);
@@ -203,6 +206,8 @@ describe("profile directories", () => {
 		setAgentDir(customAgentDir);
 		expect(getAgentDir()).toBe(customAgentDir);
 		expect(process.env.PI_CODING_AGENT_DIR).toBe(customAgentDir);
+		expect(getLcmDir()).toBe(path.join(customAgentDir, "lcm"));
+		expect(getLcmDir(path.join(tempRoot, "explicit-agent"))).toBe(path.join(tempRoot, "explicit-agent", "lcm"));
 
 		setProfile("work");
 		expect(getActiveProfile()).toBe("work");

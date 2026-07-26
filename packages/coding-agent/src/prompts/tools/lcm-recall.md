@@ -1,0 +1,1 @@
+Answer a question from bounded, explicitly selected current-session LCM source slices. The synthesis runs as an isolated toolless `@smol` one-shot with no inherited conversation, journal access, store access, or child session, and returns executable opaque source handles.

@@ -61,6 +61,8 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+export type SettingProvenance = "runtime" | "overlay" | "project" | "global" | "default";
+
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -92,6 +94,41 @@ function getByPath(obj: RawSettings, segments: readonly string[]): unknown {
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;
+}
+
+/** Whether an object owns the complete leaf path, even when its value is undefined. */
+function hasByPath(obj: RawSettings, segments: readonly string[]): boolean {
+	let current: unknown = obj;
+	for (let i = 0; i < segments.length; i++) {
+		if (!isRecord(current) || !Object.hasOwn(current, segments[i])) return false;
+		if (i === segments.length - 1) return true;
+		current = current[segments[i]];
+	}
+	return false;
+}
+
+/** Delete one leaf and prune only now-empty object ancestors. */
+function deleteByPath(obj: RawSettings, segments: readonly string[]): boolean {
+	if (segments.length === 0) return false;
+	const parents: Array<{ parent: RawSettings; key: string }> = [];
+	let current = obj;
+	for (let i = 0; i < segments.length - 1; i++) {
+		const key = segments[i];
+		const child = current[key];
+		if (!isRecord(child)) return false;
+		parents.push({ parent: current, key });
+		current = child;
+	}
+	const leaf = segments[segments.length - 1];
+	if (!Object.hasOwn(current, leaf)) return false;
+	delete current[leaf];
+	for (let i = parents.length - 1; i >= 0; i--) {
+		const { parent, key } = parents[i];
+		const child = parent[key];
+		if (!isRecord(child) || Object.keys(child).length > 0) break;
+		delete parent[key];
+	}
+	return true;
 }
 
 const SETTING_PATH_SEGMENTS: Record<SettingPath, readonly string[]> = Object.fromEntries(
@@ -472,6 +509,16 @@ export class Settings {
 		return getByPath(this.#merged, SETTING_PATH_SEGMENTS[path]) !== undefined;
 	}
 
+	/** Layer that owns an effective setting leaf, in merge-precedence order. */
+	getSettingProvenance(path: SettingPath): SettingProvenance {
+		const segments = SETTING_PATH_SEGMENTS[path];
+		if (hasByPath(this.#overrides, segments)) return "runtime";
+		if (hasByPath(this.#configOverlay, segments)) return "overlay";
+		if (hasByPath(this.#projectSettingsForMerge(), segments)) return "project";
+		if (hasByPath(this.#global, segments)) return "global";
+		return "default";
+	}
+
 	/**
 	 * Set a setting value (sync).
 	 * Updates global settings and queues a background save.
@@ -491,6 +538,25 @@ export class Settings {
 		if (hook) {
 			hook(next, prev);
 		}
+		this.#fireEffectiveSettingChanged(path, next, prev);
+	}
+
+	/**
+	 * Delete a global setting leaf and queue a merge-safe save. Empty object
+	 * ancestors are pruned, while siblings at every level are preserved. The
+	 * deletion is recorded even when the loaded snapshot lacked the leaf, so an
+	 * explicit unset wins over a concurrent external addition.
+	 */
+	unset(path: SettingPath): void {
+		const prev = this.get(path);
+		deleteByPath(this.#global, SETTING_PATH_SEGMENTS[path]);
+		this.#modified.add(path);
+		this.#rebuildMerged();
+		const next = this.get(path);
+		this.#queueSave();
+
+		const hook = SETTING_HOOKS[path];
+		if (hook) hook(next, prev);
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
 
@@ -1092,17 +1158,35 @@ export class Settings {
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			let merged: RawSettings = {};
+			const nativeOverrides: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
-				if (item.level === "project") {
+				if (item.level !== "project") continue;
+				if (item._source.provider !== "native" || path.basename(item.path) !== "config.yml") {
 					merged = this.#deepMerge(merged, item.data as RawSettings);
+					continue;
+				}
+
+				// Keep the native project config surface intentionally narrow. Building one
+				// nested overlay preserves global/project-provider sibling values during merge.
+				for (const settingPath of [
+					"modelRoles",
+					"autocompleteMaxVisible",
+					"context.engine",
+					"context.lossless.summaryModel",
+					"gc.blobs",
+					"gc.archive",
+					"gc.wal",
+					"gc.coldArchiveAfterDays",
+					"gc.retainNewestGlobal",
+					"gc.retainNewestPerCwd",
+				] as const) {
+					const value = getByPath(item.data, SETTING_PATH_SEGMENTS[settingPath]);
+					if (value !== undefined) {
+						setByPath(nativeOverrides, [...SETTING_PATH_SEGMENTS[settingPath]], value);
+					}
 				}
 			}
-			const nativeProject = await this.#loadYaml(path.join(this.#cwd, ".omp", "config.yml"));
-			const nativeModelRoles = getByPath(nativeProject, ["modelRoles"]);
-			if (nativeModelRoles !== undefined) {
-				merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
-			}
-			return this.#migrateRawSettings(merged);
+			return this.#migrateRawSettings(this.#deepMerge(merged, nativeOverrides));
 		} catch {
 			return {};
 		}
@@ -1721,11 +1805,16 @@ export class Settings {
 				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
 
-				// Apply only our modified whole-value paths
+				// Apply only our modified whole-value paths. A missing local leaf
+				// is an explicit unset: delete it from the re-read file and prune
+				// only empty ancestors so concurrent sibling edits survive.
 				for (const modPath of modifiedPaths) {
 					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
+					if (hasByPath(this.#global, segments)) {
+						setByPath(current, segments, getByPath(this.#global, segments));
+					} else {
+						deleteByPath(current, segments);
+					}
 				}
 
 				// Merge only the model roles captured by this save. Then retain
