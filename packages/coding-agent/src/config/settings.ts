@@ -359,6 +359,10 @@ export class Settings {
 	#project: RawSettings = {};
 	/** Extra config.yml-style overlays passed by CLI */
 	#configOverlay: RawSettings = {};
+	/** Project settings file that most recently supplied shellPath. */
+	#projectShellPathSource: string | undefined;
+	/** Explicit config overlay that most recently supplied shellPath. */
+	#overlayShellPathSource: string | undefined;
 	/** Runtime overrides (not persisted) */
 	#overrides: RawSettings = {};
 	/** Merged view (global + project + overrides) */
@@ -659,8 +663,10 @@ export class Settings {
 		cloned.#configPath = this.#configPath;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
+		if (!this.#persist) cloned.#projectShellPathSource = this.#projectShellPathSource;
 		cloned.#configFiles = [...this.#configFiles];
 		cloned.#configOverlay = structuredClone(this.#configOverlay);
+		cloned.#overlayShellPathSource = this.#overlayShellPathSource;
 		cloned.#overrides = this.#buildOriginalOverrides();
 		cloned.#rebuildMerged();
 		cloned.#fireAllHooks();
@@ -719,7 +725,17 @@ export class Settings {
 	 */
 	getShellConfig() {
 		const shell = this.get("shellPath");
-		return procmgr.getShellConfig(shell);
+		let configSource = this.#configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		if (Object.hasOwn(this.#project, "shellPath")) {
+			configSource = this.#projectShellPathSource ?? "the active project configuration";
+		}
+		if (Object.hasOwn(this.#configOverlay, "shellPath")) {
+			configSource = this.#overlayShellPathSource ?? "the active config overlay";
+		}
+		if (Object.hasOwn(this.#overrides, "shellPath")) {
+			configSource = "the runtime settings override";
+		}
+		return procmgr.getShellConfig(shell, { configSource });
 	}
 
 	/**
@@ -1156,6 +1172,7 @@ export class Settings {
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
+		this.#projectShellPathSource = undefined;
 		try {
 			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
 			let merged: RawSettings = {};
@@ -1164,14 +1181,18 @@ export class Settings {
 				if (item.level !== "project") continue;
 				if (item._source.provider !== "native" || path.basename(item.path) !== "config.yml") {
 					merged = this.#deepMerge(merged, item.data as RawSettings);
+					if (Object.hasOwn(item.data, "shellPath")) this.#projectShellPathSource = item.path;
 					continue;
 				}
+
+				if (Object.hasOwn(item.data, "shellPath")) this.#projectShellPathSource = item.path;
 
 				// Keep the native project config surface intentionally narrow. Building one
 				// nested overlay preserves global/project-provider sibling values during merge.
 				for (const settingPath of [
 					"modelRoles",
 					"autocompleteMaxVisible",
+					"shellPath",
 					...getLcmSettingPaths(),
 					"gc.blobs",
 					"gc.archive",
@@ -1188,14 +1209,18 @@ export class Settings {
 			}
 			return this.#migrateRawSettings(this.#deepMerge(merged, nativeOverrides));
 		} catch {
+			this.#projectShellPathSource = undefined;
 			return {};
 		}
 	}
 
 	async #loadConfigOverlays(): Promise<RawSettings> {
+		this.#overlayShellPathSource = undefined;
 		let merged: RawSettings = {};
 		for (const filePath of this.#configFiles) {
-			merged = this.#deepMerge(merged, await this.#loadOverlayYaml(filePath));
+			const overlay = await this.#loadOverlayYaml(filePath);
+			merged = this.#deepMerge(merged, overlay);
+			if (Object.hasOwn(overlay, "shellPath")) this.#overlayShellPathSource = filePath;
 		}
 		return merged;
 	}

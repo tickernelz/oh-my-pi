@@ -179,6 +179,24 @@ describe("update install origin handling", () => {
 		}
 	});
 
+	it("does not misclassify a standalone downstream binary in a package-manager bin directory", () => {
+		expect(
+			resolveUpdateMethodForTest("/home/test/.local/bin/omp", "/home/test/.local/bin", {
+				npmBinDir: "/home/test/.local/bin",
+				ompIsRegularFile: true,
+			}),
+		).toBe("binary");
+	});
+
+	it("keeps package-manager symlinks on the rejected managed-install path", () => {
+		expect(
+			resolveUpdateMethodForTest("/home/test/.local/bin/omp", "/home/test/.local/bin", {
+				npmBinDir: "/home/test/.local/bin",
+				ompIsRegularFile: false,
+			}),
+		).toBe("bun");
+	});
+
 	it("detects a Homebrew symlink without naming an upstream formula", async () => {
 		const dir = await makeTempDir();
 		const prefix = path.join(dir, "homebrew");
