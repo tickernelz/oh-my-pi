@@ -16,6 +16,7 @@ import { parseBind } from "../utils/parse-bind";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
 	ClientUsageReportRequest,
+	CredentialBlockDeleteResponse,
 	CredentialBlockResponse,
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
@@ -40,6 +41,7 @@ import {
 } from "./types";
 import {
 	clientUsageReportRequestSchema,
+	credentialBlockDeleteRequestSchema,
 	credentialBlockRequestSchema,
 	credentialDisableRequestSchema,
 	credentialUploadRequestSchema,
@@ -701,6 +703,38 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					logger.info("auth-broker credential disabled", { id, peer, cause });
 					const response: CredentialDisableResponse = { ok: true };
 					return json(200, response);
+				}
+				const blockDeleteMatch = req.method === "DELETE" ? pathname.match(BLOCK_ROUTE) : null;
+				if (blockDeleteMatch) {
+					const id = Number.parseInt(blockDeleteMatch[1], 10);
+					const parsed = await parseBody(req, credentialBlockDeleteRequestSchema);
+					if (!parsed.ok) return parsed.response;
+					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
+						logger.info("auth-broker credential block delete miss", { id, peer });
+						return json(404, { error: `No credential with id=${id}` });
+					}
+					try {
+						const deleted = await opts.storage.deleteCredentialBlockIfUnchanged({
+							credentialId: id,
+							providerKey: parsed.data.providerKey,
+							blockScope: parsed.data.blockScope,
+							blockedUntilMs: parsed.data.blockedUntilMs,
+							updatedAtMs: parsed.data.updatedAtMs,
+						});
+						const response: CredentialBlockDeleteResponse = { deleted };
+						logger.info("auth-broker credential block delete resolved", {
+							id,
+							peer,
+							providerKey: parsed.data.providerKey,
+							blockScope: parsed.data.blockScope,
+							deleted,
+						});
+						return json(200, response);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						logger.warn("auth-broker credential block delete failed", { id, peer, error: message });
+						return json(500, { error: message });
+					}
 				}
 				const blockMatch = req.method === "POST" ? pathname.match(BLOCK_ROUTE) : null;
 				if (blockMatch) {

@@ -101,6 +101,14 @@ export interface CredentialBlockResponse {
 	ok: boolean;
 }
 
+/** DELETE /v1/credential/:id/block request body. */
+export type CredentialBlockDeleteRequest = Omit<CredentialBlockSnapshot, "updatedAtMs"> & { updatedAtMs: number };
+
+/** DELETE /v1/credential/:id/block response body. */
+export interface CredentialBlockDeleteResponse {
+	deleted: boolean;
+}
+
 /** DELETE /v1/credential/:id/blocks response body. */
 export interface CredentialBlocksDeleteResponse {
 	ok: boolean;

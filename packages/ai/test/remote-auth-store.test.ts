@@ -756,14 +756,20 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		}
 	});
 
-	test("RemoteAuthCredentialStore reads snapshot blocks and applies upserts before broker acknowledgement", () => {
+	test("RemoteAuthCredentialStore applies version-fenced scoped block mutations", async () => {
 		const futureBlock = Date.now() + 60_000;
 		const laterBlock = futureBlock + 60_000;
+		const newestBlock = laterBlock + 60_000;
 		const brokerClient = new AuthBrokerClient({ url: "http://127.0.0.1:9", token: "unused" });
 		const fetchSnapshotPending = Promise.withResolvers<FetchSnapshotResult>();
 		vi.spyOn(brokerClient, "fetchSnapshot").mockReturnValue(fetchSnapshotPending.promise);
 		const upsertPending = Promise.withResolvers<CredentialBlockResponse>();
 		const upsertSpy = vi.spyOn(brokerClient, "upsertCredentialBlock").mockReturnValue(upsertPending.promise);
+		const deleteSpy = vi
+			.spyOn(brokerClient, "deleteCredentialBlockIfUnchanged")
+			.mockResolvedValueOnce({ deleted: false })
+			.mockResolvedValueOnce({ deleted: true })
+			.mockResolvedValueOnce({ deleted: true });
 		const remoteStore = new RemoteAuthCredentialStore({
 			client: brokerClient,
 			streamSnapshots: false,
@@ -787,13 +793,24 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 						identityKey: "email:remote@example.com",
 						rotatesInMs: null,
 						blocks: [
-							{ providerKey: "anthropic:oauth", blockScope: "tier:fable", blockedUntilMs: futureBlock },
-							{ providerKey: "anthropic:oauth", blockScope: "shared", blockedUntilMs: futureBlock },
+							{
+								providerKey: "anthropic:oauth",
+								blockScope: "tier:fable",
+								blockedUntilMs: futureBlock,
+								updatedAtMs: 1_000,
+							},
+							{
+								providerKey: "anthropic:oauth",
+								blockScope: "shared",
+								blockedUntilMs: futureBlock,
+								updatedAtMs: 1_000,
+							},
 						],
 					},
 				],
 			},
 		});
+		const refreshSpy = vi.spyOn(remoteStore, "refreshSnapshot").mockResolvedValue(remoteStore.snapshot);
 		try {
 			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(futureBlock);
 
@@ -810,10 +827,49 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				blockScope: "tier:fable",
 				blockedUntilMs: laterBlock,
 			});
-			remoteStore.deleteCredentialBlock(7, "anthropic:oauth", "tier:fable");
+			expect(
+				await remoteStore.deleteCredentialBlockIfUnchanged({
+					credentialId: 7,
+					providerKey: "anthropic:oauth",
+					blockScope: "tier:fable",
+					blockedUntilMs: laterBlock,
+					updatedAtMs: 1_000,
+				}),
+			).toBe(false);
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
 			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(laterBlock);
-			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "shared")).toBe(futureBlock);
+			remoteStore.upsertCredentialBlock({
+				credentialId: 7,
+				providerKey: "anthropic:oauth",
+				blockScope: "tier:fable",
+				blockedUntilMs: newestBlock,
+			});
+			expect(
+				await remoteStore.deleteCredentialBlockIfUnchanged({
+					credentialId: 7,
+					providerKey: "anthropic:oauth",
+					blockScope: "tier:fable",
+					blockedUntilMs: laterBlock,
+					updatedAtMs: 1_000,
+				}),
+			).toBe(false);
+			expect(refreshSpy).toHaveBeenCalledTimes(2);
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(newestBlock);
+			expect(
+				await remoteStore.deleteCredentialBlockIfUnchanged({
+					credentialId: 7,
+					providerKey: "anthropic:oauth",
+					blockScope: "shared",
+					blockedUntilMs: futureBlock,
+					updatedAtMs: 1_000,
+				}),
+			).toBe(true);
+			expect(deleteSpy).toHaveBeenCalledTimes(3);
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(newestBlock);
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "shared")).toBeUndefined();
 		} finally {
+			upsertPending.resolve({ ok: true });
+			await upsertPending.promise;
 			remoteStore.close();
 		}
 	});

@@ -12,6 +12,8 @@ import type {
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
+	CredentialBlockDeleteRequest,
+	CredentialBlockDeleteResponse,
 	CredentialBlockRequest,
 	CredentialBlockResponse,
 	CredentialBlocksDeleteResponse,
@@ -31,6 +33,7 @@ import type {
 import {
 	clientUsageReportResponseSchema,
 	clientUsageSummaryResponseSchema,
+	credentialBlockDeleteResponseSchema,
 	credentialBlockResponseSchema,
 	credentialBlocksDeleteResponseSchema,
 	credentialDisableResponseSchema,
@@ -351,6 +354,18 @@ export class AuthBrokerClient {
 		return this.#request<CredentialBlockResponse>("POST", `/v1/credential/${id}/block`, {
 			body,
 			schema: credentialBlockResponseSchema,
+			signal,
+		});
+	}
+
+	async deleteCredentialBlockIfUnchanged(
+		id: number,
+		block: CredentialBlockDeleteRequest,
+		signal?: AbortSignal,
+	): Promise<CredentialBlockDeleteResponse> {
+		return this.#request<CredentialBlockDeleteResponse>("DELETE", `/v1/credential/${id}/block`, {
+			body: block,
+			schema: credentialBlockDeleteResponseSchema,
 			signal,
 		});
 	}

@@ -19,6 +19,7 @@ import {
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
 	type StoredCredentialBlock,
+	type VersionedStoredCredentialBlock,
 } from "../auth-storage";
 import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
@@ -539,10 +540,24 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			});
 	}
 
-	deleteCredentialBlock(_credentialId: number, _providerKey: string, _blockScope: string): void {
-		// The broker protocol only supports deleting every block for a credential.
-		// Keep scoped blocks until expiry rather than risk deleting unrelated or
-		// newer broker state through that broader operation.
+	async deleteCredentialBlockIfUnchanged(block: VersionedStoredCredentialBlock): Promise<boolean> {
+		const response = await this.#client.deleteCredentialBlockIfUnchanged(block.credentialId, {
+			providerKey: block.providerKey,
+			blockScope: block.blockScope,
+			blockedUntilMs: block.blockedUntilMs,
+			updatedAtMs: block.updatedAtMs,
+		});
+		if (!response.deleted) {
+			await this.refreshSnapshot();
+			return false;
+		}
+		if (!this.#deleteSnapshotBlockIfUnchanged(block)) {
+			await this.refreshSnapshot();
+			return false;
+		}
+		this.#credentialBlockReconcileAfter.delete(`${block.credentialId}\0${block.providerKey}\0${block.blockScope}`);
+		this.#invalidateUsageCache();
+		return true;
 	}
 
 	deleteCredentialBlocks(credentialId: number): void {
@@ -808,6 +823,27 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const credentials = [...this.#snapshot.credentials];
 		credentials[index] = { ...entry, blocks };
 		this.#snapshot = { ...this.#snapshot, credentials };
+	}
+
+	#deleteSnapshotBlockIfUnchanged(block: VersionedStoredCredentialBlock): boolean {
+		const index = this.#snapshot.credentials.findIndex(entry => entry.id === block.credentialId);
+		if (index === -1) return false;
+		const entry = this.#snapshot.credentials[index]!;
+		const blocks = entry.blocks?.filter(
+			candidate =>
+				candidate.providerKey !== block.providerKey ||
+				candidate.blockScope !== block.blockScope ||
+				candidate.blockedUntilMs !== block.blockedUntilMs ||
+				candidate.updatedAtMs !== block.updatedAtMs,
+		);
+		if (!blocks || blocks.length === entry.blocks?.length) return false;
+		const next: SnapshotEntry = { ...entry };
+		if (blocks.length > 0) next.blocks = blocks;
+		else delete next.blocks;
+		const credentials = [...this.#snapshot.credentials];
+		credentials[index] = next;
+		this.#snapshot = { ...this.#snapshot, credentials };
+		return true;
 	}
 
 	#deleteSnapshotBlocks(credentialId: number): void {

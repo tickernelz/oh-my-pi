@@ -347,9 +347,22 @@ export const disabledCredentialsResponseSchema = type({
 
 export const credentialBlockRequestSchema = credentialBlockSnapshotSchema;
 
+export const credentialBlockDeleteRequestSchema = type({
+	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+	blockedUntilMs: "number",
+	updatedAtMs: "number",
+});
+
 export const credentialBlockResponseSchema = type({
 	"+": "reject",
 	ok: "boolean",
+});
+
+export const credentialBlockDeleteResponseSchema = type({
+	"+": "reject",
+	deleted: "boolean",
 });
 
 export const credentialBlocksDeleteResponseSchema = type({

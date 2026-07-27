@@ -171,6 +171,8 @@ export interface StoredCredentialBlock {
 	updatedAtMs?: number;
 }
 
+export type VersionedStoredCredentialBlock = StoredCredentialBlock & { updatedAtMs: number };
+
 /**
  * Identity slice of a disabled (soft-deleted) credential tombstone — cause and
  * account identity only, never token material. Surfaced so auto-disabled
@@ -421,6 +423,8 @@ export interface AuthCredentialStore {
 	upsertCredentialBlock?(block: StoredCredentialBlock): void;
 	/** Drop one block row for a credential/provider/scope key. */
 	deleteCredentialBlock?(credentialId: number, providerKey: string, blockScope: string): void;
+	/** Delete only when the persisted row still matches the observed version. */
+	deleteCredentialBlockIfUnchanged?(block: VersionedStoredCredentialBlock): boolean | Promise<boolean>;
 	/** Drop every block row for a credential (all providerKeys/scopes). */
 	deleteCredentialBlocks?(credentialId: number): void;
 	/** Prune rows with blocked_until_ms <= nowMs. */
@@ -3113,7 +3117,7 @@ export class AuthStorage {
 				// times decorrelate within a few cycles.
 				this.#usageCache.set(cacheKey, { value: report, expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter });
 				this.#recordUsageHistory(request, report);
-				this.#reconcileCodexUsageBlock(request, report);
+				await this.#reconcileCodexUsageBlock(request, report);
 				return report;
 			}
 			// Failure: apply a short jittered cool-down so the credential doesn't
@@ -3643,7 +3647,7 @@ export class AuthStorage {
 			if (storeHook) {
 				const report = await storeHook(provider, credential, options?.signal);
 				if (report) {
-					this.#reconcileCodexUsageBlock(
+					await this.#reconcileCodexUsageBlock(
 						this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl),
 						report,
 					);
@@ -3875,7 +3879,7 @@ export class AuthStorage {
 				this.#usageReportsInFlight.set(OVERRIDE_KEY, shared);
 			}
 			const reports = await raceUsageWithSignal(shared, options?.signal);
-			if (shouldReconcileStoreHookReports && reports) this.#reconcileCodexUsageBlocksFromReports(reports);
+			if (shouldReconcileStoreHookReports && reports) await this.#reconcileCodexUsageBlocksFromReports(reports);
 			return reports;
 		}
 		if (!this.#usageProviderResolver) return null;
@@ -5679,21 +5683,15 @@ export class AuthStorage {
 		};
 	}
 
-	/**
-	 * Clear one backoff scope. The in-memory backoff is per scope so it is
-	 * dropped directly; the persisted store deletes a credential's blocks as a
-	 * unit, so it is only purged once no other scope still holds a live block.
-	 * Leaving a persisted row behind is safe: the scope it belongs to is
-	 * unblocked in memory, and the row heals on the pass where its own meter
-	 * recovers.
-	 */
-	#clearCredentialBlockScope(
+	/** Clear one backoff scope without deleting a newer persisted replacement. */
+	async #clearCredentialBlockScope(
 		provider: string,
 		credentialId: number,
 		credentialIndex: number,
 		providerKey: string,
 		blockScope: string | undefined,
-	): void {
+		observedBlock: VersionedStoredCredentialBlock | undefined,
+	): Promise<boolean> {
 		const key = this.#toScopedBackoffKey(providerKey, blockScope);
 		const backoffMap = this.#credentialBackoff.get(key);
 		backoffMap?.delete(credentialIndex);
@@ -5702,9 +5700,14 @@ export class AuthStorage {
 		probeAfterMap?.delete(credentialIndex);
 		if (probeAfterMap?.size === 0) this.#credentialBackoffProbeAfter.delete(key);
 		try {
+			if (this.#store.deleteCredentialBlockIfUnchanged) {
+				return observedBlock ? await this.deleteCredentialBlockIfUnchanged(observedBlock) : false;
+			}
 			this.deleteCredentialBlock(credentialId, providerKey, blockScope ?? "");
+			return true;
 		} catch (err) {
 			logger.debug("Failed to clear persisted credential block", { err, provider, credentialId, blockScope });
+			return false;
 		}
 	}
 
@@ -5715,22 +5718,35 @@ export class AuthStorage {
 		return !this.#isUsageLimitReached(report.limits);
 	}
 
-	#reconcileCodexUsageBlockForCredential(provider: Provider, credentialId: number, report: UsageReport): void {
+	async #reconcileCodexUsageBlockForCredential(
+		provider: Provider,
+		credentialId: number,
+		report: UsageReport,
+	): Promise<void> {
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
 		const credentialIndex = this.#getStoredCredentials(provider).findIndex(entry => entry.id === credentialId);
 		if (credentialIndex < 0) return;
-		// Mirror selection: consult the same strategy scope `markUsageLimitReached`
-		// persists under, else a scoped block is invisible here and never healed.
-		// Reconciliation has no request context, so it cannot know which scope a
-		// block was written under. Heal every scope the strategy can produce, plus
-		// any legacy scope it still lists, or a block persisted under one scope
-		// stays invisible here forever.
+		// Reconciliation has no request context, so inspect both strategy scopes
+		// and persisted legacy scopes rather than leaving either invisible.
 		const strategy = this.#rankingStrategyResolver?.(provider);
-		const blockScopes =
+		const strategyScopes =
 			strategy?.blockScopes?.() ?? [strategy?.blockScope?.({})].filter(scope => scope !== undefined);
-		const scopesToHeal = blockScopes.length > 0 ? blockScopes : [undefined];
+		const persistedBlocks = (this.#store.listCredentialBlocks?.([credentialId]) ?? []).filter(
+			block => block.providerKey === providerKey,
+		);
+		const persistedScopes = persistedBlocks.map(block => block.blockScope || undefined);
+		const candidateScopes = [...strategyScopes, ...persistedScopes];
+		const scopesToHeal = candidateScopes.length > 0 ? [...new Set(candidateScopes)] : [undefined];
 		for (const blockScope of scopesToHeal) {
-			this.#healCodexUsageBlockScope(
+			const persistedBlock = persistedBlocks.find(block => block.blockScope === (blockScope ?? ""));
+			const observedBlock =
+				persistedBlock && typeof persistedBlock.updatedAtMs === "number"
+					? ({
+							...persistedBlock,
+							updatedAtMs: persistedBlock.updatedAtMs,
+						} satisfies VersionedStoredCredentialBlock)
+					: undefined;
+			await this.#healCodexUsageBlockScope(
 				provider,
 				providerKey,
 				credentialId,
@@ -5738,6 +5754,7 @@ export class AuthStorage {
 				blockScope,
 				report,
 				strategy,
+				observedBlock,
 			);
 		}
 	}
@@ -5750,7 +5767,7 @@ export class AuthStorage {
 	 * would then delete every scope including a block that is still valid. So
 	 * each scope is evaluated against its own limits and cleared on its own.
 	 */
-	#healCodexUsageBlockScope(
+	async #healCodexUsageBlockScope(
 		provider: Provider,
 		providerKey: string,
 		credentialId: number,
@@ -5758,10 +5775,13 @@ export class AuthStorage {
 		blockScope: string | undefined,
 		report: UsageReport,
 		strategy: CredentialRankingStrategy | undefined,
-	): void {
+		observedBlock: VersionedStoredCredentialBlock | undefined,
+	): Promise<void> {
 		const scopedReport = this.#scopeUsageReportToBlockScope(report, blockScope, strategy);
 		if (!this.#isHealthyCodexUsageReport(scopedReport)) return;
-		const blockedUntilMs = this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, blockScope);
+		const blockedUntilMs =
+			observedBlock?.blockedUntilMs ??
+			this.#getCredentialBlockedUntil(provider, providerKey, credentialIndex, blockScope);
 		if (blockedUntilMs === undefined) return;
 		// `/usage` can lag the request path that just returned 429. Fresh local or
 		// broker-sourced blocks get one usage-cache window before healthy reports may
@@ -5776,7 +5796,18 @@ export class AuthStorage {
 		if (Math.max(globalProbeAfterMs, scopedProbeAfterMs, storeGlobalProbeAfterMs, storeScopedProbeAfterMs) > nowMs) {
 			return;
 		}
-		this.#clearCredentialBlockScope(provider, credentialId, credentialIndex, providerKey, blockScope);
+		if (
+			!(await this.#clearCredentialBlockScope(
+				provider,
+				credentialId,
+				credentialIndex,
+				providerKey,
+				blockScope,
+				observedBlock,
+			))
+		) {
+			return;
+		}
 		logger.info("Cleared stale Codex usage-limit block after healthy live usage report", {
 			credentialId,
 			provider,
@@ -5785,11 +5816,11 @@ export class AuthStorage {
 		});
 	}
 
-	#reconcileCodexUsageBlock(request: UsageRequestDescriptor, report: UsageReport): void {
+	async #reconcileCodexUsageBlock(request: UsageRequestDescriptor, report: UsageReport): Promise<void> {
 		if (request.provider !== "openai-codex") return;
 		const credentialId = this.#findStoredCredentialIdForUsageCredential(request.provider, request.credential);
 		if (credentialId === undefined) return;
-		this.#reconcileCodexUsageBlockForCredential(request.provider, credentialId, report);
+		await this.#reconcileCodexUsageBlockForCredential(request.provider, credentialId, report);
 	}
 
 	#findStoredCredentialIdsForUsageReport(report: UsageReport): number[] {
@@ -5818,13 +5849,13 @@ export class AuthStorage {
 		return matches;
 	}
 
-	#reconcileCodexUsageBlocksFromReports(reports: UsageReport[]): void {
+	async #reconcileCodexUsageBlocksFromReports(reports: UsageReport[]): Promise<void> {
 		const reconciled = new Set<number>();
 		for (const report of reports) {
 			for (const credentialId of this.#findStoredCredentialIdsForUsageReport(report)) {
 				if (reconciled.has(credentialId)) continue;
 				reconciled.add(credentialId);
-				this.#reconcileCodexUsageBlockForCredential(report.provider, credentialId, report);
+				await this.#reconcileCodexUsageBlockForCredential(report.provider, credentialId, report);
 			}
 		}
 	}
@@ -6273,6 +6304,16 @@ export class AuthStorage {
 		this.#bumpGeneration("credential-block");
 	}
 
+	async deleteCredentialBlockIfUnchanged(block: VersionedStoredCredentialBlock): Promise<boolean> {
+		const deleteIfUnchanged = this.#store.deleteCredentialBlockIfUnchanged?.bind(this.#store);
+		if (!deleteIfUnchanged) return false;
+		const deleted = await deleteIfUnchanged(block);
+		if (!deleted) return false;
+		this.#invalidateUsageReportCacheForProviderKey(block.providerKey);
+		this.#bumpGeneration("credential-block");
+		return true;
+	}
+
 	deleteCredentialBlocks(credentialId: number): void {
 		const deleteCredentialBlocks = this.#store.deleteCredentialBlocks?.bind(this.#store);
 		if (!deleteCredentialBlocks) return;
@@ -6654,6 +6695,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#upsertCredentialBlockStmt: Statement;
 	#deleteCredentialBlocksStmt: Statement;
 	#deleteCredentialBlockStmt: Statement;
+	#deleteCredentialBlockIfUnchangedStmt: Statement;
 	#deleteExpiredCredentialBlocksStmt: Statement;
 	#acquireCredentialRefreshLeaseStmt: Statement;
 	#getCredentialRefreshLeaseStmt: Statement;
@@ -6741,11 +6783,14 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			VALUES (?, ?, ?, ?, ${SQLITE_NOW_EPOCH})
 			ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
 				blocked_until_ms = MAX(blocked_until_ms, excluded.blocked_until_ms),
-				updated_at = excluded.updated_at`,
+				updated_at = MAX(auth_credential_blocks.updated_at + 1, ${SQLITE_NOW_EPOCH})`,
 		);
 		this.#deleteCredentialBlocksStmt = this.#db.prepare("DELETE FROM auth_credential_blocks WHERE credential_id = ?");
 		this.#deleteCredentialBlockStmt = this.#db.prepare(
 			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ?",
+		);
+		this.#deleteCredentialBlockIfUnchangedStmt = this.#db.prepare(
+			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ? AND blocked_until_ms = ? AND updated_at = ?",
 		);
 		this.#deleteExpiredCredentialBlocksStmt = this.#db.prepare(
 			"DELETE FROM auth_credential_blocks WHERE blocked_until_ms <= ?",
@@ -7544,6 +7589,19 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#credentialBlockReconcileAfter.delete(`${credentialId}\0${providerKey}\0${blockScope}`);
 	}
 
+	deleteCredentialBlockIfUnchanged(block: VersionedStoredCredentialBlock): boolean {
+		const result = this.#deleteCredentialBlockIfUnchangedStmt.run(
+			block.credentialId,
+			block.providerKey,
+			block.blockScope,
+			block.blockedUntilMs,
+			block.updatedAtMs / 1000,
+		) as { changes: number };
+		if (result.changes === 0) return false;
+		this.#credentialBlockReconcileAfter.delete(`${block.credentialId}\0${block.providerKey}\0${block.blockScope}`);
+		return true;
+	}
+
 	deleteCredentialBlocks(credentialId: number): void {
 		this.#deleteCredentialBlocksStmt.run(credentialId);
 		for (const key of this.#credentialBlockReconcileAfter.keys()) {
@@ -7916,6 +7974,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCredentialBlockStmt.finalize();
 		this.#deleteCredentialBlocksStmt.finalize();
 		this.#deleteCredentialBlockStmt.finalize();
+		this.#deleteCredentialBlockIfUnchangedStmt.finalize();
 		this.#deleteExpiredCredentialBlocksStmt.finalize();
 		this.#insertUsageHistoryStmt.finalize();
 		this.#lastUsageHistoryStmt.finalize();

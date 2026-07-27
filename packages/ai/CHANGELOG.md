@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed healthy broker-sourced Codex usage leaving a remote gateway credential blocked until expiry: reconciliation now awaits a scoped broker delete fenced by the exact expiry and monotonic row version it inspected, so a concurrent newer 429 block is preserved.
+
 ## [17.1.4] - 2026-07-26
 
 ### Added

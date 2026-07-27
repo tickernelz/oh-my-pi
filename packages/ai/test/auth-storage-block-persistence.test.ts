@@ -138,6 +138,37 @@ describe("AuthStorage credential block persistence", () => {
 		}
 	});
 
+	it("preserves a newer same-scope block when conditional deletion uses a stale version", async () => {
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		store.saveOAuth(PROVIDER, oauthCredential("conditional-delete"));
+		const [row] = store.listAuthCredentials(PROVIDER);
+		if (!row) throw new Error("expected credential row");
+		const block = {
+			credentialId: row.id,
+			providerKey: PROVIDER_KEY,
+			blockScope: "tier:fable",
+			blockedUntilMs: FUTURE_BLOCK_MS,
+		};
+		try {
+			store.upsertCredentialBlock(block);
+			const captured = store.listCredentialBlocks([row.id])[0];
+			if (!captured || captured.updatedAtMs === undefined) throw new Error("expected versioned block");
+			store.upsertCredentialBlock(block);
+			const replacement = store.listCredentialBlocks([row.id])[0];
+			if (!replacement || replacement.updatedAtMs === undefined) throw new Error("expected replacement block");
+
+			expect(replacement.updatedAtMs).toBeGreaterThan(captured.updatedAtMs);
+			expect(store.deleteCredentialBlockIfUnchanged({ ...captured, updatedAtMs: captured.updatedAtMs })).toBe(false);
+			expect(store.listCredentialBlocks([row.id])).toEqual([replacement]);
+			expect(store.deleteCredentialBlockIfUnchanged({ ...replacement, updatedAtMs: replacement.updatedAtMs })).toBe(
+				true,
+			);
+			expect(store.listCredentialBlocks([row.id])).toEqual([]);
+		} finally {
+			store.close();
+		}
+	});
+
 	it("drops expired rows from reads and clears persisted blocks through the public delete wrapper", async () => {
 		const store = await SqliteAuthCredentialStore.open(dbPath);
 		store.saveOAuth(PROVIDER, oauthCredential("1"));
