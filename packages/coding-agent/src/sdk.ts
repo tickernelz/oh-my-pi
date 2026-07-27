@@ -190,6 +190,7 @@ import {
 	type LspStartupServerInfo,
 	ReadTool,
 	releaseComputerSessionsForOwner,
+	TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES,
 	type Tool,
 	type ToolSession,
 	WebSearchTool,
@@ -1558,6 +1559,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	const hasExplicitToolNames = (options.toolNames?.length ?? 0) > 0;
+	const configuredToolNames = hasExplicitToolNames ? normalizeToolNames(options.toolNames ?? []) : undefined;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = !restrictToolNames && (options.enableLsp ?? true);
 	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
@@ -1631,7 +1634,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			enableIrc: restrictToolNames ? false : options.enableIrc,
 			restrictToolNames,
 			get hasEditTool() {
-				const requestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+				const requestedToolNames = configuredToolNames;
 				return restrictToolNames
 					? requestedToolNames?.includes("edit") === true
 					: !requestedToolNames || requestedToolNames.includes("edit");
@@ -1661,7 +1664,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
-			getLcmRuntime: settings.get("context.engine") === "lossless" ? () => session : undefined,
+			getLcmRuntime: () => (session?.lcmEnabled ? session : undefined),
 			getForwardedLcmRuntime: options.parentLcmRuntime ? () => options.parentLcmRuntime : undefined,
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
@@ -1770,6 +1773,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		const ambientLcmToolNames =
+			!restrictToolNames && taskDepth === 0 && !hasExplicitToolNames ? TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES : [];
+		const registryBuiltinTools = [...builtinTools];
+		const registryBuiltinToolNames = new Set(registryBuiltinTools.map(tool => tool.name));
+		for (const name of ambientLcmToolNames) {
+			if (registryBuiltinToolNames.has(name)) continue;
+			const mounted = toolSession.xdevRegistry?.get(name);
+			const created = mounted ?? (await BUILTIN_TOOLS[name](toolSession));
+			if (!created) continue;
+			registryBuiltinTools.push(mounted ? created : wrapToolWithMetaNotice(created));
+			registryBuiltinToolNames.add(name);
+		}
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
@@ -1861,7 +1876,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// to mirror the AsyncJobManager ownership rule.
 		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
 
-		const builtInToolNames = builtinTools.map(t => t.name);
+		const builtInToolNames = registryBuiltinTools.map(t => t.name);
 		let customToolPaths: ToolPathWithSource[] = [];
 		const inlineExtensions: ExtensionFactory[] = [];
 		if (!restrictToolNames) {
@@ -1870,7 +1885,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// (filtered in `createTools`), custom tools are force-activated via
 			// `alwaysInclude` below, so an explicit `--no-tools`/whitelist must be
 			// honored here or image-gen would leak past every filter (issue #5305).
-			const imageGenRequested = !options.toolNames || options.toolNames.includes("generate_image");
+			const imageGenRequested = !hasExplicitToolNames || configuredToolNames?.includes("generate_image") === true;
 			if (settings.get("generate_image.enabled") && imageGenRequested) {
 				const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
 				if (imageGenTools.length > 0) {
@@ -2534,7 +2549,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
 		const builtInRegistryToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool>();
-		for (const tool of builtinTools) {
+		for (const tool of registryBuiltinTools) {
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.add(tool.name);
 		}
@@ -2738,7 +2753,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+		const explicitlyRequestedToolNames = configuredToolNames ? [...configuredToolNames] : undefined;
 		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
 		// `yield` call to terminate. The tool registry already includes `yield` (see
 		// `createTools`), but an explicit `toolNames` list would otherwise drop it from the
@@ -2777,9 +2792,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const xdevReadAvailable =
 			builtInRegistryToolNames.has("read") &&
 			(explicitlyRequestedToolNameSet === undefined || explicitlyRequestedToolNameSet.has("read"));
-		const initialRequestedActiveToolNames = options.toolNames
-			? requestedActiveToolNames
-			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
+		const ambientLcmToolNameSet = new Set<string>(ambientLcmToolNames);
+		const initialRequestedActiveToolNames = (
+			explicitlyRequestedToolNames !== undefined
+				? requestedActiveToolNames
+				: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name))
+		).filter(name => settings.get("context.engine") === "lossless" || !ambientLcmToolNameSet.has(name));
 		let initialToolNames = [...initialRequestedActiveToolNames];
 
 		// Custom tools and extension-registered tools are always included regardless of toolNames filter.
@@ -3012,6 +3030,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: requestModel => modelRegistry.resolver(requestModel, agent.sessionId),
 			streamFn: (streamModel, context, streamOptions) => {
+				session?.beginPrimaryProviderRequest();
 				if (notifyFirstChatDispatch) {
 					const cb = notifyFirstChatDispatch;
 					notifyFirstChatDispatch = undefined;
@@ -3153,18 +3172,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					? () => createVibeTools(toolSession)
 					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
+			ambientLcmToolNames,
 			sideTransformContext,
-			lcm:
-				settings.get("context.engine") === "lossless"
-					? {
-							agentDir,
-							summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
-							maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
-							registerProject: async (project, journal) => {
-								await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
-							},
-						}
-					: undefined,
+			lcm: {
+				agentDir,
+				summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
+				maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
+				registerProject: async (project, journal) => {
+					await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
+				},
+			},
 			transformProviderContext,
 			onPayload,
 			onResponse,

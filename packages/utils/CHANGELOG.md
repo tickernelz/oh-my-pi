@@ -5,6 +5,11 @@
 ### Added
 
 - Added strict compiled-build provenance resolution for downstream version, upstream commit, downstream commit, and LCM revision, plus canonical per-project LCM data-root helpers.
+
+### Fixed
+
+- Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
+
 ## [17.1.4] - 2026-07-26
 
 ### Fixed

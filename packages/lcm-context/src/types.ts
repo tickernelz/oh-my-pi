@@ -339,8 +339,6 @@ export interface LcmContext extends Disposable {
 	expandSummary(request: SummaryExpansionRequest): SummaryExpansion | null;
 	status(): LcmStatus;
 	doctor(): DoctorReport;
-	/** Logically quarantine this derived store until `rebuild` succeeds. */
-	quarantine(redactedReason: string): void;
 	rebuild(snapshots: readonly SourceSnapshot[]): RebuildResult;
 	purge(): PurgeResult;
 	close(): void;

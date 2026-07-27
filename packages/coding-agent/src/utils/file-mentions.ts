@@ -21,6 +21,7 @@ import {
 	truncateHeadBytes,
 } from "../session/streaming-output";
 import { resolveReadPath } from "../tools/path-utils";
+import { fileContentHash } from "./file-content-hash";
 import { formatDimensionNote, resizeImage } from "./image-resize";
 
 /** Regex to match @filepath patterns in text */
@@ -55,12 +56,6 @@ async function pathExists(filePath: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-async function fileContentHash(filePath: string): Promise<string> {
-	const hasher = new Bun.CryptoHasher("sha256");
-	for await (const chunk of Bun.file(filePath).stream()) hasher.update(chunk);
-	return hasher.digest("hex");
 }
 
 async function resolveMentionPath(filePath: string, cwd: string): Promise<string | null> {

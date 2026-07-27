@@ -6,8 +6,7 @@
  * fixed delay and returns a deterministic one-token summary.
  *
  * Run: `bun run packages/coding-agent/bench/lcm-backlog.bench.ts`
- * Env: `LCM_BACKLOG_CONCURRENCY` selects the comparison width from 2 through 4 (default 2);
- *      `LCM_BACKLOG_DELAY_MS` controls completion latency (default 25);
+ * Env: `LCM_BACKLOG_DELAY_MS` controls completion latency (default 25);
  *      `LCM_BACKLOG_SAMPLES` controls samples per width (default 5).
  */
 import * as fs from "node:fs/promises";
@@ -21,9 +20,8 @@ import {
 } from "../src/session/session-lcm";
 import { SessionManager } from "../src/session/session-manager";
 
-type Width = 1 | 2 | 3 | 4;
-const COMPARISON_WIDTH = envInteger("LCM_BACKLOG_CONCURRENCY", 2, 2, 4) as Exclude<Width, 1>;
-const WIDTHS: readonly Width[] = [1, COMPARISON_WIDTH];
+type Width = 1 | 2;
+const WIDTHS: readonly Width[] = [1, 2];
 type JobCounts = NonNullable<LcmPublicStatus["store"]>["jobs"];
 type JobState = keyof JobCounts;
 
@@ -207,7 +205,7 @@ async function measure(): Promise<Map<Width, RunResult[]>> {
 		const manager = createWorkload(projectRoot);
 		const results = new Map<Width, RunResult[]>(WIDTHS.map(width => [width, []]));
 		for (let sample = 1; sample <= SAMPLES; sample++) {
-			const order: readonly Width[] = sample % 2 === 1 ? WIDTHS : [COMPARISON_WIDTH, 1];
+			const order: readonly Width[] = sample % 2 === 1 ? WIDTHS : [2, 1];
 			for (const width of order) {
 				const runDir = path.join(root, `sample-${sample}-width-${width}`);
 				await fs.mkdir(runDir);
@@ -232,8 +230,8 @@ const widthStats = new Map<Width, Stats>(
 	WIDTHS.map(width => [width, stats(runsFor(width).map(result => result.elapsedMs))]),
 );
 const statsFor = (width: Width): Stats => widthStats.get(width)!;
-const speedup = statsFor(1).medianMs / statsFor(COMPARISON_WIDTH).medianMs;
-const elapsedReduction = 1 - statsFor(COMPARISON_WIDTH).medianMs / statsFor(1).medianMs;
+const speedup = statsFor(1).medianMs / statsFor(2).medianMs;
+const elapsedReduction = 1 - statsFor(2).medianMs / statsFor(1).medianMs;
 const baseline = runsFor(1)[0]!;
 const failures: string[] = [];
 const requireInvariant = (condition: boolean, message: string): void => {
@@ -278,7 +276,7 @@ for (const width of WIDTHS) {
 }
 requireInvariant(
 	Number.isFinite(speedup) && elapsedReduction >= 0.25,
-	`width ${COMPARISON_WIDTH} median ${statsFor(COMPARISON_WIDTH).medianMs.toFixed(3)} ms is not at least 25% below width 1 median ${statsFor(1).medianMs.toFixed(3)} ms`,
+	`width 2 median ${statsFor(2).medianMs.toFixed(3)} ms is not at least 25% below width 1 median ${statsFor(1).medianMs.toFixed(3)} ms`,
 );
 
 console.log(`\nBenchmark: lcm-backlog (delay=${DELAY_MS} ms, samples=${SAMPLES}, sources=${SOURCE_COUNT})\n`);
@@ -294,7 +292,7 @@ for (const width of WIDTHS) {
 		`    jobs: ${final.jobs.pending} pending, ${final.jobs.leased} leased, ${final.jobs.failed} failed, ${final.jobs.completed} completed, ${final.jobs.obsolete} obsolete`,
 	);
 }
-console.log(`\n  speedup (width 1 / width ${COMPARISON_WIDTH}): ${speedup.toFixed(3)}x\n`);
+console.log(`\n  speedup (width 1 / width 2): ${speedup.toFixed(3)}x\n`);
 
 console.log(`METRIC job_count=${baseline.jobs.completed}`);
 console.log(`METRIC leaf_job_count=${baseline.leafJobs}`);

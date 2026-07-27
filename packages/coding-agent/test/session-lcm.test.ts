@@ -655,6 +655,33 @@ describe("SessionLcm", () => {
 		});
 	}
 
+	it("keeps the first store failure sticky through release finalization", async () => {
+		const manager = SessionManager.inMemory("/sticky-store-failure");
+		appendUser(manager, "completion failure", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("sticky-store-failure"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const completionAttempted = Promise.withResolvers<void>();
+		context.completeSummaryJob = () => {
+			completionAttempted.resolve();
+			throw undefined;
+		};
+		context.releaseErrors.push(new Error("later release finalization failed"));
+		complete.mockResolvedValue("redacted summary");
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await completionAttempted.promise;
+		const lifecycle = await lcm.close().then(
+			() => ({ rejected: false as const }),
+			error => ({ rejected: true as const, error }),
+		);
+
+		expect(lifecycle).toEqual({ rejected: true, error: undefined });
+		expect(context.leasedJobs.size).toBe(1);
+		expect(context.releaseErrors).toHaveLength(0);
+		expect(context.closed).toBe(true);
+	});
+
 	it("releases structural aborts without backoff and fences a later owner from the stale token", async () => {
 		const manager = SessionManager.inMemory("/structural-abort");
 		appendUser(manager, "abort me", 1);
@@ -687,6 +714,9 @@ describe("SessionLcm", () => {
 		expect(context.leasedJobs.get(reclaimed.jobId)?.leaseToken).toBe(reclaimed.leaseToken);
 		expect(status.runtime.summaryBackoff).toBeUndefined();
 		expect(status.store?.jobs.failed).toBe(0);
+		expect(status.runtime.phase).not.toBe("degraded");
+		expect(status.runtime.lastFailureCategory).toBeUndefined();
+		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
 		await lcm.rebind();
 		expect(context.releaseCalls.at(-1)).toEqual({
 			jobId: reclaimed.jobId,
@@ -711,13 +741,13 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
-	it("captures the summary selector per claimed job and defaults an absent selector to @smol", async () => {
+	it("normalizes a malformed selector to @smol and captures reconfiguration per claimed job", async () => {
 		const manager = SessionManager.inMemory("/selector-capture");
 		appendUser(manager, "two jobs", 1);
 		const context = new FakeLcmContext();
 		context.queueJobs(summaryJob("first"), summaryJob("second"));
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
-		lcm.configure({ summaryModel: undefined });
+		lcm.configure({ summaryModel: { malformed: true } as unknown as string });
 		const first = Promise.withResolvers<void>();
 		const firstCalled = Promise.withResolvers<void>();
 		const secondCalled = Promise.withResolvers<void>();
@@ -731,6 +761,7 @@ describe("SessionLcm", () => {
 			if (selectors.length === 2) secondCalled.resolve();
 			return "tiny";
 		});
+		expect((await lcm.status()).runtime.summaryModelSelector).toBe("@smol");
 		await lcm.project(manager.buildSessionContext().messages);
 		await firstCalled.promise;
 		lcm.configure({ summaryModel: "@next" });
@@ -826,6 +857,65 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
+	it("admits preferred work within width while only fallback work is backed off", async () => {
+		const manager = SessionManager.inMemory("/fallback-preferred-capacity");
+		appendUser(manager, "fallback backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(
+			summaryJob("failed-fallback", { queueClass: "fallback" }),
+			summaryJob("held-fallback", { queueClass: "fallback" }),
+		);
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			2,
+		);
+		const heldGate = Promise.withResolvers<void>();
+		const heldStarted = Promise.withResolvers<void>();
+		complete.mockImplementation(async request => {
+			if (request.prompt.includes("source-failed-fallback")) {
+				throw new LcmCompletionError("fallback provider failure", { provider: "test" });
+			}
+			if (request.prompt.includes("source-held-fallback")) {
+				heldStarted.resolve();
+				await heldGate.promise;
+			}
+			return "redacted summary";
+		});
+
+		await lcm.project(manager.buildSessionContext().messages);
+		await Promise.all([context.summaryFailed.promise, heldStarted.promise]);
+		await flushScheduler();
+		const backedOff = await lcm.status();
+		expect(backedOff.runtime.summaryBackoff).toEqual({ fallback: context.now + 30_000 });
+		const preferredClaimStart = context.claimCalls.length;
+
+		context.queueJobs(summaryJob("new-preferred-with-capacity"));
+		appendUser(manager, "new preferred history", 2);
+		await lcm.project(manager.buildSessionContext().messages);
+		await settleUntil(
+			() => context.completedJobIds.has("new-preferred-with-capacity"),
+			"preferred admission during fallback backoff",
+		);
+		await flushScheduler();
+		const status = await lcm.status();
+
+		expect(context.claimCalls.slice(preferredClaimStart).some(call => call.allowFallback === false)).toBe(true);
+		expect(context.maxLeased).toBe(2);
+		expect(context.leasedJobs.has("held-fallback")).toBe(true);
+		expect(status.runtime.phase).not.toBe("degraded");
+		expect(status.runtime.summaryWorkers).toEqual({ active: 1, limit: 2 });
+		expect(status.store?.jobs).toMatchObject({ leased: 1, failed: 1, completed: 1 });
+		heldGate.resolve();
+		await settleUntil(() => context.completedJobIds.has("held-fallback"), "held fallback completion");
+		await lcm.close();
+	});
+
 	it("keeps one provider failure visible after its sibling succeeds", async () => {
 		const manager = SessionManager.inMemory("/sibling-failure");
 		appendUser(manager, "sibling jobs", 1);
@@ -867,6 +957,90 @@ describe("SessionLcm", () => {
 		expect(status.runtime.lastFailureCategory).toBe("provider");
 		await lcm.close();
 	});
+
+	for (const unfitFirst of [true, false] as const) {
+		it(`keeps preferred unfit degraded when its sibling settles ${unfitFirst ? "after" : "before"} it`, async () => {
+			const manager = SessionManager.inMemory(`/preferred-unfit-${unfitFirst ? "first" : "last"}`);
+			appendUser(manager, "preferred siblings", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob("preferred-unfit"), summaryJob("preferred-sibling"));
+			let atHard = false;
+			const { lcm, complete } = createHarness(
+				manager,
+				context,
+				undefined,
+				undefined,
+				() => ({ ...softProjectionLimits(), sourceTokens: atHard ? 100 : 90 }),
+				20,
+				undefined,
+				2,
+			);
+			const unfitGate = Promise.withResolvers<void>();
+			const siblingGate = Promise.withResolvers<void>();
+			const unfitStarted = Promise.withResolvers<void>();
+			const siblingStarted = Promise.withResolvers<void>();
+			complete.mockImplementation(async request => {
+				const unfit = request.prompt.includes("source-preferred-unfit");
+				(unfit ? unfitStarted : siblingStarted).resolve();
+				await (unfit ? unfitGate : siblingGate).promise;
+				return unfit ? "unfit summary" : "sibling summary";
+			});
+			const completeSummaryJob = context.completeSummaryJob.bind(context);
+			context.completeSummaryJob = (jobId, leaseToken, completion) => {
+				if (jobId !== "preferred-unfit") return completeSummaryJob(jobId, leaseToken, completion);
+				const leased = context.leasedJobs.get(jobId);
+				if (leased?.leaseToken !== leaseToken) return { accepted: false, reason: "lease_lost" };
+				context.leasedJobs.delete(jobId);
+				context.queuedJobs = Math.max(0, context.queuedJobs - 1);
+				if (context.relevantPendingJobs !== undefined) {
+					context.relevantPendingJobs = Math.max(0, context.relevantPendingJobs - 1);
+				}
+				return { accepted: false, reason: "deterministic_failed" };
+			};
+
+			await lcm.project(manager.buildSessionContext().messages);
+			await Promise.all([unfitStarted.promise, siblingStarted.promise]);
+			const firstJob = unfitFirst ? "preferred-unfit" : "preferred-sibling";
+			const secondJob = unfitFirst ? "preferred-sibling" : "preferred-unfit";
+			(unfitFirst ? unfitGate : siblingGate).resolve();
+			await settleUntil(() => !context.leasedJobs.has(firstJob), `${firstJob} settlement`);
+			await flushScheduler();
+			const afterFirst = await lcm.status();
+
+			(unfitFirst ? siblingGate : unfitGate).resolve();
+			await settleUntil(() => !context.leasedJobs.has(secondJob), `${secondJob} settlement`);
+			await flushScheduler();
+			const afterBoth = await lcm.status();
+
+			if (unfitFirst) {
+				expect(afterFirst.runtime.phase).toBe("degraded");
+				expect(afterFirst.runtime.lastFailureCategory).toBe("unfit");
+			}
+			expect(afterBoth.runtime.phase).toBe("degraded");
+			expect(afterBoth.runtime.lastFailureCategory).toBe("unfit");
+
+			context.projectImpl = (_request, snapshot) => ({
+				revision: 2,
+				ready: true,
+				historical: [],
+				freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: snapshot.entries.length,
+				estimatedTokens: snapshot.entries.length,
+				pendingJobs: 0,
+			});
+			atHard = true;
+			const fitted = await lcm.project(manager.buildSessionContext().messages);
+			const active = await lcm.status();
+			expect(fitted.owned).toBe(true);
+			expect(active.runtime.phase).toBe("active");
+			expect(active.runtime.lastFailureCategory).toBeUndefined();
+			await lcm.close();
+		});
+	}
 
 	it("uses the larger retry hint or capped exponential transport delay", async () => {
 		const cases = [
@@ -924,11 +1098,12 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
-	it("fails open without retrying non-contention reconcile errors", async () => {
+	it("fails open without retrying non-contention errors and clears the fallback annotation on rebind", async () => {
 		const manager = SessionManager.inMemory("/non-contention-fail-open");
 		appendUser(manager, "store failure", 1);
 		const context = new FakeLcmContext();
-		context.reconcileErrors.push(Object.assign(new Error("disk full"), { code: "SQLITE_FULL" }));
+		const storeError = Object.assign(new Error("disk full"), { code: "SQLITE_FULL" });
+		context.reconcileErrors.push(storeError);
 		const { lcm, complete } = createHarness(manager, context);
 		const input = manager.buildSessionContext().messages;
 
@@ -937,7 +1112,9 @@ describe("SessionLcm", () => {
 		expect(result.owned).toBe(false);
 		expect(context.reconcileAttempts).toBe(1);
 		expect(complete).not.toHaveBeenCalled();
-		expect(lcm.takePendingFallbackCategory()).toBe("store");
+		expect((await lcm.status()).runtime.lastFailureCategory).toBe("store");
+		await lcm.rebind();
+		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
 		await lcm.close();
 	});
 

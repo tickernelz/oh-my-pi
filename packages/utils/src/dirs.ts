@@ -163,7 +163,7 @@ export function pathIsWithin(root: string, candidate: string): boolean {
 	const normalizedRoot = normalizePathForComparison(root);
 	const normalizedCandidate = normalizePathForComparison(candidate);
 	const relative = path.relative(normalizedRoot, normalizedCandidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 export function relativePathWithinRoot(root: string, candidate: string): string | null {

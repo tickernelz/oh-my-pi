@@ -488,42 +488,52 @@ function parseArtifactRefs(serialized: string): string[] {
 	return parsed;
 }
 
-function errorCauseMatches(
-	error: unknown,
-	predicate: (error: { code?: unknown; message?: unknown }) => boolean,
-): boolean {
+function visitErrorCauses(error: unknown, visitor: (error: { code?: unknown; message?: unknown }) => void): void {
 	const seen = new Set<object>();
 	let current = error;
 	while (current !== null && typeof current === "object") {
-		if (seen.has(current)) return false;
+		if (seen.has(current)) return;
 		seen.add(current);
 		const candidate = current as { cause?: unknown; code?: unknown; message?: unknown };
-		if (predicate(candidate)) return true;
+		visitor(candidate);
 		current = candidate.cause;
 	}
-	return false;
 }
 
 export function isLcmSqliteContentionError(error: unknown): boolean {
-	return errorCauseMatches(error, candidate => {
-		if (typeof candidate.code === "string") {
-			return candidate.code.startsWith("SQLITE_BUSY") || candidate.code.startsWith("SQLITE_LOCKED");
+	let sawExplicitCode = false;
+	let sawContentionCode = false;
+	let sawCanonicalLockMessage = false;
+	visitErrorCauses(error, candidate => {
+		if (candidate.code !== undefined) {
+			sawExplicitCode = true;
+			if (
+				typeof candidate.code === "string" &&
+				(candidate.code.startsWith("SQLITE_BUSY") || candidate.code.startsWith("SQLITE_LOCKED"))
+			) {
+				sawContentionCode = true;
+			}
+			return;
 		}
-		return (
-			candidate.code === undefined &&
-			(candidate.message === "database is locked" || candidate.message === "database table is locked")
-		);
+		if (candidate.message === "database is locked" || candidate.message === "database table is locked") {
+			sawCanonicalLockMessage = true;
+		}
 	});
+	return sawContentionCode || (!sawExplicitCode && sawCanonicalLockMessage);
 }
 
 export function isLcmSqliteCorruptionError(error: unknown): boolean {
-	return errorCauseMatches(error, candidate => {
+	let matched = false;
+	visitErrorCauses(error, candidate => {
 		const code = candidate.code;
-		return (
+		if (
 			typeof code === "string" &&
 			(code.startsWith("SQLITE_CORRUPT") || code === "SQLITE_IOERR_CORRUPTFS" || code === "SQLITE_NOTADB")
-		);
+		) {
+			matched = true;
+		}
 	});
+	return matched;
 }
 
 function isMissingFile(error: unknown): boolean {
@@ -550,26 +560,79 @@ async function quarantineDatabaseFiles(dbPath: string, now: number): Promise<str
 	return quarantinePath;
 }
 
+function databaseFilePath(dbPath: string): string | undefined {
+	if (dbPath === ":memory:") return undefined;
+	if (!dbPath.startsWith("file:")) return dbPath;
+	const queryIndex = dbPath.indexOf("?");
+	const encodedPath = dbPath.slice("file:".length, queryIndex === -1 ? undefined : queryIndex);
+	const mode = queryIndex === -1 ? null : new URLSearchParams(dbPath.slice(queryIndex + 1)).get("mode");
+	if (!encodedPath || encodedPath === ":memory:" || mode === "memory") return undefined;
+	let decodedPath: string;
+	try {
+		decodedPath = decodeURIComponent(encodedPath);
+	} catch {
+		return undefined;
+	}
+	if (decodedPath === ":memory:") return undefined;
+	if (!decodedPath.startsWith("//")) return decodedPath;
+	const pathIndex = decodedPath.indexOf("/", 2);
+	if (pathIndex === -1) return undefined;
+	const authority = decodedPath.slice(2, pathIndex);
+	if (authority && authority.toLowerCase() !== "localhost") return undefined;
+	return decodedPath.slice(pathIndex) || undefined;
+}
+
+function openDatabaseRecoveryGuard(lockPath: string, busyTimeoutMs: number): Database {
+	let guard: Database | undefined;
+	try {
+		guard = new Database(lockPath, { create: true, readwrite: true, strict: true });
+		guard.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+		// BEGIN EXCLUSIVE excludes readers only in rollback-journal mode.
+		const journalMode = guard.query<{ journal_mode: string }, []>("PRAGMA journal_mode = DELETE").get();
+		if (journalMode?.journal_mode !== "delete") throw new Error("LCM recovery guard requires DELETE journal mode");
+		guard.run("CREATE TABLE IF NOT EXISTS lcm_owner_guard (id INTEGER PRIMARY KEY)");
+		return guard;
+	} catch (error) {
+		guard?.close();
+		throw error;
+	}
+}
+
+function closeDatabaseRecoveryGuard(guard: Database | undefined): void {
+	if (!guard) return;
+	try {
+		guard.run("ROLLBACK");
+	} catch {}
+	guard.close();
+}
+
+function acquireDatabaseOwnerGuard(dbPath: string, busyTimeoutMs: number): Database | undefined {
+	const databasePath = databaseFilePath(dbPath);
+	if (!databasePath) return undefined;
+	const guard = openDatabaseRecoveryGuard(`${databasePath}.recovery-lock`, busyTimeoutMs);
+	try {
+		guard.run("BEGIN");
+		// BEGIN is deferred; this read acquires the shared lock retained by the live context.
+		guard.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM lcm_owner_guard").get();
+		return guard;
+	} catch (error) {
+		closeDatabaseRecoveryGuard(guard);
+		throw error;
+	}
+}
+
 async function withDatabaseRecoveryLock<T>(
-	dbPath: string,
+	lockPath: string,
 	busyTimeoutMs: number,
 	operation: () => Promise<T>,
 ): Promise<T> {
 	let lock: Database | undefined;
-	let acquired = false;
 	try {
-		lock = new Database(`${dbPath}.recovery-lock`, { create: true, readwrite: true, strict: true });
-		lock.run(`PRAGMA busy_timeout = ${Math.max(busyTimeoutMs, 1_000)}`);
-		lock.run("BEGIN IMMEDIATE");
-		acquired = true;
+		lock = openDatabaseRecoveryGuard(lockPath, Math.max(busyTimeoutMs, 1_000));
+		lock.run("BEGIN EXCLUSIVE");
 		return await operation();
 	} finally {
-		if (acquired) {
-			try {
-				lock?.run("ROLLBACK");
-			} catch {}
-		}
-		lock?.close();
+		closeDatabaseRecoveryGuard(lock);
 	}
 }
 
@@ -577,13 +640,15 @@ class SqliteLcmContext implements LcmContext {
 	#db: Database;
 	#dbPath: string;
 	#options: InternalOptions;
+	#ownerGuard: Database | undefined;
 	#closed = false;
 	#quarantined = false;
 
-	constructor(db: Database, dbPath: string, options: InternalOptions) {
+	constructor(db: Database, dbPath: string, options: InternalOptions, ownerGuard: Database | undefined) {
 		this.#db = db;
 		this.#dbPath = dbPath;
 		this.#options = options;
+		this.#ownerGuard = ownerGuard;
 		const state = this.#readState();
 		this.#quarantined = state.quarantined_at !== null;
 	}
@@ -2310,18 +2375,6 @@ class SqliteLcmContext implements LcmContext {
 		return { ok: checks.every(item => item.ok), checks };
 	}
 
-	quarantine(redactedReason: string): void {
-		this.#assertOpen();
-		if (typeof redactedReason !== "string" || redactedReason.trim().length === 0) {
-			throw new TypeError("redactedReason must be a non-empty string");
-		}
-		this.#db.run("UPDATE store_state SET quarantined_at = ?, quarantine_reason = ? WHERE id = 1", [
-			this.#options.now(),
-			boundedDiagnostic(redactedReason),
-		]);
-		this.#quarantined = true;
-	}
-
 	rebuild(snapshots: readonly SourceSnapshot[]): RebuildResult {
 		this.#assertOpen();
 		if (!Array.isArray(snapshots)) throw new TypeError("snapshots must be an array");
@@ -2435,8 +2488,13 @@ class SqliteLcmContext implements LcmContext {
 
 	close(): void {
 		if (this.#closed) return;
-		this.#closed = true;
-		this.#db.close();
+		try {
+			this.#db.close();
+		} finally {
+			closeDatabaseRecoveryGuard(this.#ownerGuard);
+			this.#ownerGuard = undefined;
+			this.#closed = true;
+		}
 	}
 
 	[Symbol.dispose](): void {
@@ -2450,9 +2508,16 @@ function assertLcmDatabaseIntegrity(db: Database): void {
 	throw Object.assign(new Error("LCM SQLite integrity check failed"), { code: "SQLITE_CORRUPT" });
 }
 
-function createSqliteLcmContext(dbPath: string, options: InternalOptions, verifyIntegrity: boolean): SqliteLcmContext {
+function createSqliteLcmContext(
+	dbPath: string,
+	options: InternalOptions,
+	verifyIntegrity: boolean,
+	holdOwnerGuard = true,
+): SqliteLcmContext {
 	let db: Database | undefined;
+	let ownerGuard: Database | undefined;
 	try {
+		if (holdOwnerGuard) ownerGuard = acquireDatabaseOwnerGuard(dbPath, options.busyTimeoutMs);
 		db = new Database(dbPath, { create: true, readwrite: true, strict: true });
 		if (verifyIntegrity) {
 			db.run(`PRAGMA busy_timeout = ${options.busyTimeoutMs}`);
@@ -2461,9 +2526,13 @@ function createSqliteLcmContext(dbPath: string, options: InternalOptions, verify
 			assertLcmDatabaseIntegrity(db);
 		}
 		initializeLcmSchema(db, options.busyTimeoutMs);
-		return new SqliteLcmContext(db, dbPath, options);
+		return new SqliteLcmContext(db, dbPath, options, ownerGuard);
 	} catch (error) {
-		db?.close();
+		try {
+			db?.close();
+		} finally {
+			closeDatabaseRecoveryGuard(ownerGuard);
+		}
 		throw error;
 	}
 }
@@ -2472,10 +2541,11 @@ async function createSqliteLcmContextWithRetry(
 	dbPath: string,
 	options: InternalOptions,
 	verifyIntegrity: boolean,
+	holdOwnerGuard = true,
 ): Promise<SqliteLcmContext> {
 	for (let attempt = 0; ; attempt++) {
 		try {
-			return createSqliteLcmContext(dbPath, options, verifyIntegrity);
+			return createSqliteLcmContext(dbPath, options, verifyIntegrity, holdOwnerGuard);
 		} catch (error) {
 			if (!isLcmSqliteContentionError(error) || attempt >= SQLITE_OPEN_RETRY_DELAYS_MS.length) throw error;
 			await Bun.sleep(SQLITE_OPEN_RETRY_DELAYS_MS[attempt]!);
@@ -2489,26 +2559,34 @@ export async function openLcmContext(options: LcmContextOptions): Promise<LcmCon
 	try {
 		return await createSqliteLcmContextWithRetry(options.dbPath, normalized, options.recoverCorrupt === true);
 	} catch (error) {
+		const databasePath = databaseFilePath(options.dbPath);
 		if (
 			!options.recoverCorrupt ||
-			options.dbPath === ":memory:" ||
+			!databasePath ||
 			error instanceof UnsupportedLcmSchemaError ||
 			!isLcmSqliteCorruptionError(error)
 		) {
 			throw error;
 		}
-		return withDatabaseRecoveryLock(options.dbPath, normalized.busyTimeoutMs, async () => {
+		// Recheck or rebuild under the exclusive guard, but close the main handle before releasing it.
+		await withDatabaseRecoveryLock(`${databasePath}.recovery-lock`, normalized.busyTimeoutMs, async () => {
+			let context: SqliteLcmContext | undefined;
 			try {
-				return await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
-			} catch (currentError) {
-				if (currentError instanceof UnsupportedLcmSchemaError || !isLcmSqliteCorruptionError(currentError)) {
-					throw currentError;
+				try {
+					context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
+				} catch (currentError) {
+					if (currentError instanceof UnsupportedLcmSchemaError || !isLcmSqliteCorruptionError(currentError)) {
+						throw currentError;
+					}
+					const quarantinePath = await quarantineDatabaseFiles(databasePath, normalized.now());
+					context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
+					context.recordRecovery(quarantinePath, String(currentError));
 				}
-				const quarantinePath = await quarantineDatabaseFiles(options.dbPath, normalized.now());
-				const context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
-				context.recordRecovery(quarantinePath, String(currentError));
-				return context;
+			} finally {
+				context?.close();
 			}
 		});
+		// Reopen through the normal path so the returned context retains its own shared guard.
+		return await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
 	}
 }

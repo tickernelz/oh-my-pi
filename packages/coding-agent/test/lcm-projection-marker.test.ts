@@ -6,7 +6,12 @@ import {
 	LcmProjectionMarkerComponent,
 	lcmProjectionFingerprint,
 } from "@oh-my-pi/pi-coding-agent/modes/components/lcm-projection-marker";
-import { getSymbolPresetOverride, initTheme, setSymbolPreset } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import {
+	getSymbolPresetOverride,
+	initTheme,
+	type SymbolPreset,
+	setSymbolPreset,
+} from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 function projection(overrides: Partial<ContextProjection> = {}): ContextProjection {
 	return {
@@ -76,7 +81,7 @@ function assistantMessage(): AssistantMessage {
 	};
 }
 
-let previousPreset: ReturnType<typeof getSymbolPresetOverride>;
+let previousPreset: SymbolPreset | undefined;
 
 beforeAll(async () => {
 	await initTheme(false);

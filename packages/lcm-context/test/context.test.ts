@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -84,22 +84,35 @@ function sqliteError(code: string, message = code): Error & { code: string } {
 	return Object.assign(new Error(message), { code });
 }
 
-async function createLatentlyCorruptDatabase(dbPath: string): Promise<void> {
-	const corrupt = new Database(dbPath);
-	corrupt.run("CREATE TABLE unrelated_payloads (payload BLOB NOT NULL)");
-	const insert = corrupt.prepare("INSERT INTO unrelated_payloads (payload) VALUES (?)");
-	for (let index = 0; index < 32; index++) insert.run(Buffer.alloc(4_096, index));
-	const pageSize = corrupt.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
-	const rootPage = corrupt
-		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_schema WHERE name = 'unrelated_payloads'")
-		.get()!.rootpage;
-	corrupt.close();
+function seedPayloadDatabase(dbPath: string): { pageSize: number; rootPage: number } {
+	const db = new Database(dbPath);
+	try {
+		db.run("CREATE TABLE unrelated_payloads (payload BLOB NOT NULL)");
+		const insert = db.prepare("INSERT INTO unrelated_payloads (payload) VALUES (?)");
+		for (let index = 0; index < 32; index++) insert.run(Buffer.alloc(4_096, index));
+		return {
+			pageSize: db.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size,
+			rootPage: db
+				.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_schema WHERE name = 'unrelated_payloads'")
+				.get()!.rootpage,
+		};
+	} finally {
+		db.close();
+	}
+}
+
+async function corruptDatabasePage(dbPath: string, pageSize: number, pageNumber: number): Promise<void> {
 	const file = await fs.open(dbPath, "r+");
 	try {
-		await file.write(Buffer.alloc(pageSize), 0, pageSize, (rootPage - 1) * pageSize);
+		await file.write(Buffer.alloc(pageSize), 0, pageSize, (pageNumber - 1) * pageSize);
 	} finally {
 		await file.close();
 	}
+}
+
+async function createLatentlyCorruptDatabase(dbPath: string): Promise<void> {
+	const { pageSize, rootPage } = seedPayloadDatabase(dbPath);
+	await corruptDatabasePage(dbPath, pageSize, rootPage);
 }
 
 describe("LCM SQLite error classification", () => {
@@ -109,6 +122,9 @@ describe("LCM SQLite error classification", () => {
 		expect(isLcmSqliteContentionError(sqliteError("SQLITE_LOCKED_SHAREDCACHE"))).toBe(true);
 		expect(isLcmSqliteContentionError(new Error("database is locked"))).toBe(true);
 		expect(isLcmSqliteContentionError(new Error("database table is locked"))).toBe(true);
+		expect(isLcmSqliteContentionError(new Error("database is locked", { cause: new Error("inner failure") }))).toBe(
+			true,
+		);
 		expect(isLcmSqliteContentionError(new Error("outer", { cause: sqliteError("SQLITE_BUSY_SNAPSHOT") }))).toBe(true);
 	});
 
@@ -116,6 +132,9 @@ describe("LCM SQLite error classification", () => {
 		expect(isLcmSqliteContentionError(sqliteError("SQLITE_FULL", "database is locked"))).toBe(false);
 		expect(isLcmSqliteContentionError(sqliteError("SQLITE_IOERR"))).toBe(false);
 		expect(isLcmSqliteContentionError(sqliteError("EACCES"))).toBe(false);
+		for (const code of ["SQLITE_FULL", "EACCES", "SQLITE_IOERR"]) {
+			expect(isLcmSqliteContentionError(new Error("database is locked", { cause: sqliteError(code) }))).toBe(false);
+		}
 		expect(isLcmSqliteContentionError(new Error("unknown sqlite failure"))).toBe(false);
 		expect(isLcmSqliteContentionError(null)).toBe(false);
 	});
@@ -151,7 +170,6 @@ describe("LCM context contracts", () => {
 	});
 
 	afterEach(async () => {
-		vi.restoreAllMocks();
 		context?.close();
 		if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 	});
@@ -346,8 +364,13 @@ describe("LCM context contracts", () => {
 		const blocker = new Database(lockedPath);
 		initializeLcmSchema(blocker, 0);
 		blocker.run("BEGIN IMMEDIATE");
-		const sleep = vi.spyOn(Bun, "sleep").mockResolvedValue(undefined);
-		let sleepCalls = 0;
+		const retryDelays: number[] = [];
+		const nativeSleep = Bun.sleep;
+		const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async delay => {
+			if (typeof delay !== "number") throw new TypeError("Expected numeric SQLite retry delay");
+			retryDelays.push(delay);
+			await nativeSleep(delay);
+		});
 		let failure: unknown;
 		try {
 			await openLcmContext({ dbPath: lockedPath, busyTimeoutMs: 0, recoverCorrupt: true });
@@ -356,15 +379,29 @@ describe("LCM context contracts", () => {
 		} finally {
 			blocker.run("ROLLBACK");
 			blocker.close();
-			sleepCalls = sleep.mock.calls.length;
-			sleep.mockRestore();
+			sleepSpy.mockRestore();
 		}
 		expect(isLcmSqliteContentionError(failure)).toBe(true);
-		expect(sleepCalls).toBe(3);
+		expect(retryDelays).toEqual([100, 200, 400]);
 		expect((await fs.readdir(tempDir)).some(file => file.startsWith("locked.db.quarantine-"))).toBe(false);
+
+		const reopened = await openLcmContext({ dbPath: lockedPath, recoverCorrupt: true });
+		try {
+			expect(reopened.status()).toMatchObject({ schemaVersion: 5, quarantined: false, recoveredFrom: null });
+		} finally {
+			reopened.close();
+		}
 		const observer = new Database(lockedPath);
 		try {
-			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+			expect(observer.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").get()?.quick_check).toBe("ok");
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(0);
+			expect(
+				observer
+					.query<{ last_recovery_path: string | null }, []>("SELECT last_recovery_path FROM store_state")
+					.get()?.last_recovery_path,
+			).toBeNull();
 		} finally {
 			observer.close();
 		}
@@ -383,6 +420,71 @@ describe("LCM context contracts", () => {
 			recovered.close();
 		}
 	});
+
+	test("live owners fence physical corruption recovery until close", async () => {
+		const ownedPath = path.join(tempDir, "live-owner.db");
+		const { pageSize, rootPage } = seedPayloadDatabase(ownedPath);
+		const owner = await openLcmContext({ dbPath: ownedPath, recoverCorrupt: true, busyTimeoutMs: 0, now: () => now });
+		let recovered: LcmContext | undefined;
+		try {
+			expect(owner.status()).toMatchObject({ schemaVersion: 5, quarantined: false, recoveredFrom: null });
+			await corruptDatabasePage(ownedPath, pageSize, rootPage);
+
+			let blockedContext: LcmContext | undefined;
+			let blockedFailure: unknown;
+			try {
+				blockedContext = await openLcmContext({
+					dbPath: ownedPath,
+					recoverCorrupt: true,
+					busyTimeoutMs: 0,
+					now: () => now,
+				});
+			} catch (error) {
+				blockedFailure = error;
+			} finally {
+				blockedContext?.close();
+			}
+			expect(isLcmSqliteContentionError(blockedFailure)).toBe(true);
+			expect(await Bun.file(ownedPath).exists()).toBe(true);
+			expect(
+				(await fs.readdir(tempDir)).filter(
+					file => file.startsWith("live-owner.db.quarantine-") && !file.endsWith("-wal") && !file.endsWith("-shm"),
+				),
+			).toHaveLength(0);
+
+			owner.close();
+			recovered = await openLcmContext({
+				dbPath: ownedPath,
+				recoverCorrupt: true,
+				busyTimeoutMs: 0,
+				now: () => now,
+			});
+			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(recoveredFrom).toStartWith(`${ownedPath}.quarantine-${now}-`);
+			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
+		} finally {
+			recovered?.close();
+			owner.close();
+		}
+
+		const quarantines = (await fs.readdir(tempDir)).filter(
+			file => file.startsWith("live-owner.db.quarantine-") && !file.endsWith("-wal") && !file.endsWith("-shm"),
+		);
+		expect(quarantines).toHaveLength(1);
+		const observer = new Database(ownedPath);
+		try {
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(1);
+			expect(
+				observer
+					.query<{ last_recovery_path: string | null }, []>("SELECT last_recovery_path FROM store_state")
+					.get()?.last_recovery_path,
+			).toBe(path.join(tempDir, quarantines[0]!));
+		} finally {
+			observer.close();
+		}
+	}, 10_000);
 
 	test("independent processes serialize latent-corruption recovery", async () => {
 		const corruptPath = path.join(tempDir, "concurrent-corrupt.db");
@@ -1014,21 +1116,30 @@ describe("LCM context contracts", () => {
 		expect(context.searchProject({ projectId: MAIN.projectId, query: "s0" })).toEqual([]);
 	});
 
-	test("quarantine blocks projection until rebuild replaces every derived index", () => {
+	test("physical corruption recovery replaces every derived index", async () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "obsolete searchable term")]));
 		expect(context.search({ ...MAIN, query: "obsolete" })).toHaveLength(1);
-		context.quarantine("integrity check failed");
-		expect(context.status()).toMatchObject({ quarantined: true, quarantineReason: "integrity check failed" });
-		expect(() => context.project({ ...MAIN, tokenBudget: 10, freshTail: { maxSources: 1, maxTokens: 10 } })).toThrow(
-			"quarantined",
-		);
+		context.close();
+		await fs.writeFile(dbPath, Buffer.alloc(512, 0x78));
 
-		const rebuilt = context.rebuild([snapshot(MAIN, [entry(MAIN, "e2", "replacement searchable term")])]);
-		expect(rebuilt).toMatchObject({ branches: 1, activeSources: 1 });
-		expect(context.status().quarantined).toBe(false);
-		expect(context.search({ ...MAIN, query: "obsolete" })).toEqual([]);
-		expect(context.search({ ...MAIN, query: "replacement" })[0]?.citations[0]?.sourceId).toBe("e2");
-		expect(context.doctor().ok).toBe(true);
+		const recovered = await openLcmContext({ dbPath, recoverCorrupt: true, now: () => now });
+		try {
+			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(recovered.status()).toMatchObject({ schemaVersion: 5, quarantined: false });
+			expect(recoveredFrom).toStartWith(`${dbPath}.quarantine-${now}-`);
+			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
+			expect(recovered.search({ ...MAIN, query: "obsolete" })).toEqual([]);
+
+			expect(recovered.reconcile(snapshot(MAIN, [entry(MAIN, "e2", "replacement searchable term")]))).toMatchObject({
+				changed: true,
+				activeSources: 1,
+			});
+			expect(recovered.search({ ...MAIN, query: "obsolete" })).toEqual([]);
+			expect(recovered.search({ ...MAIN, query: "replacement" })[0]?.citations[0]?.sourceId).toBe("e2");
+			expect(recovered.doctor().ok).toBe(true);
+		} finally {
+			recovered.close();
+		}
 	});
 
 	test("tombstones remain until the configured retention horizon and are then purged", () => {

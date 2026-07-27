@@ -450,7 +450,12 @@ export class AgentSession {
 	readonly #prewalk: PrewalkCoordinator;
 
 	readonly #providerBoundary: SessionProviderBoundary;
-	readonly #lcm: SessionLcm | undefined;
+	readonly #lcmOptions: AgentSessionConfig["lcm"];
+	#lcm: SessionLcm | undefined;
+	#lcmLifecycleTail: Promise<void> = Promise.resolve();
+	#pendingPrimaryRequestUsedLcm = false;
+	#inflightPrimaryRequestUsedLcm = false;
+	readonly #lcmProjectedPrimaryResponses = new WeakSet<AssistantMessage>();
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1127,6 +1132,7 @@ export class AgentSession {
 			createVibeTools: config.createVibeTools,
 			createComputerTool: config.createComputerTool,
 			builtInToolNames: config.builtInToolNames,
+			ambientLcmToolNames: config.ambientLcmToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
@@ -1169,18 +1175,9 @@ export class AgentSession {
 			obfuscator: this.#obfuscator,
 		};
 		this.#providerBoundary = new SessionProviderBoundary(providerBoundaryHost);
-		this.#lcm = config.lcm
-			? new SessionLcm(
-					{
-						sessionManager: this.sessionManager,
-						obfuscator: this.#obfuscator,
-						projectionLimits: messages => this.#lcmProjectionLimits(messages),
-						projectionFits: messages => this.#lcmProjectionFits(messages),
-						complete: request => this.lcmComplete(request),
-					},
-					config.lcm,
-				)
-			: undefined;
+		this.#lcmOptions = config.lcm ? { ...config.lcm } : undefined;
+		this.#lcm =
+			this.#lcmOptions && this.settings.get("context.engine") === "lossless" ? this.#createLcm() : undefined;
 		const streamGuardsHost: StreamGuardsHost = {
 			agent: this.agent,
 			settings: this.settings,
@@ -1343,6 +1340,7 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 			messages: () => this.messages,
 			losslessOwnsRequest: (messages, signal) => this.#lcm?.ownsRequest(messages, signal) ?? Promise.resolve(false),
+			requestUsedLossless: message => this.#lcmProjectedPrimaryResponses.has(message),
 			takeLosslessFallbackCategory: () => this.#lcm?.takePendingFallbackCategory(),
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
@@ -2213,6 +2211,8 @@ export class AgentSession {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			if (this.#inflightPrimaryRequestUsedLcm) this.#lcmProjectedPrimaryResponses.add(event.message);
+			this.#inflightPrimaryRequestUsedLcm = false;
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3552,7 +3552,7 @@ export class AgentSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
-			this.#lcm?.close() ?? Promise.resolve(),
+			this.#enqueueLcmLifecycle(() => this.#closeCurrentLcm()),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
@@ -4140,21 +4140,89 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Apply the pinned Lossless projection to primary requests only. */
+	#createLcm(): SessionLcm | undefined {
+		const options = this.#lcmOptions;
+		if (!options || this.#isDisposed) return undefined;
+		try {
+			return new SessionLcm(
+				{
+					sessionManager: this.sessionManager,
+					obfuscator: this.#obfuscator,
+					projectionLimits: messages => this.#lcmProjectionLimits(messages),
+					projectionFits: messages => this.#lcmProjectionFits(messages),
+					complete: request => this.lcmComplete(request),
+				},
+				options,
+			);
+		} catch (error) {
+			logger.warn("LCM session creation failed; native context remains available", { error: String(error) });
+			return undefined;
+		}
+	}
+
+	#enqueueLcmLifecycle(operation: () => Promise<void>): Promise<void> {
+		const task = this.#lcmLifecycleTail.then(operation);
+		this.#lcmLifecycleTail = task.catch(() => {});
+		return task;
+	}
+
+	async #closeCurrentLcm(): Promise<void> {
+		const lcm = this.#lcm;
+		if (!lcm) return;
+		this.#lcm = undefined;
+		lcm.beginDispose();
+		await lcm.close();
+	}
+
+	/** Apply Lossless projection to a primary request. */
 	async projectLcmContext(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
-		if (!this.#lcm) return messages;
-		const result = await this.#lcm.project(messages, signal);
+		this.#pendingPrimaryRequestUsedLcm = false;
+		const lcm = this.#lcm;
+		if (!lcm) return messages;
+		const result = await lcm.project(messages, signal);
+		this.#pendingPrimaryRequestUsedLcm = result.owned && !signal?.aborted;
 		if (result.projection && !signal?.aborted) this.#emit({ type: "lcm_projection", projection: result.projection });
 		return result.messages;
 	}
 
+	/** Pin the completed primary transform to the provider request about to start. */
+	beginPrimaryProviderRequest(): void {
+		this.#inflightPrimaryRequestUsedLcm = this.#pendingPrimaryRequestUsedLcm;
+		this.#pendingPrimaryRequestUsedLcm = false;
+	}
+
 	async #rebindLcm(): Promise<void> {
-		this.refreshLcmSettings();
-		try {
-			await this.#lcm?.rebind();
-		} catch (error) {
-			logger.warn("LCM session rebind failed; native context remains available", { error: String(error) });
-		}
+		await this.#enqueueLcmLifecycle(async () => {
+			const shouldEnable =
+				!this.#isDisposed && this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless";
+			if (!shouldEnable) {
+				try {
+					await this.#closeCurrentLcm();
+				} catch (error) {
+					logger.warn("LCM session close failed; native context remains available", { error: String(error) });
+				}
+				await this.#tools.setAmbientLcmToolsEnabled(false);
+				return;
+			}
+
+			let lcm = this.#lcm;
+			if (!lcm) {
+				lcm = this.#createLcm();
+				if (!lcm) {
+					await this.#tools.setAmbientLcmToolsEnabled(false);
+					return;
+				}
+				this.#lcm = lcm;
+			}
+
+			this.refreshLcmSettings();
+			try {
+				await lcm.rebind();
+			} catch (error) {
+				logger.warn("LCM session rebind failed; native context remains available", { error: String(error) });
+			}
+			await this.#tools.setAmbientLcmToolsEnabled(this.#lcm?.enabled === true);
+		});
 	}
 
 	get lcmEnabled(): boolean {

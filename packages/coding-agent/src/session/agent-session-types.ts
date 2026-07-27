@@ -145,13 +145,15 @@ export interface AgentSessionConfig {
 	createVibeTools?: () => AgentTool[];
 	/** Names whose current registry entry is the built-in implementation. */
 	builtInToolNames?: Iterable<string>;
+	/** Own-session LCM tools that follow the live context engine unless explicitly pinned. */
+	ambientLcmToolNames?: Iterable<string>;
 	/** Updates tool-session predicates from the live active tool set. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Registers the write transport when runtime xdev mounts first need it. */
 	ensureWriteRegistered?: () => Promise<boolean>;
 	/** Extension/steering transform used only by AgentSession-owned side requests. */
 	sideTransformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
-	/** Lossless Context configuration pinned for this AgentSession; absent keeps native context. */
+	/** LCM capability and construction options; the effective context engine controls its live lifecycle. */
 	lcm?: Pick<SessionLcmOptions, "agentDir" | "summaryModel" | "maxConcurrentSummaries" | "registerProject">;
 	/** Provider request transform applied after message conversion. */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;

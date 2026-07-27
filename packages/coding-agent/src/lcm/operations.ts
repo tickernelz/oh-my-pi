@@ -18,7 +18,7 @@ import { escapeXmlText, getLcmDir, normalizePathForComparison, prompt } from "@o
 import recallPrompt from "../prompts/lcm/recall.md" with { type: "text" };
 import recallSystemPrompt from "../prompts/lcm/recall-system.md" with { type: "text" };
 import type { LcmCompletionRequest } from "../session/session-lcm";
-import { TRUNCATE_LENGTHS } from "../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS } from "../tools/render-utils";
 import { resolveLcmProjectSelector } from "./project-catalog";
 
 const HANDLE_PREFIX = "lcm-handle:v1:";
@@ -314,7 +314,7 @@ function fileLines(files: readonly LcmFileMetadata[], scope: ContextScope): stri
 	const lines: string[] = [];
 	for (const file of files.slice(0, LCM_MAX_FILES)) {
 		lines.push(
-			`- ${renderLcmHandle({ kind: "file", reference: { ...scope, fileId: file.fileId } })} · ${replaceTabs(file.path)} · ${file.fileType} · ${file.byteSize} bytes · ~${file.tokenCount} tokens`,
+			`- ${renderLcmHandle({ kind: "file", reference: { ...scope, fileId: file.fileId } })} · ${truncateToWidth(replaceTabs(shortenPath(file.path)), TRUNCATE_LENGTHS.CONTENT)} · ${truncateToWidth(replaceTabs(file.fileType), TRUNCATE_LENGTHS.CONTENT)} · ${file.byteSize} bytes · ~${file.tokenCount} tokens`,
 		);
 	}
 	if (files.length > LCM_MAX_FILES) lines.push(`[${files.length - LCM_MAX_FILES} additional file refs omitted]`);
@@ -422,8 +422,8 @@ async function renderSummaryDescription(
 function renderFileDescription(description: FileDescription & { available: boolean }): string {
 	const lines = [
 		`Handle: ${renderLcmHandle({ kind: "file", reference: description })}`,
-		`Path: ${replaceTabs(description.path)}`,
-		`Type: ${replaceTabs(description.fileType)}`,
+		`Path: ${truncateToWidth(replaceTabs(shortenPath(description.path)), TRUNCATE_LENGTHS.CONTENT)}`,
+		`Type: ${truncateToWidth(replaceTabs(description.fileType), TRUNCATE_LENGTHS.CONTENT)}`,
 		`Hash: ${description.contentHash}`,
 		`Size: ${description.byteSize} bytes`,
 		`Tokens: ${description.tokenCount}`,

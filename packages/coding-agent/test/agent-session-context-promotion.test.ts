@@ -1,12 +1,16 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm, createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SessionLcm } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -155,6 +159,100 @@ describe("AgentSession context promotion", () => {
 		await session.waitForIdle();
 	}
 
+	async function runLosslessOverflowScenario(projectedRequestIndexes: readonly number[], overflowRequests: number) {
+		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		if (!smallModel || !largeModel) throw new Error("Expected small and large codex models to exist");
+
+		const marker = "Lossless projection owned this provider request.";
+		const projection: ContextProjection = {
+			revision: 1,
+			ready: true,
+			historical: [
+				{
+					kind: "summary",
+					summaryId: "overflow-summary",
+					summaryHandle: "overflow-summary-handle",
+					level: 0,
+					redactedText: marker,
+					tokenCount: 8,
+					sourceIds: ["overflow-source"],
+					citations: [],
+				},
+			],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: [],
+			sourceTokens: 100,
+			selectedLevelCounts: { 0: 1 },
+			coveredSourceCount: 1,
+			freshSourceCount: 0,
+			estimatedTokens: 8,
+			pendingJobs: 0,
+		};
+		const requests: Array<{ model: string; usedLossless: boolean }> = [];
+		let liveSession: AgentSession | undefined;
+		vi.spyOn(SessionLcm.prototype, "project").mockImplementation(async messages => {
+			if (liveSession?.model?.id !== smallModel.id || !projectedRequestIndexes.includes(requests.length)) {
+				return { messages, owned: false };
+			}
+			const historical = createHistoricalContextMessage({ redactedCitedContent: marker, timestamp: Date.now() });
+			const projectedMessages: AgentMessage[] = messages[0]
+				? [messages[0], historical, ...messages.slice(1)]
+				: [historical];
+			return { messages: projectedMessages, owned: true, projection };
+		});
+		vi.spyOn(SessionLcm.prototype, "ownsRequest").mockResolvedValue(true);
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: smallModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			transformContext: async (messages, signal) => {
+				if (!liveSession) throw new Error("Expected live session before provider request");
+				return await liveSession.projectLcmContext(messages, signal);
+			},
+			streamFn: (requestModel, context) => {
+				liveSession?.beginPrimaryProviderRequest();
+				const requestIndex = requests.length;
+				requests.push({
+					model: requestModel.id,
+					usedLossless: JSON.stringify(context.messages).includes(marker),
+				});
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (requestIndex < overflowRequests) {
+						const message = createOverflowMessage(requestModel);
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "error", reason: "error", error: message });
+						return;
+					}
+					const message = createAssistantMessage(requestModel, "Recovered after promotion");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"context.engine": "lossless",
+				"contextPromotion.enabled": true,
+				"retry.enabled": false,
+			}),
+			modelRegistry,
+			lcm: { agentDir: tempDir.path() },
+		});
+		liveSession = session;
+
+		await session.prompt("Recover this overflowing request");
+		await waitFor(() => requests.length > overflowRequests, 1_000);
+		await session.waitForIdle();
+		return { requests, smallModel, largeModel, lastMessage: session.getLastAssistantMessage() };
+	}
+
 	it("promotes to a larger-context model on overflow and clears codex websocket session state", async () => {
 		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
 		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
@@ -198,6 +296,27 @@ describe("AgentSession context promotion", () => {
 		expect(session.model?.id).toBe(largeModel.id);
 		expect(closeSpy).toHaveBeenCalledTimes(1);
 		expect(session.providerSessionState.size).toBe(0);
+	});
+
+	it("promotes instead of repeating an already Lossless-owned overflowing request", async () => {
+		const { requests, smallModel, largeModel, lastMessage } = await runLosslessOverflowScenario([0, 1], 1);
+
+		expect(requests).toEqual([
+			{ model: smallModel.id, usedLossless: true },
+			{ model: largeModel.id, usedLossless: false },
+		]);
+		expect(lastMessage).toMatchObject({ model: largeModel.id, stopReason: "stop" });
+	});
+
+	it("gives a native overflow one Lossless-owned continuation before promotion", async () => {
+		const { requests, smallModel, largeModel, lastMessage } = await runLosslessOverflowScenario([1, 2], 2);
+
+		expect(requests).toEqual([
+			{ model: smallModel.id, usedLossless: false },
+			{ model: smallModel.id, usedLossless: true },
+			{ model: largeModel.id, usedLossless: false },
+		]);
+		expect(lastMessage).toMatchObject({ model: largeModel.id, stopReason: "stop" });
 	});
 
 	it("promotes on 413 payload-too-large overflow errors", async () => {

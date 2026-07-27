@@ -243,15 +243,13 @@ describe("LCM retrieval operations", () => {
 					summaryHandle: oversized,
 					redactedText: "summary",
 					rank: 0,
-					citations: [oversizedCitation],
+					citations: [oversizedCitation, citation(2)],
 				},
 			]),
 		];
 
-		for (const text of rendered) {
-			expect(text).toContain("[handle unavailable]");
-			for (const token of lcmTokens(text)) expect(() => decodeLcmHandle(token)).not.toThrow();
-		}
+		for (const text of rendered) expect(text).toContain("[handle unavailable]");
+		expect(rendered.flatMap(lcmTokens).map(decodeLcmHandle)).toEqual([{ kind: "source", citation: citation(2) }]);
 	});
 
 	it("renders executable stable handles with pagination and optional summary suppression", async () => {
@@ -277,6 +275,90 @@ describe("LCM retrieval operations", () => {
 				.map(decodeLcmHandle)
 				.map(handle => handle.kind),
 		).toEqual(["source"]);
+	});
+
+	it("shortens home paths and bounds display lines without changing opaque handle identities", async () => {
+		const sourcePath = path.join(os.homedir(), "workspace", "journal.jsonl");
+		const filePath = path.join(os.homedir(), "workspace", "p".repeat(160), "report.txt");
+		const sourceCitation = { ...citation(7), sourceKey: sourcePath };
+		const longLine = "x".repeat(200);
+		const longFileType = `application/${"v".repeat(160)}`;
+		const rendered = await renderLcmDescription({
+			kind: "source",
+			value: {
+				...description(sourceCitation, longLine),
+				files: [
+					{
+						fileId: filePath,
+						contentHash: "file-hash",
+						path: filePath,
+						fileType: longFileType,
+						byteSize: 200,
+						tokenCount: 50,
+						explorationSummary: "report",
+					},
+				],
+			},
+		});
+
+		expect(rendered).toContain(" · ~/workspace/");
+		expect(rendered).not.toContain(filePath);
+		expect(rendered).not.toContain(longFileType);
+		const displayLine = rendered.split("\n").find(line => line.startsWith("x"));
+		expect(displayLine).toBeDefined();
+		expect(Bun.stringWidth(displayLine!)).toBeLessThanOrEqual(110);
+		expect(displayLine).not.toBe(longLine);
+		const fileRendered = await renderLcmDescription({
+			kind: "file",
+			value: {
+				projectId: sourceCitation.projectId,
+				sessionId: sourceCitation.sessionId,
+				branchId: sourceCitation.branchId,
+				fileId: filePath,
+				contentHash: "file-hash",
+				path: filePath,
+				fileType: longFileType,
+				byteSize: 200,
+				tokenCount: 50,
+				explorationSummary: "report",
+				sources: [sourceCitation],
+				available: true,
+			},
+		});
+		const pathLine = fileRendered.split("\n").find(line => line.startsWith("Path: "));
+		const typeLine = fileRendered.split("\n").find(line => line.startsWith("Type: "));
+		if (!pathLine || !typeLine) throw new Error("Expected rendered Path and Type lines");
+		expect(Bun.stringWidth(pathLine)).toBeLessThanOrEqual(116);
+		expect(Bun.stringWidth(typeLine)).toBeLessThanOrEqual(116);
+		expect(pathLine).not.toContain(filePath);
+		expect(typeLine).not.toContain(longFileType);
+		expect(
+			lcmTokens(fileRendered)
+				.map(decodeLcmHandle)
+				.filter(handle => handle.kind === "file"),
+		).toEqual([
+			{
+				kind: "file",
+				reference: {
+					projectId: sourceCitation.projectId,
+					sessionId: sourceCitation.sessionId,
+					branchId: sourceCitation.branchId,
+					fileId: filePath,
+				},
+			},
+		]);
+		expect(lcmTokens(rendered).map(decodeLcmHandle)).toEqual([
+			{ kind: "source", citation: sourceCitation },
+			{
+				kind: "file",
+				reference: {
+					projectId: sourceCitation.projectId,
+					sessionId: sourceCitation.sessionId,
+					branchId: sourceCitation.branchId,
+					fileId: filePath,
+				},
+			},
+		]);
 	});
 
 	it("sends only bounded selected redacted slices to an isolated recall completion", async () => {

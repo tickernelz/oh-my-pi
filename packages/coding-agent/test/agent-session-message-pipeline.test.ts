@@ -107,6 +107,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory("/lcm-completion-test"),
 			settings: Settings.isolated({
 				"compaction.enabled": false,
+				"context.engine": "lossless",
 				modelRoles: { smol: "lcm-completion-model" },
 			}),
 			modelRegistry: {
@@ -1350,6 +1351,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: manager,
 			settings: Settings.isolated({
 				"compaction.enabled": false,
+				"context.engine": "lossless",
 				modelProviderOrder: ["opencode-go", "openai"],
 				modelRoles: { smol: "missing-summary-model,summary-model" },
 			}),
@@ -1542,6 +1544,7 @@ describe("AgentSession message pipeline", () => {
 		} as ModelSpec<Api>) as Model<Api>;
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
+			"context.engine": "lossless",
 			"providers.maxInFlightRequests": { [provider]: 1 },
 			modelRoles: { smol: "limited-lcm-model" },
 		});

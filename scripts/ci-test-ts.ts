@@ -87,6 +87,7 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
 	"packages/hashline",
+	"packages/lcm-context",
 	"packages/wire",
 	"packages/utils",
 	"packages/catalog",

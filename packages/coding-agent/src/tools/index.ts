@@ -66,6 +66,13 @@ import { WriteTool } from "./write";
 import { isMountableUnderXdev, XdevRegistry } from "./xdev";
 import { YieldTool } from "./yield";
 
+export const TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES = [
+	"lcm_search",
+	"lcm_describe",
+	"lcm_recall",
+	"lcm_cross_project_search",
+] as const;
+
 const LCM_RETRIEVAL_TOOL_NAMES: Readonly<Record<string, true>> = {
 	lcm_search: true,
 	lcm_describe: true,

@@ -187,6 +187,8 @@ export interface SessionMaintenanceHost {
 	sessionId(): string;
 	messages(): AgentMessage[];
 	losslessOwnsRequest(messages: AgentMessage[], signal?: AbortSignal): Promise<boolean>;
+	/** Whether this exact primary response came from a Lossless-owned provider request. */
+	requestUsedLossless(message: AssistantMessage): boolean;
 	takeLosslessFallbackCategory?(): LcmFallbackCategory | undefined;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
@@ -1141,9 +1143,15 @@ export class SessionMaintenance {
 			// MUST keep the only assistant message explaining why the turn
 			// stopped. The branch entry is dropped further down, but only on the
 			// paths that actually schedule a retry/compaction.
-			const losslessOwnsRequest = await this.#host.losslessOwnsRequest(this.#host.messages());
+			// A native request may use a projection that became ready while the provider was in flight.
+			// Never retry an already projected final payload: extension transforms would reproduce its overflow.
+			const losslessOwnsRequest =
+				!this.#host.requestUsedLossless(assistantMessage) &&
+				(await this.#host.losslessOwnsRequest(this.#host.messages()));
 			if (losslessOwnsRequest) {
 				if (autoContinue) {
+					this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
+					await this.#host.dropPersistedAssistantTurn(assistantMessage);
 					this.#host.scheduleAgentContinue({ delayMs: 100, generation });
 					return COMPACTION_CHECK_CONTINUATION;
 				}

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Lossless context now follows effective engine changes on settings/CWD reload, keeps own-session retrieval tools and provider prompts synchronized across Native/Lossless transitions, disposes cleanly on rollback to Native, and sends extension-expanded projected overflows through state-changing promotion/native recovery instead of retrying the same projection.
+- LCM summary scheduling now preserves and propagates the first store failure through direct close, admits preferred work during fallback-only backoff, keeps abort/unfit health deterministic, clears stale fallback annotations on rebind, validates summary-model selectors, and sanitizes rendered file paths and metadata.
+
 ## [17.1.4] - 2026-07-26
 
 ### Added
