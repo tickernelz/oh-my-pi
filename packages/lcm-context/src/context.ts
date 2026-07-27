@@ -550,6 +550,29 @@ async function quarantineDatabaseFiles(dbPath: string, now: number): Promise<str
 	return quarantinePath;
 }
 
+async function withDatabaseRecoveryLock<T>(
+	dbPath: string,
+	busyTimeoutMs: number,
+	operation: () => Promise<T>,
+): Promise<T> {
+	let lock: Database | undefined;
+	let acquired = false;
+	try {
+		lock = new Database(`${dbPath}.recovery-lock`, { create: true, readwrite: true, strict: true });
+		lock.run(`PRAGMA busy_timeout = ${Math.max(busyTimeoutMs, 1_000)}`);
+		lock.run("BEGIN IMMEDIATE");
+		acquired = true;
+		return await operation();
+	} finally {
+		if (acquired) {
+			try {
+				lock?.run("ROLLBACK");
+			} catch {}
+		}
+		lock?.close();
+	}
+}
+
 class SqliteLcmContext implements LcmContext {
 	#db: Database;
 	#dbPath: string;
@@ -2421,10 +2444,22 @@ class SqliteLcmContext implements LcmContext {
 	}
 }
 
-function createSqliteLcmContext(dbPath: string, options: InternalOptions): SqliteLcmContext {
+function assertLcmDatabaseIntegrity(db: Database): void {
+	const result = db.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").get();
+	if (result?.quick_check === "ok") return;
+	throw Object.assign(new Error("LCM SQLite integrity check failed"), { code: "SQLITE_CORRUPT" });
+}
+
+function createSqliteLcmContext(dbPath: string, options: InternalOptions, verifyIntegrity: boolean): SqliteLcmContext {
 	let db: Database | undefined;
 	try {
 		db = new Database(dbPath, { create: true, readwrite: true, strict: true });
+		if (verifyIntegrity) {
+			db.run(`PRAGMA busy_timeout = ${options.busyTimeoutMs}`);
+			const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
+			if (version > LCM_SCHEMA_VERSION) throw new UnsupportedLcmSchemaError(version);
+			assertLcmDatabaseIntegrity(db);
+		}
 		initializeLcmSchema(db, options.busyTimeoutMs);
 		return new SqliteLcmContext(db, dbPath, options);
 	} catch (error) {
@@ -2433,10 +2468,14 @@ function createSqliteLcmContext(dbPath: string, options: InternalOptions): Sqlit
 	}
 }
 
-async function createSqliteLcmContextWithRetry(dbPath: string, options: InternalOptions): Promise<SqliteLcmContext> {
+async function createSqliteLcmContextWithRetry(
+	dbPath: string,
+	options: InternalOptions,
+	verifyIntegrity: boolean,
+): Promise<SqliteLcmContext> {
 	for (let attempt = 0; ; attempt++) {
 		try {
-			return createSqliteLcmContext(dbPath, options);
+			return createSqliteLcmContext(dbPath, options, verifyIntegrity);
 		} catch (error) {
 			if (!isLcmSqliteContentionError(error) || attempt >= SQLITE_OPEN_RETRY_DELAYS_MS.length) throw error;
 			await Bun.sleep(SQLITE_OPEN_RETRY_DELAYS_MS[attempt]!);
@@ -2448,7 +2487,7 @@ export async function openLcmContext(options: LcmContextOptions): Promise<LcmCon
 	const normalized = normalizeOptions(options);
 	await prepareDatabaseParent(options.dbPath);
 	try {
-		return await createSqliteLcmContextWithRetry(options.dbPath, normalized);
+		return await createSqliteLcmContextWithRetry(options.dbPath, normalized, options.recoverCorrupt === true);
 	} catch (error) {
 		if (
 			!options.recoverCorrupt ||
@@ -2458,9 +2497,18 @@ export async function openLcmContext(options: LcmContextOptions): Promise<LcmCon
 		) {
 			throw error;
 		}
-		const quarantinePath = await quarantineDatabaseFiles(options.dbPath, normalized.now());
-		const context = await createSqliteLcmContextWithRetry(options.dbPath, normalized);
-		context.recordRecovery(quarantinePath, String(error));
-		return context;
+		return withDatabaseRecoveryLock(options.dbPath, normalized.busyTimeoutMs, async () => {
+			try {
+				return await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
+			} catch (currentError) {
+				if (currentError instanceof UnsupportedLcmSchemaError || !isLcmSqliteCorruptionError(currentError)) {
+					throw currentError;
+				}
+				const quarantinePath = await quarantineDatabaseFiles(options.dbPath, normalized.now());
+				const context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
+				context.recordRecovery(quarantinePath, String(currentError));
+				return context;
+			}
+		});
 	}
 }

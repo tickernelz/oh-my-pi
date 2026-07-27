@@ -84,6 +84,24 @@ function sqliteError(code: string, message = code): Error & { code: string } {
 	return Object.assign(new Error(message), { code });
 }
 
+async function createLatentlyCorruptDatabase(dbPath: string): Promise<void> {
+	const corrupt = new Database(dbPath);
+	corrupt.run("CREATE TABLE unrelated_payloads (payload BLOB NOT NULL)");
+	const insert = corrupt.prepare("INSERT INTO unrelated_payloads (payload) VALUES (?)");
+	for (let index = 0; index < 32; index++) insert.run(Buffer.alloc(4_096, index));
+	const pageSize = corrupt.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const rootPage = corrupt
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_schema WHERE name = 'unrelated_payloads'")
+		.get()!.rootpage;
+	corrupt.close();
+	const file = await fs.open(dbPath, "r+");
+	try {
+		await file.write(Buffer.alloc(pageSize), 0, pageSize, (rootPage - 1) * pageSize);
+	} finally {
+		await file.close();
+	}
+}
+
 describe("LCM SQLite error classification", () => {
 	test("recognizes contention codes, canonical codeless messages, and wrapped causes", () => {
 		expect(isLcmSqliteContentionError(sqliteError("SQLITE_BUSY"))).toBe(true);
@@ -347,6 +365,81 @@ describe("LCM context contracts", () => {
 		const observer = new Database(lockedPath);
 		try {
 			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("recoverCorrupt detects latent B-tree corruption before returning a context", async () => {
+		const corruptPath = path.join(tempDir, "latent-corrupt.db");
+		await createLatentlyCorruptDatabase(corruptPath);
+
+		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		try {
+			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
+		} finally {
+			recovered.close();
+		}
+	});
+
+	test("independent processes serialize latent-corruption recovery", async () => {
+		const corruptPath = path.join(tempDir, "concurrent-corrupt.db");
+		await createLatentlyCorruptDatabase(corruptPath);
+		const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/index.ts")).href;
+		const script = `
+			import { openLcmContext } from ${JSON.stringify(moduleUrl)};
+			console.log("ready");
+			await Bun.stdin.text();
+			const context = await openLcmContext({
+				dbPath: Bun.env.LCM_DB_PATH,
+				recoverCorrupt: true,
+				now: () => 1_900_000_000_000,
+			});
+			context.close();
+		`;
+		const children = Array.from({ length: 4 }, () =>
+			Bun.spawn([process.execPath, "--eval", script], {
+				env: { ...process.env, LCM_DB_PATH: corruptPath },
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const ready = await Promise.all(
+			children.map(async child => {
+				const reader = child.stdout.getReader();
+				const chunk = await reader.read();
+				reader.releaseLock();
+				return new TextDecoder().decode(chunk.value).trim();
+			}),
+		);
+		expect(ready).toEqual(["ready", "ready", "ready", "ready"]);
+		for (const child of children) {
+			child.stdin.write("start");
+			child.stdin.end();
+		}
+		const results = await Promise.all(
+			children.map(async child => ({
+				exitCode: await child.exited,
+				stderr: await new Response(child.stderr).text(),
+			})),
+		);
+		expect(results.map(result => result.exitCode)).toEqual([0, 0, 0, 0]);
+		expect(results.map(result => result.stderr)).toEqual(["", "", "", ""]);
+
+		const quarantines = (await fs.readdir(tempDir)).filter(
+			file =>
+				file.startsWith("concurrent-corrupt.db.quarantine-") && !file.endsWith("-wal") && !file.endsWith("-shm"),
+		);
+		expect(quarantines).toHaveLength(1);
+		const observer = new Database(corruptPath);
+		try {
+			expect(observer.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").get()?.quick_check).toBe("ok");
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(1);
 		} finally {
 			observer.close();
 		}
