@@ -286,7 +286,7 @@ jobs:
               targets: linux-x64-baseline linux-x64-modern
          - name: Test workspace packages and repo scripts (TS)
            env:
-              OMP_TEST_CONCURRENCY: "4"
+              OMP_TEST_CONCURRENCY: "2"
            run: bun run ci:test:ts:workspace
 
    test_coding_agent_singleton:

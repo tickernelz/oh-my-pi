@@ -115,6 +115,11 @@ describe("downstream release governance", () => {
 		const nativeAddons = record(jobs.native_addons, "native_addons");
 		const smoke = namedStep(nativeAddons, "Smoke addons before caching");
 		expect(String(smoke.run)).toContain('node "$RUNNER_TEMP/smoke-addons.js"');
+		const workspaceTests = namedStep(
+			record(jobs.test_workspace, "test_workspace"),
+			"Test workspace packages and repo scripts (TS)",
+		);
+		expect(record(workspaceTests.env, "workspace test environment").OMP_TEST_CONCURRENCY).toBe("2");
 
 		for (const [name, value] of Object.entries(jobs)) {
 			const job = record(value, name);
