@@ -39,13 +39,7 @@ import {
 	DEFAULT_SERVER_IDLE_TIMEOUT_S,
 	DEFAULT_STREAM_KEEPALIVE_MS,
 } from "./types";
-import {
-	clientUsageReportRequestSchema,
-	credentialBlockDeleteRequestSchema,
-	credentialBlockRequestSchema,
-	credentialDisableRequestSchema,
-	credentialUploadRequestSchema,
-} from "./wire-schemas";
+import { getAuthBrokerWireSchemas } from "./wire-schema-resource";
 
 export interface AuthBrokerServerOptions {
 	/** Underlying credential storage (wraps the local SQLite store on the broker). */
@@ -624,7 +618,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					return json(200, { generatedAt: Date.now(), entries });
 				}
 				if (req.method === "POST" && pathname === "/v1/usage/observed") {
-					const parsed = await parseBody(req, clientUsageReportRequestSchema);
+					const parsed = await parseBody(req, getAuthBrokerWireSchemas().clientUsageReportRequestSchema);
 					if (!parsed.ok) return parsed.response;
 					// Arktype's inferred union collides the `entries` field with
 					// Array.prototype.entries; the schema already validated the shape.
@@ -691,7 +685,9 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				const disableMatch = req.method === "POST" ? pathname.match(DISABLE_ROUTE) : null;
 				if (disableMatch) {
 					const id = Number.parseInt(disableMatch[1], 10);
-					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
+					const parsed = await parseBody(req, getAuthBrokerWireSchemas().credentialDisableRequestSchema, {
+						allowEmpty: true,
+					});
 					if (!parsed.ok) return parsed.response;
 					const cause =
 						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
@@ -707,6 +703,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				const blockDeleteMatch = req.method === "DELETE" ? pathname.match(BLOCK_ROUTE) : null;
 				if (blockDeleteMatch) {
 					const id = Number.parseInt(blockDeleteMatch[1], 10);
+					// A static facade import would eagerly construct every wire schema during server startup.
+					const { credentialBlockDeleteRequestSchema } = await import("./wire-schemas");
 					const parsed = await parseBody(req, credentialBlockDeleteRequestSchema);
 					if (!parsed.ok) return parsed.response;
 					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
@@ -739,7 +737,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				const blockMatch = req.method === "POST" ? pathname.match(BLOCK_ROUTE) : null;
 				if (blockMatch) {
 					const id = Number.parseInt(blockMatch[1], 10);
-					const parsed = await parseBody(req, credentialBlockRequestSchema);
+					const parsed = await parseBody(req, getAuthBrokerWireSchemas().credentialBlockRequestSchema);
 					if (!parsed.ok) return parsed.response;
 					const block: StoredCredentialBlock = {
 						credentialId: id,
@@ -789,7 +787,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					}
 				}
 				if (req.method === "POST" && pathname === "/v1/credential") {
-					const parsed = await parseBody(req, credentialUploadRequestSchema);
+					const parsed = await parseBody(req, getAuthBrokerWireSchemas().credentialUploadRequestSchema);
 					if (!parsed.ok) return parsed.response;
 					const { provider, credential } = parsed.data;
 					try {

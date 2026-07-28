@@ -1875,7 +1875,9 @@ export class TUI extends Container {
 			this.terminal.write(targetRow <= viewportBottom ? "\r" : "\r\n");
 		}
 
-		this.terminal.showCursor();
+		// Force: the parent shell needs the cursor back regardless of what the
+		// terminal-level dedupe believes was last written.
+		this.terminal.showCursor(true);
 		this.#forgetHardwareCursorState();
 		this.terminal.stop();
 	}

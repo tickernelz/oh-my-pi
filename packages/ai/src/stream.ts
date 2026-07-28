@@ -970,7 +970,9 @@ function extractStatusFromAssistantError(message: AssistantMessage): number | un
 }
 
 function isRetryableUpstreamError(error: unknown, status: number | undefined, message: string | undefined): boolean {
-	// 401 means the credential is bad. Usage-limit phrasing (Codex's
+	// 401 means the credential is bad; 403 is its valid-token twin (access
+	// denied by plan, model policy, or org restriction — a sibling account may
+	// not share it). Usage-limit phrasing (Codex's
 	// "You have hit your ChatGPT usage limit", Anthropic's "usage_limit_reached",
 	// Google's "resource_exhausted", OpenAI's "insufficient_quota") and 429s
 	// without transient rate-limit wording mean this account is parked but a
@@ -983,7 +985,7 @@ function isRetryableUpstreamError(error: unknown, status: number | undefined, me
 	// instead of burning siblings.
 	if (AIError.isUsageLimit(error)) return true;
 	if (isInvalidatedOAuthTokenError(error)) return true;
-	if (status === 401) return true;
+	if (status === 401 || status === 403) return true;
 	return isUsageLimitOutcome(status, message);
 }
 

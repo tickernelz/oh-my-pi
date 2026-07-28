@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-coding-agent",
-  "version": "17.1.4",
+  "version": "17.1.7",
   "description": "Coding agent CLI with read, bash, edit, write tools and session management",
   "homepage": "https://github.com/tickernelz/oh-my-pi#readme",
   "author": "Can Boluk",
@@ -51,7 +51,6 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",
     "@babel/parser": "catalog:",
-    "@babel/traverse": "catalog:",
     "@mozilla/readability": "catalog:",
     "@oh-my-pi/hashline": "catalog:",
     "@oh-my-pi/lcm-context": "catalog:",
@@ -107,6 +106,7 @@
   "files": [
     "src",
     "dist/cli.js",
+    "dist/CHANGELOG-*.md",
     "dist/*.node",
     "scripts",
     "examples",

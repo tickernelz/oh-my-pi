@@ -54,6 +54,7 @@ import {
 	renderChangelogEntries,
 } from "../utils/changelog";
 import { copyToClipboard } from "../utils/clipboard";
+import type { InspectImageMode } from "../utils/inspect-image-mode";
 import { CollabQrCodeComponent } from "./helpers/collab-qrcode";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
@@ -150,6 +151,33 @@ async function applyComputerUseToggle(session: AgentSession, enable: boolean): P
 	return enable
 		? `Computer use enabled for this session. ${formatComputerUseStatus(session)}`
 		: "Computer use disabled for this session.";
+}
+
+/** Session-effective `/vision status` line. */
+function formatVisionStatus(session: AgentSession): string {
+	const { mode, active, model } = session.inspectImageState();
+	const override = session.getInspectImageModeOverride();
+	const modelObj = session.model;
+	const capability = modelObj
+		? modelObj.input.includes("image")
+			? "native image input"
+			: "no native image input"
+		: "no active model";
+	return [
+		`inspect_image: ${active ? "active" : "inactive"}`,
+		`mode: ${mode}${override ? " (session override)" : ""}`,
+		...(override ? [`configured: ${session.settings.get("inspect_image.mode")}`] : []),
+		`model: ${model ?? "none"} (${capability})`,
+	].join(" · ");
+}
+
+/** Applies a `/vision` mode for this session and returns the operator feedback line. */
+async function applyVisionMode(session: AgentSession, mode: InspectImageMode): Promise<string> {
+	const applied = await session.setInspectImageMode(mode);
+	if (!applied) {
+		return "inspect_image is unavailable in this session.";
+	}
+	return `Vision mode: ${mode}. ${formatVisionStatus(session)}`;
 }
 
 const AUTOCOMPLETE_DETAIL_LIMIT = 48;
@@ -645,6 +673,47 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			runtime.ctx.showStatus("Usage: /computer [on|off|status]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "vision",
+		description: "Control the inspect_image vision-delegation tool for this session",
+		acpDescription: "Toggle vision delegation",
+		acpInputHint: "[on|off|auto|status]",
+		subcommands: [
+			{ name: "on", description: "Always expose inspect_image this session" },
+			{ name: "off", description: "Never expose inspect_image this session" },
+			{ name: "auto", description: "Follow inspect_image.mode (auto hides it for vision-capable models)" },
+			{ name: "status", description: "Show inspect_image status" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => `Vision: ${runtime.ctx.session.inspectImageState().mode}`,
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg === "status") {
+				await runtime.output(formatVisionStatus(runtime.session));
+				return commandConsumed();
+			}
+			if (arg === "on" || arg === "off" || arg === "auto") {
+				await runtime.output(await applyVisionMode(runtime.session, arg));
+				return commandConsumed();
+			}
+			return usage("Usage: /vision [on|off|auto|status]", runtime);
+		},
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg === "status") {
+				runtime.ctx.showStatus(formatVisionStatus(runtime.ctx.session));
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (arg === "on" || arg === "off" || arg === "auto") {
+				runtime.ctx.showStatus(await applyVisionMode(runtime.ctx.session, arg));
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /vision [on|off|auto|status]");
 			runtime.ctx.editor.setText("");
 		},
 	},

@@ -88,7 +88,14 @@ import {
 } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
-import { renderXdevCall, renderXdevResult, type XdevDispatch } from "./xdev";
+import {
+	dispatchXdevTool,
+	renderXdevCall,
+	renderXdevResult,
+	resolveXdevTool,
+	type XdevDispatch,
+	xdevListing,
+} from "./xdev";
 
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
@@ -471,7 +478,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (xdevTarget) {
 			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
 			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
-			const inst = xdevTarget.name ? this.session.xdevRegistry?.get(xdevTarget.name) : undefined;
+			const inst =
+				xdevTarget.name && this.session.xdev ? resolveXdevTool(this.session.xdev, xdevTarget.name) : undefined;
 			if (!inst) return "exec";
 			// Decode the device JSON payload and evaluate the mounted tool's own
 			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
@@ -1104,14 +1112,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 									};
 									return;
 								}
-								const registry = this.session.xdevRegistry;
-								if (!registry || registry.size === 0) {
+								const xdev = this.session.xdev;
+								if (!xdev) {
 									throw new ToolError("xd:// is not mounted in this session.");
 								}
 								if (!name) {
-									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${registry.listing()}`);
+									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
 								}
-								const { result, xdev } = await registry.dispatch(
+								const { result, xdev: dispatch } = await dispatchXdevTool(
+									xdev,
 									name,
 									deviceContent,
 									_toolCallId,
@@ -1124,7 +1133,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 								);
 								xdResult = {
 									content: result.content,
-									details: { xdev },
+									details: { xdev: dispatch },
 									isError: result.isError,
 									useless: result.useless,
 								};

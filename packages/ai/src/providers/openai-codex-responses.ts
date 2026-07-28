@@ -61,7 +61,7 @@ import {
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
+import { getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { notifyRawSseEvent } from "../utils/sse-debug";
@@ -3855,15 +3855,7 @@ async function getOrCreateCodexWebSocketConnection(
 	provider: string,
 	signal?: AbortSignal,
 ): Promise<CodexWebSocketConnection> {
-	const targetUrl = new URL(url);
-	const proxy = shouldBypassProxy(targetUrl)
-		? undefined
-		: (getProxyForProvider(provider) ??
-			(targetUrl.protocol === "wss:"
-				? Bun.env.HTTPS_PROXY || Bun.env.https_proxy
-				: Bun.env.HTTP_PROXY || Bun.env.http_proxy) ??
-			Bun.env.ALL_PROXY ??
-			Bun.env.all_proxy);
+	const proxy = getProxyForUrl(provider, new URL(url));
 	const headerRecord = headersToRecord(headers);
 	// Join an in-flight handshake instead of tearing it down: closing a
 	// CONNECTING socket rejects the concurrent caller (prewarm racing the first

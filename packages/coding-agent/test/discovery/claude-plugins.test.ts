@@ -491,6 +491,53 @@ describe("listClaudePluginRoots", () => {
 		}
 	});
 
+	test("deduplicates a plugin alias of a directly configured MCP connection", async () => {
+		const pluginsDir = path.join(tempDir, ".claude", "plugins");
+		const pluginPath = path.join(tempDir, "plugins", "context7");
+		const directConfigPath = path.join(tempDir, ".omp", "mcp.json");
+		const connection = {
+			type: "http",
+			url: "https://mcp.context7.example/mcp",
+			headers: { CONTEXT7_API_KEY: "ctx7sk-test-key" },
+		};
+		await fs.mkdir(pluginsDir, { recursive: true });
+		await fs.mkdir(pluginPath, { recursive: true });
+		await fs.mkdir(path.dirname(directConfigPath), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"context7@claude-plugins-official": [
+						{
+							scope: "user",
+							installPath: pluginPath,
+							version: "1.0.0",
+							installedAt: "2026-06-01T00:00:00Z",
+							lastUpdated: "2026-06-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.writeFile(path.join(pluginPath, ".mcp.json"), JSON.stringify({ context7: connection }));
+		await fs.writeFile(
+			directConfigPath,
+			JSON.stringify({
+				mcpServers: { context7: connection },
+			}),
+		);
+
+		const result = await loadCapability<MCPServer>(mcpCapability.id, {
+			cwd: tempDir,
+			providers: ["native", "claude-plugins"],
+		});
+
+		expect(result.items.map(server => server.name)).toEqual(["context7"]);
+		expect(result.items[0]?._source.provider).toBe("native");
+		expect(result.all.find(server => server.name === "context7:context7")?._shadowed).toBe(true);
+	});
+
 	test("resolves relative path-like command and cwd against the plugin config directory", async () => {
 		const pluginsDir = path.join(tempDir, ".claude", "plugins");
 		const pluginPath = path.join(tempDir, "plugins", "computer-use");

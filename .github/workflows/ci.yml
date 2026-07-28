@@ -5,137 +5,51 @@ on:
       branches: [main]
       paths:
          - "packages/**"
+         - "crates/**"
+         - "scripts/**"
+         - "bazel/**"
+         - "MODULE.bazel"
+         - "BUILD.bazel"
+         - ".bazelrc"
+         - ".bazelversion"
+         - "Cargo.toml"
+         - "Cargo.lock"
+         - "Cargo.Bazel.lock"
+         - ".github/**"
    pull_request:
       branches: [main]
       paths:
          - "packages/**"
+         - "crates/**"
+         - "scripts/**"
+         - "bazel/**"
+         - "MODULE.bazel"
+         - "BUILD.bazel"
+         - ".bazelrc"
+         - ".bazelversion"
+         - "Cargo.toml"
+         - "Cargo.lock"
+         - "Cargo.Bazel.lock"
+         - ".github/**"
    workflow_dispatch:
 
-# Version-tagged main commits retain a non-cancelling CI group so their
-# release-mode native validation is not interrupted by later main churn.
+# Version-tagged main commits retain a non-cancelling CI group so private-release
+# validation is not interrupted by later main churn.
 concurrency:
    group: "${{ github.workflow }}-${{ (startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && format('release-{0}', github.sha) || github.ref }}"
    cancel-in-progress: "${{ !(startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}"
 
 env:
    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-   # glibc floor for shipped Linux native addons. Ubuntu 22.04 ships a newer
-   # glibc, so plain native builds link symbol versions unavailable on older
-   # distros. Build linux-gnu addons through cargo-zigbuild against this floor
-   # to keep them portable. Bump only to raise the minimum supported glibc.
-   GLIBC_FLOOR: "2.17"
-   # audiopus_sys bundles an opus tree whose CMakeLists declares a minimum below
-   # 3.5; CMake 4.x refuses it without this native/install override.
-   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 permissions:
    contents: read
-   actions: read
 
 jobs:
-   # Resolve an upstream-style version tag only to preserve the stricter native
-   # validation mode inherited from upstream. All publication jobs are removed
-   # in this downstream; authenticated LCM prereleases use downstream-release.yml.
-   release_metadata:
-      name: Resolve release metadata
-      runs-on: ubuntu-22.04
-      outputs:
-         is-release: ${{ steps.detect.outputs.is-release }}
-         release-tag: ${{ steps.detect.outputs.release-tag }}
-      steps:
-         # Only a main-branch run needs tags fetched, so `git tag --points-at
-         # HEAD` can see the freshly-pushed `v*`. A tag-ref dispatch reads the
-         # tag straight from `github.ref_name`, and fetching `--tags` while
-         # checkout uses an explicit tag refspec makes git refuse — so scope
-         # fetch-tags to main refs.
-         - uses: actions/checkout@v4
-           with:
-              fetch-tags: ${{ github.ref == 'refs/heads/main' }}
-         - name: Detect release tag at HEAD
-           id: detect
-           shell: bash
-           run: |
-              is_release=false
-              release_tag=""
-              case "${{ github.ref }}" in
-                refs/tags/v[0-9]*)
-                  release_tag="${{ github.ref_name }}"
-                  ;;
-                refs/heads/main)
-                  if [ "${{ github.event_name }}" != "pull_request" ]; then
-                    release_tag=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -n1 || true)
-                  fi
-                  ;;
-              esac
-              if [ -n "$release_tag" ]; then
-                echo "HEAD carries release tag $release_tag; this run uses release-mode validation only."
-                is_release=true
-              fi
-              {
-                echo "is-release=$is_release"
-                echo "release-tag=$release_tag"
-              } >> "$GITHUB_OUTPUT"
 
-   # Compute a stable hash of every input that affects the native cdylib output,
-   # then look for a prior successful main run that already uploaded the Linux
-   # x64 baseline + modern artifacts for this hash. The modern artifact is the
-   # canary because both variants upload from the same matrix job. Non-release
-   # native jobs can reuse that run until its artifacts expire.
-   native_artifact_lookup:
-      name: Look up cached Linux x64 native artifacts
-      runs-on: ubuntu-22.04
-      outputs:
-         source-hash: ${{ steps.compute.outputs.source-hash }}
-         linux-x64-run-id: ${{ steps.find.outputs.linux-x64-run-id }}
-      steps:
-         - uses: actions/checkout@v4
-         - name: Compute native source hash
-           id: compute
-           shell: bash
-           run: |
-              source_hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
-                      packages/natives/scripts packages/natives/package.json \
-                      scripts/ci-build-native.ts scripts/host-detect.ts \
-                      -type f -print0 \
-                    | sort -z \
-                    | xargs -0 sha256sum \
-                    | sha256sum \
-                    | cut -c1-16)
-              echo "source-hash=$source_hash" >> "$GITHUB_OUTPUT"
-              echo "Native source hash: $source_hash"
-         - name: Find prior main build with matching Linux x64 native artifacts
-           id: find
-           env:
-              GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-           shell: bash
-           run: |
-              hash="${{ steps.compute.outputs.source-hash }}"
-              # Canary for native_linux_x64: presence of the modern artifact
-              # implies the baseline sibling is also there (they upload from the
-              # same job).
-              linux_canary="pi-natives-linux-x64-modern-h${hash}"
-              linux_x64_run_id=""
-              for candidate in $(gh run list \
-                  --workflow=ci.yml --branch=main --status=success --event=push \
-                  --limit=20 --json databaseId --jq='.[].databaseId'); do
-                names=$(gh api "/repos/${{ github.repository }}/actions/runs/$candidate/artifacts?per_page=100" \
-                    --jq '.artifacts[] | select(.expired == false) | .name')
-                if echo "$names" | grep -qFx "$linux_canary"; then
-                  linux_x64_run_id="$candidate"
-                  break
-                fi
-              done
-              if [ -n "$linux_x64_run_id" ]; then
-                echo "Reusing Linux x64 native artifacts from run $linux_x64_run_id"
-              else
-                echo "No cached Linux x64 native artifacts for hash $hash; native_linux_x64 will rebuild."
-              fi
-              echo "linux-x64-run-id=$linux_x64_run_id" >> "$GITHUB_OUTPUT"
-
-   # Fast lint, type check, and browser bundle build (no Rust, no native build needed)
    check:
       name: Lint, type check & web build
-      runs-on: ubuntu-22.04
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -144,92 +58,122 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Linux x64 baseline + modern: required by native-dependent test jobs, so it
-   # runs on every PR unless native_artifact_lookup found a cached run. Release runs always
-   # rebuild for fresh artifacts but skip clippy + Rust tests (skip_validation):
-   # the bump commit only changes version strings over content that already
-   # passed validation on its main-push run.
-   native_linux_x64:
-      name: "Native: Linux x64 (${{ matrix.variant }})"
-      needs: [release_metadata, native_artifact_lookup]
-      if: ${{ needs.release_metadata.outputs.is-release == 'true' || needs.native_artifact_lookup.outputs.linux-x64-run-id == '' }}
-      runs-on: ubuntu-22.04
-      strategy:
-         fail-fast: false
-         matrix:
-            include:
-               - { variant: baseline, rust_checks: true }
-               - { variant: modern }
+   # One Bazel job validates Rust changes and builds native addons for every
+   # downstream job. Main builds all Linux-hosted targets. Pull requests build
+   # only the Linux x64 pair required by tests.
+   rust:
+      name: Validate Rust workspace (bazel)
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
       steps:
          - uses: actions/checkout@v4
-         - uses: ./.github/actions/build-native
+         # TS-only PRs skip Rust validation. They still materialize the Linux
+         # x64 addons once from the main-exported disk cache.
+         - name: Detect Rust-affecting changes
+           id: changes
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: |
+              if [ "${{ github.event_name }}" != "pull_request" ]; then
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if gh pr diff ${{ github.event.pull_request.number }} --name-only \
+                 | grep -qE '^(crates/|Cargo\.(toml|lock)|Cargo\.Bazel\.lock|MODULE\.bazel|BUILD\.bazel|\.bazelrc|\.bazelversion|bazel/|rust-toolchain\.toml|rustfmt\.toml|scripts/bazel-natives|\.github/actions/bazel-|\.github/workflows/ci\.yml)'; then
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "No Rust-affecting changes; skipping validation."
+                echo "rust=false" >> "$GITHUB_OUTPUT"
+              fi
+         - if: steps.changes.outputs.rust == 'true'
+           uses: ./.github/actions/bun-install
+         - id: cache
+           uses: ./.github/actions/bazel-cache
            with:
-              hash: ${{ needs.native_artifact_lookup.outputs.source-hash }}
-              platform: linux
-              arch: x64
-              variant: ${{ matrix.variant }}
-              glibc: ${{ env.GLIBC_FLOOR }}
-              rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
-              skip_validation: ${{ needs.release_metadata.outputs.is-release }}
-              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+              scope: linux
+              # Main pushes export the disk cache PRs restore (once per
+              # lockfile change; no-op otherwise).
+              export: ${{ github.event_name != 'pull_request' }}
+         - name: Rust tests
+           if: steps.changes.outputs.rust == 'true'
+           # The ulimit guard runs in the step that launches the bazel server
+           # (limits are per-process and the server persists across steps).
+           run: |
+              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" test //crates/...
+         # Clippy scope mirrors `cargo clippy --workspace` (libraries only, no
+         # test targets) plus the strict/default split: crates with
+         # `[lints] workspace = true` get the workspace policy, the vendored
+         # brush fork is exempt (same as run-rs-task.ts's cargo excludes).
+         - name: Clippy (workspace lint policy on opted-in crates)
+           if: steps.changes.outputs.rust == 'true'
+           run: |
+              bazelisk query "kind('rust_library|rust_shared_library', //crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...)" \
+                | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy-strict --
+         - name: Clippy (default lints elsewhere)
+           if: steps.changes.outputs.rust == 'true'
+           run: |
+              bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (//crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...) - //crates/vendor/brush-core/... - //crates/vendor/brush-builtins/...)" \
+                | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy --
+         - name: Rustfmt
+           if: steps.changes.outputs.rust == 'true'
+           run: bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=rustfmt //crates/...
+         - name: Build native addons once
+           env:
+              EVENT_NAME: ${{ github.event_name }}
+           run: |
+              set -euo pipefail
+              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+              targets=(//:natives-linux-x64-baseline //:natives-linux-x64-modern)
+              if [ "$EVENT_NAME" != "pull_request" ]; then
+                targets=(//:natives-linux-all)
+              fi
+              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "${targets[@]}"
+         - name: Save Bazel disk cache
+           if: steps.cache.outputs.save-needed == 'true'
+           uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.cache/omp-bazel-disk
+              key: ${{ steps.cache.outputs.cache-key }}
+         - name: Upload native addon artifacts
+           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+           with:
+              name: native-addons
+              path: bazel-bin/natives-*/*.node
+              if-no-files-found: error
+              retention-days: 1
 
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test workspace packages and repo scripts (TS)
+           env:
+              OMP_TEST_CONCURRENCY: "4"
            run: bun run ci:test:ts:workspace
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test coding-agent singleton/global-state bucket
            # Keep global Settings/env/fake-timer tests serial; native addon
            # artifacts are still available like every other coding-agent bucket.
@@ -237,182 +181,108 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
-
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test native/TUI/browser-ish packages (TS)
+           env:
+              OMP_TEST_CONCURRENCY: "4"
            run: bun run ci:test:ts:native
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
-
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test coding-agent UI/TUI bucket
+           env:
+              OMP_TEST_CONCURRENCY: "2"
            run: bun run ci:test:coding-agent:ui
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test coding-agent runtime bucket
            # Runtime/session tests import native-backed barrels too; keep this
            # separate for concurrency, not as a native-free guardrail.
+           env:
+              OMP_TEST_CONCURRENCY: "4"
            run: bun run ci:test:coding-agent:runtime
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
-
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: Test coding-agent native/unit bucket
+           env:
+              OMP_TEST_CONCURRENCY: "4"
            run: bun run ci:test:coding-agent:native
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ubuntu-22.04
-      needs: [native_linux_x64, native_artifact_lookup]
-      if: ${{ !cancelled() && needs.native_linux_x64.result != 'failure' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       timeout-minutes: 15
       steps:
          - uses: actions/checkout@v4
-
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
-         - name: Resolve Linux x64 native artifact run
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux_x64.result }}" = "success" ]; then
-                echo "artifact-run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "artifact-run-id=${{ needs.native_artifact_lookup.outputs.linux-x64-run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           uses: actions/download-artifact@v4
+         - uses: ./.github/actions/native-artifacts
            with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.native_artifact_lookup.outputs.source-hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.artifact-run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
+              targets: linux-x64-baseline linux-x64-modern
          - name: CLI smoke test
            run: bun run ci:test:smoke
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ubuntu-22.04
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      needs: [rust]
+      if: ${{ !cancelled() && needs.rust.result == 'success' }}
       steps:
          - uses: actions/checkout@v4
-         - uses: ./.github/actions/ensure-rust-toolchain
-           with:
-              toolchain: nightly-2026-04-29
-         - uses: ./.github/actions/ensure-cmake
-         - name: Setup sccache
-           uses: mozilla-actions/sccache-action@v0.0.10
-         - name: Enable sccache for cargo
-           shell: bash
-           run: |
-              {
-                echo "RUSTC_WRAPPER=sccache"
-                echo "CARGO_INCREMENTAL=0"
-                echo "SCCACHE_GHA_ENABLED=true"
-              } >> "$GITHUB_ENV"
-
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
+         - uses: ./.github/actions/native-artifacts
+           with:
+              targets: linux-x64-baseline linux-x64-modern
          - name: Install method smoke tests
+           env:
+              OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
 
