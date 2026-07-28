@@ -9,8 +9,11 @@ if (!missingPackageChangelogPath) {
 const entries = await parseChangelog(missingPackageChangelogPath);
 const latest = entries[0];
 const version = latest ? `${latest.major}.${latest.minor}.${latest.patch}` : undefined;
-if (version !== VERSION || !latest?.content.startsWith(`## [${VERSION}]`)) {
-	throw new Error(`Unexpected latest changelog release: ${JSON.stringify({ version, expected: VERSION })}`);
+const expectedVersion = VERSION.replace(/-lcm\.\d+$/, "");
+if (version !== expectedVersion || !latest?.content.startsWith(`## [${expectedVersion}]`)) {
+	throw new Error(
+		`Unexpected latest changelog release: ${JSON.stringify({ version, expected: expectedVersion, runtime: VERSION })}`,
+	);
 }
 
 process.stdout.write(JSON.stringify({ version, entries: entries.length }));

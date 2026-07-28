@@ -120,6 +120,11 @@ describe("downstream release governance", () => {
 			"Test workspace packages and repo scripts (TS)",
 		);
 		expect(record(workspaceTests.env, "workspace test environment").OMP_TEST_CONCURRENCY).toBe("2");
+		const nativeTests = namedStep(
+			record(jobs.test_coding_agent_native, "test_coding_agent_native"),
+			"Test coding-agent native/unit bucket",
+		);
+		expect(record(nativeTests.env, "native test environment").OMP_TEST_CONCURRENCY).toBe("2");
 
 		for (const [name, value] of Object.entries(jobs)) {
 			const job = record(value, name);

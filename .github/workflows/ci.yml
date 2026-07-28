@@ -378,7 +378,7 @@ jobs:
               targets: linux-x64-baseline linux-x64-modern
          - name: Test coding-agent native/unit bucket
            env:
-              OMP_TEST_CONCURRENCY: "4"
+              OMP_TEST_CONCURRENCY: "2"
            run: bun run ci:test:coding-agent:native
 
    test_smoke:

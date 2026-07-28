@@ -19,6 +19,7 @@ const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const heapProbePath = path.resolve(import.meta.dir, "..", "fixtures", "changelog-static-import-heap-probe.ts");
 const bundleProbePath = path.resolve(import.meta.dir, "..", "fixtures", "changelog-bundle-fallback-probe.ts");
 const utilsStubPath = path.resolve(import.meta.dir, "..", "fixtures", "changelog-utils-stub.ts");
+const changelogVersion = VERSION.replace(/-lcm\.\d+$/, "");
 
 async function runProbe(command: string[], cwd?: string): Promise<BundleProbeResult> {
 	const proc = Bun.spawn(command, {
@@ -115,7 +116,7 @@ describe("changelog static import resources", () => {
 				unrelatedCwd,
 			);
 
-			expect(result.version).toBe(VERSION);
+			expect(result.version).toBe(changelogVersion);
 			expect(result.entries).toBe(sourceResult.entries);
 		} finally {
 			await fs.rm(tempDir, { force: true, recursive: true });
@@ -147,7 +148,7 @@ describe("changelog static import resources", () => {
 			expect(buildOutput.success, buildOutput.logs.map(log => log.message).join("\n")).toBe(true);
 
 			const result = await runProbe([binaryPath, missingPackageChangelogPath], unrelatedCwd);
-			expect(result.version).toBe(VERSION);
+			expect(result.version).toBe(changelogVersion);
 			expect(result.entries).toBe(sourceResult.entries);
 		} finally {
 			await fs.rm(tempDir, { force: true, recursive: true });
