@@ -1623,12 +1623,12 @@ describe("SessionLcm", () => {
 		}
 	});
 
-	it("inserts one stable transient history after the first user, before the active user, and preserves live tail", async () => {
+	it("preserves a colliding same-millisecond live tail around transient history", async () => {
 		const manager = SessionManager.inMemory("/worktree-a");
 		const first = appendUser(manager, "first", 1);
 		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
 		const active = appendUser(manager, "active", 3);
-		const live: AgentMessage = { role: "user", content: [{ type: "text", text: "live" }], timestamp: 4 };
+		const live: AgentMessage = { role: "user", content: [{ type: "text", text: "live" }], timestamp: 3 };
 		const { lcm, context } = createHarness(manager);
 		context.projectImpl = (_request, snapshot) => {
 			const old = snapshot.entries[1]!;

@@ -41,7 +41,7 @@ import {
 import type { SessionContext } from "./session-context";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
-import { sessionMessagePersistenceKey } from "./turn-persistence";
+import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 
 const SUMMARY_LEASE_MS = 10 * 60_000;
 const SUMMARY_RETRY_DELAY_MS = 30_000;
@@ -487,9 +487,19 @@ function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext
 	if (messages.length === 0) return [];
 	let persistedIndex = persisted.messages.length - 1;
 	for (let inputIndex = messages.length - 1; inputIndex >= 0; inputIndex--) {
-		const key = messageIdentity(messages[inputIndex]!);
-		while (persistedIndex >= 0 && messageIdentity(persisted.messages[persistedIndex]!) !== key) persistedIndex--;
-		if (persistedIndex >= 0) return messages.slice(inputIndex + 1);
+		const inputMessage = messages[inputIndex]!;
+		const key = messageIdentity(inputMessage);
+		const requiresContentMatch = sessionMessagePersistenceKey(inputMessage) !== undefined;
+		while (persistedIndex >= 0) {
+			const persistedMessage = persisted.messages[persistedIndex]!;
+			if (
+				messageIdentity(persistedMessage) === key &&
+				(!requiresContentMatch || sameMessageContent(persistedMessage, inputMessage))
+			) {
+				return messages.slice(inputIndex + 1);
+			}
+			persistedIndex--;
+		}
 	}
 	return [...messages];
 }
