@@ -1,4 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { initializeLcmSchema, LCM_SCHEMA_VERSION, summaryHandleForInput, UnsupportedLcmSchemaError } from "./schema";
@@ -48,6 +49,9 @@ const DEFAULT_LEAF_MAX_TOKENS = 4_000;
 const DEFAULT_CONDENSE_FAN_IN = 4;
 const MAX_STORED_DIAGNOSTIC_LENGTH = 2_000;
 const SQLITE_OPEN_RETRY_DELAYS_MS = [100, 200, 400] as const;
+const MAX_SEARCH_LIMIT = 100;
+const MAX_SEARCH_OFFSET = 1_000;
+const MAX_SEARCH_CANDIDATES = MAX_SEARCH_OFFSET + MAX_SEARCH_LIMIT;
 
 interface InternalOptions {
 	busyTimeoutMs: number;
@@ -545,27 +549,303 @@ async function prepareDatabaseParent(dbPath: string): Promise<void> {
 	await fs.mkdir(path.dirname(dbPath), { recursive: true });
 }
 
-async function quarantineDatabaseFiles(dbPath: string, now: number): Promise<string> {
-	const quarantinePath = `${dbPath}.quarantine-${now}-${crypto.randomUUID()}`;
-	let movedMain = false;
-	for (const suffix of ["", "-wal", "-shm"] as const) {
+const DATABASE_QUARANTINE_SIDECAR_SUFFIXES = ["-wal", "-shm"] as const;
+const MAX_PENDING_DATABASE_QUARANTINE_BYTES = 32_768;
+const DATABASE_QUARANTINE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+interface PendingDatabaseQuarantine {
+	quarantinePath: string;
+	reason: string;
+}
+
+class PendingDatabaseQuarantineError extends Error {}
+
+function pendingDatabaseQuarantinePath(dbPath: string): string {
+	return `${dbPath}.quarantine-pending`;
+}
+
+async function databaseFileExists(filePath: string): Promise<boolean> {
+	try {
+		await fs.stat(filePath);
+		return true;
+	} catch (error) {
+		if (isMissingFile(error)) return false;
+		throw error;
+	}
+}
+
+async function syncDatabaseDirectory(dbPath: string): Promise<void> {
+	const directory = await fs.open(path.dirname(path.resolve(dbPath)), "r");
+	try {
+		await directory.sync();
+	} finally {
+		await directory.close();
+	}
+}
+
+function isValidDatabaseQuarantinePath(dbPath: string, quarantinePath: string): boolean {
+	const normalizedDatabasePath = path.normalize(dbPath);
+	if (quarantinePath !== path.normalize(quarantinePath)) return false;
+	if (path.dirname(quarantinePath) !== path.dirname(normalizedDatabasePath)) return false;
+	const prefix = `${path.basename(normalizedDatabasePath)}.quarantine-`;
+	const basename = path.basename(quarantinePath);
+	if (!basename.startsWith(prefix)) return false;
+	const suffix = basename.slice(prefix.length);
+	const uuidIndex = suffix.length - 36;
+	if (uuidIndex <= 1 || suffix[uuidIndex - 1] !== "-") return false;
+	const timestamp = suffix.slice(0, uuidIndex - 1);
+	return (
+		/^(0|[1-9]\d*)$/.test(timestamp) &&
+		Number.isSafeInteger(Number(timestamp)) &&
+		DATABASE_QUARANTINE_UUID_PATTERN.test(suffix.slice(uuidIndex))
+	);
+}
+
+async function publishPendingDatabaseQuarantine(dbPath: string, pending: PendingDatabaseQuarantine): Promise<void> {
+	const markerPath = pendingDatabaseQuarantinePath(dbPath);
+	const payload = Buffer.from(JSON.stringify(pending), "utf8");
+	if (payload.byteLength > MAX_PENDING_DATABASE_QUARANTINE_BYTES) {
+		throw new Error(`Pending LCM quarantine manifest is too large: ${markerPath}`);
+	}
+	if (await databaseFileExists(markerPath)) {
+		throw new PendingDatabaseQuarantineError(`LCM database quarantine recovery is pending: ${dbPath}`);
+	}
+	const temporaryPath = path.join(
+		path.dirname(markerPath),
+		`.${path.basename(markerPath)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+	);
+	let removeTemporary = false;
+	try {
+		const handle = await fs.open(temporaryPath, "wx", 0o600);
+		removeTemporary = true;
 		try {
-			await fs.rename(`${dbPath}${suffix}`, `${quarantinePath}${suffix}`);
-			if (suffix === "") movedMain = true;
-		} catch (error) {
-			if (!isMissingFile(error)) throw error;
+			await handle.writeFile(payload);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.rename(temporaryPath, markerPath);
+		removeTemporary = false;
+		await syncDatabaseDirectory(dbPath);
+	} finally {
+		if (removeTemporary) await fs.rm(temporaryPath, { force: true }).catch(() => {});
+	}
+}
+
+async function readPendingDatabaseQuarantine(dbPath: string): Promise<PendingDatabaseQuarantine | undefined> {
+	const markerPath = pendingDatabaseQuarantinePath(dbPath);
+	let serialized: Buffer;
+	try {
+		serialized = await fs.readFile(markerPath);
+	} catch (error) {
+		if (isMissingFile(error)) return undefined;
+		throw error;
+	}
+	if (serialized.byteLength > MAX_PENDING_DATABASE_QUARANTINE_BYTES) {
+		throw new Error(`Invalid pending LCM quarantine manifest: ${markerPath}`);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(serialized.toString("utf8"));
+	} catch (error) {
+		throw new Error(`Invalid pending LCM quarantine manifest: ${markerPath}`, { cause: error });
+	}
+	if (
+		typeof parsed !== "object" ||
+		parsed === null ||
+		!("quarantinePath" in parsed) ||
+		typeof parsed.quarantinePath !== "string" ||
+		!isValidDatabaseQuarantinePath(dbPath, parsed.quarantinePath) ||
+		!("reason" in parsed) ||
+		typeof parsed.reason !== "string" ||
+		parsed.reason.length > MAX_STORED_DIAGNOSTIC_LENGTH
+	) {
+		throw new Error(`Invalid pending LCM quarantine manifest: ${markerPath}`);
+	}
+	return { quarantinePath: parsed.quarantinePath, reason: parsed.reason };
+}
+
+async function removePendingDatabaseQuarantine(dbPath: string): Promise<void> {
+	try {
+		await fs.unlink(pendingDatabaseQuarantinePath(dbPath));
+	} catch (error) {
+		if (isMissingFile(error)) return;
+		throw error;
+	}
+	await syncDatabaseDirectory(dbPath);
+}
+
+async function databaseUnitIsFullyOriginal(dbPath: string, quarantinePath: string): Promise<boolean> {
+	if (!(await databaseFileExists(dbPath)) || (await databaseFileExists(quarantinePath))) return false;
+	for (const suffix of DATABASE_QUARANTINE_SIDECAR_SUFFIXES) {
+		if (await databaseFileExists(`${quarantinePath}${suffix}`)) return false;
+	}
+	return true;
+}
+
+async function completeDatabaseQuarantine(dbPath: string, quarantinePath: string): Promise<void> {
+	const originalSidecars: (typeof DATABASE_QUARANTINE_SIDECAR_SUFFIXES)[number][] = [];
+	for (const suffix of DATABASE_QUARANTINE_SIDECAR_SUFFIXES) {
+		const originalExists = await databaseFileExists(`${dbPath}${suffix}`);
+		const quarantinedExists = await databaseFileExists(`${quarantinePath}${suffix}`);
+		if (originalExists && quarantinedExists) {
+			throw new Error(`Pending LCM quarantine has conflicting sidecars: ${dbPath}${suffix}`);
+		}
+		if (originalExists) originalSidecars.push(suffix);
+	}
+	for (const suffix of originalSidecars) {
+		await fs.rename(`${dbPath}${suffix}`, `${quarantinePath}${suffix}`);
+	}
+	await syncDatabaseDirectory(dbPath);
+
+	const originalMainExists = await databaseFileExists(dbPath);
+	const quarantinedMainExists = await databaseFileExists(quarantinePath);
+	if (originalMainExists && quarantinedMainExists) {
+		throw new Error(`Pending LCM quarantine has conflicting database files: ${dbPath}`);
+	}
+	if (!quarantinedMainExists) {
+		if (!originalMainExists) throw new Error(`Cannot quarantine missing LCM database: ${dbPath}`);
+		await fs.rename(dbPath, quarantinePath);
+	}
+	await syncDatabaseDirectory(dbPath);
+}
+
+async function restoreOriginalDatabaseUnit(dbPath: string, quarantinePath: string): Promise<void> {
+	const originalMainExists = await databaseFileExists(dbPath);
+	const quarantinedMainExists = await databaseFileExists(quarantinePath);
+	if (originalMainExists && quarantinedMainExists) {
+		throw new Error(`Pending LCM quarantine has conflicting database files: ${dbPath}`);
+	}
+	if (!originalMainExists && !quarantinedMainExists) {
+		throw new Error(`Pending LCM quarantine is missing both database files: ${dbPath}`);
+	}
+	const quarantinedSidecars: (typeof DATABASE_QUARANTINE_SIDECAR_SUFFIXES)[number][] = [];
+	for (const suffix of DATABASE_QUARANTINE_SIDECAR_SUFFIXES) {
+		const originalExists = await databaseFileExists(`${dbPath}${suffix}`);
+		const quarantinedExists = await databaseFileExists(`${quarantinePath}${suffix}`);
+		if (originalExists && quarantinedExists) {
+			throw new Error(`Pending LCM quarantine has conflicting sidecars: ${dbPath}${suffix}`);
+		}
+		if (quarantinedExists) quarantinedSidecars.push(suffix);
+	}
+	for (const suffix of quarantinedSidecars) {
+		await fs.rename(`${quarantinePath}${suffix}`, `${dbPath}${suffix}`);
+	}
+	await syncDatabaseDirectory(dbPath);
+	if (quarantinedMainExists) {
+		await fs.rename(quarantinePath, dbPath);
+		await syncDatabaseDirectory(dbPath);
+	}
+}
+
+async function recoverPendingDatabaseQuarantine(dbPath: string): Promise<PendingDatabaseQuarantine | undefined> {
+	const pending = await readPendingDatabaseQuarantine(dbPath);
+	if (!pending) return undefined;
+	const originalMainExists = await databaseFileExists(dbPath);
+	const quarantinedMainExists = await databaseFileExists(pending.quarantinePath);
+	if (quarantinedMainExists) return pending;
+	if (!originalMainExists) {
+		throw new Error(`Pending LCM quarantine is missing both database files: ${dbPath}`);
+	}
+	try {
+		await restoreOriginalDatabaseUnit(dbPath, pending.quarantinePath);
+	} catch (rollbackError) {
+		if (await databaseUnitIsFullyOriginal(dbPath, pending.quarantinePath)) throw rollbackError;
+		try {
+			await completeDatabaseQuarantine(dbPath, pending.quarantinePath);
+			return pending;
+		} catch (completionError) {
+			throw new AggregateError(
+				[rollbackError, completionError],
+				`Failed to settle pending LCM database quarantine: ${dbPath}`,
+			);
 		}
 	}
-	if (!movedMain) throw new Error(`Cannot quarantine missing LCM database: ${dbPath}`);
-	return quarantinePath;
+	await removePendingDatabaseQuarantine(dbPath);
+	return undefined;
+}
+
+async function quarantineDatabaseFiles(dbPath: string, now: number, reason: string): Promise<string> {
+	const normalizedDatabasePath = path.normalize(dbPath);
+	const quarantinePath = path.join(
+		path.dirname(normalizedDatabasePath),
+		`${path.basename(normalizedDatabasePath)}.quarantine-${assertInteger(now, "now", 0)}-${crypto.randomUUID()}`,
+	);
+	await publishPendingDatabaseQuarantine(dbPath, {
+		quarantinePath,
+		reason: boundedDiagnostic(reason),
+	});
+	try {
+		await completeDatabaseQuarantine(dbPath, quarantinePath);
+		return quarantinePath;
+	} catch (forwardError) {
+		try {
+			await restoreOriginalDatabaseUnit(dbPath, quarantinePath);
+		} catch (rollbackError) {
+			if (await databaseUnitIsFullyOriginal(dbPath, quarantinePath)) {
+				throw new AggregateError(
+					[forwardError, rollbackError],
+					`Failed to quarantine LCM database after restoring the original unit: ${dbPath}`,
+				);
+			}
+			try {
+				await completeDatabaseQuarantine(dbPath, quarantinePath);
+				return quarantinePath;
+			} catch (completionError) {
+				const errors: unknown[] = [forwardError, rollbackError, completionError];
+				try {
+					await restoreOriginalDatabaseUnit(dbPath, quarantinePath);
+				} catch (finalRestoreError) {
+					errors.push(finalRestoreError);
+				}
+				throw new AggregateError(errors, `Failed to settle LCM database quarantine: ${dbPath}`);
+			}
+		}
+		try {
+			await removePendingDatabaseQuarantine(dbPath);
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[forwardError, cleanupError],
+				`Failed to quarantine LCM database after restoring the original unit: ${dbPath}`,
+			);
+		}
+		throw forwardError;
+	}
+}
+
+function sqliteUriParameters(dbPath: string): URLSearchParams | undefined {
+	const queryIndex = dbPath.indexOf("?");
+	const fragmentIndex = dbPath.indexOf("#");
+	if (queryIndex === -1 || (fragmentIndex !== -1 && fragmentIndex < queryIndex)) return undefined;
+	const query = dbPath.slice(queryIndex + 1, fragmentIndex === -1 ? undefined : fragmentIndex);
+	return new URLSearchParams(query.replaceAll("+", "%2B"));
+}
+
+function sqliteUriBoolean(value: string | null | undefined, fallback: boolean): boolean {
+	if (value === undefined || value === null) return fallback;
+	switch (value.toLowerCase()) {
+		case "yes":
+		case "true":
+		case "on":
+			return true;
+		case "no":
+		case "false":
+		case "off":
+			return false;
+	}
+	const numericPrefix = /^[+-]?\d+/.exec(value)?.[0];
+	return numericPrefix === undefined ? fallback : !/^[+-]?0+$/.test(numericPrefix);
 }
 
 function databaseFilePath(dbPath: string): string | undefined {
 	if (dbPath === ":memory:") return undefined;
 	if (!dbPath.startsWith("file:")) return dbPath;
 	const queryIndex = dbPath.indexOf("?");
-	const encodedPath = dbPath.slice("file:".length, queryIndex === -1 ? undefined : queryIndex);
-	const mode = queryIndex === -1 ? null : new URLSearchParams(dbPath.slice(queryIndex + 1)).get("mode");
+	const fragmentIndex = dbPath.indexOf("#");
+	const hasQuery = queryIndex !== -1 && (fragmentIndex === -1 || queryIndex < fragmentIndex);
+	const pathEnd = hasQuery ? queryIndex : fragmentIndex === -1 ? undefined : fragmentIndex;
+	const encodedPath = dbPath.slice("file:".length, pathEnd);
+	const mode = sqliteUriParameters(dbPath)?.get("mode");
 	if (!encodedPath || encodedPath === ":memory:" || mode === "memory") return undefined;
 	let decodedPath: string;
 	try {
@@ -582,15 +862,34 @@ function databaseFilePath(dbPath: string): string | undefined {
 	return decodedPath.slice(pathIndex) || undefined;
 }
 
+function databaseRecoveryFilePath(dbPath: string): string | undefined {
+	const databasePath = databaseFilePath(dbPath);
+	if (!databasePath || !dbPath.startsWith("file:")) return databasePath;
+	const parameters = sqliteUriParameters(dbPath);
+	const mode = parameters?.get("mode")?.toLowerCase();
+	if (mode === "ro" || mode === "rw" || sqliteUriBoolean(parameters?.get("immutable"), false)) return undefined;
+	return databasePath;
+}
+
 function openDatabaseRecoveryGuard(lockPath: string, busyTimeoutMs: number): Database {
 	let guard: Database | undefined;
 	try {
 		guard = new Database(lockPath, { create: true, readwrite: true, strict: true });
 		guard.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
-		// BEGIN EXCLUSIVE excludes readers only in rollback-journal mode.
-		const journalMode = guard.query<{ journal_mode: string }, []>("PRAGMA journal_mode = DELETE").get();
+		// BEGIN EXCLUSIVE excludes readers only in rollback-journal mode. Established
+		// owner guards must remain read-only so another live owner cannot block here.
+		const currentMode = guard.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+		const journalMode =
+			currentMode?.journal_mode === "delete"
+				? currentMode
+				: guard.query<{ journal_mode: string }, []>("PRAGMA journal_mode = DELETE").get();
 		if (journalMode?.journal_mode !== "delete") throw new Error("LCM recovery guard requires DELETE journal mode");
-		guard.run("CREATE TABLE IF NOT EXISTS lcm_owner_guard (id INTEGER PRIMARY KEY)");
+		const ownerTable = guard
+			.query<{ name: string }, []>(
+				"SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'lcm_owner_guard'",
+			)
+			.get();
+		if (!ownerTable) guard.run("CREATE TABLE IF NOT EXISTS lcm_owner_guard (id INTEGER PRIMARY KEY)");
 		return guard;
 	} catch (error) {
 		guard?.close();
@@ -683,6 +982,16 @@ class SqliteLcmContext implements LcmContext {
 			]);
 		});
 		transaction.immediate();
+		this.flushRecoveryProvenance();
+	}
+
+	flushRecoveryProvenance(): void {
+		const checkpoint = this.#db
+			.query<{ busy: number; log: number; checkpointed: number }, []>("PRAGMA wal_checkpoint(FULL)")
+			.get();
+		if (checkpoint?.busy !== 0 || checkpoint.log !== checkpoint.checkpointed) {
+			throw new Error("LCM recovery provenance checkpoint did not complete");
+		}
 	}
 
 	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult {
@@ -1925,114 +2234,216 @@ class SqliteLcmContext implements LcmContext {
 	search(request: SearchRequest): SearchHit[] {
 		this.#assertAvailable();
 		const scope = normalizeScope(request);
-		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), 100);
-		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), 1_000);
+		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), MAX_SEARCH_LIMIT);
+		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), MAX_SEARCH_OFFSET);
 		const match = this.#ftsMatch(request.query);
 		if (!match) return [];
-		const branchRows = this.#activeSourceRows(scope);
-		if (branchRows.length === 0) return [];
-		let scopedLineage: string[] | undefined;
-		if (request.summaryHandle !== undefined) {
-			const handle = assertIdentifier(request.summaryHandle, "summaryHandle");
-			const root = this.#summaryByHandle(scope.projectId, handle);
-			if (!root) return [];
-			scopedLineage = this.#summaryLineage(root.summary_id);
-			if (findAlignedSequence(branchRows, scopedLineage) < 0) return [];
-		}
-		const hits: SearchHit[] = [];
-		for (const document of this.#searchDocuments(scope.projectId, match, offset + limit)) {
-			if (document.document_kind === "source") {
-				if (scopedLineage && !scopedLineage.includes(document.ref_id)) continue;
-				const matches = branchRows.filter(row => row.source_key === document.ref_id);
-				if (matches.length === 0) continue;
+		const transaction = this.#db.transaction((): SearchHit[] => {
+			const branchRows = this.#activeSourceRows(scope);
+			if (branchRows.length === 0) return [];
+			let scopedLineage: string[] | undefined;
+			let scopedSummaryId: string | undefined;
+			if (request.summaryHandle !== undefined) {
+				const handle = assertIdentifier(request.summaryHandle, "summaryHandle");
+				const root = this.#summaryByHandle(scope.projectId, handle);
+				if (!root) return [];
+				scopedLineage = this.#summaryLineage(root.summary_id);
+				scopedSummaryId = root.summary_id;
+				if (findAlignedSequence(branchRows, scopedLineage) < 0) return [];
+			}
+			const hits: SearchHit[] = [];
+			for (const document of this.#searchDocuments(scope.projectId, match, offset + limit, scope, scopedSummaryId)) {
+				if (document.document_kind === "source") {
+					if (scopedLineage && !scopedLineage.includes(document.ref_id)) continue;
+					const matches = branchRows.filter(row => row.source_key === document.ref_id);
+					if (matches.length === 0) continue;
+					hits.push({
+						kind: "source",
+						id: document.ref_id,
+						redactedText: document.redacted_text,
+						rank: Number(document.rank),
+						citations: matches.map(row => this.#citation(row)),
+					});
+					continue;
+				}
+				const summary = this.#summaryById(document.ref_id);
+				if (!summary) continue;
+				const lineage = this.#summaryLineage(summary.summary_id);
+				if (scopedLineage && !containsSequence(scopedLineage, lineage)) continue;
+				const start = findAlignedSequence(branchRows, lineage);
+				if (start < 0) continue;
 				hits.push({
-					kind: "source",
-					id: document.ref_id,
+					kind: "summary",
+					id: summary.summary_id,
+					summaryHandle: summary.stable_handle,
 					redactedText: document.redacted_text,
 					rank: Number(document.rank),
-					citations: matches.map(row => this.#citation(row)),
+					citations: branchRows.slice(start, start + lineage.length).map(row => this.#citation(row)),
 				});
-				continue;
 			}
-			const summary = this.#summaryById(document.ref_id);
-			if (!summary) continue;
-			const lineage = this.#summaryLineage(summary.summary_id);
-			if (scopedLineage && !containsSequence(scopedLineage, lineage)) continue;
-			const start = findAlignedSequence(branchRows, lineage);
-			if (start < 0) continue;
-			hits.push({
-				kind: "summary",
-				id: summary.summary_id,
-				summaryHandle: summary.stable_handle,
-				redactedText: document.redacted_text,
-				rank: Number(document.rank),
-				citations: branchRows.slice(start, start + lineage.length).map(row => this.#citation(row)),
-			});
-		}
-		return hits.slice(offset, offset + limit);
+			return hits.slice(offset, offset + limit);
+		});
+		return transaction.deferred();
 	}
 
 	searchProject(request: ProjectSearchRequest): SearchHit[] {
 		this.#assertAvailable();
 		const projectId = assertIdentifier(request.projectId, "projectId");
-		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), 100);
-		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), 1_000);
+		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), MAX_SEARCH_LIMIT);
+		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), MAX_SEARCH_OFFSET);
 		const match = this.#ftsMatch(request.query);
 		if (!match) return [];
-		const projectRows = this.#activeProjectSourceRows(projectId);
-		if (projectRows.length === 0) return [];
-		const byBranch = new Map<number, ProjectSourceRow[]>();
-		for (const row of projectRows) {
-			const rows = byBranch.get(row.branch_row_id);
-			if (rows) rows.push(row);
-			else byBranch.set(row.branch_row_id, [row]);
-		}
+		const transaction = this.#db.transaction((): SearchHit[] => {
+			const projectRows = this.#activeProjectSourceRows(projectId);
+			if (projectRows.length === 0) return [];
+			const byBranch = new Map<number, ProjectSourceRow[]>();
+			for (const row of projectRows) {
+				const rows = byBranch.get(row.branch_row_id);
+				if (rows) rows.push(row);
+				else byBranch.set(row.branch_row_id, [row]);
+			}
 
-		const hits: SearchHit[] = [];
-		for (const document of this.#searchDocuments(projectId, match, offset + limit)) {
-			if (document.document_kind === "source") {
-				const matches = projectRows.filter(row => row.source_key === document.ref_id);
-				if (matches.length === 0) continue;
+			const hits: SearchHit[] = [];
+			for (const document of this.#searchDocuments(projectId, match, offset + limit)) {
+				if (document.document_kind === "source") {
+					const matches = projectRows.filter(row => row.source_key === document.ref_id);
+					if (matches.length === 0) continue;
+					hits.push({
+						kind: "source",
+						id: document.ref_id,
+						redactedText: document.redacted_text,
+						rank: Number(document.rank),
+						citations: matches.map(row => this.#citation(row)),
+					});
+					continue;
+				}
+				const summary = this.#summaryById(document.ref_id);
+				if (!summary) continue;
+				const lineage = this.#summaryLineage(summary.summary_id);
+				const citations: Citation[] = [];
+				for (const branchRows of byBranch.values()) {
+					for (const start of findAlignedSequences(branchRows, lineage)) {
+						citations.push(...branchRows.slice(start, start + lineage.length).map(row => this.#citation(row)));
+					}
+				}
+				if (citations.length === 0) continue;
 				hits.push({
-					kind: "source",
-					id: document.ref_id,
+					kind: "summary",
+					id: summary.summary_id,
+					summaryHandle: summary.stable_handle,
 					redactedText: document.redacted_text,
 					rank: Number(document.rank),
-					citations: matches.map(row => this.#citation(row)),
+					citations,
 				});
-				continue;
 			}
-			const summary = this.#summaryById(document.ref_id);
-			if (!summary) continue;
-			const lineage = this.#summaryLineage(summary.summary_id);
-			const citations: Citation[] = [];
-			for (const branchRows of byBranch.values()) {
-				for (const start of findAlignedSequences(branchRows, lineage)) {
-					citations.push(...branchRows.slice(start, start + lineage.length).map(row => this.#citation(row)));
-				}
-			}
-			if (citations.length === 0) continue;
-			hits.push({
-				kind: "summary",
-				id: summary.summary_id,
-				summaryHandle: summary.stable_handle,
-				redactedText: document.redacted_text,
-				rank: Number(document.rank),
-				citations,
-			});
-		}
-		return hits.slice(offset, offset + limit);
+			return hits.slice(offset, offset + limit);
+		});
+		return transaction.deferred();
 	}
 
-	#searchDocuments(projectId: string, match: string, requested: number): SearchDocumentRow[] {
-		const candidateLimit = Math.min(Math.max(requested * 16, 64), 1_000);
+	#searchDocuments(
+		projectId: string,
+		match: string,
+		requested: number,
+		scope?: ContextScope,
+		scopedSummaryId?: string,
+	): SearchDocumentRow[] {
+		const sessionId = scope?.sessionId ?? null;
+		const branchId = scope?.branchId ?? null;
+		const summaryId = scopedSummaryId ?? null;
+		const candidateLimit = Math.min(requested, MAX_SEARCH_CANDIDATES);
 		return this.#db
-			.query<SearchDocumentRow, [string, string, number]>(
-				`SELECT d.document_kind, d.ref_id, d.redacted_text, bm25(search_fts) AS rank
+			.query<
+				SearchDocumentRow,
+				[
+					string,
+					string | null,
+					string | null,
+					string | null,
+					string,
+					string,
+					string | null,
+					string | null,
+					string | null,
+					string | null,
+					number,
+				]
+			>(
+				`WITH requested_branches AS (
+					SELECT id FROM branches
+					WHERE project_id = ? AND (? IS NULL OR (session_id = ? AND branch_id = ?))
+				 )
+				 SELECT d.document_kind, d.ref_id, d.redacted_text, bm25(search_fts) AS rank
 				 FROM search_fts JOIN search_documents d ON d.id = search_fts.rowid
-				 WHERE search_fts MATCH ? AND d.project_id = ? ORDER BY rank, d.id LIMIT ?`,
+				 WHERE search_fts MATCH ? AND d.project_id = ? AND (
+					(d.document_kind = 'source'
+					 AND EXISTS (
+						SELECT 1 FROM requested_branches rb
+						JOIN branch_sources bs ON bs.branch_row_id = rb.id AND bs.active = 1
+						WHERE bs.source_key = d.ref_id
+					 )
+					 AND (? IS NULL OR EXISTS (
+						SELECT 1 FROM summary_lineage root_source
+						WHERE root_source.summary_id = ? AND root_source.source_key = d.ref_id
+					 )))
+					OR
+					(d.document_kind = 'summary'
+					 AND EXISTS (
+						SELECT 1 FROM requested_branches rb
+						JOIN summary_lineage first_lineage
+						  ON first_lineage.summary_id = d.ref_id AND first_lineage.ordinal = 0
+						JOIN branch_sources start_source
+						  ON start_source.branch_row_id = rb.id AND start_source.active = 1
+						 AND start_source.source_key = first_lineage.source_key
+						WHERE NOT EXISTS (
+							SELECT 1 FROM summary_lineage candidate_lineage
+							LEFT JOIN branch_sources placed_source
+							  ON placed_source.branch_row_id = rb.id AND placed_source.active = 1
+							 AND placed_source.position = start_source.position + candidate_lineage.ordinal
+							 AND placed_source.source_key = candidate_lineage.source_key
+							WHERE candidate_lineage.summary_id = d.ref_id AND placed_source.id IS NULL
+						)
+						AND NOT EXISTS (
+							SELECT 1 FROM branch_sources atomic_source
+							WHERE atomic_source.branch_row_id = rb.id AND atomic_source.active = 1
+							  AND atomic_source.atomic_group_id IS NOT NULL
+							GROUP BY atomic_source.atomic_group_id
+							HAVING (
+								start_source.position BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
+								OR start_source.position + (
+									SELECT COUNT(*) FROM summary_lineage lineage_size
+									WHERE lineage_size.summary_id = d.ref_id
+								) BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
+							)
+						)
+					 )
+					 AND (? IS NULL OR EXISTS (
+						SELECT 1 FROM summary_lineage root_start
+						WHERE root_start.summary_id = ? AND NOT EXISTS (
+							SELECT 1 FROM summary_lineage candidate_lineage
+							LEFT JOIN summary_lineage root_lineage
+							  ON root_lineage.summary_id = root_start.summary_id
+							 AND root_lineage.ordinal = root_start.ordinal + candidate_lineage.ordinal
+							 AND root_lineage.source_key = candidate_lineage.source_key
+							WHERE candidate_lineage.summary_id = d.ref_id AND root_lineage.summary_id IS NULL
+						)
+					 )))
+				 )
+				 ORDER BY rank, d.id LIMIT ?`,
 			)
-			.all(match, projectId, candidateLimit);
+			.all(
+				projectId,
+				sessionId,
+				sessionId,
+				branchId,
+				match,
+				projectId,
+				summaryId,
+				summaryId,
+				summaryId,
+				summaryId,
+				candidateLimit,
+			);
 	}
 
 	#summaryById(summaryId: string): SummaryRow | null {
@@ -2518,6 +2929,10 @@ function createSqliteLcmContext(
 	let ownerGuard: Database | undefined;
 	try {
 		if (holdOwnerGuard) ownerGuard = acquireDatabaseOwnerGuard(dbPath, options.busyTimeoutMs);
+		const databasePath = databaseFilePath(dbPath);
+		if (holdOwnerGuard && databasePath && existsSync(pendingDatabaseQuarantinePath(databasePath))) {
+			throw new PendingDatabaseQuarantineError(`LCM database quarantine recovery is pending: ${databasePath}`);
+		}
 		db = new Database(dbPath, { create: true, readwrite: true, strict: true });
 		if (verifyIntegrity) {
 			db.run(`PRAGMA busy_timeout = ${options.busyTimeoutMs}`);
@@ -2556,37 +2971,60 @@ async function createSqliteLcmContextWithRetry(
 export async function openLcmContext(options: LcmContextOptions): Promise<LcmContext> {
 	const normalized = normalizeOptions(options);
 	await prepareDatabaseParent(options.dbPath);
-	try {
-		return await createSqliteLcmContextWithRetry(options.dbPath, normalized, options.recoverCorrupt === true);
-	} catch (error) {
-		const databasePath = databaseFilePath(options.dbPath);
-		if (
-			!options.recoverCorrupt ||
-			!databasePath ||
-			error instanceof UnsupportedLcmSchemaError ||
-			!isLcmSqliteCorruptionError(error)
-		) {
-			throw error;
-		}
-		// Recheck or rebuild under the exclusive guard, but close the main handle before releasing it.
-		await withDatabaseRecoveryLock(`${databasePath}.recovery-lock`, normalized.busyTimeoutMs, async () => {
-			let context: SqliteLcmContext | undefined;
-			try {
-				try {
-					context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
-				} catch (currentError) {
-					if (currentError instanceof UnsupportedLcmSchemaError || !isLcmSqliteCorruptionError(currentError)) {
-						throw currentError;
-					}
-					const quarantinePath = await quarantineDatabaseFiles(databasePath, normalized.now());
-					context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
-					context.recordRecovery(quarantinePath, String(currentError));
-				}
-			} finally {
-				context?.close();
+	for (;;) {
+		try {
+			return await createSqliteLcmContextWithRetry(options.dbPath, normalized, options.recoverCorrupt === true);
+		} catch (error) {
+			const databasePath = databaseRecoveryFilePath(options.dbPath);
+			const pendingFailure = error instanceof PendingDatabaseQuarantineError;
+			if (pendingFailure) {
+				if (!options.recoverCorrupt || !databasePath) throw error;
+			} else if (
+				!options.recoverCorrupt ||
+				!databasePath ||
+				error instanceof UnsupportedLcmSchemaError ||
+				!isLcmSqliteCorruptionError(error)
+			) {
+				throw error;
 			}
-		});
-		// Reopen through the normal path so the returned context retains its own shared guard.
-		return await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
+			let completedRecovery = false;
+			// Recheck or rebuild under the exclusive guard, but close the main handle before releasing it.
+			await withDatabaseRecoveryLock(`${databasePath}.recovery-lock`, normalized.busyTimeoutMs, async () => {
+				let context: SqliteLcmContext | undefined;
+				try {
+					const pending = await recoverPendingDatabaseQuarantine(databasePath);
+					if (pending) {
+						context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
+						if (context.status().recoveredFrom !== pending.quarantinePath) {
+							context.recordRecovery(pending.quarantinePath, pending.reason);
+						} else {
+							context.flushRecoveryProvenance();
+						}
+						await removePendingDatabaseQuarantine(databasePath);
+						completedRecovery = true;
+						return;
+					}
+					if (pendingFailure) return;
+					try {
+						context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
+					} catch (currentError) {
+						if (currentError instanceof UnsupportedLcmSchemaError || !isLcmSqliteCorruptionError(currentError)) {
+							throw currentError;
+						}
+						const reason = String(currentError);
+						const quarantinePath = await quarantineDatabaseFiles(databasePath, normalized.now(), reason);
+						context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
+						context.recordRecovery(quarantinePath, reason);
+						await removePendingDatabaseQuarantine(databasePath);
+					}
+					completedRecovery = true;
+				} finally {
+					context?.close();
+				}
+			});
+			if (!completedRecovery) continue;
+			// Reopen through the normal path so the returned context retains its own shared guard.
+			return await createSqliteLcmContextWithRetry(options.dbPath, normalized, true);
+		}
 	}
 }

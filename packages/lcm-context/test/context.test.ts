@@ -10,6 +10,7 @@ import {
 	isLcmSqliteCorruptionError,
 	type LcmContext,
 	openLcmContext,
+	type SearchHit,
 	type SourceEntry,
 	type SourceSnapshot,
 } from "../src";
@@ -359,6 +360,36 @@ describe("LCM context contracts", () => {
 		);
 	});
 
+	test("established recovery guards admit simultaneous owners without mode writes", async () => {
+		const sharedPath = path.join(tempDir, "shared-owner.db");
+		const guardPath = `${sharedPath}.recovery-lock`;
+		const seed = new Database(guardPath);
+		try {
+			seed.run("PRAGMA journal_mode = WAL");
+			seed.run("CREATE TABLE lcm_owner_guard (id INTEGER PRIMARY KEY)");
+		} finally {
+			seed.close();
+		}
+
+		const first = await openLcmContext({ dbPath: sharedPath, busyTimeoutMs: 0 });
+		let second: LcmContext | undefined;
+		try {
+			second = await openLcmContext({ dbPath: sharedPath, busyTimeoutMs: 0 });
+			expect(first.status().schemaVersion).toBe(5);
+			expect(second.status().schemaVersion).toBe(5);
+		} finally {
+			second?.close();
+			first.close();
+		}
+
+		const observer = new Database(guardPath);
+		try {
+			expect(observer.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode).toBe("delete");
+		} finally {
+			observer.close();
+		}
+	});
+
 	test("exhausted SQLite contention preserves the original store without quarantine", async () => {
 		const lockedPath = path.join(tempDir, "locked.db");
 		const blocker = new Database(lockedPath);
@@ -418,6 +449,510 @@ describe("LCM context contracts", () => {
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 		} finally {
 			recovered.close();
+		}
+	});
+
+	test("quarantine rolls back sidecars when a later move fails and remains safely retryable", async () => {
+		for (const completedMoves of [1, 2]) {
+			const corruptPath = path.join(tempDir, `rename-failure-${completedMoves}.db`);
+			const mainBytes = Buffer.alloc(512, 0x40 + completedMoves);
+			const walBytes = Buffer.from(`stale-wal-${completedMoves}`);
+			const shmBytes = Buffer.from(`stale-shm-${completedMoves}`);
+			await fs.writeFile(corruptPath, mainBytes);
+			const nativeRename = fs.rename;
+			const injectedFailure = Object.assign(new Error("injected quarantine rename failure"), { code: "EIO" });
+			let quarantineAttempt = 0;
+			let movesThisAttempt = 0;
+			let injected = false;
+			const markerPath = `${corruptPath}.quarantine-pending`;
+			const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+				const sourcePath = String(source);
+				const destinationPath = String(destination);
+				if (destinationPath === markerPath) {
+					await nativeRename(source, destination);
+					quarantineAttempt += 1;
+					movesThisAttempt = 0;
+					await Promise.all([
+						fs.writeFile(`${corruptPath}-wal`, walBytes),
+						fs.writeFile(`${corruptPath}-shm`, shmBytes),
+					]);
+					return;
+				}
+				const isForwardMove =
+					[corruptPath, `${corruptPath}-wal`, `${corruptPath}-shm`].includes(sourcePath) &&
+					destinationPath.startsWith(`${corruptPath}.quarantine-`);
+				if (isForwardMove) {
+					movesThisAttempt += 1;
+					if (!injected && quarantineAttempt === 1 && movesThisAttempt === completedMoves + 1) {
+						injected = true;
+						throw injectedFailure;
+					}
+				}
+				await nativeRename(source, destination);
+			});
+			let recovered: LcmContext | undefined;
+			try {
+				let failure: unknown;
+				try {
+					await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBe(injectedFailure);
+				expect(injected).toBe(true);
+				expect(await fs.readFile(corruptPath)).toEqual(mainBytes);
+				expect(await fs.readFile(`${corruptPath}-wal`)).toEqual(walBytes);
+				expect(await fs.readFile(`${corruptPath}-shm`)).toEqual(shmBytes);
+				expect(
+					(await fs.readdir(tempDir)).filter(file => file.startsWith(`${path.basename(corruptPath)}.quarantine-`)),
+				).toEqual([]);
+
+				recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+				const recoveredFrom = recovered.status().recoveredFrom;
+				expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+				expect(await fs.readFile(`${recoveredFrom!}-wal`)).toEqual(walBytes);
+				expect(await fs.readFile(`${recoveredFrom!}-shm`)).toEqual(shmBytes);
+				expect(await Bun.file(`${corruptPath}.quarantine-pending`).exists()).toBe(false);
+				recovered.close();
+				recovered = undefined;
+				const observer = new Database(corruptPath);
+				try {
+					expect(
+						observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+					).toBe(1);
+				} finally {
+					observer.close();
+				}
+			} finally {
+				recovered?.close();
+				renameSpy.mockRestore();
+			}
+		}
+	}, 10_000);
+
+	test("a rollback failure falls forward to a coherent quarantined unit", async () => {
+		const corruptPath = path.join(tempDir, "rollback-rename-failure.db");
+		const markerPath = `${corruptPath}.quarantine-pending`;
+		const mainBytes = Buffer.alloc(512, 0x52);
+		const walBytes = Buffer.from("rollback-stale-wal");
+		const shmBytes = Buffer.from("rollback-stale-shm");
+		await fs.writeFile(corruptPath, mainBytes);
+		const nativeRename = fs.rename;
+		const forwardFailure = Object.assign(new Error("injected main quarantine failure"), { code: "EIO" });
+		const rollbackFailure = Object.assign(new Error("injected sidecar rollback failure"), { code: "EIO" });
+		let mainForwardAttempts = 0;
+		let failedRollback = false;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			const sourcePath = String(source);
+			const destinationPath = String(destination);
+			if (destinationPath === markerPath) {
+				await nativeRename(source, destination);
+				await Promise.all([
+					fs.writeFile(`${corruptPath}-wal`, walBytes),
+					fs.writeFile(`${corruptPath}-shm`, shmBytes),
+				]);
+				return;
+			}
+			if (sourcePath === corruptPath && destinationPath.startsWith(`${corruptPath}.quarantine-`)) {
+				mainForwardAttempts += 1;
+				if (mainForwardAttempts === 1) throw forwardFailure;
+			}
+			if (
+				!failedRollback &&
+				sourcePath.startsWith(`${corruptPath}.quarantine-`) &&
+				sourcePath.endsWith("-shm") &&
+				destinationPath === `${corruptPath}-shm`
+			) {
+				failedRollback = true;
+				throw rollbackFailure;
+			}
+			await nativeRename(source, destination);
+		});
+		let recovered: LcmContext | undefined;
+		try {
+			recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(mainForwardAttempts).toBe(2);
+			expect(failedRollback).toBe(true);
+			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+			expect(await fs.readFile(recoveredFrom!)).toEqual(mainBytes);
+			expect(await fs.readFile(`${recoveredFrom!}-wal`)).toEqual(walBytes);
+			expect(await fs.readFile(`${recoveredFrom!}-shm`)).toEqual(shmBytes);
+			expect(await Bun.file(markerPath).exists()).toBe(false);
+			const observer = new Database(corruptPath);
+			try {
+				expect(observer.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").get()?.quick_check).toBe("ok");
+				expect(
+					observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+				).toBe(1);
+			} finally {
+				observer.close();
+			}
+		} finally {
+			recovered?.close();
+			renameSpy.mockRestore();
+		}
+	}, 10_000);
+
+	test("a second fall-forward failure retains a coherent replay marker", async () => {
+		const corruptPath = path.join(tempDir, "fall-forward-main-failure.db");
+		const markerPath = `${corruptPath}.quarantine-pending`;
+		const mainBytes = Buffer.alloc(512, 0x53);
+		const walBytes = Buffer.from("fall-forward-stale-wal");
+		const shmBytes = Buffer.from("fall-forward-stale-shm");
+		await fs.writeFile(corruptPath, mainBytes);
+		const nativeRename = fs.rename;
+		const firstForwardFailure = Object.assign(new Error("injected initial main move failure"), { code: "EIO" });
+		const rollbackFailure = Object.assign(new Error("injected rollback failure"), { code: "EIO" });
+		const secondForwardFailure = Object.assign(new Error("injected fall-forward main failure"), { code: "EIO" });
+		let mainForwardAttempts = 0;
+		let failedRollback = false;
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			const sourcePath = String(source);
+			const destinationPath = String(destination);
+			if (destinationPath === markerPath) {
+				await nativeRename(source, destination);
+				await Promise.all([
+					fs.writeFile(`${corruptPath}-wal`, walBytes),
+					fs.writeFile(`${corruptPath}-shm`, shmBytes),
+				]);
+				return;
+			}
+			if (sourcePath === corruptPath && destinationPath.startsWith(`${corruptPath}.quarantine-`)) {
+				mainForwardAttempts += 1;
+				if (mainForwardAttempts === 1) throw firstForwardFailure;
+				if (mainForwardAttempts === 2) throw secondForwardFailure;
+			}
+			if (
+				!failedRollback &&
+				sourcePath.startsWith(`${corruptPath}.quarantine-`) &&
+				sourcePath.endsWith("-shm") &&
+				destinationPath === `${corruptPath}-shm`
+			) {
+				failedRollback = true;
+				throw rollbackFailure;
+			}
+			await nativeRename(source, destination);
+		});
+		let failure: unknown;
+		try {
+			await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		} catch (error) {
+			failure = error;
+		} finally {
+			renameSpy.mockRestore();
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect(mainForwardAttempts).toBe(2);
+		expect(failedRollback).toBe(true);
+		expect(await fs.readFile(corruptPath)).toEqual(mainBytes);
+		expect(await fs.readFile(`${corruptPath}-wal`)).toEqual(walBytes);
+		expect(await fs.readFile(`${corruptPath}-shm`)).toEqual(shmBytes);
+		expect(await Bun.file(markerPath).exists()).toBe(true);
+		expect(
+			(await fs.readdir(tempDir)).filter(
+				file => file.startsWith("fall-forward-main-failure.db.quarantine-") && file !== path.basename(markerPath),
+			),
+		).toEqual([]);
+
+		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		try {
+			expect(recovered.status().recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+			expect(await Bun.file(markerPath).exists()).toBe(false);
+		} finally {
+			recovered.close();
+		}
+		const observer = new Database(corruptPath);
+		try {
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(1);
+		} finally {
+			observer.close();
+		}
+	}, 10_000);
+
+	test("a completely staged quarantine is rebuilt and recorded before an ordinary create", async () => {
+		const recoveredPath = path.join(tempDir, "complete-pending.db");
+		const quarantinePath = `${recoveredPath}.quarantine-${now}-00000000-0000-4000-8000-000000000001`;
+		const corruptBytes = Buffer.alloc(512, 0x63);
+		const walBytes = Buffer.from("complete-pending-wal");
+		const shmBytes = Buffer.from("complete-pending-shm");
+		await Promise.all([
+			fs.writeFile(quarantinePath, corruptBytes),
+			fs.writeFile(`${quarantinePath}-wal`, walBytes),
+			fs.writeFile(`${quarantinePath}-shm`, shmBytes),
+			fs.writeFile(
+				`${recoveredPath}.quarantine-pending`,
+				JSON.stringify({ quarantinePath, reason: "injected failure after complete unit move" }),
+			),
+		]);
+
+		const recovered = await openLcmContext({ dbPath: recoveredPath, recoverCorrupt: true, now: () => now });
+		try {
+			expect(recovered.status()).toMatchObject({ recoveredFrom: quarantinePath, quarantined: false });
+			expect(await fs.readFile(quarantinePath)).toEqual(corruptBytes);
+			expect(await fs.readFile(`${quarantinePath}-wal`)).toEqual(walBytes);
+			expect(await fs.readFile(`${quarantinePath}-shm`)).toEqual(shmBytes);
+			expect(await Bun.file(`${recoveredPath}.quarantine-pending`).exists()).toBe(false);
+		} finally {
+			recovered.close();
+		}
+		const observer = new Database(recoveredPath);
+		try {
+			expect(observer.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").get()?.quick_check).toBe("ok");
+			expect(
+				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+			).toBe(1);
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("pending manifests are synced before database moves and clean failed temporaries", async () => {
+		for (const phase of ["manifest", "directory"] as const) {
+			const corruptPath = path.join(tempDir, `manifest-sync-${phase}.db`);
+			const markerPath = `${corruptPath}.quarantine-pending`;
+			const original = Buffer.alloc(512, phase === "manifest" ? 0x64 : 0x65);
+			await fs.writeFile(corruptPath, original);
+			const injectedFailure = Object.assign(new Error(`injected ${phase} sync failure`), { code: "EIO" });
+			const nativeOpen = fs.open;
+			const nativeRename = fs.rename;
+			const events: string[] = [];
+			const databaseRenames: string[] = [];
+			const openSpy = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+				const handle = await nativeOpen(file, flags, mode);
+				const nativeSync = handle.sync.bind(handle);
+				Object.defineProperty(handle, "sync", {
+					configurable: true,
+					value: async () => {
+						const filePath = String(file);
+						if (filePath === tempDir) {
+							events.push("sync:directory");
+							if (phase === "directory") throw injectedFailure;
+						} else if (filePath.endsWith(".tmp") && filePath.includes(path.basename(markerPath))) {
+							events.push("sync:manifest");
+							if (phase === "manifest") throw injectedFailure;
+						}
+						await nativeSync();
+					},
+				});
+				return handle;
+			});
+			const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+				if ([corruptPath, `${corruptPath}-wal`, `${corruptPath}-shm`].includes(String(source))) {
+					databaseRenames.push(`${String(source)} -> ${String(destination)}`);
+				}
+				events.push(String(destination) === markerPath ? "rename:manifest" : "rename:database");
+				await nativeRename(source, destination);
+			});
+			let failure: unknown;
+			try {
+				await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+			} catch (error) {
+				failure = error;
+			} finally {
+				renameSpy.mockRestore();
+				openSpy.mockRestore();
+			}
+			expect(failure).toBe(injectedFailure);
+			expect(databaseRenames).toEqual([]);
+			expect(await fs.readFile(corruptPath)).toEqual(original);
+			expect(events[0]).toBe("sync:manifest");
+			if (phase === "manifest") {
+				expect(await Bun.file(markerPath).exists()).toBe(false);
+				expect(events).toEqual(["sync:manifest"]);
+			} else {
+				expect(await Bun.file(markerPath).exists()).toBe(true);
+				expect(events.slice(0, 3)).toEqual(["sync:manifest", "rename:manifest", "sync:directory"]);
+			}
+			expect((await fs.readdir(tempDir)).filter(file => file.endsWith(".tmp"))).toEqual([]);
+		}
+	});
+
+	test("sidecars are synced before the main quarantine commit", async () => {
+		const corruptPath = path.join(tempDir, "sidecar-sync-failure.db");
+		const markerPath = `${corruptPath}.quarantine-pending`;
+		const mainBytes = Buffer.alloc(512, 0x66);
+		const walBytes = Buffer.from("sync-stale-wal");
+		const shmBytes = Buffer.from("sync-stale-shm");
+		await fs.writeFile(corruptPath, mainBytes);
+		const injectedFailure = Object.assign(new Error("injected sidecar directory sync failure"), { code: "EIO" });
+		const nativeOpen = fs.open;
+		const nativeRename = fs.rename;
+		let directorySyncs = 0;
+		let mainMovedForward = false;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await nativeOpen(file, flags, mode);
+			const nativeSync = handle.sync.bind(handle);
+			Object.defineProperty(handle, "sync", {
+				configurable: true,
+				value: async () => {
+					if (String(file) === tempDir && ++directorySyncs === 2) throw injectedFailure;
+					await nativeSync();
+				},
+			});
+			return handle;
+		});
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			const sourcePath = String(source);
+			const destinationPath = String(destination);
+			if (destinationPath === markerPath) {
+				await nativeRename(source, destination);
+				await Promise.all([
+					fs.writeFile(`${corruptPath}-wal`, walBytes),
+					fs.writeFile(`${corruptPath}-shm`, shmBytes),
+				]);
+				return;
+			}
+			if (sourcePath === corruptPath && destinationPath.startsWith(`${corruptPath}.quarantine-`)) {
+				mainMovedForward = true;
+			}
+			await nativeRename(source, destination);
+		});
+		let failure: unknown;
+		try {
+			await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		} catch (error) {
+			failure = error;
+		} finally {
+			renameSpy.mockRestore();
+			openSpy.mockRestore();
+		}
+		expect(failure).toBe(injectedFailure);
+		expect(mainMovedForward).toBe(false);
+		expect(await fs.readFile(corruptPath)).toEqual(mainBytes);
+		expect(await fs.readFile(`${corruptPath}-wal`)).toEqual(walBytes);
+		expect(await fs.readFile(`${corruptPath}-shm`)).toEqual(shmBytes);
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+		expect(
+			(await fs.readdir(tempDir)).filter(file => file.startsWith("sidecar-sync-failure.db.quarantine-")),
+		).toEqual([]);
+	});
+
+	test("recovery provenance is checkpointed before durable marker retirement", async () => {
+		const corruptPath = path.join(tempDir, "recovery-checkpoint.db");
+		const markerPath = `${corruptPath}.quarantine-pending`;
+		await fs.writeFile(corruptPath, Buffer.alloc(512, 0x67));
+		const retirementFailure = Object.assign(new Error("injected marker retirement failure"), { code: "EIO" });
+		const nativeOpen = fs.open;
+		const nativeUnlink = fs.unlink;
+		let unlinkAttempts = 0;
+		let markerUnlinked = false;
+		let directorySyncedAfterUnlink = false;
+		let durableRecoveryPath: string | null | undefined;
+		let durableRecoveryEvents: number | undefined;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await nativeOpen(file, flags, mode);
+			const nativeSync = handle.sync.bind(handle);
+			Object.defineProperty(handle, "sync", {
+				configurable: true,
+				value: async () => {
+					if (String(file) === tempDir && markerUnlinked) directorySyncedAfterUnlink = true;
+					await nativeSync();
+				},
+			});
+			return handle;
+		});
+		const unlinkSpy = spyOn(fs, "unlink").mockImplementation(async file => {
+			if (String(file) !== markerPath) return await nativeUnlink(file);
+			unlinkAttempts += 1;
+			const observer = new Database(corruptPath, { readonly: true, strict: true });
+			try {
+				durableRecoveryPath = observer
+					.query<{ last_recovery_path: string | null }, []>(
+						"SELECT last_recovery_path FROM store_state WHERE id = 1",
+					)
+					.get()?.last_recovery_path;
+				durableRecoveryEvents = observer
+					.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events")
+					.get()?.count;
+			} finally {
+				observer.close();
+			}
+			if (unlinkAttempts === 1) throw retirementFailure;
+			await nativeUnlink(file);
+			markerUnlinked = true;
+		});
+		let failure: unknown;
+		try {
+			await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBe(retirementFailure);
+		expect(durableRecoveryPath).toStartWith(`${corruptPath}.quarantine-${now}-`);
+		expect(durableRecoveryEvents).toBe(1);
+		if (!durableRecoveryPath) throw new Error("expected durable recovery provenance");
+		expect(await Bun.file(markerPath).exists()).toBe(true);
+
+		let recovered: LcmContext | undefined;
+		try {
+			recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+			expect(recovered.status().recoveredFrom).toBe(durableRecoveryPath);
+			expect(unlinkAttempts).toBe(2);
+			expect(directorySyncedAfterUnlink).toBe(true);
+			expect(await Bun.file(markerPath).exists()).toBe(false);
+			const observer = new Database(corruptPath);
+			try {
+				expect(
+					observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
+				).toBe(1);
+			} finally {
+				observer.close();
+			}
+		} finally {
+			recovered?.close();
+			unlinkSpy.mockRestore();
+			openSpy.mockRestore();
+		}
+	});
+
+	test("rejects malformed and traversing quarantine manifests before filesystem probes", async () => {
+		const corruptPath = path.join(tempDir, "confined-manifest.db");
+		const markerPath = `${corruptPath}.quarantine-pending`;
+		const unrelatedPath = path.join(tempDir, "unrelated.db");
+		const original = Buffer.alloc(512, 0x68);
+		const unrelated = Buffer.from("unrelated-data");
+		await Promise.all([fs.writeFile(corruptPath, original), fs.writeFile(unrelatedPath, unrelated)]);
+		const validUuid = "00000000-0000-4000-8000-000000000002";
+		const candidates = [
+			`${corruptPath}.quarantine-${now}-${validUuid}/../${path.basename(unrelatedPath)}`,
+			`${corruptPath}.quarantine-${now}-not-a-uuid`,
+		];
+		const nativeStat = fs.stat;
+		const nativeRename = fs.rename;
+		const probedPaths: string[] = [];
+		const renamedPaths: string[] = [];
+		const statImplementation = (async (...args: unknown[]) => {
+			probedPaths.push(String(args[0]));
+			return await (nativeStat as unknown as (...statArgs: unknown[]) => Promise<unknown>)(...args);
+		}) as unknown as typeof fs.stat;
+		const statSpy = spyOn(fs, "stat").mockImplementation(statImplementation);
+		const renameSpy = spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			renamedPaths.push(`${String(source)} -> ${String(destination)}`);
+			await nativeRename(source, destination);
+		});
+		try {
+			for (const quarantinePath of candidates) {
+				probedPaths.length = 0;
+				renamedPaths.length = 0;
+				await fs.writeFile(markerPath, JSON.stringify({ quarantinePath, reason: "malformed manifest" }));
+				let failure: unknown;
+				try {
+					await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
+				} catch (error) {
+					failure = error;
+				}
+				expect(String(failure)).toContain("Invalid pending LCM quarantine manifest");
+				expect(probedPaths).toEqual([]);
+				expect(renamedPaths).toEqual([]);
+				expect(await fs.readFile(corruptPath)).toEqual(original);
+				expect(await fs.readFile(unrelatedPath)).toEqual(unrelated);
+			}
+		} finally {
+			renameSpy.mockRestore();
+			statSpy.mockRestore();
 		}
 	});
 
@@ -558,6 +1093,44 @@ describe("LCM context contracts", () => {
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 		} finally {
 			recovered.close();
+		}
+	});
+
+	test("read-only and immutable SQLite URIs never attempt physical corruption recovery", async () => {
+		for (const [index, query] of [
+			"mode=ro",
+			"mode=rw",
+			"immutable=1",
+			"immutable=2",
+			"immutable=2suffix",
+			"immutable=+2",
+			"immutable=yes",
+			"immutable=true",
+			"immutable=on",
+			"immutable=2#immutable=0",
+			"mode=ro#mode=rwc",
+		].entries()) {
+			const corruptPath = path.join(tempDir, `recovery-ineligible-uri-${index}.db`);
+			const original = Buffer.alloc(512, 0x61 + index);
+			await fs.writeFile(corruptPath, original);
+			let opened: LcmContext | undefined;
+			let failure: unknown;
+			try {
+				opened = await openLcmContext({
+					dbPath: `${pathToFileURL(corruptPath).href}?${query}`,
+					recoverCorrupt: true,
+					now: () => now,
+				});
+			} catch (error) {
+				failure = error;
+			} finally {
+				opened?.close();
+			}
+			expect(failure).toBeDefined();
+			expect(await fs.readFile(corruptPath)).toEqual(original);
+			expect(
+				(await fs.readdir(tempDir)).filter(file => file.startsWith(`${path.basename(corruptPath)}.quarantine-`)),
+			).toEqual([]);
 		}
 	});
 
@@ -1073,6 +1646,94 @@ describe("LCM context contracts", () => {
 		completeEveryJob(context);
 		const summaryHit = context.search({ ...MAIN, query: "s0" }).find(hit => hit.kind === "summary");
 		expect(summaryHit?.citations.map(citation => citation.sourceId)).toEqual(["e1"]);
+	});
+
+	test("branch search scopes equal-ranked candidates before pagination", () => {
+		const fork = { ...MAIN, branchId: "search-noise" };
+		const redactedText = "branchscope equal ranked document";
+		context.reconcile(
+			snapshot(
+				fork,
+				Array.from({ length: 141 }, (_, index) => entry(fork, `noise-${index}`, redactedText)),
+			),
+			{ summarize: false },
+		);
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "target", redactedText)]), { summarize: false });
+
+		const hits = context.search({ ...MAIN, query: "branchscope", limit: 1 });
+		expect(hits).toHaveLength(1);
+		expect(hits[0]?.citations.map(citation => citation.sourceId)).toEqual(["target"]);
+	});
+
+	test("branch and project search paginate one read snapshot at the maximum offset", async () => {
+		const staging = { ...MAIN, branchId: "search-staging" };
+		const redactedText = "offsetboundary equal ranked document";
+		const original = Array.from({ length: 1_001 }, (_, index) => entry(MAIN, `source-${index}`, redactedText));
+		const replacements = Array.from({ length: 1_001 }, (_, index) =>
+			entry(MAIN, `replacement-${index}`, redactedText),
+		);
+		context.reconcile(
+			snapshot(
+				staging,
+				replacements.map(source => ({ ...source, ...staging })),
+			),
+			{ summarize: false },
+		);
+		context.reconcile(snapshot(staging, []), { summarize: false });
+		context.reconcile(snapshot(MAIN, original), { summarize: false });
+
+		expect(context.status().journalMode).toBe("wal");
+
+		const writer = await openLcmContext({ dbPath, now: () => now });
+		const searchDuringReplacement = (scopeQuery: string, action: () => SearchHit[]): SearchHit[] => {
+			const realQuery = Database.prototype.query;
+			let injected = false;
+			let replacementApplied = false;
+			const queryImplementation = function (this: Database, sql: string): unknown {
+				const statement = Reflect.apply(realQuery, this, [sql]) as object & {
+					all: (...bindings: unknown[]) => unknown[];
+				};
+				if (injected || !sql.includes(scopeQuery)) return statement;
+				const all = statement.all.bind(statement);
+				return new Proxy(statement, {
+					get(target, property) {
+						if (property !== "all") return Reflect.get(target, property, target);
+						return (...bindings: unknown[]) => {
+							const rows = all(...bindings);
+							injected = true;
+							replacementApplied = writer.reconcile(snapshot(MAIN, replacements), { summarize: false }).changed;
+							return rows;
+						};
+					},
+				});
+			} as unknown as typeof Database.prototype.query;
+			const querySpy = spyOn(Database.prototype, "query").mockImplementation(queryImplementation);
+			try {
+				const hits = action();
+				expect(injected).toBe(true);
+				expect(replacementApplied).toBe(true);
+				return hits;
+			} finally {
+				querySpy.mockRestore();
+			}
+		};
+
+		try {
+			const branchHits = searchDuringReplacement("AND b.session_id = ? AND b.branch_id = ?", () =>
+				context.search({ ...MAIN, query: "offsetboundary", offset: 1_000, limit: 1 }),
+			);
+			expect(branchHits).toHaveLength(1);
+			expect(branchHits[0]?.citations.map(citation => citation.sourceId)).toEqual(["source-1000"]);
+
+			writer.reconcile(snapshot(MAIN, original), { summarize: false });
+			const projectHits = searchDuringReplacement("ORDER BY bs.branch_row_id, bs.position", () =>
+				context.searchProject({ projectId: MAIN.projectId, query: "offsetboundary", offset: 1_000, limit: 1 }),
+			);
+			expect(projectHits).toHaveLength(1);
+			expect(projectHits[0]?.citations.map(citation => citation.sourceId)).toEqual(["source-1000"]);
+		} finally {
+			writer.close();
+		}
 	});
 
 	test("project search is explicitly isolated and cites only active placements", async () => {

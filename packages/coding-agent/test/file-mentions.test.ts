@@ -118,6 +118,7 @@ describe("generateFileMentionMessages path resolution", () => {
 		expect(message.files).toHaveLength(2);
 		for (const file of message.files) {
 			expect(file.skippedReason).toBe("binary");
+			expect(file.contentHash).toBeUndefined();
 			expect(file.content).toContain("binary file");
 			expect(file.content).not.toContain("\u0000");
 		}
@@ -125,5 +126,28 @@ describe("generateFileMentionMessages path resolution", () => {
 			new Bun.CryptoHasher("sha256").update(fontBytes).digest("hex"),
 			new Bun.CryptoHasher("sha256").update(blobBytes).digest("hex"),
 		]);
+	});
+
+	test("hashes skipped oversized files only when LCM identity is requested", async () => {
+		const cwd = await createTempDir();
+		const filePath = path.join(cwd, "oversized.txt");
+		const byteSize = 6 * 1024 * 1024;
+		await Bun.write(filePath, "x");
+		await fs.truncate(filePath, byteSize);
+
+		const nativeMessages = await generateFileMentionMessages(["oversized.txt"], cwd);
+		const nativeMessage = nativeMessages[0];
+		if (nativeMessage?.role !== "fileMention") throw new Error("expected file mention message");
+		expect(nativeMessage.files[0]).toMatchObject({ byteSize, skippedReason: "tooLarge" });
+		expect(nativeMessage.files[0]?.contentHash).toBeUndefined();
+
+		const lcmMessages = await generateFileMentionMessages(["oversized.txt"], cwd, {
+			hashSkippedFiles: true,
+		});
+		const lcmMessage = lcmMessages[0];
+		if (lcmMessage?.role !== "fileMention") throw new Error("expected file mention message");
+		expect(lcmMessage.files[0]).toMatchObject({ byteSize, skippedReason: "tooLarge" });
+		expect(lcmMessage.files[0]?.content).toBe(nativeMessage.files[0]?.content);
+		expect(lcmMessage.files[0]?.contentHash).toMatch(/^[a-f0-9]{64}$/);
 	});
 });

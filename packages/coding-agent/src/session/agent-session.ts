@@ -5252,6 +5252,9 @@ export class AgentSession {
 					autoResizeImages: this.settings.get("images.autoResize"),
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
+					hashSkippedFiles:
+						this.lcmEnabled ||
+						(this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless"),
 				});
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));

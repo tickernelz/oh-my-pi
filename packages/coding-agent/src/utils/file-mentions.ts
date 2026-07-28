@@ -188,7 +188,12 @@ export function extractFileMentions(text: string): string[] {
 export async function generateFileMentionMessages(
 	filePaths: string[],
 	cwd: string,
-	options?: { autoResizeImages?: boolean; useHashLines?: boolean; snapshotStore?: SnapshotStore },
+	options?: {
+		autoResizeImages?: boolean;
+		useHashLines?: boolean;
+		snapshotStore?: SnapshotStore;
+		hashSkippedFiles?: boolean;
+	},
 ): Promise<AgentMessage[]> {
 	if (filePaths.length === 0) return [];
 
@@ -218,7 +223,7 @@ export async function generateFileMentionMessages(
 						path: resolvedPath,
 						content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 						byteSize: stat.size,
-						contentHash: await fileContentHash(absolutePath),
+						contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 						skippedReason: "tooLarge",
 					});
 					continue;
@@ -255,7 +260,7 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
-					contentHash: await fileContentHash(absolutePath),
+					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "tooLarge",
 				});
 				continue;
@@ -265,7 +270,7 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: binary file, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
-					contentHash: await fileContentHash(absolutePath),
+					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "binary",
 				});
 				continue;
