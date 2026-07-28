@@ -534,6 +534,13 @@ export class AgentSession {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/**
+	 * Async-delivery generation, bumped on every session transition that evicts
+	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
+	 * onto each queued async-result follow-up so a delivery formatted or drained
+	 * across a `/new` is dropped regardless of job-id reuse.
+	 */
+	#asyncDeliveryEpoch = 0;
 
 	readonly #irc: IrcBridge;
 	// Agent identity (registry id) used for IRC routing and job ownership.
@@ -1224,7 +1231,7 @@ export class AgentSession {
 				this.#deliverAsyncJobResult(manager, jobId, text, job),
 			);
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => manager.isDeliverySuppressed(entry.jobId),
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -1666,7 +1673,9 @@ export class AgentSession {
 	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
 	 * cleans up its own background work without touching its parent's jobs.
 	 *
-	 * Cancellation runs against this session's scoped manager. Subagents have
+	 * Cleanup runs against this session's scoped manager: running jobs are
+	 * cancelled, finished rows are evicted with their pending deliveries, and any
+	 * async-result follow-up already queued for injection is dropped. Subagents have
 	 * unique agent ids and inherit the parent's manager to clean up their own
 	 * jobs. A secondary in-process top-level session gets no scoped manager,
 	 * because it defaults to `MAIN_AGENT_ID`; reaching through the global
@@ -1679,6 +1688,12 @@ export class AgentSession {
 		if (!this.#agentId) return;
 		const manager = this.#asyncJobManager;
 		manager?.cancelAll({ ownerId: this.#agentId });
+		manager?.evictCompletedJobs({ ownerId: this.#agentId });
+		// Invalidate this owner's in-flight/drained deliveries against the new
+		// generation, then drop any async-result follow-up already queued, so a
+		// prior session's background result cannot inject into the next transcript.
+		this.#asyncDeliveryEpoch += 1;
+		this.yieldQueue.clear("async-result");
 	}
 
 	/**
@@ -1744,10 +1759,17 @@ export class AgentSession {
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
+		// Snapshot the generation before the async format step: a `/new` during it
+		// bumps the epoch, so this delivery belongs to the replaced session and
+		// must not enqueue — the suppression marker alone is unreliable because
+		// job-id reuse clears it.
+		const epoch = this.#asyncDeliveryEpoch;
 		const formatted = await this.#formatAsyncResultForFollowUp(text);
+		if (this.#isDisposed) return;
+		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs });
+		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs, epoch });
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {
@@ -4937,7 +4959,9 @@ export class AgentSession {
 		return {
 			role: "custom",
 			customType: "vibe-mode-context",
-			content: prompt.render(vibeModeActivePrompt),
+			content: prompt.render(vibeModeActivePrompt, {
+				todoAvailable: this.getActiveToolNames().includes("todo"),
+			}),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),

@@ -581,9 +581,9 @@ export class ModelControls {
 
 	/**
 	 * Classify the current user turn and set the effective thinking level for it.
-	 * Bounded by a timeout + abort; on any failure (no smol model, timeout, parse
-	 * error) it falls back to the provisional concrete level and continues. Never
-	 * throws into the turn, and never clears `#autoThinking` (auto stays active).
+	 * Bounded by a timeout + abort; on failure it preserves the last classified
+	 * level, or uses the provisional concrete level before the first resolution.
+	 * Never throws into the turn, and never clears `#autoThinking`.
 	 */
 	async applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
 		const model = this.#model;
@@ -625,7 +625,7 @@ export class ModelControls {
 
 		const effort = clampThinkingLevelToCeiling(
 			model,
-			resolved ?? resolveProvisionalAutoLevel(model),
+			resolved ?? this.#autoResolvedLevel ?? resolveProvisionalAutoLevel(model),
 			this.#thinkingLevelCeiling,
 		);
 		if (effort === undefined) return;

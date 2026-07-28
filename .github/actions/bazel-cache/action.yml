@@ -1,24 +1,27 @@
 name: "Compose bazel cache config"
 description: >
    Selects the CI cache backend and emits a bazelrc fragment. A shell probe
-   exposes the backend through step outputs before any action condition uses it.
+   exposes the backend through step outputs before any action condition
+   uses it.
 
-   omp-kata jobs use the cluster remote cache. An exporting main job first
-   performs an exact GitHub cache lookup without downloading the archive. A
-   genuine miss switches that job to a local disk cache for one build. The
-   workflow saves that populated cache explicitly after the build.
+   omp-kata jobs use the cluster remote cache. GitHub-hosted jobs use an
+   actions/cache-backed disk cache seeded by the bazel-cache-warm workflow
+   on the same runner image — cross-host action keys never hit, so the disk
+   cache is hosted-only and its key carries a schema version (v1 was
+   poisoned by a kata-produced export that silently missed every action).
 
-   GitHub-hosted jobs restore the exported disk cache and never contact the
-   cluster. Build callers can save a new exact-key archive after a miss.
+   The v3 key is <config hash>-<source hash>: config covers toolchain and
+   build settings, source covers crates/** + BUILD.bazel. Restores fall
+   back to the config-scoped prefix, so a source generation the exact key
+   has never seen still seeds from the previous generation's archive, and
+   the refreshed archive is saved after the build (an exact hit suppresses
+   the save — without the source component the first archive for a config
+   generation would permanently shadow newer source states).
 
 inputs:
    scope:
       description: Disk-cache key discriminator shared by compatible consumers
       required: true
-   export:
-      description: Prepare a portable disk cache after an exact lookup miss
-      required: false
-      default: "false"
 
 outputs:
    rc:
@@ -27,9 +30,6 @@ outputs:
    cache-key:
       description: Exact GitHub cache key for a later explicit save
       value: ${{ steps.backend.outputs.cache-key }}
-   export-needed:
-      description: Whether the remote exporter switched to a portable disk cache
-      value: ${{ steps.compose.outputs.export-needed }}
    save-needed:
       description: Whether a disk-cache build can save a new exact-key archive
       value: ${{ steps.compose.outputs.save-needed }}
@@ -44,7 +44,8 @@ runs:
         id: backend
         shell: bash
         env:
-           CACHE_KEY: bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.Bazel.lock', 'MODULE.bazel', 'rust-toolchain.toml') }}
+           CONFIG_HASH: ${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**') }}
+           SOURCE_HASH: ${{ hashFiles('crates/**', 'BUILD.bazel') }}
         run: |
            set -euo pipefail
            remote=false
@@ -55,9 +56,12 @@ runs:
              fi
              remote=true
            fi
+           key="bazel-disk-v3-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-$CONFIG_HASH-$SOURCE_HASH"
+           prefix="bazel-disk-v3-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-$CONFIG_HASH-"
            {
              echo "remote=$remote"
-             echo "cache-key=$CACHE_KEY"
+             echo "cache-key=$key"
+             echo "cache-prefix=$prefix"
            } >> "$GITHUB_OUTPUT"
 
       - name: Restore bazel disk cache
@@ -68,38 +72,31 @@ runs:
            path: ~/.cache/omp-bazel-disk
            key: ${{ steps.backend.outputs.cache-key }}
            restore-keys: |
-              bazel-disk-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Look up bazel disk cache export
-        if: steps.backend.outputs.remote == 'true' && inputs.export == 'true'
-        id: export
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-           path: ~/.cache/omp-bazel-disk
-           key: ${{ steps.backend.outputs.cache-key }}
-           lookup-only: true
+              ${{ steps.backend.outputs.cache-prefix }}
 
       - name: Compose cache config
         id: compose
         shell: bash
         env:
            REMOTE: ${{ steps.backend.outputs.remote }}
-           EXPORT_REQUESTED: ${{ inputs.export }}
-           EXPORT_HIT: ${{ steps.export.outputs.cache-hit }}
            RESTORE_HIT: ${{ steps.restore.outputs.cache-hit }}
         run: |
            set -euo pipefail
-           export_needed=false
-           if [ "$REMOTE" = "true" ] && [ "$EXPORT_REQUESTED" = "true" ] && [ "$EXPORT_HIT" != "true" ]; then
-             export_needed=true
-           fi
-           save_needed=$export_needed
+           save_needed=false
            if [ "$REMOTE" != "true" ] && [ "$RESTORE_HIT" != "true" ]; then
              save_needed=true
            fi
 
            rc="$RUNNER_TEMP/bazel-cache.rc"
            if [ "$REMOTE" = "true" ]; then
+             # Mask the derived credential BEFORE writing the rc: config=ci
+             # enables --announce_rc, which prints --remote_header verbatim.
+             # Mask lines inside the redirected block below would land in the
+             # rc file itself and mask nothing.
+             raw_auth="${BAZEL_REMOTE_USER}:${BAZEL_REMOTE_PASSWORD}"
+             auth="$(printf %s "$raw_auth" | base64 | tr -d '\n')"
+             echo "::add-mask::$raw_auth"
+             echo "::add-mask::$auth"
              {
                # The PVC mount lives outside $HOME. Pods are single-job and
                # use RUNNER_TEMP for Bazel's output root.
@@ -107,26 +104,12 @@ runs:
                echo "common --config=ci"
                echo "common --repository_cache=/opt/bazel-repo-cache"
                echo "common --repo_env=OMP_XWIN_CACHE_DIR=/opt/bazel-repo-cache/xwin"
+               echo "common --config=cache-rw"
+               echo "common --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092"
+               echo "common --tls_certificate=infra/bazel-remote/ca.crt"
+               echo "common --remote_header='authorization=Basic ${auth}'"
+               echo "common --remote_download_toplevel"
              } > "$rc"
-
-             if [ "$export_needed" = "true" ]; then
-               # Do not combine remote and disk caches. Remote hits do not
-               # materialize a portable disk cache for hosted runners.
-               mkdir -p "$HOME/.cache/omp-bazel-disk"
-               echo "common --disk_cache=$HOME/.cache/omp-bazel-disk" >> "$rc"
-             else
-               raw_auth="${BAZEL_REMOTE_USER}:${BAZEL_REMOTE_PASSWORD}"
-               auth="$(printf %s "$raw_auth" | base64 | tr -d '\n')"
-               echo "::add-mask::$raw_auth"
-               echo "::add-mask::$auth"
-               {
-                 echo "common --config=cache-rw"
-                 echo "common --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092"
-                 echo "common --tls_certificate=infra/bazel-remote/ca.crt"
-                 echo "common --remote_header='authorization=Basic ${auth}'"
-                 echo "common --remote_download_toplevel"
-               } >> "$rc"
-             fi
            else
              mkdir -p "$HOME/.cache/omp-bazel-disk" "$HOME/.cache/omp-bazel-repo"
              {
@@ -138,6 +121,5 @@ runs:
 
            {
              echo "rc=$rc"
-             echo "export-needed=$export_needed"
              echo "save-needed=$save_needed"
            } >> "$GITHUB_OUTPUT"

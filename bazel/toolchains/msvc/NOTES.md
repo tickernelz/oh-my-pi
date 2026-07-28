@@ -65,8 +65,8 @@ exec hosts. Replaces cargo-xwin.
 - `bazel build --nobuild //:natives-win32-x64-baseline` analyzes clean;
   `cquery deps(...)` confirms `@msvc_cc//:cc_toolchain` (not the host Xcode
   toolchain) resolved for the windows target. Full fetch + splat took ~2.5 min
-  on a fast link. Repin (`bun run bazel:repin`) already run for the
-  `CMAKE_GENERATOR_x86_64_pc_windows_msvc` annotation key.
+  on a fast link; crate-universe generation included the
+  `CMAKE_GENERATOR_x86_64_pc_windows_msvc` annotation.
 - Wrapper smoke test outside Bazel: `clang-cl /MD` compiled a windows.h +
   smmintrin.h SSE4.1 program and driver-linked it via `-fuse-ld=lld-link` +
   `LIB` into a valid PE32+ exe; the standalone `lld-link` wrapper (rustc's
@@ -84,7 +84,7 @@ exec hosts. Replaces cargo-xwin.
   rules_rust runner then substitutes `${pwd}` → exec root). The wrapper dir
   reaches the sandbox via the cc toolchain's `all_files`. NOTE: the PATH entry
   hardcodes @msvc_cc's canonical repo name — keep in sync if the repo rule or
-  repo name changes. Repin for this annotation already run.
+  repo name changes. The generated crate graph includes this annotation.
 - audiopus_sys/opus cmake exe links (can.internal finding #2): cmake's
   `vs_link_exe` demands rc/mt tools that `find_program` can't locate on a
   linux/mac PATH. @msvc_cc now generates `toolchain.cmake` (self-locating via
@@ -98,7 +98,7 @@ exec hosts. Replaces cargo-xwin.
   and `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL` (/MD everywhere).
   Verified on darwin: scratch `project(C)` + `add_executable` configures with
   "Clang 20.1.7 with MSVC-like command-line" and links a valid PE32+ exe
-  through vs_link_exe with the wrapper rc/mt/linker. Repin already run.
+  through vs_link_exe with the wrapper rc/mt/linker.
 
 ## What to verify on can.internal (linux-x64)
 

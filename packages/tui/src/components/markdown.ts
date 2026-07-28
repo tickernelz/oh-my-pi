@@ -1874,9 +1874,10 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 			);
 			const tokenLineOffsets = [0];
 			for (const line of renderedTokenLines) {
-				// Skip wrapping for image protocol lines and OSC 66 sized headings
-				// (would corrupt escape sequences / split the indivisible sized span).
-				if (TERMINAL.isImageLine(line) || isOsc66Line(line)) {
+				// Lists wrap while their structural prefixes are still available, so
+				// continuation rows retain the correct hanging indent. Re-wrapping the
+				// flattened rows here would discard that structure.
+				if (token.type === "list" || TERMINAL.isImageLine(line) || isOsc66Line(line)) {
 					wrappedLines.push(line);
 				} else {
 					wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
@@ -2273,7 +2274,7 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 			}
 
 			case "list": {
-				const listLines = this.#renderList(token as ListToken, 0, styleContext);
+				const listLines = this.#renderList(token as ListToken, 0, width, styleContext);
 				lines.push(...listLines);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
@@ -2589,46 +2590,60 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 	/**
 	 * Render a list with proper nesting support
 	 */
-	#renderList(token: ListToken, depth: number, styleContext?: InlineStyleContext): string[] {
+	#renderList(token: ListToken, depth: number, width: number, styleContext?: InlineStyleContext): string[] {
 		const lines: string[] = [];
 		const indent = "  ".repeat(depth);
 		// Use the list's start property (defaults to 1 for ordered lists)
 		const startNumber = token.start ?? 1;
+		const pushWrapped = (text: string, firstPrefix: string, continuationPrefix: string): void => {
+			const prefixWidth = visibleWidth(firstPrefix);
+			if (prefixWidth >= width) {
+				lines.push(truncateToWidth(firstPrefix, width, Ellipsis.Omit));
+				lines.push(...wrapTextWithAnsi(text, Math.max(1, width)));
+				return;
+			}
+			const bodyWidth = width - prefixWidth;
+			const wrapped = wrapTextWithAnsi(text, bodyWidth);
+			if (wrapped.length === 0) {
+				lines.push(firstPrefix);
+				return;
+			}
+			lines.push(firstPrefix + wrapped[0]);
+			for (let lineIndex = 1; lineIndex < wrapped.length; lineIndex++) {
+				lines.push(continuationPrefix + wrapped[lineIndex]);
+			}
+		};
 
 		for (let i = 0; i < token.items.length; i++) {
 			const item = token.items[i];
 			const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
+			const firstPrefix = indent + this.#theme.listBullet(bullet);
 			// Continuation rows align under the item text, so the hang matches the
 			// actual bullet width (`10. ` is 4 cells, not 2).
-			const continuationIndent = indent + padding(bullet.length);
+			const continuationIndent = indent + padding(visibleWidth(bullet));
 
 			// Process item tokens; nested-list lines arrive structurally tagged and
 			// already carry their own full indent.
-			const itemLines = this.#renderListItem(item.tokens || [], depth, styleContext);
+			const itemLines = this.#renderListItem(item.tokens || [], depth, width, styleContext);
 
 			if (itemLines.length > 0) {
 				const firstLine = itemLines[0]!;
 				if (firstLine.nested) {
-					// Nested list first - keep as-is (already has full indent)
 					lines.push(firstLine.text);
 				} else {
-					// Regular text content - add indent and bullet
-					lines.push(indent + this.#theme.listBullet(bullet) + firstLine.text);
+					pushWrapped(firstLine.text, firstPrefix, continuationIndent);
 				}
 
-				// Rest of the lines
 				for (let j = 1; j < itemLines.length; j++) {
 					const line = itemLines[j]!;
 					if (line.nested) {
-						// Nested list line - already has full indent
 						lines.push(line.text);
 					} else {
-						// Regular content - hang under the item text
-						lines.push(continuationIndent + line.text);
+						pushWrapped(line.text, continuationIndent, continuationIndent);
 					}
 				}
 			} else {
-				lines.push(indent + this.#theme.listBullet(bullet));
+				lines.push(firstPrefix);
 			}
 		}
 
@@ -2644,6 +2659,7 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 	#renderListItem(
 		tokens: Token[],
 		parentDepth: number,
+		width: number,
 		styleContext?: InlineStyleContext,
 	): Array<{ text: string; nested: boolean }> {
 		const lines: Array<{ text: string; nested: boolean }> = [];
@@ -2652,7 +2668,7 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 			if (token.type === "list") {
 				// Nested list - render with one additional indent level
 				// These lines carry their own indent, so tag them for pass-through
-				const nestedLines = this.#renderList(token as ListToken, parentDepth + 1, styleContext);
+				const nestedLines = this.#renderList(token as ListToken, parentDepth + 1, width, styleContext);
 				for (const nestedLine of nestedLines) {
 					lines.push({ text: nestedLine, nested: true });
 				}

@@ -69,6 +69,7 @@ import {
 	sanitizeOpenAIResponsesAssistantFallbackItemsForReplay,
 	sanitizeOpenAIResponsesAssistantHistoryItemsForReplay,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
+	stripUnpairedOpenAIResponsesComputerReasoningIdsForReplay,
 } from "../utils";
 import {
 	clearStreamingPartialJson,
@@ -1646,6 +1647,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems && shouldReplayPayloadItems) {
 				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
 					supportsImageDetailOriginal,
+					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
 				messages.push(
 					...adaptResponsesReplayItemsForModel(
@@ -1694,7 +1696,10 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems) {
 				const rawSanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
 					filterReasoning(historyItems),
-					{ supportsImageDetailOriginal },
+					{
+						supportsImageDetailOriginal,
+						supportsComputerUse: options.model.supportsComputerUse === true,
+					},
 				);
 				const sanitizedHistoryItems = rawSanitizedHistoryItems
 					? adaptResponsesReplayItemsForModel(
@@ -1755,7 +1760,8 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	}
 
 	const withRepairedOutputs = options.repairOrphanOutputs ? repairOrphanResponsesToolOutputs(messages) : messages;
-	return repairOrphanResponsesToolCalls(withRepairedOutputs);
+	const withRepairedCalls = repairOrphanResponsesToolCalls(withRepairedOutputs);
+	return stripUnpairedOpenAIResponsesComputerReasoningIdsForReplay(withRepairedCalls);
 }
 
 type ResponsesReplayAssistantMessage = Omit<ResponseOutputMessage, "id"> & { id?: string };

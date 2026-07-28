@@ -5,16 +5,18 @@
  * Package-manager installations are detected solely so they can fail closed
  * instead of crossing over to an upstream distribution channel.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
-import { verifyDownloadedArtifactHash, verifyPinnedChecksumManifest } from "./downstream-artifact-verification";
+import { verifyPinnedChecksumManifest } from "./downstream-artifact-verification";
 import {
 	compareDownstreamVersions,
 	DOWNSTREAM_INSTALL_COMMAND,
@@ -31,6 +33,140 @@ const BINARY_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 const MAX_CHECKSUMS_BYTES = 1024 * 1024;
 const MAX_SIGNATURE_BYTES = 64;
 const REPORTED_VERSION_RE = /^(?:omp\/)?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-lcm\.(?:0|[1-9]\d*))$/;
+
+export interface ReleaseBinaryAsset {
+	url: string;
+	size: number;
+	digest: string;
+}
+
+type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+/** Validate the exact private release asset before downloading it. */
+export function resolveDownstreamReleaseBinaryAsset(
+	release: unknown,
+	expectedTag: string,
+	binaryName: string,
+): ReleaseBinaryAsset {
+	if (
+		!isRecord(release) ||
+		release.tag_name !== expectedTag ||
+		release.draft !== false ||
+		!Array.isArray(release.assets)
+	) {
+		throw new Error(`Invalid GitHub release metadata for ${expectedTag}`);
+	}
+	const matches = release.assets.filter(asset => isRecord(asset) && asset.name === binaryName);
+	if (matches.length !== 1) {
+		throw new Error(`GitHub release ${expectedTag} has ${matches.length} assets named ${binaryName}`);
+	}
+	const asset = matches[0];
+	if (!isRecord(asset) || asset.state !== "uploaded") {
+		throw new Error(`GitHub release asset ${binaryName} is not fully uploaded`);
+	}
+	if (typeof asset.size !== "number" || !Number.isSafeInteger(asset.size) || asset.size <= 0) {
+		throw new Error(`GitHub release asset ${binaryName} has an invalid size`);
+	}
+	if (typeof asset.digest !== "string") {
+		throw new Error(`GitHub release asset ${binaryName} has no digest`);
+	}
+	const digest = /^sha256:([0-9a-f]{64})$/i.exec(asset.digest)?.[1];
+	if (!digest) {
+		throw new Error(`GitHub release asset ${binaryName} has an unsupported digest`);
+	}
+	const url = `https://github.com/${DOWNSTREAM_REPO}/releases/download/${encodeURIComponent(expectedTag)}/${binaryName}`;
+	if (asset.browser_download_url !== url) {
+		throw new Error(`GitHub release asset ${binaryName} has an unexpected download URL`);
+	}
+	return { url, size: asset.size, digest: `sha256:${digest.toLowerCase()}` };
+}
+
+async function getDownstreamReleaseBinaryAsset(
+	release: DownstreamReleaseInfo,
+	binaryName: string,
+	token: string,
+	fetchImpl: Fetch = fetch,
+): Promise<ReleaseBinaryAsset> {
+	let response: Response;
+	try {
+		response = await fetchImpl(
+			`https://api.github.com/repos/${DOWNSTREAM_REPO}/releases/tags/${encodeURIComponent(release.tag)}`,
+			{
+				headers: getDownstreamGitHubHeaders(token, "application/vnd.github+json"),
+				signal: withTimeoutSignal(RELEASE_AUTH_TIMEOUT_MS),
+			},
+		);
+	} catch (err) {
+		if (isTimeoutError(err)) throw new Error("Timed out fetching GitHub release metadata after 30s", { cause: err });
+		throw err;
+	}
+	if (!response.ok) throw new Error(`Failed to fetch GitHub release metadata: ${response.statusText}`);
+	return resolveDownstreamReleaseBinaryAsset(await response.json(), release.tag, binaryName);
+}
+
+export interface VerifiedBinaryDownloadOptions {
+	url: string;
+	targetPath: string;
+	expectedSize: number;
+	expectedDigest: string;
+	headers?: Record<string, string>;
+	fetchImpl?: Fetch;
+}
+
+/** Download a binary only when its byte count and SHA-256 digest match release metadata. */
+export async function downloadVerifiedBinary(options: VerifiedBinaryDownloadOptions): Promise<void> {
+	const fetchImpl = options.fetchImpl ?? fetch;
+	await unlinkIfExists(options.targetPath);
+	let response: Response;
+	try {
+		response = await fetchImpl(options.url, {
+			headers: options.headers,
+			redirect: "follow",
+			signal: withTimeoutSignal(BINARY_DOWNLOAD_TIMEOUT_MS),
+		});
+	} catch (err) {
+		if (isTimeoutError(err)) throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
+		throw err;
+	}
+	if (!response.ok || !response.body) throw new Error(`Download failed: ${response.statusText}`);
+
+	const hash = createHash("sha256");
+	let size = 0;
+	const verifier = new Transform({
+		transform(chunk, _encoding, callback) {
+			size += chunk.byteLength;
+			if (size > options.expectedSize) {
+				callback(
+					new Error(
+						`Downloaded binary size mismatch: expected ${options.expectedSize} bytes, received at least ${size}`,
+					),
+				);
+				return;
+			}
+			hash.update(chunk);
+			callback(null, chunk);
+		},
+	});
+	try {
+		await pipeline(response.body, verifier, fs.createWriteStream(options.targetPath, { mode: 0o600 }));
+		const digest = `sha256:${hash.digest("hex")}`;
+		if (size !== options.expectedSize) {
+			throw new Error(`Downloaded binary size mismatch: expected ${options.expectedSize} bytes, received ${size}`);
+		}
+		if (digest !== options.expectedDigest) {
+			throw new Error(`Downloaded binary digest mismatch: expected ${options.expectedDigest}, received ${digest}`);
+		}
+		await fs.promises.chmod(options.targetPath, 0o755);
+	} catch (err) {
+		await unlinkIfExists(options.targetPath);
+		if (isTimeoutError(err)) throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
+		throw err;
+	}
+}
 
 /** Result from running the installed binary and parsing its reported version. */
 export interface InstalledVersionVerification {
@@ -427,32 +563,29 @@ async function updateViaBinaryAt(targetPath: string, release: DownstreamReleaseI
 
 	try {
 		console.log(chalk.dim(`Authenticating ${release.tag} from ${DOWNSTREAM_REPO}…`));
-		const [checksumsResponse, signatureResponse] = await Promise.all([
+		const [checksumsResponse, signatureResponse, asset] = await Promise.all([
 			fetchDownstreamReleaseAsset(`${releaseUrl}/SHA256SUMS`, "SHA256SUMS", token, RELEASE_AUTH_TIMEOUT_MS),
 			fetchDownstreamReleaseAsset(`${releaseUrl}/SHA256SUMS.sig`, "SHA256SUMS.sig", token, RELEASE_AUTH_TIMEOUT_MS),
+			getDownstreamReleaseBinaryAsset(release, binaryName, token),
 		]);
 		const [checksums, signature] = await Promise.all([
 			readBoundedResponse(checksumsResponse, MAX_CHECKSUMS_BYTES, "SHA256SUMS"),
 			readBoundedResponse(signatureResponse, MAX_SIGNATURE_BYTES, "SHA256SUMS.sig"),
 		]);
 		const expectedHash = await verifyPinnedChecksumManifest({ checksums, signature, assetName: binaryName });
+		if (asset.digest !== `sha256:${expectedHash}`) {
+			throw new Error(`GitHub release asset ${binaryName} digest does not match the signed SHA256SUMS entry`);
+		}
 
 		console.log(chalk.dim(`Downloading ${binaryName}…`));
-		const binaryResponse = await fetchDownstreamReleaseAsset(
-			`${releaseUrl}/${binaryName}`,
-			binaryName,
-			token,
-			BINARY_DOWNLOAD_TIMEOUT_MS,
-		);
-		const tempHandle = await fs.promises.open(tempPath, "wx", 0o600);
 		tempCreated = true;
-		try {
-			await pipeline(binaryResponse.body!, tempHandle.createWriteStream({ autoClose: false }));
-		} finally {
-			await tempHandle.close();
-		}
-		await verifyDownloadedArtifactHash({ assetName: binaryName, assetPath: tempPath, expectedHash });
-		await fs.promises.chmod(tempPath, 0o755);
+		await downloadVerifiedBinary({
+			url: asset.url,
+			targetPath: tempPath,
+			expectedSize: asset.size,
+			expectedDigest: asset.digest,
+			headers: getDownstreamGitHubHeaders(token, "application/octet-stream"),
+		});
 	} catch (err) {
 		if (tempCreated) await unlinkIfExists(tempPath);
 		throw err;

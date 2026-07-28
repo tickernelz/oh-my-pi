@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -12,9 +13,11 @@ import * as pluginCli from "@oh-my-pi/pi-coding-agent/cli/plugin-cli";
 import * as updateCli from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import {
 	assertDownstreamUpdateTarget,
+	downloadVerifiedBinary,
 	getDownstreamBinaryName,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
+	resolveDownstreamReleaseBinaryAsset,
 	resolveUpdateMethodForTest,
 	sweepStaleBackups,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
@@ -218,6 +221,153 @@ describe("update install origin handling", () => {
 		expect(() => getDownstreamBinaryName("darwin", "arm64", false)).toThrow("Linux x64 (including WSL) only");
 		expect(() => getDownstreamBinaryName("darwin", "arm64", false)).toThrow(sourceCommand);
 		expect(() => getDownstreamBinaryName("win32", "x64", false)).toThrow(sourceCommand);
+	});
+});
+
+describe("downstream release binary integrity", () => {
+	const tag = "v17.1.8-lcm.1";
+	const binaryName = "omp-linux-x64";
+	const url = `https://github.com/tickernelz/oh-my-pi/releases/download/${tag}/${binaryName}`;
+	const content = "verified downstream binary";
+	const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+
+	function releaseAsset(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			tag_name: tag,
+			draft: false,
+			prerelease: true,
+			assets: [
+				{
+					name: binaryName,
+					state: "uploaded",
+					size: Buffer.byteLength(content),
+					digest,
+					browser_download_url: url,
+					...overrides,
+				},
+			],
+		};
+	}
+
+	it("accepts the exact uploaded downstream prerelease asset", () => {
+		expect(resolveDownstreamReleaseBinaryAsset(releaseAsset(), tag, binaryName)).toEqual({
+			url,
+			size: Buffer.byteLength(content),
+			digest,
+		});
+	});
+
+	it("rejects malformed or ambiguous downstream release asset metadata", () => {
+		expect(() => resolveDownstreamReleaseBinaryAsset(releaseAsset({ digest: null }), tag, binaryName)).toThrow(
+			"has no digest",
+		);
+		expect(() =>
+			resolveDownstreamReleaseBinaryAsset(
+				{ ...releaseAsset(), assets: [releaseAsset().assets, releaseAsset().assets].flat() },
+				tag,
+				binaryName,
+			),
+		).toThrow(`has 2 assets named ${binaryName}`);
+		expect(() => resolveDownstreamReleaseBinaryAsset({ ...releaseAsset(), draft: true }, tag, binaryName)).toThrow(
+			"Invalid GitHub release metadata",
+		);
+	});
+
+	it("writes a download only after its size and digest match with private-release credentials", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		let requestHeaders: Headers | undefined;
+		await downloadVerifiedBinary({
+			url,
+			targetPath,
+			expectedSize: Buffer.byteLength(content),
+			expectedDigest: digest,
+			headers: { Authorization: "Bearer private-token" },
+			fetchImpl: async (_input, init) => {
+				requestHeaders = new Headers(init?.headers);
+				return new Response(content);
+			},
+		});
+		expect(requestHeaders?.get("authorization")).toBe("Bearer private-token");
+		expect(await Bun.file(targetPath).text()).toBe(content);
+		expect((await fs.stat(targetPath)).mode & 0o777).toBe(0o755);
+	});
+
+	it("stops an oversized response before it reads another chunk", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		let pulls = 0;
+		const body = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					pulls++;
+					controller.enqueue(new Uint8Array(pulls === 1 ? 2 : 1));
+					if (pulls === 2) controller.close();
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		await expect(
+			downloadVerifiedBinary({
+				url,
+				targetPath,
+				expectedSize: 1,
+				expectedDigest: digest,
+				fetchImpl: async () => new Response(body),
+			}),
+		).rejects.toThrow("received at least 2");
+		expect(pulls).toBe(1);
+		expect(await Bun.file(targetPath).exists()).toBe(false);
+	});
+
+	it("wraps a timeout during body streaming and removes the partial download", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		const body = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					controller.enqueue(new Uint8Array(1));
+					controller.error(new DOMException("The operation timed out.", "TimeoutError"));
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		await expect(
+			downloadVerifiedBinary({
+				url,
+				targetPath,
+				expectedSize: Buffer.byteLength(content),
+				expectedDigest: digest,
+				fetchImpl: async () => new Response(body),
+			}),
+		).rejects.toThrow("Timed out downloading release binary after 15 minutes");
+		expect(await Bun.file(targetPath).exists()).toBe(false);
+	});
+
+	it("removes downloads whose size or digest does not match", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, binaryName);
+		const fetchImpl = async () => new Response(content);
+		await expect(
+			downloadVerifiedBinary({
+				url,
+				targetPath,
+				expectedSize: Buffer.byteLength(content) + 1,
+				expectedDigest: digest,
+				fetchImpl,
+			}),
+		).rejects.toThrow("size mismatch");
+		expect(await Bun.file(targetPath).exists()).toBe(false);
+		await expect(
+			downloadVerifiedBinary({
+				url,
+				targetPath,
+				expectedSize: Buffer.byteLength(content),
+				expectedDigest: `sha256:${createHash("sha256").update("different binary").digest("hex")}`,
+				fetchImpl,
+			}),
+		).rejects.toThrow("digest mismatch");
+		expect(await Bun.file(targetPath).exists()).toBe(false);
 	});
 });
 

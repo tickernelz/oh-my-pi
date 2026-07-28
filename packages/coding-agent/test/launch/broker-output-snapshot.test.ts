@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { setProcessName, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient } from "../../src/launch/client";
 import {
@@ -119,7 +119,7 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
 			await broker;
-			process.title = previousTitle;
+			setProcessName(previousTitle);
 			vi.restoreAllMocks();
 		}
 	}, 20_000);

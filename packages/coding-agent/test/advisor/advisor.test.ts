@@ -14,7 +14,6 @@ import {
 	AdvisorRuntime,
 	type AdvisorRuntimeHost,
 	advisorTranscriptFilename,
-	annotateForStaleness,
 	buildAdvisorQuarantineSourceText,
 	deriveAdvisorTelemetry,
 	formatAdvisorBatchContent,
@@ -376,25 +375,6 @@ describe("advisor", () => {
 			yq.clear("advisor");
 			expect(yq.has("advisor")).toBe(false);
 			expect(yq.has("normal")).toBe(true);
-		});
-	});
-
-	describe("annotateForStaleness", () => {
-		it("returns the note unchanged when hasFreshBacklog is false", () => {
-			expect(annotateForStaleness("watch out", false)).toBe("watch out");
-		});
-
-		it("appends the staleness caveat when hasFreshBacklog is true", () => {
-			const result = annotateForStaleness("watch out", true);
-			expect(result).toContain("watch out");
-			expect(result).toContain("newer primary turns arrived after this reviewed window");
-			expect(result).toContain("verify this still applies");
-		});
-
-		it("preserves the original note text verbatim (no mutations)", () => {
-			const note = "multi\nline\nnote";
-			const result = annotateForStaleness(note, true);
-			expect(result.startsWith(note)).toBe(true);
 		});
 	});
 
@@ -1344,50 +1324,6 @@ describe("advisor", () => {
 			expect(promptInputs).toHaveLength(1);
 			expect(promptInputs[0]).toContain("### Session update\n");
 			expect(promptInputs[0]).not.toContain("[in progress");
-		});
-
-		it("hasFreshBacklog is true only while pending queue is non-empty during a prompt", async () => {
-			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();
-			const { promise: firstPromptDone, resolve: finishFirstPrompt } = Promise.withResolvers<void>();
-			const { promise: secondPromptDone, resolve: finishSecondPrompt } = Promise.withResolvers<void>();
-			let promptCalls = 0;
-			const agent: AdvisorAgent = {
-				prompt: async () => {
-					promptCalls++;
-					if (promptCalls === 1) {
-						startFirstPrompt();
-						await firstPromptDone;
-					} else {
-						finishSecondPrompt();
-					}
-				},
-				abort: () => {},
-				reset: () => {},
-				state: { messages: [] },
-			};
-			const messages: AgentMessage[] = [{ role: "user", content: "a", timestamp: 1 } as AgentMessage];
-			const host: AdvisorRuntimeHost = {
-				snapshotMessages: () => messages,
-				enqueueAdvice: () => {},
-			};
-			const runtime = new AdvisorRuntime(agent, host);
-
-			runtime.onTurnEnd();
-			await firstPromptStarted;
-
-			// No late arrivals — false while first prompt runs with empty pending.
-			expect(runtime.hasFreshBacklog).toBe(false);
-
-			// Push a second turn while the first prompt is still in-flight.
-			messages.push({ role: "user", content: "b", timestamp: 2 } as AgentMessage);
-			runtime.onTurnEnd();
-			expect(runtime.hasFreshBacklog).toBe(true);
-
-			finishFirstPrompt();
-			await secondPromptDone;
-
-			// After the second turn is fully drained, pending is empty again.
-			expect(runtime.hasFreshBacklog).toBe(false);
 		});
 
 		it("sends the batch when context maintenance fails", async () => {

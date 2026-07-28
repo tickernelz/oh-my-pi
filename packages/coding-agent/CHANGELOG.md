@@ -10,6 +10,41 @@
 - `generateFileMentionMessages()` now defaults `hashSkippedFiles` to false, avoiding full hashes for skipped oversized and binary files; sessions request those hashes while Lossless context is active or being enabled.
 - Lossless projection now preserves live user, developer, file-mention, and assistant messages when their persistence metadata collides with older same-millisecond content.
 - Lossless projection fit checks now charge the serialized historical payload and warning before admitting provider requests near the context limit.
+## [17.1.8] - 2026-07-28
+
+### Breaking Changes
+
+- Changed tab.screenshot() to no longer accept a per-call save path; it now saves screenshots under browser.screenshotDir (or the OS temp directory if unset) and returns the saved path.
+
+### Added
+
+- Added omp cleanse, a new command that automatically detects language-ecosystem checkers, parses diagnostics (such as Cargo Clippy JSON), distributes repair workloads across concurrent subagents, and runs verification checks with a live progress bar.
+
+### Changed
+
+- Reworked the /guided-goal command from a modal-based popup flow into a natural, conversational chat interface where the agent asks follow-up questions directly in the session.
+- Reduced startup memory usage by lazy-loading HTML session export assets only on their first use.
+
+### Fixed
+
+- Fixed Advisor notes appending stale-review-window warnings when newer primary turns are queued during a review.
+- Fixed layout padding alignment issues in bordered output blocks and web-search result panels.
+- Fixed excluded web search providers remaining visible in the Web Search Provider Order settings list.
+- Fixed internal Hub peer messages being exposed as ordinary tool-call updates in clients like Paseo.
+- Fixed compatibility issues when installing legacy pi extensions by updating the legacy shim to correctly bridge missing runtime symbols and exports (such as isContextOverflow, isRetryableAssistantError, and JSON parsing utilities).
+- Fixed an issue where routine daemon operations (like list, logs, stop, or describe) could inadvertently trigger a restart loop for detached daemons in a backoff window.
+- Fixed marketplace plugin MCP discovery to correctly honor the mcpServers manifest field in plugin configuration files.
+- Fixed user-initiated shell executions (! and $) being misattributed as agent actions in advisor transcripts.
+- Fixed unnecessary prompt-cache invalidations by preserving the active auto-thinking effort level when per-turn classification fails.
+- Fixed the omp process name showing up as bun in Linux process managers (like ps and top).
+- Fixed agent shell commands inheriting environment variables from the launch directory's .env file, ensuring they only receive the parent environment and explicit tool overrides.
+- Fixed the /new command retaining completed or failed async jobs from the previous session.
+- Improved error handling in omp update to display a friendly timeout message if the download times out while streaming the binary.
+- Fixed the write tool incorrectly treating semicolon-joined read selectors as filesystem paths and creating unintended directory structures.
+- Fixed omp worktree clear prematurely deleting active task-isolation sandboxes owned by running subagents.
+- Fixed /vibe mode preventing the director from completing parent tasks after verifying worker results by keeping the built-in todo tool active.
+- Fixed numeric GitHub issue and pull request autocomplete being suppressed inside skill slash-command arguments.
+
 ## [17.1.7] - 2026-07-27
 
 ### Fixed

@@ -51,6 +51,7 @@ import {
 	normalizeSystemPrompts,
 	sanitizeOpenAIResponsesAssistantFallbackItemsForReplay,
 	sanitizeOpenAIResponsesAssistantHistoryItemsForReplay,
+	stripOpenAIResponsesComputerLinkedReasoningIdsForReplay,
 } from "../utils";
 import { clearStreamingPartialJson, kStreamingLastParseLen, kStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -1172,8 +1173,9 @@ export function normalizeCodexToolChoice(
 	return undefined;
 }
 function unrollCodexComputerItems(items: ResponseInput, supportsImageDetailOriginal: boolean): ResponseInput {
+	const replayItems = stripOpenAIResponsesComputerLinkedReasoningIdsForReplay(items);
 	const unrolled: ResponseInput = [];
-	for (const item of items) {
+	for (const item of replayItems) {
 		if (item.type === "computer_call") {
 			const actions = item.actions ?? (item.action ? [item.action] : []);
 			unrolled.push({

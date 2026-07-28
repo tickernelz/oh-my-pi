@@ -160,7 +160,42 @@ function throwReadSelectorMisfire(target: string, sel: string): never {
 	);
 }
 
+/**
+ * Recognize a semicolon-joined list of read-tool selectors mis-dispatched as a
+ * single write target — the multi-file read expression the scout emitted in
+ * issue #6809 (`a.txt:1-2;b/c.txt:3-4`). Every `;`-segment must be non-empty and
+ * carry its own read selector ({@link splitPathAndSel} peels a `:N-M`, `:raw`,
+ * or `:conflicts` tail). No real call targets such a list: `read` accepts one
+ * path, `write` writes one file. Unlike {@link readSelectorForEmptyWrite} this
+ * fires regardless of `content` — the non-empty-content escape hatch exists for
+ * a lone selector-shaped *filename*, never a `;`-list, and honoring it here
+ * silently creates a nested directory tree (`a.txt:1-2;b/`) in the workspace.
+ * The caller still probes the literal target first, so an existing POSIX file
+ * by that exact name stays writable (same escape as the single-selector guard).
+ */
+function readSelectorListMisfire(target: string): number | undefined {
+	if (!target.includes(";")) return undefined;
+	const segments = target.split(";");
+	if (segments.length < 2) return undefined;
+	for (const segment of segments) {
+		const trimmed = segment.trim();
+		if (trimmed.length === 0 || splitPathAndSel(trimmed).sel === undefined) return undefined;
+	}
+	return segments.length;
+}
+
+function throwReadSelectorListMisfire(target: string, count: number): never {
+	throw new ToolError(
+		`write target '${target}' is a semicolon-joined list of ${count} read-tool selectors, not a filesystem path — refusing to create it. ` +
+			`write creates a single file; issue one read() per path to read these ranges (e.g. read({ path: "<one path>:<range>" })).`,
+	);
+}
+
 async function assertNotReadSelectorMisfire(target: string, content: string, cwd: string): Promise<void> {
+	const listCount = readSelectorListMisfire(target);
+	if (listCount !== undefined && (await probeLiteralPathExists(target, cwd)) === "missing") {
+		throwReadSelectorListMisfire(target, listCount);
+	}
 	const sel = readSelectorForEmptyWrite(target, content);
 	if (sel === undefined) return;
 	if ((await probeLiteralPathExists(target, cwd)) !== "missing") return;

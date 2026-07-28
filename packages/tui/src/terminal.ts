@@ -275,17 +275,15 @@ export function emergencyTerminalRestore(): void {
 		restoreTerminalStderr();
 		const terminal = activeTerminal;
 		if (terminal) {
-			terminal.stop();
-			// stop() never touches the alternate screen — the TUI owns that
-			// state and exits it on the normal shutdown path. Only crash paths
-			// with a fullscreen overlay still hold the alt buffer here. The
-			// leave sequence is gated on the tracked state because it is NOT a
-			// universally safe no-op: Windows' VT dispatcher homes the cursor
-			// on DECRST 1049 even when the alt buffer is inactive.
+			// Keyboard enhancement state is screen-local: pop the alt-screen
+			// frame before leaving it, then let stop() pop omp's main-screen frame.
 			if (altScreenActive) {
-				terminal.write("\x1b[?1049l");
+				const keyboardExit =
+					terminal.keyboardEnhancementExitSequence ?? (terminal.kittyEnableSequence ? "\x1b[<u" : "");
+				terminal.write(`${keyboardExit}\x1b[?1049l`);
 				altScreenActive = false;
 			}
+			terminal.stop();
 			terminal.showCursor(true);
 		} else if (terminalEverStarted && !isTerminalHeadless()) {
 			// Blind restore only if we know a terminal was started but lost track of it
@@ -305,7 +303,7 @@ export function emergencyTerminalRestore(): void {
 					// actually holds it — on Windows, DECRST 1049 on the main
 					// buffer homes the cursor (unconditional CursorRestoreState
 					// with no prior save), corrupting the shell handoff on exit.
-					(altScreenActive ? "\x1b[?1049l" : "") +
+					(altScreenActive ? "\x1b[?1049l\x1b[?1l\x1b>\x1b[<u" : "") + // Leave alt; reset main keyboard
 					"\x1b[?25h", // Show cursor
 			);
 			altScreenActive = false;

@@ -59,7 +59,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$here/runner.Dockerfile" ] || { echo "no runner.Dockerfile next to $0" >&2; exit 1; }
 
 echo "==> [0/5] copying Dockerfile to ${CI_HOST}:${REMOTE_CTX}"
-ssh "$CI_HOST" "mkdir -p '$REMOTE_CTX'"
+ssh "$CI_HOST" bash -s -- "$REMOTE_CTX" <<'REMOTE'
+mkdir -p "$1"
+REMOTE
 scp -q "$here/runner.Dockerfile" "${CI_HOST}:${REMOTE_CTX}/Dockerfile"
 
 # All build/import/rollout steps run on the host. Config is passed as positional

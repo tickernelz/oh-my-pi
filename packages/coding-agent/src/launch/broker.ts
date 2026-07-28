@@ -3,7 +3,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
-import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText } from "@oh-my-pi/pi-utils";
+import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
 import { workerEnvFromParent } from "../subprocess/worker-client";
@@ -101,6 +101,10 @@ function quoteShellArg(value: string): string {
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
 	return state === "exited" || state === "failed";
+}
+
+function settledState(state: DaemonSnapshot["state"]): boolean {
+	return terminalState(state) || state === "restarting";
 }
 
 /**
@@ -754,7 +758,7 @@ class DaemonBroker {
 	}
 
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
-		if (!record.spec.detached || terminalState(record.snapshot.state)) return;
+		if (!record.spec.detached || settledState(record.snapshot.state)) return;
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
 		if (generation !== record.generation || record.process) return;
@@ -791,8 +795,14 @@ class DaemonBroker {
 	}
 
 	async #settle(record: ManagedDaemon, generation: number, exitCode?: number, error?: string): Promise<void> {
-		if (generation !== record.generation || terminalState(record.snapshot.state)) return;
+		// `restarting` is a settled state (child exited, relaunch timer armed). Any op that
+		// runs #refreshDetached on such a record must not re-settle it: re-entry double-counts
+		// restartCount and overwrites record.restartTimer, orphaning the armed timer so it fires
+		// after stop() and resurrects the daemon (issue #6852).
+		if (generation !== record.generation || settledState(record.snapshot.state)) return;
 		await this.#readDetachedOutput(record, generation);
+		// The output read yields, so a concurrent refresh may settle this generation first.
+		if (generation !== record.generation || settledState(record.snapshot.state)) return;
 		record.process = undefined;
 		record.input = undefined;
 		record.pty = undefined;
@@ -1110,7 +1120,7 @@ export async function startDaemonBrokerFromEnvironment(): Promise<void> {
 	await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
 	const lease = await acquireBrokerLease(runtimeDir);
 	if (!lease) return;
-	process.title = "omp daemon broker";
+	setProcessName("omp daemon broker");
 	const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
 	if (!token) throw new Error("Daemon broker token is empty");
 	const broker = new DaemonBroker(projectDir, runtimeDir, token, idleGraceMs);

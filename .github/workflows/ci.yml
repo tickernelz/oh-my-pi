@@ -9,12 +9,15 @@ on:
          - "scripts/**"
          - "bazel/**"
          - "MODULE.bazel"
+         - "MODULE.bazel.lock"
          - "BUILD.bazel"
          - ".bazelrc"
+         - ".bazelignore"
          - ".bazelversion"
          - "Cargo.toml"
          - "Cargo.lock"
-         - "Cargo.Bazel.lock"
+         - "rust-toolchain.toml"
+         - "rustfmt.toml"
          - ".github/**"
    pull_request:
       branches: [main]
@@ -24,12 +27,15 @@ on:
          - "scripts/**"
          - "bazel/**"
          - "MODULE.bazel"
+         - "MODULE.bazel.lock"
          - "BUILD.bazel"
          - ".bazelrc"
+         - ".bazelignore"
          - ".bazelversion"
          - "Cargo.toml"
          - "Cargo.lock"
-         - "Cargo.Bazel.lock"
+         - "rust-toolchain.toml"
+         - "rustfmt.toml"
          - ".github/**"
    workflow_dispatch:
 
@@ -46,7 +52,6 @@ permissions:
    contents: read
 
 jobs:
-
    check:
       name: Lint, type check & web build
       runs-on: ubuntu-22.04
@@ -58,44 +63,26 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # One Bazel job validates Rust changes and builds native addons for every
-   # downstream job. Main builds all Linux-hosted targets. Pull requests build
-   # only the Linux x64 pair required by tests.
-   rust:
+   # Rust validation (tests, clippy, rustfmt) and native addon production are
+   # separate jobs: TS test shards wait only on the addons, and on
+   # native-changing PRs validation no longer delays artifact production.
+   rust_validate:
       name: Validate Rust workspace (bazel)
       runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
-         # TS-only PRs skip Rust validation. They still materialize the Linux
-         # x64 addons once from the main-exported disk cache.
-         - name: Detect Rust-affecting changes
-           id: changes
-           shell: bash
-           env:
-              GH_TOKEN: ${{ github.token }}
-           run: |
-              if [ "${{ github.event_name }}" != "pull_request" ]; then
-                echo "rust=true" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              if gh pr diff ${{ github.event.pull_request.number }} --name-only \
-                 | grep -qE '^(crates/|Cargo\.(toml|lock)|Cargo\.Bazel\.lock|MODULE\.bazel|BUILD\.bazel|\.bazelrc|\.bazelversion|bazel/|rust-toolchain\.toml|rustfmt\.toml|scripts/bazel-natives|\.github/actions/bazel-|\.github/workflows/ci\.yml)'; then
-                echo "rust=true" >> "$GITHUB_OUTPUT"
-              else
-                echo "No Rust-affecting changes; skipping validation."
-                echo "rust=false" >> "$GITHUB_OUTPUT"
-              fi
-         - if: steps.changes.outputs.rust == 'true'
+         - id: inputs
+           uses: ./.github/actions/native-inputs
+         # TS-only PRs skip Rust validation entirely.
+         - if: steps.inputs.outputs.rust == 'true'
            uses: ./.github/actions/bun-install
          - id: cache
+           if: steps.inputs.outputs.rust == 'true'
            uses: ./.github/actions/bazel-cache
            with:
               scope: linux
-              # Main pushes export the disk cache PRs restore (once per
-              # lockfile change; no-op otherwise).
-              export: ${{ github.event_name != 'pull_request' }}
          - name: Rust tests
-           if: steps.changes.outputs.rust == 'true'
+           if: steps.inputs.outputs.rust == 'true'
            # The ulimit guard runs in the step that launches the bazel server
            # (limits are per-process and the server persists across steps).
            run: |
@@ -106,35 +93,176 @@ jobs:
          # `[lints] workspace = true` get the workspace policy, the vendored
          # brush fork is exempt (same as run-rs-task.ts's cargo excludes).
          - name: Clippy (workspace lint policy on opted-in crates)
-           if: steps.changes.outputs.rust == 'true'
+           if: steps.inputs.outputs.rust == 'true'
            run: |
               bazelisk query "kind('rust_library|rust_shared_library', //crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...)" \
                 | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy-strict --
          - name: Clippy (default lints elsewhere)
-           if: steps.changes.outputs.rust == 'true'
+           if: steps.inputs.outputs.rust == 'true'
            run: |
               bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (//crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...) - //crates/vendor/brush-core/... - //crates/vendor/brush-builtins/...)" \
                 | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy --
          - name: Rustfmt
-           if: steps.changes.outputs.rust == 'true'
+           if: steps.inputs.outputs.rust == 'true'
            run: bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=rustfmt //crates/...
-         - name: Build native addons once
-           env:
-              EVENT_NAME: ${{ github.event_name }}
+         # No disk-cache save here: native_addons saves this same key
+         # concurrently, and an immutable archive can have only one producer
+         # per key — a validation-only archive winning the race would
+         # suppress the addon half on every later exact hit. Validation
+         # actions are seeded by the main cache warmer's combined archive.
+
+   # Builds the Linux x64 addons every downstream test job installs. TS-only
+   # pull requests may restore the trusted main cache; all other runs build the
+   # same baseline/modern pair with Bazel.
+   native_addons:
+      name: Build native addons (bazel)
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@v4
+         - id: inputs
+           uses: ./.github/actions/native-inputs
+         # Trusted fast path. Exact-key restores only — a prefix fallback
+         # could resolve valid-but-wrong .node files under a changed
+         # target/profile (the key embeds schema + os/arch + target pair +
+         # build profile + input hash; see native-inputs action).
+         - name: Restore prebuilt native addons
+           id: prebuilt
+           if: github.event_name == 'pull_request'
+           uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.cache/omp-native-addons
+              key: ${{ steps.inputs.outputs.cache-key }}
+         - name: Stage cached addons
+           if: steps.prebuilt.outputs.cache-hit == 'true'
+           shell: bash
+           # Canonical filenames come from the target map in
+           # scripts/bazel-natives.ts; staging reproduces the bazel-bin
+           # layout the artifact upload below globs.
            run: |
               set -euo pipefail
+              mkdir -p bazel-bin/natives-linux-x64-baseline bazel-bin/natives-linux-x64-modern
+              cp ~/.cache/omp-native-addons/pi_natives.linux-x64-baseline.node bazel-bin/natives-linux-x64-baseline/
+              cp ~/.cache/omp-native-addons/pi_natives.linux-x64-modern.node bazel-bin/natives-linux-x64-modern/
+         # A poisoned cache entry must not ship: load both addons before
+         # trusting them. Failure falls back to a full build (loudly) rather
+         # than failing the PR.
+         - name: Smoke cached addons
+           id: smoke
+           if: steps.prebuilt.outputs.cache-hit == 'true'
+           shell: bash
+           run: |
+              set -uo pipefail
+              # NOTE: `bun -e 'require("./x.node")'` swallows dlopen failures
+              # (exit 0 on a bogus addon); a script file enforces them in
+              # both bun and node. Verified against a corrupt .node fixture.
+              cat > "$RUNNER_TEMP/smoke-addons.js" <<'EOF'
+              for (const f of process.argv.slice(2)) {
+               const m = require(f);
+               if (!m || Object.keys(m).length === 0) {
+               	console.error(`addon failed to load: ${f}`);
+               	process.exit(1);
+               }
+              }
+              EOF
+              loader=node
+              if command -v bun >/dev/null 2>&1; then loader=bun; fi
+              if "$loader" "$RUNNER_TEMP/smoke-addons.js" \
+                 "$PWD/bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
+                 "$PWD/bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"; then
+                echo "ok=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "::warning::cached native addons failed to load; falling back to a full bazel build"
+                rm -rf bazel-bin
+                echo "ok=false" >> "$GITHUB_OUTPUT"
+              fi
+         - name: Decide build path
+           id: decide
+           shell: bash
+           env:
+              HIT: ${{ steps.prebuilt.outputs.cache-hit }}
+              SMOKE: ${{ steps.smoke.outputs.ok }}
+           run: |
+              if [ "$HIT" = "true" ] && [ "$SMOKE" = "true" ]; then
+                echo "Prebuilt addons restored and verified; skipping bazel."
+                echo "needed=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "needed=true" >> "$GITHUB_OUTPUT"
+              fi
+         - id: cache
+           if: steps.decide.outputs.needed == 'true'
+           uses: ./.github/actions/bazel-cache
+           with:
+              scope: linux
+         - name: Build native addons once
+           if: steps.decide.outputs.needed == 'true'
+           run: |
+              set -eo pipefail
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
               targets=(//:natives-linux-x64-baseline //:natives-linux-x64-modern)
-              if [ "$EVENT_NAME" != "pull_request" ]; then
-                targets=(//:natives-linux-all)
-              fi
-              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "${targets[@]}"
+              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "${targets[@]}" 2>&1 | tee "$RUNNER_TEMP/bazel-build.log"
+         # Cache-hit visibility: a supposedly warm build that executes
+         # thousands of actions is the failure mode that made CI slow — make
+         # it visible in the run summary instead of discovering it weeks in.
+         - name: Report bazel cache stats
+           if: steps.decide.outputs.needed == 'true'
+           shell: bash
+           run: |
+              # Bazel runs with --color=yes (config=ci); strip ANSI before
+              # matching — escapes split "INFO:" from the process count in
+              # the raw log.
+              summary=$(sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/bazel-build.log" | grep -E '[0-9]+ processes:' | tail -1 || true)
+              echo "::notice title=Bazel build summary::${summary:-no process summary found}"
          - name: Save Bazel disk cache
            if: steps.cache.outputs.save-needed == 'true'
            uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
            with:
               path: ~/.cache/omp-bazel-disk
               key: ${{ steps.cache.outputs.cache-key }}
+         # Producer side of the fast path: trusted main builds publish the
+         # x64 pair under the content-addressed key. Smoke-load before save —
+         # an exact-key archive is never overwritten, so bad bytes would
+         # poison every TS-only PR until manual eviction.
+         - name: Stage built addons for cache
+           if: github.event_name != 'pull_request'
+           shell: bash
+           run: |
+              set -euo pipefail
+              mkdir -p ~/.cache/omp-native-addons
+              cp bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node \
+                 bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node \
+                 ~/.cache/omp-native-addons/
+         - name: Smoke addons before caching
+           if: github.event_name != 'pull_request'
+           shell: bash
+           run: |
+              set -euo pipefail
+              cd ~/.cache/omp-native-addons
+              cat > "$RUNNER_TEMP/smoke-addons.js" <<'EOF'
+              for (const f of process.argv.slice(2)) {
+               const m = require(f);
+               if (!m || Object.keys(m).length === 0) {
+               	console.error(`addon failed to load: ${f}`);
+               	process.exit(1);
+               }
+              }
+              EOF
+              bun "$RUNNER_TEMP/smoke-addons.js" \
+                "$PWD/pi_natives.linux-x64-baseline.node" \
+                "$PWD/pi_natives.linux-x64-modern.node"
+         - name: Look up native addon cache
+           id: addon-cache
+           if: github.event_name != 'pull_request'
+           uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.cache/omp-native-addons
+              key: ${{ steps.inputs.outputs.cache-key }}
+              lookup-only: true
+         - name: Save native addon cache
+           if: github.event_name != 'pull_request' && steps.addon-cache.outputs.cache-hit != 'true'
+           uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.cache/omp-native-addons
+              key: ${{ steps.inputs.outputs.cache-key }}
          - name: Upload native addon artifacts
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
@@ -146,8 +274,8 @@ jobs:
    test_workspace:
       name: Test TS workspace fast
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
@@ -164,8 +292,8 @@ jobs:
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
@@ -182,8 +310,8 @@ jobs:
    test_ts_native:
       name: Test TS native/integration packages
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -200,8 +328,8 @@ jobs:
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -218,8 +346,8 @@ jobs:
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -238,8 +366,8 @@ jobs:
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -256,8 +384,8 @@ jobs:
    test_smoke:
       name: Test CLI smoke (TS)
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 15
       steps:
          - uses: actions/checkout@v4
@@ -272,8 +400,8 @@ jobs:
    install_methods:
       name: Install method smoke tests
       runs-on: ubuntu-22.04
-      needs: [rust]
-      if: ${{ !cancelled() && needs.rust.result == 'success' }}
+      needs: [native_addons]
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/setup-system-deps

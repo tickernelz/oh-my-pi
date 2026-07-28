@@ -469,12 +469,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "guided-goal",
-		description: "Interview and refine a goal before enabling goal mode",
+		description: "Have the agent interview you in chat, then set up goal mode",
 		inlineHint: "[rough objective]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			await runtime.ctx.handleGuidedGoalCommand(command.args || undefined);
+			// Clear the slash draft BEFORE the await: the handler blocks for the
+			// whole kickoff turn, and a post-await clear would wipe an answer the
+			// user starts typing while the first interview question streams.
 			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleGuidedGoalCommand(command.args || undefined);
 		},
 	},
 	{

@@ -47,12 +47,12 @@ describe("downstream release governance", () => {
 		expect(record(job.permissions, "release permissions").contents).toBe("write");
 
 		const native = namedStep(job, "Build glibc Linux x64 native addon");
-		expect(native.uses).toBe("./.github/actions/build-native");
-		expect(record(native.with, "native inputs")).toMatchObject({
-			platform: "linux",
-			arch: "x64",
-			variant: "baseline",
+		expect(native.uses).toBe("./.github/actions/bazel-natives");
+		expect(record(native.with, "native inputs")).toEqual({
+			targets: "linux-x64-baseline",
+			"cache-scope": "downstream-release-linux-x64",
 		});
+		expect(await Bun.file(path.join(repoRoot, String(native.uses), "action.yml")).exists()).toBe(true);
 		expect(namedStepIndex(job, "Build glibc Linux x64 native addon")).toBeLessThan(
 			namedStepIndex(job, "Run focused downstream contract gates"),
 		);
@@ -93,10 +93,9 @@ describe("downstream release governance", () => {
 		);
 		const jobs = record(ci.jobs, "CI jobs");
 		const expectedJobs = [
-			"release_metadata",
-			"native_artifact_lookup",
 			"check",
-			"native_linux_x64",
+			"rust_validate",
+			"native_addons",
 			"test_workspace",
 			"test_coding_agent_singleton",
 			"test_ts_native",
@@ -107,16 +106,7 @@ describe("downstream release governance", () => {
 			"install_methods",
 		];
 		expect(Object.keys(jobs)).toEqual(expectedJobs);
-		expect(ci.permissions).toEqual({ contents: "read", actions: "read" });
-
-		const lookup = record(jobs.native_artifact_lookup, "native_artifact_lookup");
-		expect(Object.keys(record(lookup.outputs, "native artifact lookup outputs"))).toEqual([
-			"source-hash",
-			"linux-x64-run-id",
-		]);
-		const native = record(jobs.native_linux_x64, "native_linux_x64");
-		const nativeMatrix = record(record(native.strategy, "native strategy").matrix, "native matrix");
-		expect(nativeMatrix.include).toEqual([{ variant: "baseline", rust_checks: true }, { variant: "modern" }]);
+		expect(ci.permissions).toEqual({ contents: "read" });
 
 		const serialized = JSON.stringify(ci);
 		expect(serialized).not.toMatch(/omp-kata|macos-15-intel|native_cross_platform|cross-platform-run-id/);

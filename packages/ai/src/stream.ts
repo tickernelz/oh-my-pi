@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl } from "@oh-my-pi/pi-catalog/hosts";
+import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl, resolveVertexEndpointHost } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
@@ -662,7 +662,7 @@ function resolveVertexRequest(input: string | URL | Request): string | URL | Req
 			url.includes("{location}") ||
 			url.includes("%7Bproject%7D") ||
 			url.includes("%7Blocation%7D");
-		const host = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
+		const host = resolveVertexEndpointHost(location);
 		const rewritten = hasPlaceholder
 			? url
 					.replace("https://{location}-aiplatform.googleapis.com", `https://${host}`)

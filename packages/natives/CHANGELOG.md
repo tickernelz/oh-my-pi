@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Fixed
+
+- Fixed an issue on macOS (darwin) where the native addon delivered zero AudioCapture callbacks, which prevented microphone audio from being captured.
+
 ## [17.1.6] - 2026-07-27
 
 ### Changed

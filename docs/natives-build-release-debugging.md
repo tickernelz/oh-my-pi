@@ -20,7 +20,7 @@ Build side:
 - `bazel/variants/BUILD.bazel` — `baseline`/`modern` ISA constraint values
 - `bazel/toolchains/` — musl rustc disambiguation + the msvc cross cc toolchain (`msvc/NOTES.md`)
 - `bazel/clippy.bazelrc` — generated from `[workspace.lints]` in `Cargo.toml`
-- `MODULE.bazel`, `.bazelrc`, `.bazelversion` (Bazel 9.2.0), `Cargo.Bazel.lock`
+- `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`, `.bazelversion` (Bazel 9.2.0)
 - `scripts/bazel-natives.ts` — the canonical driver (build + locate + install)
 - `crates/pi-natives/BUILD.bazel`, `crates/pi-natives/Cargo.toml`
 
@@ -79,15 +79,9 @@ Rust toolchains are nightly (pinned in `MODULE.bazel`), with repo-local musl re-
 
 ### 4) Third-party crates (`crate_universe`)
 
-`@crates//...` is generated from the workspace `Cargo.toml`/`Cargo.lock` (lockfile: `Cargo.Bazel.lock`), restricted to exactly the seven shipped triples. Crate-specific build fixes live as `crate.annotation`s in `MODULE.bazel` (see the debugging playbook below).
+`@crates//...` is generated from the workspace `Cargo.toml`/`Cargo.lock`, restricted to exactly the seven shipped triples. Crate-specific build fixes live as `crate.annotation`s in `MODULE.bazel` (see the debugging playbook below).
 
-**Repin flow:** after any `Cargo.toml`/`Cargo.lock` change (or annotation edit), run
-
-```bash
-bun run bazel:repin   # = CARGO_BAZEL_REPIN=1 bazelisk fetch @crates//...
-```
-
-and commit the updated `Cargo.Bazel.lock`. A stale lockfile fails analysis with a "lockfile out of date" style error.
+The root module intentionally omits `crate_universe`'s optional rendering lock. The first evaluation after crate inputs change splices the workspace and generates external repository specs from the pinned `Cargo.lock`; Bazel records that extension result in `MODULE.bazel.lock`, so later clean output bases reuse it. Cargo manifest, lock, and annotation edits therefore require no separate repin step.
 
 ## Local development
 
@@ -140,9 +134,11 @@ build --tls_certificate=infra/bazel-remote/ca.crt
 
 ## CI
 
-### `rust` job (validate + cache warm)
+### Split Rust validation and addon production
 
-`.github/workflows/ci.yml` `rust` runs on `omp-kata` pods for pushes and `ubuntu-22.04` for PRs, composes cache wiring via the `bazel-cache` action, then:
+`.github/workflows/ci.yml` separates `rust_validate` from `native_addons`. Both run on `omp-kata` pods for pushes and `ubuntu-22.04` for pull requests, but TypeScript jobs depend only on `native_addons`.
+
+`rust_validate` uses `.github/actions/native-inputs` to inspect the complete pull-request file list. TypeScript-only pull requests skip every Rust step; native-affecting changes and all non-PR events run:
 
 ```bash
 bazelisk --bazelrc="$rc" test //crates/...                 # full Rust suite
@@ -155,30 +151,40 @@ bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (…stri
 bazelisk --bazelrc="$rc" build --config=rustfmt //crates/...
 ```
 
-- `--config=clippy` = rules_rust clippy aspect + `-Dwarnings`; `--config=clippy-strict` layers the generated `bazel/clippy.bazelrc` (rendered from `[workspace.lints]` in `Cargo.toml` — regenerate it when workspace lints change) for the crates with `[lints] workspace = true`.
+- `--config=clippy` = rules_rust clippy aspect + `-Dwarnings`; `--config=clippy-strict` layers the generated `bazel/clippy.bazelrc` for crates with `[lints] workspace = true`.
 - `--config=rustfmt` = rustfmt aspect against the workspace `rustfmt.toml`.
-- On main pushes (read-write cache) the job additionally runs `bazelisk build //:natives-linux-all` to warm the shared cache for every downstream job.
+- `rust_validate` never saves a hosted disk-cache archive: `native_addons` may concurrently own the same immutable key, while the main-branch warmer publishes a combined validation/addon archive.
 
-No toolchain setup steps: bazelisk is on the GitHub images and baked into the kata runner image; Bazel fetches Rust/zig/LLVM/xwin hermetically.
+`native_addons` is the artifact producer for every downstream TypeScript and release job:
+
+- Pull requests first restore the exact `native-addons-v1-linux-x64-baseline+modern-opt-<source-hash>` cache entry published by trusted main builds. Both addons are loaded before use; a miss or failed smoke check falls back to building the Linux x64 pair.
+- Main and other non-PR runs build `//:natives-linux-all`, smoke the x64 pair before publishing its exact addon cache, and upload every `.node` output as the `native-addons` workflow artifact.
+- Downstream jobs use `.github/actions/native-artifacts` to download that workflow artifact and install the requested target set without invoking Bazel.
+
+No toolchain setup steps are required for native jobs: bazelisk is on the GitHub images and baked into the kata runner image; Bazel fetches Rust/zig/LLVM/xwin hermetically.
+
+### Hosted cache warmer
+
+`.github/workflows/bazel-cache-warm.yml` runs the full hosted validation and Linux x64 addon invocation set on `ubuntu-22.04`. Main-branch input changes restore the previous config-compatible generation, rebuild incrementally, and publish one combined exact-key disk-cache archive visible to pull requests.
 
 ### `bazel-cache` action (`.github/actions/bazel-cache`)
 
-Single source of truth for cache wiring, emitted as a bazelrc fragment (its `rc` output) that consumers pass via `bazelisk --bazelrc=...` (or `OMP_BAZEL_RC` for the driver). Two modes, detected via `BAZEL_REMOTE_USER`/`BAZEL_REMOTE_PASSWORD` (injected from the `bazel-remote-ci` secret on kata pods only):
+Single source of truth for cache wiring, emitted as a bazelrc fragment (its `rc` output) that consumers pass via `bazelisk --bazelrc=...` or `OMP_BAZEL_RC`. Two modes are selected via `BAZEL_REMOTE_USER`/`BAZEL_REMOTE_PASSWORD`:
 
 | Runner | Fragment contents |
 | --- | --- |
 | omp-kata pod | `--config=ci --config=cache-rw --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092 --tls_certificate=infra/bazel-remote/ca.crt --remote_header='authorization=Basic <b64 ci creds>'` |
-| GitHub-hosted | `--config=ci --disk_cache=~/.cache/omp-bazel-disk --repository_cache=~/.cache/omp-bazel-repo`, persisted by `actions/cache` keyed on `bazel-disk-<scope>-<os>-<arch>-<hash(Cargo.Bazel.lock, MODULE.bazel, rust-toolchain.toml)>` |
+| GitHub-hosted | `--config=ci --disk_cache=~/.cache/omp-bazel-disk --repository_cache=~/.cache/omp-bazel-repo` |
 
-The remote endpoint resolves **only inside the cluster** (see `infra/bazel-remote/` and `infra/docs/04-arc-and-caching.md` §5); GitHub-hosted runners never talk to it. The `scope` input separates disk-cache keys per target set (`linux-x64-pair`, `release-<target_id>`, …) so jobs don't evict each other's entries.
+Hosted disk caches use `bazel-disk-v3-<scope>-<os>-<arch>-<config-hash>-<source-hash>`. The config hash covers Cargo/Bazel/toolchain settings; the source hash covers `crates/**` and root `BUILD.bazel`. An exact miss restores the newest config-compatible generation and permits one refreshed exact-key save. The remote endpoint resolves only inside the cluster.
 
-### `bazel-natives` action (`.github/actions/bazel-natives`)
+### Native artifact actions
 
-Thin composite: `bazel-cache` (with `cache-scope`) → `OMP_BAZEL_RC=<rc> bun scripts/bazel-natives.ts <targets> --dest <dest>`. Every TS test job uses it with `targets: linux-x64-baseline linux-x64-modern`, `cache-scope: linux-x64-pair`.
+`.github/actions/bazel-natives` is the direct builder: `bazel-cache` → `OMP_BAZEL_RC=<rc> bun scripts/bazel-natives.ts <targets> --dest <dest>`, followed by a disk-cache save after a hosted miss. `.github/actions/native-artifacts` is the no-build consumer: download `native-addons` → run the same driver with `--source`.
 
 ### `release_binary`
 
-Release runners are GitHub-hosted and build addons **inline** (disk-cache mode — repeat releases with unchanged Rust are mostly local cache hits): the `bazel-natives` action runs with the matrix's `native_targets` (`linux-x64-baseline linux-x64-modern`, `linux-musl-x64-baseline`, `linux-arm64`, `linux-musl-arm64`, `darwin-all` on both mac runners, `win32-x64-baseline` cross-built from `ubuntu-22.04`) and `cache-scope: release-<target_id>`, then `bun run ci:release:build-binaries` embeds and compiles.
+Linux and Windows release matrices install addons from the `native_addons` workflow artifact. Darwin artifacts cannot be cross-built on Linux, so each macOS matrix builds only its own architecture through `bazel-natives` with scope `release-<target_id>`, then `bun run ci:release:build-binaries` embeds and compiles the executable.
 
 ## Debugging playbook
 
@@ -221,8 +227,8 @@ bazelisk build --nobuild //:natives-win32-x64-baseline
 
 ### Cache behavior
 
-- **omp-kata (push/main, release_binary is not here):** read-write gRPC to in-cluster bazel-remote (`grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092`, TLS via the committed `infra/bazel-remote/ca.crt`, htpasswd user `ci`). Expect `remote cache hit` counts in the build summary; the `rust` job's `//:natives-linux-all` warm build on main pushes is what seeds it. `--remote_local_fallback` + retries mean a cache outage degrades to a local build, never a failure.
-- **GitHub-hosted (PRs, macOS, releases):** no remote cache at all — `--disk_cache`/`--repository_cache` persisted by `actions/cache`, keyed on `(scope, os, arch, hash(Cargo.Bazel.lock, MODULE.bazel, rust-toolchain.toml))` with a prefix restore key. A lockfile/module change starts from the nearest previous entry.
+- **omp-kata:** read-write gRPC to the in-cluster bazel-remote (`grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092`, TLS via the committed `infra/bazel-remote/ca.crt`, htpasswd user `ci`). `--remote_local_fallback` plus retries make an outage degrade to local execution rather than fail the build.
+- **GitHub-hosted:** no cluster access. The v3 `actions/cache` disk key separates config and source generations; `.github/workflows/bazel-cache-warm.yml` publishes the combined default-branch archive from the same `ubuntu-22.04` image as pull-request consumers. The smaller final-addon cache is independent and is trusted only after both addons load successfully.
 - **msvc repos:** the ~2 GiB LLVM download is sha256-pinned and repository-cache backed; the ~1 GiB xwin CRT/SDK splat is fetched from the Microsoft CDN inside the repo rule and is **not** repo-cache backed — a cold output base re-downloads it. Microsoft advances the VS channel payload over time, so remote-cache hit rates for win32 actions degrade gracefully after an MS bump (same property the previous cross toolchain had). Win32 link actions also don't share cache entries across host OSes (linux vs mac clang binaries).
 - Server-side operations (deploy, TLS/auth, egress, poisoning boundary): `infra/docs/04-arc-and-caching.md` §5.
 
@@ -312,7 +318,6 @@ Generated declarations currently include exports from these Rust modules:
 - Unknown target name: the driver errors with the full known-target list (`//:natives-*` names + `host`/`linux-all`/`darwin-all`).
 - No `.node` outputs located after a successful build: driver exits 1 (check `bazel cquery --output=files` manually).
 - Basename collision (gnu + musl in one invocation): driver refuses to install and names both sources — split into separate `--dest` dirs.
-- Stale `Cargo.Bazel.lock` after a `Cargo.{toml,lock}` change: run `bun run bazel:repin`.
 - `build:bindings` (napi) failure: script surfaces non-zero exit and stderr; artifact builds are unaffected (Bazel never runs the napi CLI).
 
 ## Runtime loader failures (`native/loader-state.js`)
@@ -344,9 +349,6 @@ bun scripts/bazel-natives.ts linux-x64-modern linux-x64-baseline --dest packages
 
 # Raw bazel (output: bazel-bin/natives-<t>/pi_natives.<...>.node)
 bazelisk build //:natives-darwin-arm64
-
-# Refresh Cargo.Bazel.lock after Cargo.{toml,lock} or annotation changes
-bun run bazel:repin
 
 # Regenerate TS typedefs + enum exports (napi CLI, only on Rust API changes)
 bun --cwd=packages/natives run build:bindings
@@ -387,7 +389,7 @@ The key is `sha256` over `(path \t git-tree-hash \n)` pairs for the following in
 
 Tree hashes come from one `git cat-file --batch-check` invocation against `HEAD`; paths missing from `HEAD` fold in as a fixed null hash so the key stays deterministic across repos that don't ship every input. The target-triple suffix matches the addon basename convention (`<platform>-<arch>` for non-x64, `<platform>-<arch>-<variant>` for x64).
 
-Anything outside this input set (Bazel definition files like `MODULE.bazel`/`BUILD.bazel`/`Cargo.Bazel.lock`, host glibc, env vars) is **not** in the key. If you need to invalidate after such a change, delete the cache directory by hand or bump one of the input files.
+Anything outside this input set (Bazel definition files such as `MODULE.bazel`/`BUILD.bazel`, host glibc, env vars) is **not** in the key. If you need to invalidate after such a change, delete the cache directory by hand or bump one of the input files.
 
 ### Layout and ownership
 

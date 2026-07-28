@@ -142,6 +142,33 @@ describe("Markdown component", () => {
 			expect(plainLines.some(line => line.includes("2. Second ordered"))).toBeTruthy();
 		});
 
+		it("wraps unordered list continuations under the item text", () => {
+			const markdown = new Markdown("- Alpha beta gamma delta epsilon", 0, 0, defaultMarkdownTheme);
+
+			const plainLines = markdown.render(16).map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(plainLines).toEqual(["- Alpha beta", "  gamma delta", "  epsilon"]);
+			expect(plainLines.every(line => visibleWidth(line) <= 16)).toBe(true);
+		});
+
+		it("uses the full ordered-list marker width as the hanging indent", () => {
+			const markdown = new Markdown("10. Alpha beta gamma delta", 0, 0, defaultMarkdownTheme);
+
+			const plainLines = markdown.render(16).map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(plainLines).toEqual(["10. Alpha beta", "    gamma delta"]);
+			expect(plainLines.every(line => visibleWidth(line) <= 16)).toBe(true);
+		});
+
+		it("keeps list rows within width when the marker consumes the line", () => {
+			const markdown = new Markdown("123456789. x", 0, 0, defaultMarkdownTheme);
+
+			const plainLines = markdown.render(8).map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(plainLines.every(line => visibleWidth(line) <= 8)).toBe(true);
+			expect(plainLines.join("")).toContain("x");
+		});
+
 		it("should maintain numbering when code blocks are not indented (LLM output)", () => {
 			// When code blocks aren't indented, marked parses each item as a separate list.
 			// We use token.start to preserve the original numbering.

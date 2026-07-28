@@ -575,7 +575,16 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
-		if (name === "goal") return goalEnabled && goalModeActive;
+		// Never in the default set. Explicitly activatable while goal.enabled and
+		// no goal record exists yet — /guided-goal enables it so the agent can
+		// finish the interview with `goal create`, which turns goal mode on. Once
+		// a goal record exists, only an enabled goal keeps the tool: a completed
+		// (exiting) or paused goal must stop advertising it on the next rebuild.
+		if (name === "goal") {
+			if (!goalEnabled || restrictToolNames) return false;
+			const goalState = session.getGoalModeState?.();
+			return goalState === undefined || goalState.enabled === true || goalState.goal.status === "dropped";
+		}
 		if (name === "lcm_expand") {
 			return (session.taskDepth ?? 0) > 0 && session.getForwardedLcmRuntime?.() !== undefined;
 		}

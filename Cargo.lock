@@ -502,6 +502,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -3662,6 +3664,7 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f00ae1969d0a389937161b834623e5cba2d8449752a0970d71382cf9a905bb35"
 dependencies = [
+ "bindgen",
  "cc",
 ]
 
@@ -3777,9 +3780,9 @@ dependencies = [
 
 [[package]]
 name = "napi"
-version = "3.11.0"
+version = "3.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de33522036981030a75c231829566bc63414e08101a6f5ff4ac6cef19c8e0941"
+checksum = "6f71d6bc097c4a6eb853c3f24991ab8c9f50f57d1f719e305175541482217e36"
 dependencies = [
  "bitflags 2.13.1",
  "ctor",
@@ -3793,15 +3796,15 @@ dependencies = [
 
 [[package]]
 name = "napi-build"
-version = "2.3.2"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9c366d2c8c60b86fa632df75f745509b52f9128f91a6bad4c796e44abb505e1"
+checksum = "5282704fbe8d49b0cf8b08e3f33233416a528658f205c7e5ace63b582de0b11c"
 
 [[package]]
 name = "napi-derive"
-version = "3.6.0"
+version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a49c513341a61a16a10af6efcce46b30d0822ba2d4fb197d24d33dfc199c78d5"
+checksum = "4d5c9c02556ea6dc99dffd36c1ce60141411657438501a125b675776d011ce92"
 dependencies = [
  "convert_case 0.11.0",
  "ctor",
@@ -3813,9 +3816,9 @@ dependencies = [
 
 [[package]]
 name = "napi-derive-backend"
-version = "6.0.0"
+version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4747005fa3e2c9989ac45a723a514c5db2411238b72981a3cda4c701a9dfea17"
+checksum = "6a9d8365cf97f54d9b6d6dbf83a25ca227ad7d6e920717426c599225aca6740b"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -4729,7 +4732,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "17.1.7"
+version = "17.1.8"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4798,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "17.1.7"
+version = "17.1.8"
 dependencies = [
  "async-trait",
  "libc",
@@ -4810,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "17.1.7"
+version = "17.1.8"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4873,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "17.1.7"
+version = "17.1.8"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -4960,7 +4963,7 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "17.1.7"
+version = "17.1.8"
 dependencies = [
  "dashmap",
  "globset",
