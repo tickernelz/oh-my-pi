@@ -246,7 +246,7 @@ jobs:
                }
               }
               EOF
-              bun "$RUNNER_TEMP/smoke-addons.js" \
+              node "$RUNNER_TEMP/smoke-addons.js" \
                 "$PWD/pi_natives.linux-x64-baseline.node" \
                 "$PWD/pi_natives.linux-x64-modern.node"
          - name: Look up native addon cache

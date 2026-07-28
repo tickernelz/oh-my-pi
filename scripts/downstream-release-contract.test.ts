@@ -112,6 +112,10 @@ describe("downstream release governance", () => {
 		expect(serialized).not.toMatch(/omp-kata|macos-15-intel|native_cross_platform|cross-platform-run-id/);
 		expect(serialized).not.toMatch(/pi-natives-(?:linux-(?:arm64|musl)|darwin|win32)/);
 
+		const nativeAddons = record(jobs.native_addons, "native_addons");
+		const smoke = namedStep(nativeAddons, "Smoke addons before caching");
+		expect(String(smoke.run)).toContain('node "$RUNNER_TEMP/smoke-addons.js"');
+
 		for (const [name, value] of Object.entries(jobs)) {
 			const job = record(value, name);
 			expect(job["runs-on"], `${name} runner`).toBe("ubuntu-22.04");
