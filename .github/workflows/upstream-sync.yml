@@ -62,11 +62,12 @@ jobs:
             echo "Upstream mirror is already integrated into main."
             exit 0
           fi
-          if gh pr list --base main --head upstream-main --state open --json number --jq 'length > 0' | grep -q true; then
+          if gh pr list --repo "$GITHUB_REPOSITORY" --base main --head upstream-main --state open --json number --jq 'length > 0' | grep -q true; then
             echo "Existing upstream sync pull request updated."
             exit 0
           fi
           gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
             --base main \
             --head upstream-main \
             --title "chore(sync): merge upstream main" \
