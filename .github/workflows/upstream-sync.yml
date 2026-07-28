@@ -22,9 +22,13 @@ jobs:
         with:
           ref: upstream-main
           fetch-depth: 0
+          ssh-key: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
+          persist-credentials: false
 
       - name: Fast-forward mirror
         id: mirror
+        env:
+          UPSTREAM_SYNC_SSH_KEY: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -37,16 +41,27 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          sync_key="$RUNNER_TEMP/upstream-sync-key"
+          known_hosts="$RUNNER_TEMP/upstream-sync-known-hosts"
+          trap 'rm -f "$sync_key" "$known_hosts"' EXIT
+          printf '%s\n' "$UPSTREAM_SYNC_SSH_KEY" > "$sync_key"
+          chmod 600 "$sync_key"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$known_hosts"
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          export GIT_SSH_COMMAND="ssh -i $sync_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
           git push origin HEAD:upstream-main
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Open sync pull request
-        if: steps.mirror.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          if git merge-base --is-ancestor HEAD origin/main; then
+            echo "Upstream mirror is already integrated into main."
+            exit 0
+          fi
           if gh pr list --base main --head upstream-main --state open --json number --jq 'length > 0' | grep -q true; then
             echo "Existing upstream sync pull request updated."
             exit 0
