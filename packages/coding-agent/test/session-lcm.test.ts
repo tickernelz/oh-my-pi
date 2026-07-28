@@ -30,7 +30,9 @@ import type {
 } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
+	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	SessionLcm,
@@ -419,6 +421,14 @@ async function flushScheduler(): Promise<void> {
 }
 
 describe("SessionLcm", () => {
+	it("charges serialized historical context against projection fit budgets", () => {
+		const historical = createHistoricalContextMessage({
+			redactedCitedContent: "historical payload ".repeat(300),
+			timestamp: 1,
+		});
+		expect(estimateLcmProjectionMessageTokens(historical)).toBeGreaterThan(1_000);
+	});
+
 	it("normalizes fractional provider retry hints and caps malformed long delays", () => {
 		expect(new LcmCompletionError("fractional", { retryAfterMs: 34_074.224 }).retryAfterMs).toBe(34_075);
 		expect(new LcmCompletionError("oversized", { retryAfterMs: Number.MAX_VALUE }).retryAfterMs).toBe(

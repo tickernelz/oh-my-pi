@@ -313,6 +313,7 @@ import { formatSessionDumpText } from "./session-dump-format";
 import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
+	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmProjectionLimits,
@@ -4115,7 +4116,7 @@ export class AgentSession {
 		const hardThresholdTokens = resolveThresholdTokens(contextWindow, compaction);
 		const nonMessageTokens = computeNonMessageTokens(this);
 		let sourceTokens = nonMessageTokens;
-		for (const message of messages) sourceTokens += estimateTokens(message);
+		for (const message of messages) sourceTokens += estimateLcmProjectionMessageTokens(message);
 		const tokenBudget = Math.floor(hardThresholdTokens - nonMessageTokens - 512);
 		return {
 			sourceTokens,
@@ -4134,7 +4135,7 @@ export class AgentSession {
 		if (!limits) return false;
 		let tokens = 0;
 		for (const message of messages) {
-			tokens += estimateTokens(message);
+			tokens += estimateLcmProjectionMessageTokens(message);
 			if (tokens > limits.tokenBudget) return false;
 		}
 		return true;

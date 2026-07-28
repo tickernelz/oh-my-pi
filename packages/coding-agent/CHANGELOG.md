@@ -21,6 +21,7 @@
 - Hardened Lossless queue recovery, provider backoff, overflow handling, branch switches, and shutdown so interrupted background work remains retryable without blocking foreground turns.
 - `generateFileMentionMessages()` now defaults `hashSkippedFiles` to false, avoiding full hashes for skipped oversized and binary files; sessions request those hashes while Lossless context is active or being enabled.
 - Lossless projection now preserves live user, developer, file-mention, and assistant messages when their persistence metadata collides with older same-millisecond content.
+- Lossless projection fit checks now charge the serialized historical payload and warning before admitting provider requests near the context limit.
 
 ## [17.1.7] - 2026-07-27
 

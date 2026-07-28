@@ -14,6 +14,7 @@ import type {
 } from "@oh-my-pi/lcm-context";
 import { isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 
 import { logger, pathIsWithin, prompt } from "@oh-my-pi/pi-utils";
@@ -33,6 +34,7 @@ import { fileContentHash } from "../utils/file-content-hash";
 import type { LcmFallbackCategory } from "./messages";
 import {
 	bashExecutionToText,
+	convertToLlm,
 	createBranchSummaryMessage,
 	createCustomMessage,
 	createHistoricalContextMessage,
@@ -481,6 +483,13 @@ function messageIdentity(message: AgentMessage): string {
 		default:
 			return `${message.role}:${timestamp}`;
 	}
+}
+
+/** Estimate the provider-visible cost of one message in an LCM projection. */
+export function estimateLcmProjectionMessageTokens(message: AgentMessage): number {
+	if (message.role !== "historicalContext") return estimateTokens(message);
+	const providerMessage = convertToLlm([message])[0];
+	return providerMessage ? estimateTokens(providerMessage) : Number.POSITIVE_INFINITY;
 }
 
 function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext): AgentMessage[] {
