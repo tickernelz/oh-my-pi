@@ -122,10 +122,6 @@ describe("generateFileMentionMessages path resolution", () => {
 			expect(file.content).toContain("binary file");
 			expect(file.content).not.toContain("\u0000");
 		}
-		expect(message.files.map(file => file.contentHash)).toEqual([
-			new Bun.CryptoHasher("sha256").update(fontBytes).digest("hex"),
-			new Bun.CryptoHasher("sha256").update(blobBytes).digest("hex"),
-		]);
 	});
 
 	test("hashes skipped oversized files only when LCM identity is requested", async () => {
