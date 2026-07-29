@@ -22,6 +22,7 @@ import {
 } from "../session/streaming-output";
 import { resolveReadPath } from "../tools/path-utils";
 import { fileContentHash } from "./file-content-hash";
+import { buildExplorationSummary } from "./file-exploration";
 import { formatDimensionNote, resizeImage } from "./image-resize";
 
 /** Regex to match @filepath patterns in text */
@@ -225,6 +226,11 @@ export async function generateFileMentionMessages(
 						byteSize: stat.size,
 						contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 						skippedReason: "tooLarge",
+						explorationSummary: await buildExplorationSummary(absolutePath, {
+							byteSize: stat.size,
+							fileType: mimeType,
+							skippedReason: "tooLarge",
+						}),
 					});
 					continue;
 				}
@@ -262,6 +268,11 @@ export async function generateFileMentionMessages(
 					byteSize: stat.size,
 					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "tooLarge",
+					explorationSummary: await buildExplorationSummary(absolutePath, {
+						byteSize: stat.size,
+						fileType: path.extname(resolvedPath).slice(1).toLowerCase() || "binary",
+						skippedReason: "tooLarge",
+					}),
 				});
 				continue;
 			}
@@ -272,6 +283,11 @@ export async function generateFileMentionMessages(
 					byteSize: stat.size,
 					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "binary",
+					explorationSummary: await buildExplorationSummary(absolutePath, {
+						byteSize: stat.size,
+						fileType: path.extname(resolvedPath).slice(1).toLowerCase() || "binary",
+						skippedReason: "binary",
+					}),
 				});
 				continue;
 			}

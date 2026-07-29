@@ -9,6 +9,9 @@
 - Added a per-attempt provider usage ledger (schema v7 `summary_attempts`) with start/finish fencing, so every dispatched summary request records its billed tokens and cost under exactly one terminal outcome and a superseded or re-leased job can never resurrect an obsolete retry.
 - Added a derived branch-local span index (schema v8 `branch_summary_spans`) with exact fan-in condensation, append-only leaf scheduling, orphan repair, and a `branch-summary-spans` doctor check, replacing project-wide lineage scanning during projection and scheduling.
 - Added optional process-local `LcmStatus.performance` counters for projection calls, wall/CPU time, lineage rows read, and scheduler branch passes.
+- Added `SearchRequest.mode: "regex"`, a bounded linear-time alternative to FTS token conjunction. The package keeps zero runtime dependencies, so the host injects the matcher through `LcmContextOptions.regexEngine`; without one, regex mode throws instead of silently returning nothing. A scan streams candidates in insertion order, stops at the first full page, and examines at most 20,000 authorized branch documents.
+- Added `SearchHit.position` and `SearchHit.coveringSummaryHandle`, resolved from the current revision's `branch_summary_spans` so a source match reports the summary node that presently covers it. The lowest-level containing span wins, which is the most specific cover.
+- Added `ProjectedHistoricalItem.files`, the de-duplicated file metadata of every source a projected summary compacted, so callers can keep file awareness in the active context. It is filled by one query per projection rather than one per item, preserving the branch-span projection latency.
 
 ### Changed
 
@@ -16,6 +19,7 @@
 - Projection, job claiming, retry delay, failure listing, and retention now derive placement from current-revision branch spans instead of realigning flattened `summary_lineage`. On a 20-branch/10,000-source store this cut projection wall p95 from 55.434 ms to 1.385 ms, process-CPU p95 from 65.189 ms to 3.689 ms, lineage rows read per pass from 195,600 to 0, and scheduler branch passes from 11,620 to 20.
 - A projection now becomes ready on a complete leaf cover instead of waiting for the whole condensation tree, so background condensation no longer gates foreground readiness. `summary_lineage` and `summary_children` remain immutable provenance and continue to authorize retrieval.
 - Existing v6/v7 stores upgrade lazily: migrations create empty attempt and span tables, and the first authoritative reconcile derives current spans. Until then projection is unready and native behavior owns the request.
+- A file's `explorationSummary` no longer participates in the content-addressed source key. It is derived descriptive metadata, so including it meant that improving a file description minted new source keys and discarded every cached summary that referenced the file. Reconciling an otherwise identical entry now keeps its source key and refreshes `file_records.exploration_summary` in place, including when branch placement is unchanged.
 
 ### Fixed
 

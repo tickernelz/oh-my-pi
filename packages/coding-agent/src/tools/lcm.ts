@@ -42,6 +42,9 @@ const lcmSearchSchema = type({
 	"limit?": type("number").describe("maximum matches (1-20; default 8)"),
 	"offset?": type("number").describe("zero-based result offset (0-1000; default 0)"),
 	"summary?": type("string>0").describe("optional opaque summary handle restricting the search scope"),
+	"mode?": type("'text'|'regex'").describe(
+		"matcher: 'text' FTS token conjunction (default), or 'regex' linear-time pattern scan",
+	),
 });
 
 const lcmDescribeSchema = type({
@@ -114,9 +117,11 @@ export class LcmSearchTool implements AgentTool<typeof lcmSearchSchema> {
 			const offset = normalizeLcmOffset(params.offset);
 			const scoped = params.summary ? decodeLcmHandle(params.summary) : undefined;
 			if (scoped && scoped.kind !== "summary") throw new ToolError("LCM search scope must be a summary handle.");
+			const mode = params.mode ?? "text";
 			const hits = await runtimeFor(this.session).lcmSearch(params.query, {
 				limit,
 				offset,
+				mode,
 				...(scoped ? { summary: scoped.reference } : {}),
 			});
 			return toolResult<LcmToolDetails>({
@@ -124,7 +129,15 @@ export class LcmSearchTool implements AgentTool<typeof lcmSearchSchema> {
 				offset,
 				...(hits.length >= limit ? { nextOffset: offset + hits.length } : {}),
 			})
-				.text(await renderLcmSearchHits(hits, { artifactExists: artifactExists(this.session), offset, limit }))
+				.text(
+					await renderLcmSearchHits(hits, {
+						artifactExists: artifactExists(this.session),
+						offset,
+						limit,
+						mode,
+						grouped: true,
+					}),
+				)
 				.useless(hits.length === 0)
 				.done();
 		});

@@ -455,7 +455,7 @@ async function measureLcmCost(
 			sessionManager: manager,
 			projectionLimits: () => ({
 				sourceTokens: SOURCES * 64,
-				softThresholdTokens: 1,
+				prewarmThresholdTokens: 1,
 				hardThresholdTokens: 1,
 				tokenBudget: 120_000,
 				freshTail: { maxSources: 8, maxTokens: 4_000 },
@@ -806,7 +806,7 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 			sessionManager: manager,
 			projectionLimits: () => ({
 				sourceTokens: 1_000,
-				softThresholdTokens: 1,
+				prewarmThresholdTokens: 1,
 				hardThresholdTokens: 1,
 				tokenBudget: 60_000,
 				freshTail: { maxSources: 1, maxTokens: 2_000 },

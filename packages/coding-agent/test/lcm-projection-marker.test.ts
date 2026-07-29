@@ -27,6 +27,7 @@ function projection(overrides: Partial<ContextProjection> = {}): ContextProjecti
 				tokenCount: 100,
 				sourceIds: ["source-a"],
 				citations: [],
+				files: [],
 			},
 			{
 				kind: "summary",
@@ -37,6 +38,7 @@ function projection(overrides: Partial<ContextProjection> = {}): ContextProjecti
 				tokenCount: 100,
 				sourceIds: ["source-b"],
 				citations: [],
+				files: [],
 			},
 			{
 				kind: "summary",
@@ -47,6 +49,7 @@ function projection(overrides: Partial<ContextProjection> = {}): ContextProjecti
 				tokenCount: 100,
 				sourceIds: ["source-c"],
 				citations: [],
+				files: [],
 			},
 		],
 		freshTailSourceIds: ["fresh-1", "fresh-2", "fresh-3", "fresh-4"],

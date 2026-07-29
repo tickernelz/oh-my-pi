@@ -5,6 +5,8 @@
 ### Added
 
 - Added `packages/coding-agent/bench/lcm-scale.bench.ts`, a credential-free benchmark that charges one canonical journal through Lossless, native context-full compaction, and Snapcompact. It gates projection CPU, latency ratio, lineage-row reads, scheduler passes, coverage integrity, and attempt accounting against a fingerprinted pre-change baseline, and reports per-lane primary, maintenance, total, and break-even cost without asserting that Lossless wins on tokens — at scale a lossless cover is necessarily larger than a lossy summary.
+- Added a deterministic type-aware exploration summary for `@`-mentioned files whose bytes are too large or too binary to auto-read. SQLite files report tables, row counts, and schema; JSON/JSONL report root shape and top-level keys with value types; CSV/TSV report columns; code reports top-level declarations; anything else reports leading lines. The dispatcher never calls a model, so identical bytes always describe identically and the result is safe to persist as LCM file metadata.
+- Added `mode: "regex"` to `lcm_search`, backed by the linear-time Rust engine. Text mode remains FTS5 token conjunction, where `alpha|beta` means `"alpha" AND "beta"`; regex mode honors alternation, anchors, and ordering as written.
 
 ### Changed
 
@@ -12,6 +14,9 @@
 - `AgentSession` now records the concrete provider attempt for every LCM summary request. `SessionLcmHost.complete` returns `{ text, attempt }`, the dispatch is fenced by `onAttemptStart` so a superseded job never issues billable work, and `lcmComplete()` keeps its text-only contract and original cancellation identity for retrieval callers.
 - Lossless summary work now starts at 40% of the compaction threshold instead of 80%, tripling the wall-clock runway before the hard projection deadline. The previous 20% band is measured in tokens while the summary queue drains in seconds, so a single oversized entry could consume it in one step and a fresh session's first crossing failed open to native compaction. Sessions that pass 40% without ever compacting now pay for summaries they may not project.
 - Lossless arming now reads whichever is larger, the live request estimate or the branch source total LCM must cover. Native compaction shrinks the live request while the branch keeps growing, so a long session previously disarmed itself after every compaction and rebuilt the same race. Request ownership still reads the live request, which is what actually overflows.
+- `lcm_search` now groups source matches under the summary node currently covering them, and labels regex results by match order rather than a BM25 rank that does not apply to them.
+- Lossless historical context now annotates each projected summary with the handles of files its compacted sources referenced, capped at three per summary and twelve per projection, so the model keeps file awareness after compaction instead of only recovering it through `lcm_describe`.
+- Removed `LcmProjectionLimits.softThresholdTokens`. It was computed at 80% of the hard threshold but never read: the live gates are the 40% prewarm point and the hard threshold, so the field only misdescribed the control loop.
 
 ### Fixed
 
@@ -22,6 +27,7 @@
 - `generateFileMentionMessages()` now defaults `hashSkippedFiles` to false, avoiding full hashes for skipped oversized and binary files; sessions request those hashes while Lossless context is active or being enabled.
 - Lossless projection now preserves live user, developer, file-mention, and assistant messages when their persistence metadata collides with older same-millisecond content.
 - Lossless projection fit checks now charge the serialized historical payload and warning before admitting provider requests near the context limit.
+- Lossless now arms its hard projection wait at strictly greater than the compaction threshold, matching native `shouldCompact`. At exact equality native leaves the request alone, so the previous `>=` blocked the turn for up to 30 seconds to build a projection nothing was going to use.
 ## [17.1.8] - 2026-07-28
 
 ### Breaking Changes

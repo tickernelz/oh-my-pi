@@ -46,6 +46,16 @@ export interface LeafChunkPolicy {
 	maxTokens: number;
 }
 
+/**
+ * Host-supplied regex engine. This package keeps zero runtime dependencies, so the
+ * caller injects one; it MUST be linear-time (RE2/Rust-style) because patterns reach
+ * it straight from a model and a backtracking engine could stall the store.
+ */
+export interface LcmRegexEngine {
+	/** Returns a predicate for `pattern`, or throws a `TypeError` when it will not compile. */
+	compile(pattern: string): (text: string) => boolean;
+}
+
 export interface LcmContextOptions {
 	/** Caller-owned SQLite path. `:memory:` is supported for isolated use. */
 	dbPath: string;
@@ -56,6 +66,8 @@ export interface LcmContextOptions {
 	/** Move an unreadable database aside and create a rebuildable empty store. */
 	recoverCorrupt?: boolean;
 	now?: () => number;
+	/** Enables `SearchRequest.mode: "regex"`; absent makes that mode throw. */
+	regexEngine?: LcmRegexEngine;
 }
 
 export interface ReconcileResult {
@@ -102,6 +114,8 @@ export interface ProjectedHistoricalItem {
 	tokenCount: number;
 	sourceIds: readonly string[];
 	citations: readonly Citation[];
+	/** Files referenced by the summarized sources, so compaction never loses file awareness. */
+	files: readonly LcmFileMetadata[];
 }
 
 export type SummaryStage = "normal" | "aggressive" | "deterministic";
@@ -231,6 +245,8 @@ export interface SearchRequest extends ContextScope {
 	offset?: number;
 	/** Restrict matches to the active placement of this summary handle. */
 	summaryHandle?: string;
+	/** Matcher for `query`: FTS5 token conjunction (default) or a linear-time regex scan. */
+	mode?: "text" | "regex";
 }
 
 export interface ProjectSearchRequest {
@@ -247,8 +263,12 @@ export interface SearchHit {
 	/** Present for summary hits; unlike `id`, stable across regenerated prose. */
 	summaryHandle?: string;
 	redactedText: string;
-	/** SQLite FTS5 BM25 rank; lower values are better. */
+	/** FTS5 BM25 rank in text mode, or the zero-based match ordinal in regex mode; lower sorts first. */
 	rank: number;
+	/** Branch position of a source hit; absent for summary hits. */
+	position?: number;
+	/** Stable handle of the summary node currently covering a source hit, when one exists. */
+	coveringSummaryHandle?: string;
 	citations: readonly Citation[];
 }
 

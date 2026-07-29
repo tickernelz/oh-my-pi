@@ -277,6 +277,54 @@ describe("LCM retrieval operations", () => {
 		).toEqual(["source"]);
 	});
 
+	it("groups source hits by covering summary only when the caller resolved that placement", async () => {
+		const covered: SearchHit = {
+			kind: "source",
+			id: "source-covered",
+			redactedText: "older work",
+			rank: 1,
+			position: 0,
+			coveringSummaryHandle: "summary_stable_input_identity",
+			citations: [citation(1)],
+		};
+		const fresh: SearchHit = {
+			kind: "source",
+			id: "source-fresh",
+			redactedText: "recent work",
+			rank: 2,
+			position: 9,
+			citations: [citation(2)],
+		};
+
+		const grouped = await renderLcmSearchHits([covered, fresh], { grouped: true, offset: 0 });
+		expect(grouped).toContain("Covered by summary: ");
+		expect(grouped).toContain("Not yet summarized (fresh tail):");
+		// One running counter across groups keeps pagination numbering honest.
+		expect(grouped).toContain("1. source");
+		expect(grouped).toContain("2. source");
+
+		// `searchProject` never resolves a covering span, so cross-project results must not
+		// claim this branch's fresh tail. Ungrouped rendering stays flat.
+		const crossProject = await renderLcmSearchHits([{ ...covered, coveringSummaryHandle: undefined }, fresh], {
+			includeSummaryHandles: false,
+		});
+		expect(crossProject).not.toContain("Not yet summarized");
+		expect(crossProject).not.toContain("Covered by summary");
+	});
+
+	it("labels regex matches by match order instead of an inapplicable BM25 rank", async () => {
+		const hit: SearchHit = {
+			kind: "source",
+			id: "source-regex",
+			redactedText: "matched line",
+			rank: 0,
+			position: 3,
+			citations: [citation(1)],
+		};
+		expect(await renderLcmSearchHits([hit], { mode: "regex" })).toContain("(match #1)");
+		expect(await renderLcmSearchHits([hit], { mode: "text" })).toContain("(rank 0.0000)");
+	});
+
 	it("shortens home paths and bounds display lines without changing opaque handle identities", async () => {
 		const sourcePath = path.join(os.homedir(), "workspace", "journal.jsonl");
 		const filePath = path.join(os.homedir(), "workspace", "p".repeat(160), "report.txt");

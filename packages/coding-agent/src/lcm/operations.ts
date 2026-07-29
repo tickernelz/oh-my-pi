@@ -56,6 +56,7 @@ export interface LcmSearchOptions {
 	limit?: number;
 	offset?: number;
 	summary?: SummaryReference;
+	mode?: "text" | "regex";
 }
 
 export type LcmDescription =
@@ -323,15 +324,30 @@ function fileLines(files: readonly LcmFileMetadata[], scope: ContextScope): stri
 
 export async function renderLcmSearchHits(
 	hits: readonly SearchHit[],
-	options: { artifactExists?: ArtifactExists; offset?: number; limit?: number; includeSummaryHandles?: boolean } = {},
+	options: {
+		artifactExists?: ArtifactExists;
+		offset?: number;
+		limit?: number;
+		includeSummaryHandles?: boolean;
+		mode?: "text" | "regex";
+		/**
+		 * Group source hits under their covering summary. Only branch-scoped `lcm_search`
+		 * resolves that placement; `searchProject` cannot, and would otherwise label every
+		 * cross-project hit as this branch's fresh tail.
+		 */
+		grouped?: boolean;
+	} = {},
 ): Promise<string> {
 	if (hits.length === 0) return "No LCM matches found.";
 	const offset = options.offset ?? 0;
 	const lines: string[] = [`LCM matches (${hits.length}; offset ${offset}):`];
-	for (let index = 0; index < hits.length; index++) {
-		const hit = hits[index];
+	let ordinal = offset;
+
+	const renderHit = async (hit: SearchHit, indent: string): Promise<void> => {
 		const safeText = await sanitizeLcmArtifactUris(hit.redactedText, options.artifactExists);
-		lines.push("", `${offset + index + 1}. ${hit.kind} (rank ${hit.rank.toFixed(4)})`);
+		// BM25 rank is meaningless for a regex scan, which reports positional match order.
+		const score = options.mode === "regex" ? `match #${hit.rank + 1}` : `rank ${hit.rank.toFixed(4)}`;
+		lines.push("", `${indent}${++ordinal}. ${hit.kind} (${score})`);
 		lines.push(boundedDisplayText(safeText, LCM_SEARCH_MAX_EXCERPT_CHARS));
 		const citations = hit.citations.slice(0, LCM_MAX_HANDLES_PER_HIT);
 		if (options.includeSummaryHandles !== false && hit.kind === "summary" && hit.summaryHandle) {
@@ -346,16 +362,58 @@ export async function renderLcmSearchHits(
 				const key = scopeKey(reference);
 				if (seenScopes.has(key)) continue;
 				seenScopes.add(key);
-				lines.push(`   Summary: ${renderLcmHandle({ kind: "summary", reference })}`);
+				lines.push(`   ${indent}Summary: ${renderLcmHandle({ kind: "summary", reference })}`);
 			}
 		}
 		for (const citation of citations) {
-			lines.push(`   Source: ${renderLcmHandle({ kind: "source", citation })}`);
+			lines.push(`   ${indent}Source: ${renderLcmHandle({ kind: "source", citation })}`);
 		}
 		if (hit.citations.length > citations.length) {
-			lines.push(`   [${hit.citations.length - citations.length} additional source handles omitted]`);
+			lines.push(`   ${indent}[${hit.citations.length - citations.length} additional source handles omitted]`);
+		}
+	};
+
+	if (!options.grouped) {
+		for (const hit of hits) await renderHit(hit, "");
+	} else {
+		for (const hit of hits) {
+			if (hit.kind === "summary") await renderHit(hit, "");
+		}
+
+		// Source matches carry the region of history they belong to: group them under the
+		// summary node currently covering them, uncovered fresh-tail matches last.
+		const groups = new Map<string, SearchHit[]>();
+		for (const hit of hits) {
+			if (hit.kind !== "source") continue;
+			const key = hit.coveringSummaryHandle ?? "";
+			const group = groups.get(key);
+			if (group) group.push(hit);
+			else groups.set(key, [hit]);
+		}
+		const uncovered = groups.get("");
+		groups.delete("");
+		for (const [summaryHandle, group] of groups) {
+			const citation = group[0]?.citations[0];
+			const header = citation
+				? renderLcmHandle({
+						kind: "summary",
+						reference: {
+							projectId: citation.projectId,
+							sessionId: citation.sessionId,
+							branchId: citation.branchId,
+							summaryHandle,
+						},
+					})
+				: summaryHandle;
+			lines.push("", `Covered by summary: ${header}`);
+			for (const hit of group) await renderHit(hit, "  ");
+		}
+		if (uncovered) {
+			lines.push("", "Not yet summarized (fresh tail):");
+			for (const hit of uncovered) await renderHit(hit, "  ");
 		}
 	}
+
 	if (options.limit !== undefined && hits.length >= options.limit) {
 		lines.push("", `Next offset: ${offset + hits.length}`);
 	}

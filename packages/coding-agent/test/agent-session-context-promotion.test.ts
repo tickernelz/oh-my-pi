@@ -178,6 +178,7 @@ describe("AgentSession context promotion", () => {
 					tokenCount: 8,
 					sourceIds: ["overflow-source"],
 					citations: [],
+					files: [],
 				},
 			],
 			freshTailSourceIds: [],

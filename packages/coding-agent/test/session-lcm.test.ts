@@ -397,9 +397,8 @@ function createHarness(
 	projectId?: string,
 	registerProject?: SessionLcmOptions["registerProject"],
 	projectionLimits = () => ({
-		sourceTokens: 100,
+		sourceTokens: 101,
 		prewarmThresholdTokens: 40,
-		softThresholdTokens: 80,
 		hardThresholdTokens: 100,
 		tokenBudget: 100_000,
 		freshTail: { maxSources: 32, maxTokens: 20_000 },
@@ -496,6 +495,7 @@ function readyHistoricalProjection(snapshot: SourceSnapshot, summaryHandle: stri
 				tokenCount: 3,
 				sourceIds: [old.entryId],
 				citations: [],
+				files: [],
 			},
 		],
 		freshTailSourceIds: [fresh.entryId],
@@ -534,7 +534,6 @@ function softProjectionLimits() {
 	return {
 		sourceTokens: 90,
 		prewarmThresholdTokens: 40,
-		softThresholdTokens: 80,
 		hardThresholdTokens: 100,
 		tokenBudget: 80,
 		freshTail: { maxSources: 8, maxTokens: 40 },
@@ -576,7 +575,6 @@ describe("SessionLcm", () => {
 		const { lcm, context, complete, openContext } = createHarness(manager, undefined, undefined, undefined, () => ({
 			sourceTokens: 39,
 			prewarmThresholdTokens: 40,
-			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 80,
 			freshTail: { maxSources: 8, maxTokens: 40 },
@@ -627,7 +625,6 @@ describe("SessionLcm", () => {
 		const { lcm, complete, openContext } = createHarness(manager, context, undefined, undefined, () => ({
 			sourceTokens: 60,
 			prewarmThresholdTokens: 40,
-			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 80,
 			freshTail: { maxSources: 8, maxTokens: 40 },
@@ -1141,7 +1138,7 @@ describe("SessionLcm", () => {
 				context,
 				undefined,
 				undefined,
-				() => ({ ...softProjectionLimits(), sourceTokens: atHard ? 100 : 90 }),
+				() => ({ ...softProjectionLimits(), sourceTokens: atHard ? 101 : 90 }),
 				20,
 				undefined,
 				2,
@@ -1382,9 +1379,8 @@ describe("SessionLcm", () => {
 		});
 		let atHard = true;
 		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: atHard ? 100 : 39,
+			sourceTokens: atHard ? 101 : 39,
 			prewarmThresholdTokens: 40,
-			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 100_000,
 			freshTail: { maxSources: 32, maxTokens: 20_000 },
@@ -1447,9 +1443,8 @@ describe("SessionLcm", () => {
 		});
 		let requestCount = 0;
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: requestCount++ === 0 ? 100 : 79,
+			sourceTokens: requestCount++ === 0 ? 101 : 79,
 			prewarmThresholdTokens: 40,
-			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 100_000,
 			freshTail: { maxSources: 32, maxTokens: 20_000 },
@@ -1510,6 +1505,7 @@ describe("SessionLcm", () => {
 								position: 1,
 							},
 						],
+						files: [],
 					},
 				],
 				freshTailSourceIds: [fresh.entryId],
@@ -1572,6 +1568,7 @@ describe("SessionLcm", () => {
 								position: 1,
 							},
 						],
+						files: [],
 					},
 				],
 				freshTailSourceIds: [fresh.entryId],
@@ -1622,7 +1619,6 @@ describe("SessionLcm", () => {
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
 			sourceTokens: 90,
 			prewarmThresholdTokens: 40,
-			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 80,
 			freshTail: { maxSources: 8, maxTokens: 40 },
@@ -1996,6 +1992,7 @@ describe("SessionLcm", () => {
 								position: 1,
 							},
 						],
+						files: [],
 					},
 				],
 				freshTailSourceIds: [fresh.entryId],
@@ -2049,6 +2046,88 @@ describe("SessionLcm", () => {
 				message: expect.objectContaining({ role: "historicalContext" }),
 			}),
 		);
+		await lcm.close();
+	});
+
+	it("annotates projected summaries with bounded file handles so compaction keeps file awareness", async () => {
+		const manager = SessionManager.inMemory("/projected-files");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const { lcm, context } = createHarness(manager);
+		const files = Array.from({ length: 5 }, (_, index) => ({
+			fileId: `file_${index}`,
+			contentHash: `${index}`.repeat(64),
+			path: `/repo/data-${index}.csv`,
+			fileType: "csv",
+			byteSize: 6_000_000,
+			tokenCount: 1_500_000,
+			explorationSummary: `Columns (1): c${index}`,
+		}));
+		context.projectImpl = (_request, snapshot) => {
+			const old = snapshot.entries[1]!;
+			const fresh = snapshot.entries.at(-1)!;
+			return {
+				revision: 1,
+				ready: true,
+				historical: [
+					{
+						kind: "summary",
+						summaryId: "summary-files",
+						summaryHandle: "summary-handle-files",
+						level: 0,
+						redactedText: "older facts about the datasets",
+						tokenCount: 3,
+						sourceIds: [old.entryId],
+						citations: [
+							{
+								...snapshot.scope,
+								sourceId: old.entryId,
+								sourceKey: "key",
+								contentHash: old.contentHash,
+								position: 1,
+							},
+						],
+						files,
+					},
+				],
+				freshTailSourceIds: [fresh.entryId],
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: { 0: 1 },
+				coveredSourceCount: 1,
+				freshSourceCount: 1,
+				estimatedTokens: 10,
+				pendingJobs: 0,
+			};
+		};
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		expect(result.owned).toBe(true);
+		const scope = context.snapshots.at(-1)!.scope;
+		const providerText = convertToLlm(result.messages.filter(message => message.role === "historicalContext"))
+			.map(message =>
+				typeof message.content === "string"
+					? message.content
+					: message.content.map(block => (block.type === "text" ? block.text : "")).join("\n"),
+			)
+			.join("\n");
+
+		expect(providerText).toContain("[Files: ");
+		// Three per summary keeps the active context bounded; the rest are counted, not dropped silently.
+		expect(providerText).toContain("(+2 more)");
+		expect(providerText).toContain("data-0.csv");
+		expect(providerText).toContain("data-2.csv");
+		expect(providerText).not.toContain("data-3.csv");
+
+		const fileHandles = (providerText.match(/lcm-handle:v1:[A-Za-z0-9_-]+/g) ?? [])
+			.map(token => decodeLcmHandle(token))
+			.filter(handle => handle.kind === "file");
+		expect(fileHandles).toEqual([
+			{ kind: "file", reference: { ...scope, fileId: "file_0" } },
+			{ kind: "file", reference: { ...scope, fileId: "file_1" } },
+			{ kind: "file", reference: { ...scope, fileId: "file_2" } },
+		]);
 		await lcm.close();
 	});
 

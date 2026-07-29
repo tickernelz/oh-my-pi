@@ -5,6 +5,7 @@ import type {
 	DoctorReport,
 	LcmContext,
 	LcmFileMetadata,
+	LcmRegexEngine,
 	LcmStatus,
 	PurgeResult,
 	RebuildResult,
@@ -21,6 +22,7 @@ import { isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-contex
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { hasMatch, search as nativeSearch } from "@oh-my-pi/pi-natives";
 
 import { logger, pathIsWithin, prompt } from "@oh-my-pi/pi-utils";
 import type {
@@ -36,6 +38,7 @@ import lcmSummarySystemPrompt from "../prompts/lcm/summary-system.md" with { typ
 import lcmSummaryUserPrompt from "../prompts/lcm/summary-user.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { resolveReadPath } from "../tools/path-utils";
+import { shortenPath } from "../tools/render-utils";
 import { fileContentHash } from "../utils/file-content-hash";
 import type { LcmFallbackCategory } from "./messages";
 import {
@@ -61,6 +64,21 @@ const SQLITE_CONTENTION_DELAYS_MS = [100, 200, 400] as const;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 const ARTIFACT_REF_PATTERN = /(?:artifact:\/\/\d+|blob:sha256:[a-f0-9]{64})/g;
+/** Caps on file handles spliced into the active context, per summary and per projection. */
+const PROJECTED_FILES_PER_SUMMARY = 3;
+const PROJECTED_FILES_TOTAL = 12;
+
+/**
+ * Rust-backed matcher handed to the derived store. Its engine is linear-time, so a
+ * model-supplied pattern cannot stall a scan the way a backtracking `RegExp` could.
+ */
+const NATIVE_REGEX_ENGINE: LcmRegexEngine = {
+	compile(pattern: string) {
+		const probe = nativeSearch("", { pattern, maxCount: 1 });
+		if (probe.error) throw new TypeError(`invalid regex: ${probe.error}`);
+		return text => hasMatch(text, pattern, false, true);
+	},
+};
 
 export type LcmRuntimePhase = "disabled" | "uninitialized" | "idle" | "warming" | "active" | "degraded" | "quarantined";
 export type LcmCompletionErrorCategory = "provider_error" | "transport_error" | "empty_output" | "aborted";
@@ -180,9 +198,8 @@ export interface LcmCompletionRequest {
 export interface LcmProjectionLimits {
 	/** Total native request estimate, including stable non-message inputs. */
 	sourceTokens: number;
-	/** Point at which summary work starts, well below {@link softThresholdTokens}. */
+	/** Only asynchronous gate: background summary work starts here. */
 	prewarmThresholdTokens: number;
-	softThresholdTokens: number;
 	hardThresholdTokens: number;
 	tokenBudget: number;
 	freshTail: {
@@ -477,7 +494,11 @@ function referenceOnlyFileMetadata(
 			fileType: file.image?.mimeType ?? (path.extname(safePath).slice(1).toLowerCase() || "binary"),
 			byteSize,
 			tokenCount: Math.ceil(byteSize / 4),
-			explorationSummary: `Reference-only ${file.skippedReason === "tooLarge" ? "oversized" : "binary"} file; bytes remain outside the LCM store.`,
+			// Redacted: the dispatcher embeds real file content (keys, headers, declarations).
+			explorationSummary: redact(
+				file.explorationSummary ??
+					`Reference-only ${file.skippedReason === "tooLarge" ? "oversized" : "binary"} file; bytes remain outside the LCM store.`,
+			),
 		});
 		if (activeFiles) {
 			const originalPath = path.resolve(resolveReadPath(file.path, activeFiles.cwd));
@@ -577,14 +598,31 @@ function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext
 }
 
 function historicalText(projection: ContextProjection, scope: ContextScope): string {
+	// File handles keep the model aware of files it saw before compaction. Bounded because
+	// this text enters the active context; an oversized block would fail the projection fit.
+	let fileBudget = PROJECTED_FILES_TOTAL;
 	return projection.historical
-		.map(
-			item =>
-				`${item.redactedText}\n[Summary: ${encodeLcmHandle({
-					kind: "summary",
-					reference: { ...scope, summaryHandle: item.summaryHandle },
-				})}]`,
-		)
+		.map(item => {
+			const summary = `${item.redactedText}\n[Summary: ${encodeLcmHandle({
+				kind: "summary",
+				reference: { ...scope, summaryHandle: item.summaryHandle },
+			})}]`;
+			const allowed = Math.min(item.files.length, PROJECTED_FILES_PER_SUMMARY, fileBudget);
+			if (allowed <= 0) return summary;
+			fileBudget -= allowed;
+			const rendered = item.files
+				.slice(0, allowed)
+				.map(
+					file =>
+						`${shortenPath(file.path)} ${encodeLcmHandle({
+							kind: "file",
+							reference: { ...scope, fileId: file.fileId },
+						})}`,
+				)
+				.join(" | ");
+			const omitted = item.files.length - allowed;
+			return `${summary}\n[Files: ${rendered}${omitted > 0 ? ` (+${omitted} more)` : ""}]`;
+		})
 		.join("\n\n");
 }
 
@@ -1154,7 +1192,11 @@ export class SessionLcm {
 
 		let context: LcmContext;
 		try {
-			context = await this.#openContext({ dbPath: project.storePath, recoverCorrupt: true });
+			context = await this.#openContext({
+				dbPath: project.storePath,
+				recoverCorrupt: true,
+				regexEngine: NATIVE_REGEX_ENGINE,
+			});
 		} catch (error) {
 			logger.warn("LCM store open failed; using native context", { error: errorLabel(error) });
 			this.#noteFailure("store");
@@ -1936,7 +1978,9 @@ export class SessionLcm {
 		// reads the live request, which is what actually overflows.
 		const armTokens = Math.max(limits.sourceTokens, this.#currentBranch?.sourceTokens ?? 0);
 		if (armTokens < limits.prewarmThresholdTokens) return native;
-		const atHard = limits.sourceTokens >= limits.hardThresholdTokens;
+		// Strictly greater, matching native `shouldCompact`: at exact equality native
+		// leaves the request alone, so blocking the turn for a projection would be waste.
+		const atHard = limits.sourceTokens > limits.hardThresholdTokens;
 		if (limits.tokenBudget < 1 || limits.freshTail.maxSources < 1 || limits.freshTail.maxTokens < 1) {
 			if (atHard) this.#failOpen("unfit", attempt);
 			return native;
@@ -2168,6 +2212,7 @@ export class SessionLcm {
 				...(options.limit === undefined ? {} : { limit: options.limit }),
 				...(options.offset === undefined ? {} : { offset: options.offset }),
 				...(summary ? { summaryHandle: summary.summaryHandle } : {}),
+				...(options.mode === undefined ? {} : { mode: options.mode }),
 			});
 		});
 	}

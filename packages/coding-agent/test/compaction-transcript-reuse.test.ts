@@ -74,6 +74,7 @@ describe("post-compaction transcript reuse", () => {
 					tokenCount: 100,
 					sourceIds: ["source-a"],
 					citations: [],
+					files: [],
 				},
 			],
 			freshTailSourceIds: ["fresh"],

@@ -923,6 +923,8 @@ export interface FileMentionMessage {
 		contentHash?: string;
 		/** Why the file contents were omitted from auto-read. */
 		skippedReason?: "tooLarge" | "binary";
+		/** Deterministic type-aware preview of a file whose bytes were not loaded. */
+		explorationSummary?: string;
 		image?: ImageContent;
 	}>;
 	timestamp: number;

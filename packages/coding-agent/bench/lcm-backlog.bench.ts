@@ -185,7 +185,7 @@ async function runSample(
 			sessionManager: manager,
 			projectionLimits: () => ({
 				sourceTokens: SOURCE_COUNT * 100,
-				softThresholdTokens: 1,
+				prewarmThresholdTokens: 1,
 				hardThresholdTokens: 1,
 				tokenBudget: 256,
 				freshTail: { maxSources: 1, maxTokens: 128 },

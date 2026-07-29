@@ -23,6 +23,17 @@ import {
 
 const MAIN: ContextScope = { projectId: "project", sessionId: "session", branchId: "main" };
 
+/**
+ * The package takes no runtime dependency on a regex engine, so tests inject one.
+ * Production wires the linear-time Rust matcher instead.
+ */
+const TEST_REGEX_ENGINE = {
+	compile(pattern: string) {
+		const expression = new RegExp(pattern, "u");
+		return (text: string) => expression.test(text);
+	},
+};
+
 function contentAddress(parts: readonly string[]): string {
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const part of parts) {
@@ -181,6 +192,7 @@ describe("LCM context contracts", () => {
 			condenseFanIn: 2,
 			tombstoneRetentionMs: 100,
 			now: () => now,
+			regexEngine: TEST_REGEX_ENGINE,
 		});
 	});
 
@@ -202,6 +214,141 @@ describe("LCM context contracts", () => {
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 10, maxTokens: 100 } });
 		expect(projection.freshTailSourceIds).toEqual(["e1", "e2"]);
 		expect(projection.revision).toBe(1);
+	});
+
+	test("regex mode honors alternation that FTS token conjunction inverts", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "r1", "alpha one"), entry(MAIN, "r2", "beta two", "r1")]));
+
+		// FTS reduces `alpha|beta` to `"alpha" AND "beta"`, and no single source has both.
+		expect(context.search({ ...MAIN, query: "alpha|beta" })).toEqual([]);
+		expect(context.search({ ...MAIN, query: "alpha|beta", mode: "text" })).toEqual([]);
+
+		const matched = context.search({ ...MAIN, query: "alpha|beta", mode: "regex" });
+		expect(matched.map(hit => hit.redactedText)).toEqual(["alpha one", "beta two"]);
+		expect(matched.every(hit => hit.kind === "source")).toBe(true);
+
+		// Anchors survive too: FTS would match `one` anywhere in either document.
+		expect(context.search({ ...MAIN, query: "^beta", mode: "regex" }).map(hit => hit.redactedText)).toEqual([
+			"beta two",
+		]);
+		expect(context.search({ ...MAIN, query: "^one", mode: "regex" })).toEqual([]);
+	});
+
+	test("regex mode rejects an uncompilable pattern and an unknown mode", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "r1", "alpha one")]));
+
+		expect(() => context.search({ ...MAIN, query: "alpha(", mode: "regex" })).toThrow();
+		expect(() => context.search({ ...MAIN, query: "alpha", mode: "regexx" as "regex" })).toThrow(
+			'mode must be "text" or "regex"',
+		);
+	});
+
+	test("source hits carry their branch position and the summary node currently covering them", () => {
+		const sources = [
+			entry(MAIN, "c1", "covered alpha"),
+			entry(MAIN, "c2", "covered beta", "c1"),
+			entry(MAIN, "c3", "covered gamma", "c2"),
+			entry(MAIN, "c4", "covered delta", "c3"),
+			entry(MAIN, "c5", "freshest epsilon", "c4"),
+		];
+		// `summarize` protects the tail from scheduling, so c4/c5 never get a span.
+		context.reconcile(snapshot(MAIN, sources), {
+			summarize: { tokenBudget: 1_000, freshTail: { maxSources: 2, maxTokens: 1_000 } },
+		});
+		completeEveryJob(context);
+
+		const byText = new Map(
+			context
+				.search({ ...MAIN, query: "alpha|epsilon", mode: "regex" })
+				.filter(hit => hit.kind === "source")
+				.map(hit => [hit.redactedText, hit]),
+		);
+		const oldest = byText.get("covered alpha");
+		const newest = byText.get("freshest epsilon");
+		expect(oldest?.position).toBe(0);
+		expect(newest?.position).toBe(4);
+
+		// The oldest source sits inside a completed leaf span; the newest is always protected
+		// by the fresh tail, so nothing covers it yet.
+		expect(oldest?.coveringSummaryHandle).toBeDefined();
+		expect(newest?.coveringSummaryHandle).toBeUndefined();
+
+		const covering = context.describeSummary({ ...MAIN, summaryHandle: oldest!.coveringSummaryHandle! });
+		expect(covering?.kind).toBe("leaf");
+		expect(context.expandSummary({ ...MAIN, summaryHandle: oldest!.coveringSummaryHandle! })?.items).toContainEqual(
+			expect.objectContaining({ kind: "source", citation: expect.objectContaining({ sourceId: "c1" }) }),
+		);
+	});
+
+	test("a projected summary carries the files of every source it compacted", () => {
+		const dataset = {
+			fileId: "file_dataset",
+			contentHash: "b".repeat(64),
+			path: "/repo/events.jsonl",
+			fileType: "jsonl",
+			byteSize: 9_000_000,
+			tokenCount: 2_250_000,
+			explorationSummary: "Record keys: id (number), kind (string)",
+		};
+		const sources = [
+			{ ...entry(MAIN, "p1", "mentioned the dataset"), files: [dataset] },
+			entry(MAIN, "p2", "discussed the dataset", "p1"),
+			entry(MAIN, "p3", "newest follow-up", "p2"),
+		];
+		context.reconcile(snapshot(MAIN, sources), {
+			summarize: { tokenBudget: 1_000, freshTail: { maxSources: 1, maxTokens: 1_000 } },
+		});
+		completeEveryJob(context);
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 1_000,
+			freshTail: { maxSources: 1, maxTokens: 1_000 },
+		});
+		const covering = projection.historical.find(item => item.sourceIds.includes("p1"));
+		expect(covering).toBeDefined();
+		// The file survives compaction through source lineage, so the model can still re-read it.
+		expect(covering?.files).toEqual([dataset]);
+
+		// A summary covering no file-bearing source stays empty rather than inheriting siblings.
+		for (const item of projection.historical) {
+			if (!item.sourceIds.includes("p1")) expect(item.files).toEqual([]);
+		}
+	});
+
+	test("a refreshed exploration summary updates file metadata without changing source identity", () => {
+		const fileMetadata = (explorationSummary: string) => ({
+			fileId: "file_big_csv",
+			contentHash: "a".repeat(64),
+			path: "/repo/big.csv",
+			fileType: "csv",
+			byteSize: 6_000_000,
+			tokenCount: 1_500_000,
+			explorationSummary,
+		});
+		const mention = entry(MAIN, "f1", "mentioned the oversized dataset");
+		const sourceKeyFor = (): string => {
+			const [hit] = context.search({ ...MAIN, query: "oversized" });
+			if (hit?.kind !== "source") throw new Error("expected a source hit for the mention");
+			return hit.id;
+		};
+
+		expect(context.reconcile(snapshot(MAIN, [{ ...mention, files: [fileMetadata("first pass")] }]))).toMatchObject({
+			changed: true,
+			revision: 1,
+		});
+		const originalKey = sourceKeyFor();
+		expect(context.describeFile({ ...MAIN, fileId: "file_big_csv" })?.explorationSummary).toBe("first pass");
+
+		// Only the derived summary differs; identity is content-addressed without it, so the
+		// entry must keep its source key and its placement must not be rewritten.
+		expect(
+			context.reconcile(snapshot(MAIN, [{ ...mention, files: [fileMetadata("Columns (3): id, name, email")] }])),
+		).toMatchObject({ changed: false, revision: 1 });
+		expect(sourceKeyFor()).toBe(originalKey);
+		expect(context.describeFile({ ...MAIN, fileId: "file_big_csv" })?.explorationSummary).toBe(
+			"Columns (3): id, name, email",
+		);
 	});
 
 	test("v4 migration enforces stable handles on later updates", () => {

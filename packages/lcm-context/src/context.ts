@@ -19,6 +19,7 @@ import type {
 	LcmFileMetadata,
 	LcmPerformanceCounters,
 	LcmRecoveryCategory,
+	LcmRegexEngine,
 	LcmStatus,
 	ProjectedHistoricalItem,
 	ProjectionRequest,
@@ -61,6 +62,78 @@ const SQLITE_OPEN_RETRY_DELAYS_MS = [100, 200, 400] as const;
 const MAX_SEARCH_LIMIT = 100;
 const MAX_SEARCH_OFFSET = 1_000;
 const MAX_SEARCH_CANDIDATES = MAX_SEARCH_OFFSET + MAX_SEARCH_LIMIT;
+const MAX_REGEX_SCAN_ROWS = 20_000;
+
+/** Branch set a search may touch; a null session widens it to the whole project. */
+const REQUESTED_BRANCHES_CTE = `WITH requested_branches AS (
+					SELECT id FROM branches
+					WHERE project_id = ? AND (? IS NULL OR (session_id = ? AND branch_id = ?))
+				 )`;
+
+/**
+ * Placement and summary-scope authorization shared by the FTS and regex candidate
+ * queries. Binds `projectId` followed by four summary-scope parameters.
+ */
+const SEARCH_SCOPE_SQL = `d.project_id = ? AND (
+					(d.document_kind = 'source'
+					 AND EXISTS (
+						SELECT 1 FROM requested_branches rb
+						JOIN branch_sources bs ON bs.branch_row_id = rb.id AND bs.active = 1
+						WHERE bs.source_key = d.ref_id
+					 )
+					 AND (? IS NULL OR EXISTS (
+						SELECT 1 FROM summary_lineage root_source
+						WHERE root_source.summary_id = ? AND root_source.source_key = d.ref_id
+					 )))
+					OR
+					(d.document_kind = 'summary'
+					 AND EXISTS (
+						SELECT 1 FROM requested_branches rb
+						JOIN summary_lineage first_lineage
+						  ON first_lineage.summary_id = d.ref_id AND first_lineage.ordinal = 0
+						JOIN branch_sources start_source
+						  ON start_source.branch_row_id = rb.id AND start_source.active = 1
+						 AND start_source.source_key = first_lineage.source_key
+						WHERE NOT EXISTS (
+							SELECT 1 FROM summary_lineage candidate_lineage
+							LEFT JOIN branch_sources placed_source
+							  ON placed_source.branch_row_id = rb.id AND placed_source.active = 1
+							 AND placed_source.position = start_source.position + candidate_lineage.ordinal
+							 AND placed_source.source_key = candidate_lineage.source_key
+							WHERE candidate_lineage.summary_id = d.ref_id AND placed_source.id IS NULL
+						)
+						AND NOT EXISTS (
+							SELECT 1 FROM branch_sources atomic_source
+							WHERE atomic_source.branch_row_id = rb.id AND atomic_source.active = 1
+							  AND atomic_source.atomic_group_id IS NOT NULL
+							GROUP BY atomic_source.atomic_group_id
+							HAVING (
+								start_source.position BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
+								OR start_source.position + (
+									SELECT COUNT(*) FROM summary_lineage lineage_size
+									WHERE lineage_size.summary_id = d.ref_id
+								) BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
+							)
+						)
+					 )
+					 AND (? IS NULL OR EXISTS (
+						SELECT 1 FROM summary_lineage root_start
+						WHERE root_start.summary_id = ? AND NOT EXISTS (
+							SELECT 1 FROM summary_lineage candidate_lineage
+							LEFT JOIN summary_lineage root_lineage
+							  ON root_lineage.summary_id = root_start.summary_id
+							 AND root_lineage.ordinal = root_start.ordinal + candidate_lineage.ordinal
+							 AND root_lineage.source_key = candidate_lineage.source_key
+							WHERE candidate_lineage.summary_id = d.ref_id AND root_lineage.summary_id IS NULL
+						)
+					 )))
+				 )`;
+
+/** `REQUESTED_BRANCHES_CTE` parameters: projectId, sessionId, sessionId, branchId. */
+type SearchCteBindings = [string, string | null, string | null, string | null];
+
+/** `SEARCH_SCOPE_SQL` parameters: projectId followed by four summary-scope slots. */
+type SearchScopeBindings = [string, string | null, string | null, string | null, string | null];
 
 interface InternalOptions {
 	busyTimeoutMs: number;
@@ -69,6 +142,7 @@ interface InternalOptions {
 	leafMaxTokens: number;
 	condenseFanIn: number;
 	now: () => number;
+	regexEngine: LcmRegexEngine | undefined;
 }
 
 interface NormalizedEntry extends SourceEntry {
@@ -324,6 +398,7 @@ function normalizeOptions(options: LcmContextOptions): InternalOptions {
 		leafMaxTokens: assertInteger(options.leafChunk?.maxTokens ?? DEFAULT_LEAF_MAX_TOKENS, "leafChunk.maxTokens", 1),
 		condenseFanIn: assertInteger(options.condenseFanIn ?? DEFAULT_CONDENSE_FAN_IN, "condenseFanIn", 2),
 		now: options.now ?? Date.now,
+		regexEngine: options.regexEngine,
 	};
 }
 
@@ -412,7 +487,22 @@ function normalizeSnapshot(snapshot: SourceSnapshot): NormalizedSnapshot {
 			entry.redactedText,
 			artifactRefsJson,
 		];
-		if (files.length > 0) sourceIdentity.push(JSON.stringify(files));
+		if (files.length > 0) {
+			// Exploration summary is derived descriptive metadata, not identity: folding it in
+			// would invalidate every cached summary whenever the exploration dispatcher improves.
+			sourceIdentity.push(
+				JSON.stringify(
+					files.map(file => [
+						file.fileId,
+						file.contentHash,
+						file.path,
+						file.fileType,
+						file.byteSize,
+						file.tokenCount,
+					]),
+				),
+			);
+		}
 		const sourceKey = contentAddress(sourceIdentity);
 		normalized.push({
 			...entry,
@@ -491,6 +581,24 @@ function selectFreshTail<T extends { atomic_group_id: string | null; token_count
 		count += unit.length;
 	}
 	return { start, tokens, count };
+}
+
+/** Files of the covered sources in first-appearance order, de-duplicated on `fileId`. */
+function projectedFiles(
+	filesBySource: ReadonlyMap<string, readonly LcmFileMetadata[]>,
+	coveredRows: readonly { source_key: string }[],
+): LcmFileMetadata[] {
+	if (filesBySource.size === 0) return [];
+	const seen = new Set<string>();
+	const files: LcmFileMetadata[] = [];
+	for (const row of coveredRows) {
+		for (const file of filesBySource.get(row.source_key) ?? []) {
+			if (seen.has(file.fileId)) continue;
+			seen.add(file.fileId);
+			files.push(file);
+		}
+	}
+	return files;
 }
 
 function strategyForStage(stage: SummaryStage): SummaryStrategy {
@@ -1247,6 +1355,15 @@ class SqliteLcmContext implements LcmContext {
 			unchangedPrefix++;
 		}
 
+		if (unchanged) {
+			// Placement is identical, but derived file metadata (exploration summary) may have
+			// improved since this entry was first seen. Refresh only those rows: every other
+			// write in #insertSourceContent is INSERT OR IGNORE, so this cannot disturb placement.
+			for (const entry of snapshot.entries) {
+				if (entry.files && entry.files.length > 0) this.#insertSourceContent(snapshot.scope.projectId, entry, now);
+			}
+		}
+
 		let insertedSources = 0;
 		let tombstonedSources = 0;
 		let revision = branch.revision;
@@ -1414,8 +1531,7 @@ class SqliteLcmContext implements LcmContext {
 					existing.path !== file.path ||
 					existing.file_type !== file.fileType ||
 					existing.byte_size !== file.byteSize ||
-					existing.token_count !== file.tokenCount ||
-					existing.exploration_summary !== file.explorationSummary)
+					existing.token_count !== file.tokenCount)
 			) {
 				throw new TypeError(`file metadata collision: ${file.fileId}`);
 			}
@@ -1436,6 +1552,12 @@ class SqliteLcmContext implements LcmContext {
 						now,
 					],
 				);
+			} else if (existing.exploration_summary !== file.explorationSummary) {
+				// Derived metadata only: refreshing it never touches lineage or provenance.
+				this.#db.run("UPDATE file_records SET exploration_summary = ? WHERE file_id = ?", [
+					file.explorationSummary,
+					file.fileId,
+				]);
 			}
 			this.#db.run("INSERT OR IGNORE INTO source_files (source_key, ordinal, file_id) VALUES (?, ?, ?)", [
 				entry.sourceKey,
@@ -1452,6 +1574,16 @@ class SqliteLcmContext implements LcmContext {
 				 FROM branch_sources WHERE branch_row_id = ? AND active = 1 ORDER BY position`,
 			)
 			.all(branchRowId);
+	}
+
+	#branchRow(scope: ContextScope): BranchRow | null {
+		return (
+			this.#db
+				.query<BranchRow, [string, string, string]>(
+					"SELECT id, revision FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
+				)
+				.get(scope.projectId, scope.sessionId, scope.branchId) ?? null
+		);
 	}
 
 	#activeSourceRows(scope: ContextScope): ActiveSourceRow[] {
@@ -1932,11 +2064,7 @@ class SqliteLcmContext implements LcmContext {
 		const tokenBudget = assertInteger(request.tokenBudget, "tokenBudget", 0);
 		const maxTailSources = assertInteger(request.freshTail.maxSources, "freshTail.maxSources", 0);
 		const maxTailTokens = assertInteger(request.freshTail.maxTokens, "freshTail.maxTokens", 0);
-		const branch = this.#db
-			.query<BranchRow, [string, string, string]>(
-				"SELECT id, revision FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
-			)
-			.get(scope.projectId, scope.sessionId, scope.branchId);
+		const branch = this.#branchRow(scope);
 		if (!branch) {
 			return {
 				revision: 0,
@@ -1996,6 +2124,23 @@ class SqliteLcmContext implements LcmContext {
 			);
 		}
 
+		// One query per projection, never one per item: projection is the hot path whose p95
+		// depends on not re-scanning per row. Sessions without file mentions get an empty map.
+		const filesBySource = new Map<string, LcmFileMetadata[]>();
+		for (const row of this.#db
+			.query<FileRow & { source_key: string }, [number]>(
+				`SELECT sf.source_key, f.file_id, f.project_id, f.content_hash, f.path, f.file_type,
+					f.byte_size, f.token_count, f.exploration_summary
+				 FROM source_files sf JOIN file_records f ON f.file_id = sf.file_id
+				 WHERE sf.source_key IN (SELECT source_key FROM branch_sources WHERE branch_row_id = ? AND active = 1)
+				 ORDER BY sf.source_key, sf.ordinal`,
+			)
+			.all(branch.id)) {
+			const existing = filesBySource.get(row.source_key);
+			if (existing) existing.push(this.#toFileMetadata(row));
+			else filesBySource.set(row.source_key, [this.#toFileMetadata(row)]);
+		}
+
 		const historical: ProjectedHistoricalItem[] = [];
 		const selectedLevelCounts: Record<number, number> = {};
 		let cursor = 0;
@@ -2018,6 +2163,7 @@ class SqliteLcmContext implements LcmContext {
 				tokenCount: selected.token_count,
 				sourceIds: coveredRows.map(source => source.entry_id),
 				citations: coveredRows.map(source => this.#citation(source)),
+				files: projectedFiles(filesBySource, coveredRows),
 			});
 			selectedLevelCounts[selected.level] = (selectedLevelCounts[selected.level] ?? 0) + 1;
 			cursor = selected.end_position;
@@ -2883,8 +3029,11 @@ class SqliteLcmContext implements LcmContext {
 		const scope = normalizeScope(request);
 		const limit = Math.min(assertInteger(request.limit ?? 20, "limit", 1), MAX_SEARCH_LIMIT);
 		const offset = Math.min(assertInteger(request.offset ?? 0, "offset", 0), MAX_SEARCH_OFFSET);
-		const match = this.#ftsMatch(request.query);
-		if (!match) return [];
+		const mode = request.mode ?? "text";
+		if (mode !== "text" && mode !== "regex") throw new TypeError(`mode must be "text" or "regex", got: ${mode}`);
+		// A regex query has no token floor: `^\s*$` is meaningless to FTS but valid here.
+		const match = mode === "regex" ? null : this.#ftsMatch(request.query);
+		if (match === null && mode === "text") return [];
 		const transaction = this.#db.transaction((): SearchHit[] => {
 			const branchRows = this.#activeSourceRows(scope);
 			if (branchRows.length === 0) return [];
@@ -2898,17 +3047,40 @@ class SqliteLcmContext implements LcmContext {
 				scopedSummaryId = root.summary_id;
 				if (findAlignedSequence(branchRows, scopedLineage) < 0) return [];
 			}
+			// One pass over the current revision's placements: the lowest-level span containing a
+			// position is the most specific summary node covering it.
+			const branch = this.#branchRow(scope);
+			const coveringSpans = branch
+				? this.#db
+						.query<{ start_position: number; end_position: number; stable_handle: string }, [number, number]>(
+							`SELECT s.start_position, s.end_position, m.stable_handle
+							 FROM branch_summary_spans s JOIN summaries m ON m.summary_id = s.summary_id
+							 WHERE s.branch_row_id = ? AND s.revision = ?
+							 ORDER BY s.level, s.start_position`,
+						)
+						.all(branch.id, branch.revision)
+				: [];
+			const coveringHandleAt = (position: number): string | undefined =>
+				coveringSpans.find(span => span.start_position <= position && position < span.end_position)?.stable_handle;
+			const documents =
+				match === null
+					? this.#regexDocuments(scope.projectId, request.query, offset + limit, scope, scopedSummaryId)
+					: this.#searchDocuments(scope.projectId, match, offset + limit, scope, scopedSummaryId);
 			const hits: SearchHit[] = [];
-			for (const document of this.#searchDocuments(scope.projectId, match, offset + limit, scope, scopedSummaryId)) {
+			for (const document of documents) {
 				if (document.document_kind === "source") {
 					if (scopedLineage && !scopedLineage.includes(document.ref_id)) continue;
 					const matches = branchRows.filter(row => row.source_key === document.ref_id);
 					if (matches.length === 0) continue;
+					const position = matches[0]!.position;
+					const coveringSummaryHandle = coveringHandleAt(position);
 					hits.push({
 						kind: "source",
 						id: document.ref_id,
 						redactedText: document.redacted_text,
 						rank: Number(document.rank),
+						position,
+						...(coveringSummaryHandle ? { coveringSummaryHandle } : {}),
 						citations: matches.map(row => this.#citation(row)),
 					});
 					continue;
@@ -3000,82 +3172,11 @@ class SqliteLcmContext implements LcmContext {
 		const summaryId = scopedSummaryId ?? null;
 		const candidateLimit = Math.min(requested, MAX_SEARCH_CANDIDATES);
 		return this.#db
-			.query<
-				SearchDocumentRow,
-				[
-					string,
-					string | null,
-					string | null,
-					string | null,
-					string,
-					string,
-					string | null,
-					string | null,
-					string | null,
-					string | null,
-					number,
-				]
-			>(
-				`WITH requested_branches AS (
-					SELECT id FROM branches
-					WHERE project_id = ? AND (? IS NULL OR (session_id = ? AND branch_id = ?))
-				 )
+			.query<SearchDocumentRow, [...SearchCteBindings, string, ...SearchScopeBindings, number]>(
+				`${REQUESTED_BRANCHES_CTE}
 				 SELECT d.document_kind, d.ref_id, d.redacted_text, bm25(search_fts) AS rank
 				 FROM search_fts JOIN search_documents d ON d.id = search_fts.rowid
-				 WHERE search_fts MATCH ? AND d.project_id = ? AND (
-					(d.document_kind = 'source'
-					 AND EXISTS (
-						SELECT 1 FROM requested_branches rb
-						JOIN branch_sources bs ON bs.branch_row_id = rb.id AND bs.active = 1
-						WHERE bs.source_key = d.ref_id
-					 )
-					 AND (? IS NULL OR EXISTS (
-						SELECT 1 FROM summary_lineage root_source
-						WHERE root_source.summary_id = ? AND root_source.source_key = d.ref_id
-					 )))
-					OR
-					(d.document_kind = 'summary'
-					 AND EXISTS (
-						SELECT 1 FROM requested_branches rb
-						JOIN summary_lineage first_lineage
-						  ON first_lineage.summary_id = d.ref_id AND first_lineage.ordinal = 0
-						JOIN branch_sources start_source
-						  ON start_source.branch_row_id = rb.id AND start_source.active = 1
-						 AND start_source.source_key = first_lineage.source_key
-						WHERE NOT EXISTS (
-							SELECT 1 FROM summary_lineage candidate_lineage
-							LEFT JOIN branch_sources placed_source
-							  ON placed_source.branch_row_id = rb.id AND placed_source.active = 1
-							 AND placed_source.position = start_source.position + candidate_lineage.ordinal
-							 AND placed_source.source_key = candidate_lineage.source_key
-							WHERE candidate_lineage.summary_id = d.ref_id AND placed_source.id IS NULL
-						)
-						AND NOT EXISTS (
-							SELECT 1 FROM branch_sources atomic_source
-							WHERE atomic_source.branch_row_id = rb.id AND atomic_source.active = 1
-							  AND atomic_source.atomic_group_id IS NOT NULL
-							GROUP BY atomic_source.atomic_group_id
-							HAVING (
-								start_source.position BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
-								OR start_source.position + (
-									SELECT COUNT(*) FROM summary_lineage lineage_size
-									WHERE lineage_size.summary_id = d.ref_id
-								) BETWEEN MIN(atomic_source.position) + 1 AND MAX(atomic_source.position)
-							)
-						)
-					 )
-					 AND (? IS NULL OR EXISTS (
-						SELECT 1 FROM summary_lineage root_start
-						WHERE root_start.summary_id = ? AND NOT EXISTS (
-							SELECT 1 FROM summary_lineage candidate_lineage
-							LEFT JOIN summary_lineage root_lineage
-							  ON root_lineage.summary_id = root_start.summary_id
-							 AND root_lineage.ordinal = root_start.ordinal + candidate_lineage.ordinal
-							 AND root_lineage.source_key = candidate_lineage.source_key
-							WHERE candidate_lineage.summary_id = d.ref_id AND root_lineage.summary_id IS NULL
-						)
-					 )))
-				 )
+				 WHERE search_fts MATCH ? AND ${SEARCH_SCOPE_SQL}
 				 ORDER BY rank, d.id LIMIT ?`,
 			)
 			.all(
@@ -3091,6 +3192,44 @@ class SqliteLcmContext implements LcmContext {
 				summaryId,
 				candidateLimit,
 			);
+	}
+
+	/**
+	 * Regex scan over the same authorized candidates the FTS query sees. Streaming stops
+	 * at the first full page, and `MAX_REGEX_SCAN_ROWS` bounds a pattern that matches
+	 * nothing; `rank` carries the match ordinal so callers keep their ascending sort.
+	 */
+	#regexDocuments(
+		projectId: string,
+		pattern: string,
+		requested: number,
+		scope?: ContextScope,
+		scopedSummaryId?: string,
+	): SearchDocumentRow[] {
+		const engine = this.#options.regexEngine;
+		if (!engine) throw new TypeError("regex search requires a configured LCM regex engine");
+		const matches = engine.compile(pattern);
+		const sessionId = scope?.sessionId ?? null;
+		const branchId = scope?.branchId ?? null;
+		const summaryId = scopedSummaryId ?? null;
+		const rows = this.#db
+			.query<SearchDocumentRow, [...SearchCteBindings, ...SearchScopeBindings]>(
+				`${REQUESTED_BRANCHES_CTE}
+				 SELECT d.document_kind, d.ref_id, d.redacted_text, 0 AS rank
+				 FROM search_documents d
+				 WHERE ${SEARCH_SCOPE_SQL}
+				 ORDER BY d.id`,
+			)
+			.iterate(projectId, sessionId, sessionId, branchId, projectId, summaryId, summaryId, summaryId, summaryId);
+		const hits: SearchDocumentRow[] = [];
+		let scanned = 0;
+		for (const row of rows) {
+			if (scanned++ >= MAX_REGEX_SCAN_ROWS) break;
+			if (!matches(row.redacted_text)) continue;
+			hits.push({ ...row, rank: hits.length });
+			if (hits.length >= requested) break;
+		}
+		return hits;
 	}
 
 	#summaryById(summaryId: string): SummaryRow | null {
