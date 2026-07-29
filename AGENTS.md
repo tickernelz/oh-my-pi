@@ -43,6 +43,7 @@ This repository is the `tickernelz/oh-my-pi` downstream. Its `upstream-main` bra
 
 ## Code Quality
 
+- **Comments are the exception, not the habit.** Keep code clean of commentary. Do not narrate what the code already says, restate a name, label sections, or annotate each step. Write a comment only when it carries information the code cannot: a non-obvious invariant, a correctness/security constraint, a `null`-versus-zero or ordering subtlety, or the reason a surprising choice is deliberate. Prefer one short line over a paragraph, and prefer a clearer name or smaller function over a comment. Public API doc comments (`/** … */`) on exported types and methods are still welcome.
 - No `any` unless absolutely necessary.
 - **NEVER use `ReturnType<>`** — use the actual type name.
 - **NEVER use inline imports** — no `await import()`, no `import("pkg").Type` in type positions, no dynamic type imports. Always top-level.
