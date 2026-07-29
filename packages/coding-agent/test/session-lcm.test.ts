@@ -20,21 +20,29 @@ import type {
 	SearchRequest,
 	SourceDescription,
 	SourceSnapshot,
+	SummaryAttemptOutcome,
 	SummaryAttemptProvenance,
 	SummaryCompletion,
 	SummaryDescription,
 	SummaryExpansion,
 	SummaryExpansionRequest,
+	SummaryFailureAttemptOutcome,
 	SummaryJob,
+	SummaryLocalAttemptOutcome,
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
+	SummaryProviderUsage,
 	SummaryReference,
 } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { decodeLcmHandle, encodeLcmHandle } from "@oh-my-pi/pi-coding-agent/lcm/operations";
+import { convertToLlm, createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
+	type LcmCompletionResult,
 	SessionLcm,
 	type SessionLcmOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
@@ -71,6 +79,16 @@ class FakeLcmContext implements LcmContext {
 		retryDelayMs: number;
 		provenance: SummaryAttemptProvenance | undefined;
 	}> = [];
+	readonly attemptRows = new Map<
+		string,
+		{
+			jobId: string;
+			outcome: SummaryAttemptOutcome | "in_flight";
+			provenance: SummaryAttemptProvenance;
+			usage: SummaryProviderUsage | undefined;
+		}
+	>();
+	rejectAttemptStart = false;
 	readonly completedJobIds = new Set<string>();
 	readonly summaryCompleted = Promise.withResolvers<void>();
 	readonly summaryFailed = Promise.withResolvers<void>();
@@ -205,9 +223,45 @@ class FakeLcmContext implements LcmContext {
 		return true;
 	}
 
+	beginSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttemptStart,
+		provenance: SummaryAttemptProvenance,
+	): boolean {
+		const leased = this.leasedJobs.get(jobId);
+		if (leased?.leaseToken !== leaseToken || this.rejectAttemptStart) return false;
+		if (this.attemptRows.has(attempt.attemptId)) return false;
+		this.attemptRows.set(attempt.attemptId, { jobId, outcome: "in_flight", provenance, usage: undefined });
+		return true;
+	}
+
+	settleSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttempt,
+		requestedOutcome: SummaryLocalAttemptOutcome,
+	): SummaryAttemptOutcome | null {
+		return this.#settleAttempt(jobId, leaseToken, attempt, requestedOutcome);
+	}
+
+	#settleAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttempt,
+		requestedOutcome: SummaryAttemptOutcome,
+	): SummaryAttemptOutcome | null {
+		const row = this.attemptRows.get(attempt.attemptId);
+		if (!row || row.jobId !== jobId || row.outcome !== "in_flight") return null;
+		row.outcome = this.leasedJobs.get(jobId)?.leaseToken === leaseToken ? requestedOutcome : "lease_lost";
+		row.usage = attempt.usage;
+		return row.outcome;
+	}
+
 	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult {
 		const leased = this.leasedJobs.get(jobId);
 		if (leased?.leaseToken !== leaseToken) return { accepted: false, reason: "lease_lost" };
+		if (completion.attempt) this.#settleAttempt(jobId, leaseToken, completion.attempt, "completed");
 		this.leasedJobs.delete(jobId);
 		this.failureRecords.delete(jobId);
 		this.completedJobIds.add(jobId);
@@ -227,9 +281,16 @@ class FakeLcmContext implements LcmContext {
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
+		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
 	): boolean {
 		const leased = this.leasedJobs.get(jobId);
 		if (leased?.leaseToken !== leaseToken) return false;
+		if (
+			failedAttempt &&
+			this.#settleAttempt(jobId, leaseToken, failedAttempt.attempt, failedAttempt.outcome) !== failedAttempt.outcome
+		) {
+			return false;
+		}
 		this.leasedJobs.delete(jobId);
 		this.jobs.push(leased);
 		this.failedError = redactedError;
@@ -319,6 +380,17 @@ class FakeLcmContext implements LcmContext {
 	}
 }
 
+function syntheticUsage(): SummaryProviderUsage {
+	return {
+		input: 120,
+		output: 8,
+		cacheRead: 40,
+		cacheWrite: 16,
+		totalTokens: 184,
+		cost: { input: 0.0012, output: 0.0004, cacheRead: 0.0001, cacheWrite: 0.0002, total: 0.0019 },
+	};
+}
+
 function createHarness(
 	manager: SessionManager,
 	context = new FakeLcmContext(),
@@ -334,8 +406,39 @@ function createHarness(
 	hardWaitMs = 20,
 	projectRoot?: string,
 	maxConcurrentSummaries = 1,
+	projectionFits: (messages: AgentMessage[]) => boolean = () => true,
 ) {
 	const complete = vi.fn(async (_request: LcmCompletionRequest) => "redacted summary");
+	let attemptOrdinal = 0;
+	const attemptStarts: SummaryProviderAttemptStart[] = [];
+	const completeWithAttempt = async (request: LcmCompletionRequest): Promise<LcmCompletionResult> => {
+		const start: SummaryProviderAttemptStart = {
+			attemptId: `attempt-${++attemptOrdinal}`,
+			startedAt: context.now,
+			provider: "test-provider",
+			model: "test-model",
+		};
+		request.onResolvedModel?.("test-provider/test-model");
+		if (request.onAttemptStart && !(await request.onAttemptStart(start))) {
+			throw new LcmCompletionError("LCM completion was superseded before dispatch", {
+				provider: "test-provider",
+				category: "aborted",
+			});
+		}
+		attemptStarts.push(start);
+		const attempt: SummaryProviderAttempt = { ...start, completedAt: context.now, usage: syntheticUsage() };
+		try {
+			return { text: await complete(request), attempt };
+		} catch (error) {
+			if (!(error instanceof LcmCompletionError)) throw error;
+			throw new LcmCompletionError(error.message, {
+				...(error.provider === undefined ? {} : { provider: error.provider }),
+				...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+				category: error.category,
+				attempt,
+			});
+		}
+	};
 	const openContext = vi.fn(async () => context as LcmContext);
 	const lcm = new SessionLcm(
 		{
@@ -345,8 +448,8 @@ function createHarness(
 				obfuscate: text => text.replaceAll("raw-secret", "#SECRET"),
 			},
 			projectionLimits,
-			projectionFits: () => true,
-			complete,
+			projectionFits,
+			complete: completeWithAttempt,
 		},
 		{
 			summaryModel: "@smol",
@@ -374,6 +477,35 @@ function appendUser(manager: SessionManager, text: string, timestamp: number): A
 	const message: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp };
 	manager.appendMessage(message);
 	return message;
+}
+
+function readyHistoricalProjection(snapshot: SourceSnapshot, summaryHandle: string): ContextProjection {
+	const old = snapshot.entries[1]!;
+	const fresh = snapshot.entries.at(-1)!;
+	return {
+		revision: 1,
+		ready: true,
+		historical: [
+			{
+				kind: "summary",
+				summaryId: "summary-fail-open",
+				summaryHandle,
+				level: 0,
+				redactedText: "older facts",
+				tokenCount: 3,
+				sourceIds: [old.entryId],
+				citations: [],
+			},
+		],
+		freshTailSourceIds: [fresh.entryId],
+		uncoveredSourceIds: [],
+		sourceTokens: snapshot.entries.length,
+		selectedLevelCounts: { 0: 1 },
+		coveredSourceCount: 1,
+		freshSourceCount: 1,
+		estimatedTokens: 10,
+		pendingJobs: 0,
+	};
 }
 
 function summaryJob(
@@ -1850,6 +1982,27 @@ describe("SessionLcm", () => {
 		expect(projected.filter(message => message.role === "historicalContext")).toHaveLength(1);
 		expect(projected).toContain(active);
 		expect(projected.at(-1)).toBe(live);
+		const scope = context.snapshots.at(-1)!.scope;
+		const lowered = convertToLlm(projected.filter(message => message.role === "historicalContext"));
+		const providerText = lowered
+			.map(message =>
+				typeof message.content === "string"
+					? message.content
+					: message.content.map(block => (block.type === "text" ? block.text : "")).join("\n"),
+			)
+			.join("\n");
+		const tokens = providerText.match(/lcm-handle:v1:[A-Za-z0-9_-]+/g) ?? [];
+		expect(tokens).toHaveLength(1);
+		expect(decodeLcmHandle(tokens[0]!)).toEqual({
+			kind: "summary",
+			reference: { ...scope, summaryHandle: "summary-handle-1" },
+		});
+		expect(providerText).toContain("older facts");
+		expect(providerText).not.toContain("source:");
+		expect(providerText).not.toContain("[Sources:");
+		for (const entry of context.snapshots.at(-1)!.entries) {
+			expect(providerText).not.toContain(`source:${entry.entryId}`);
+		}
 		expect(result.projection).toMatchObject({
 			sourceTokens: context.snapshots.at(-1)!.entries.length,
 			selectedLevelCounts: { 0: 1 },
@@ -1862,6 +2015,79 @@ describe("SessionLcm", () => {
 				message: expect.objectContaining({ role: "historicalContext" }),
 			}),
 		);
+		await lcm.close();
+	});
+
+	it("fails open to the exact native input when handle-bearing history does not fit", async () => {
+		const manager = SessionManager.inMemory("/unfitted-handle-history");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		const projectionFits = vi.fn((_messages: AgentMessage[]) => false);
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			20,
+			undefined,
+			1,
+			projectionFits,
+		);
+		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, "summary-handle");
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(result.owned).toBe(false);
+		expect(result.messages).toBe(input);
+		expect(result.messages).toEqual(input);
+		expect(result.messages.some(message => message.role === "historicalContext")).toBe(false);
+		expect(projectionFits).toHaveBeenCalledTimes(1);
+		const candidate = projectionFits.mock.calls[0]![0];
+		expect(JSON.stringify(convertToLlm(candidate))).toContain("lcm-handle:v1:");
+		await lcm.close();
+	});
+
+	it("fails open to the exact native input when a summary handle exceeds the token limit", async () => {
+		const manager = SessionManager.inMemory("/oversized-summary-handle");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const maxEncodedPayloadBytes = Math.floor((4_096 - "lcm-handle:v1:".length) * (3 / 4));
+		const summaryHandle = "x".repeat(maxEncodedPayloadBytes + 256);
+		expect(() =>
+			encodeLcmHandle({
+				kind: "summary",
+				reference: { projectId: "project", sessionId: "session", branchId: "branch", summaryHandle },
+			}),
+		).toThrow("LCM handle token exceeds 4096 characters");
+		const context = new FakeLcmContext();
+		const projectionFits = vi.fn((_messages: AgentMessage[]) => true);
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			20,
+			undefined,
+			1,
+			projectionFits,
+		);
+		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, summaryHandle);
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(result.owned).toBe(false);
+		expect(result.messages).toBe(input);
+		expect(result.messages).toEqual(input);
+		expect(result.messages.some(message => message.role === "historicalContext")).toBe(false);
+		expect(JSON.stringify(result.messages)).not.toContain("[handle unavailable]");
+		expect(projectionFits).not.toHaveBeenCalled();
 		await lcm.close();
 	});
 

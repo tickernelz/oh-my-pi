@@ -143,6 +143,63 @@ describe("LCM tool registration and gating", () => {
 		expect(result.details).toMatchObject({ items: 0, offset: 1_000, nextOffset: 1_000 });
 	});
 
+	it("expands encoded summary tokens only within the forwarded branch scope", async () => {
+		const observed: LcmExpandOptions[] = [];
+		const forwarded: LcmRetrievalRuntime = {
+			...runtime,
+			lcmExpand: async options => {
+				observed.push(options);
+				if (
+					options.reference.projectId !== summaryReference.projectId ||
+					options.reference.sessionId !== summaryReference.sessionId ||
+					options.reference.branchId !== summaryReference.branchId
+				) {
+					return null;
+				}
+				return {
+					root: summary,
+					items: [
+						{
+							kind: "summary",
+							depth: 1,
+							summary: { ...summary, redactedText: "current-scope expansion content" },
+						},
+					],
+					offset: options.offset,
+					totalItems: 1,
+					estimatedTokens: 8,
+					truncated: false,
+				};
+			},
+		};
+		const [tool] = await createTools(
+			makeSession("lossless", {
+				taskDepth: 1,
+				restrictToolNames: true,
+				getForwardedLcmRuntime: () => forwarded,
+			}),
+			["lcm_expand"],
+		);
+		const handle = encodeLcmHandle({ kind: "summary", reference: summaryReference });
+		const current = await tool!.execute("current", { handle, depth: 1 });
+		const currentText = current.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(observed[0]?.reference).toEqual(summaryReference);
+		expect(currentText).toContain("current-scope expansion content");
+
+		const otherBranchReference = { ...summaryReference, branchId: "other-branch" };
+		const unavailable = await tool!.execute("other", {
+			handle: encodeLcmHandle({ kind: "summary", reference: otherBranchReference }),
+			depth: 1,
+		});
+		const unavailableText = unavailable.content.find(block => block.type === "text")?.text ?? "";
+
+		expect(observed[1]?.reference).toEqual(otherBranchReference);
+		expect(unavailable.details).toMatchObject({ available: false });
+		expect(unavailableText).toBe("LCM summary is unavailable or is outside the current session/branch scope.");
+		expect(unavailableText).not.toContain("current-scope expansion content");
+	});
+
 	it("cannot construct current-session retrieval tools without their owning runtime", async () => {
 		const childWithoutRuntime = makeSession("lossless", {
 			taskDepth: 1,

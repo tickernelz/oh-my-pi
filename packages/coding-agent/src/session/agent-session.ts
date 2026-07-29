@@ -20,7 +20,15 @@ import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
 
 import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
-import type { DoctorReport, PurgeResult, RebuildResult, SearchHit } from "@oh-my-pi/lcm-context";
+import type {
+	DoctorReport,
+	PurgeResult,
+	RebuildResult,
+	SearchHit,
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
+	SummaryProviderUsage,
+} from "@oh-my-pi/lcm-context";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -322,6 +330,7 @@ import {
 	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
+	type LcmCompletionResult,
 	type LcmProjectionLimits,
 	type LcmPublicStatus,
 	normalizeLcmBranch,
@@ -4263,7 +4272,7 @@ export class AgentSession {
 					obfuscator: this.#obfuscator,
 					projectionLimits: messages => this.#lcmProjectionLimits(messages),
 					projectionFits: messages => this.#lcmProjectionFits(messages),
-					complete: request => this.lcmComplete(request),
+					complete: request => this.#lcmCompleteWithAttempt(request),
 				},
 				options,
 			);
@@ -4411,8 +4420,26 @@ export class AgentSession {
 		return this.#lcm?.expand(options) ?? Promise.resolve(null);
 	}
 
-	/** Provider-safe, history-free one-shot used by LCM summary and recall. */
+	/**
+	 * Provider-safe, history-free one-shot used by LCM summary and recall. Retrieval
+	 * callers keep the text-only contract; the summary host uses the attempt-bearing
+	 * form so billed usage stays attributable.
+	 */
 	async lcmComplete(request: LcmCompletionRequest): Promise<string> {
+		try {
+			return (await this.#lcmCompleteWithAttempt(request)).text;
+		} catch (error) {
+			if (error instanceof LcmCompletionError && error.category === "aborted") {
+				if (error.cause instanceof Error) throw error.cause;
+				throw request.signal?.reason instanceof Error
+					? request.signal.reason
+					: new AIError.AbortError(error.message);
+			}
+			throw error;
+		}
+	}
+
+	async #lcmCompleteWithAttempt(request: LcmCompletionRequest): Promise<LcmCompletionResult> {
 		if (!this.#lcm || this.#isDisposed) throw new Error("Lossless context is not enabled for this session");
 		if (!Number.isSafeInteger(request.maxOutputTokens) || request.maxOutputTokens < 1) {
 			throw new RangeError("LCM completion maxOutputTokens must be a positive safe integer");
@@ -4429,6 +4456,17 @@ export class AgentSession {
 		const resolver = this.#modelRegistry.resolver(model, affinitySessionId);
 		const resolvedApiKey = await resolveApiKeyOnce(resolver, request.signal);
 		if (!resolvedApiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		const attemptStart: SummaryProviderAttemptStart = {
+			attemptId: Snowflake.next(),
+			startedAt: Date.now(),
+			provider: model.provider,
+			model: model.id,
+		};
+		const finishedAttempt = (usage?: SummaryProviderUsage): SummaryProviderAttempt => ({
+			...attemptStart,
+			completedAt: Math.max(attemptStart.startedAt, Date.now()),
+			...(usage ? { usage } : {}),
+		});
 		const isolatedProviderState = new Map<string, ProviderSessionState>();
 		try {
 			const systemPrompt = this.#obfuscateTextForProvider(request.systemPrompt) ?? request.systemPrompt;
@@ -4446,6 +4484,12 @@ export class AgentSession {
 				},
 				model.provider,
 			);
+			if (request.onAttemptStart && !(await request.onAttemptStart(attemptStart))) {
+				throw new LcmCompletionError("LCM completion was superseded before dispatch", {
+					provider: model.provider,
+					category: "aborted",
+				});
+			}
 			let response: AssistantMessage;
 			try {
 				response = await instrumentedCompleteSimple(
@@ -4466,7 +4510,14 @@ export class AgentSession {
 					},
 				);
 			} catch (error) {
-				if (isStructuralLcmAbortError(error)) throw error;
+				if (isStructuralLcmAbortError(error)) {
+					throw new LcmCompletionError("LCM completion aborted", {
+						provider: model.provider,
+						category: "aborted",
+						cause: error,
+						attempt: finishedAttempt(),
+					});
+				}
 				const label = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 				const headerHint = getRetryAfterMsFromHeaders(getHeadersFromError(error));
 				const textHint = extractRetryHint(undefined, label);
@@ -4482,6 +4533,8 @@ export class AgentSession {
 				throw new LcmCompletionError(safeLabel, {
 					provider: model.provider,
 					retryAfterMs,
+					category: "transport_error",
+					attempt: finishedAttempt(),
 				});
 			}
 			if (response.provider === "opencode-go") {
@@ -4504,9 +4557,11 @@ export class AgentSession {
 				costUsd: response.usage.cost.total,
 			});
 			if (response.stopReason === "aborted" || AIError.is(response.errorId, AIError.Flag.Abort)) {
-				throw request.signal?.reason instanceof Error
-					? request.signal.reason
-					: new AIError.AbortError("LCM completion aborted");
+				throw new LcmCompletionError("LCM completion aborted", {
+					provider: model.provider,
+					category: "aborted",
+					attempt: finishedAttempt(response.usage),
+				});
 			}
 			if (response.stopReason === "error") {
 				const message = response.errorMessage ?? "LCM completion failed";
@@ -4516,13 +4571,24 @@ export class AgentSession {
 				throw new LcmCompletionError(safeMessage, {
 					provider: model.provider,
 					retryAfterMs: extractRetryHint(undefined, message),
+					category: "provider_error",
+					attempt: finishedAttempt(response.usage),
 				});
 			}
 			const text = extractTextContent(response).trim();
-			if (!text) throw new Error("LCM completion returned no text");
+			if (!text) {
+				throw new LcmCompletionError("LCM completion returned no text", {
+					provider: model.provider,
+					category: "empty_output",
+					attempt: finishedAttempt(response.usage),
+				});
+			}
 			// Never deobfuscate derived output: re-apply the boundary so summary and
 			// recall cannot reveal or persist secrets absent from their redacted input.
-			return (this.#obfuscateTextForProvider(text) ?? text).trim();
+			return {
+				text: (this.#obfuscateTextForProvider(text) ?? text).trim(),
+				attempt: finishedAttempt(response.usage),
+			};
 		} finally {
 			for (const state of isolatedProviderState.values()) {
 				try {

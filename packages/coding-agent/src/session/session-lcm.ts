@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type {
 	ContextProjection,
+	ContextScope,
 	DoctorReport,
 	LcmContext,
 	LcmFileMetadata,
@@ -10,7 +11,11 @@ import type {
 	SearchHit,
 	SourceEntry,
 	SourceSnapshot,
+	SummaryFailureAttemptOutcome,
 	SummaryJob,
+	SummaryLocalAttemptOutcome,
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
 } from "@oh-my-pi/lcm-context";
 import { isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -25,6 +30,7 @@ import type {
 	LcmResolvedExpansion,
 	LcmSearchOptions,
 } from "../lcm/operations";
+import { encodeLcmHandle } from "../lcm/operations";
 import { type LcmProject, resolveLcmProject } from "../lcm/project-identity";
 import lcmSummarySystemPrompt from "../prompts/lcm/summary-system.md" with { type: "text" };
 import lcmSummaryUserPrompt from "../prompts/lcm/summary-user.md" with { type: "text" };
@@ -57,12 +63,27 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const ARTIFACT_REF_PATTERN = /(?:artifact:\/\/\d+|blob:sha256:[a-f0-9]{64})/g;
 
 export type LcmRuntimePhase = "disabled" | "uninitialized" | "idle" | "warming" | "active" | "degraded" | "quarantined";
+export type LcmCompletionErrorCategory = "provider_error" | "transport_error" | "empty_output" | "aborted";
+
 export class LcmCompletionError extends Error {
 	readonly provider: string | undefined;
 	readonly retryAfterMs: number | undefined;
+	/** Safe measurement only: never a raw response, headers, prompt, or provider exception. */
+	readonly attempt: SummaryProviderAttempt | undefined;
+	readonly category: LcmCompletionErrorCategory;
 
-	constructor(message: string, options: { provider?: string; retryAfterMs?: number }) {
-		super(message.slice(0, 2_048));
+	constructor(
+		message: string,
+		options: {
+			provider?: string;
+			retryAfterMs?: number;
+			attempt?: SummaryProviderAttempt;
+			category?: LcmCompletionErrorCategory;
+			/** Original cancellation, rethrown verbatim by the public retrieval wrapper. */
+			cause?: unknown;
+		},
+	) {
+		super(message.slice(0, 2_048), ...(options.cause === undefined ? [] : [{ cause: options.cause }]));
 		this.name = "LcmCompletionError";
 		this.provider = options.provider?.slice(0, 128);
 		const retryAfterMs = options.retryAfterMs;
@@ -70,7 +91,14 @@ export class LcmCompletionError extends Error {
 			typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
 				? Math.min(SUMMARY_RETRY_AFTER_MAX_MS, Math.ceil(retryAfterMs))
 				: undefined;
+		this.attempt = options.attempt;
+		this.category = options.category ?? "transport_error";
 	}
+}
+
+export interface LcmCompletionResult {
+	text: string;
+	attempt: SummaryProviderAttempt;
 }
 
 export function normalizeLcmMaxConcurrentSummaries(value: unknown): number {
@@ -142,6 +170,11 @@ export interface LcmCompletionRequest {
 	signal?: AbortSignal;
 	/** Reports the concrete provider/model selected for this isolated request. */
 	onResolvedModel?: (model: string) => void;
+	/**
+	 * Fences the dispatch: resolved once the provider/model is known and immediately
+	 * before the request leaves. Returning false must dispatch nothing.
+	 */
+	onAttemptStart?: (attempt: SummaryProviderAttemptStart) => Promise<boolean>;
 }
 
 export interface LcmProjectionLimits {
@@ -175,7 +208,7 @@ export interface SessionLcmHost {
 	obfuscator?: Pick<SecretObfuscator, "hasSecrets" | "obfuscate">;
 	projectionLimits(messages: readonly AgentMessage[]): LcmProjectionLimits | undefined;
 	projectionFits(messages: readonly AgentMessage[]): boolean;
-	complete(request: LcmCompletionRequest): Promise<string>;
+	complete(request: LcmCompletionRequest): Promise<LcmCompletionResult>;
 }
 
 export interface SessionLcmDependencies {
@@ -541,13 +574,15 @@ function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext
 	return [...messages];
 }
 
-function historicalText(projection: ContextProjection): string {
+function historicalText(projection: ContextProjection, scope: ContextScope): string {
 	return projection.historical
-		.map(item => {
-			const sourceIds = [...new Set(item.citations.map(citation => citation.sourceId))];
-			const citations = sourceIds.length > 0 ? `\n[Sources: ${sourceIds.map(id => `source:${id}`).join(", ")}]` : "";
-			return `${item.redactedText}${citations}`;
-		})
+		.map(
+			item =>
+				`${item.redactedText}\n[Summary: ${encodeLcmHandle({
+					kind: "summary",
+					reference: { ...scope, summaryHandle: item.summaryHandle },
+				})}]`,
+		)
 		.join("\n\n");
 }
 
@@ -1587,6 +1622,20 @@ export class SessionLcm {
 				let redactedText: string;
 				let promptHash: string;
 				let resolvedModel: string | undefined;
+				let providerAttempt: SummaryProviderAttempt | undefined;
+				const settleAttempt = async (
+					attempt: SummaryProviderAttempt | undefined,
+					requested: SummaryLocalAttemptOutcome,
+				): Promise<void> => {
+					if (!attempt) return;
+					try {
+						await this.#enqueue(() =>
+							context.settleSummaryAttempt(job.jobId, job.leaseToken, attempt, requested),
+						);
+					} catch (error) {
+						recordStoreError(error);
+					}
+				};
 				if (job.stage === "deterministic") {
 					redactedText = deterministicSummary(job);
 					promptHash = summaryPromptHash(
@@ -1601,9 +1650,10 @@ export class SessionLcm {
 						inputs: job.inputs.map(input => ({ kind: input.kind, id: input.id, text: input.redactedText })),
 					});
 					promptHash = summaryPromptHash(systemPrompt, userPrompt);
-					let output: string;
+					const startProvenance = { promptHash, modelSelector: summaryModel, strategy: job.strategy };
+					let completion: LcmCompletionResult;
 					try {
-						output = await this.#host.complete({
+						completion = await this.#host.complete({
 							systemPrompt,
 							prompt: userPrompt,
 							maxOutputTokens: job.outputTokenBudget,
@@ -1614,25 +1664,54 @@ export class SessionLcm {
 								resolvedModel = model;
 								this.#resolvedSummaryModel = model;
 							},
+							onAttemptStart: async start => {
+								try {
+									return await this.#enqueue(() => {
+										if (
+											jobSignal.aborted ||
+											this.#disposed ||
+											generation !== this.#generation ||
+											context !== this.#context
+										) {
+											return false;
+										}
+										return context.beginSummaryAttempt(job.jobId, job.leaseToken, start, startProvenance);
+									});
+								} catch (error) {
+									recordStoreError(error);
+									return false;
+								}
+							},
 						});
 					} catch (error) {
 						if (storeFailed) return { status: "store_failed", ...base, error: firstStoreError };
-						if (leaseLost) return { status: "lease_lost", ...base };
-						if (
-							this.#disposed ||
-							jobSignal.aborted ||
-							generation !== this.#generation ||
-							context !== this.#context ||
-							(!(error instanceof LcmCompletionError) && isStructuredAbortError(error))
-						) {
+						const completionError = error instanceof LcmCompletionError ? error : undefined;
+						const failedAttempt = completionError?.attempt;
+						if (completionError?.category === "aborted") {
+							await settleAttempt(failedAttempt, "aborted");
 							return { status: "aborted", ...base };
 						}
-						const retryAfterMs = error instanceof LcmCompletionError ? (error.retryAfterMs ?? 0) : 0;
+						if (leaseLost) {
+							await settleAttempt(failedAttempt, "lease_lost");
+							return { status: "lease_lost", ...base };
+						}
+						if (this.#disposed || jobSignal.aborted) {
+							await settleAttempt(failedAttempt, "aborted");
+							return { status: "aborted", ...base };
+						}
+						if (generation !== this.#generation || context !== this.#context) {
+							await settleAttempt(failedAttempt, "stale");
+							return { status: "aborted", ...base };
+						}
+						if (!completionError && isStructuredAbortError(error)) {
+							await settleAttempt(failedAttempt, "aborted");
+							return { status: "aborted", ...base };
+						}
 						const failureAt = this.#now();
 						const retryDelayMs = Math.min(
 							Number.MAX_SAFE_INTEGER - failureAt,
 							Math.max(
-								retryAfterMs,
+								completionError?.retryAfterMs ?? 0,
 								Math.min(300_000, SUMMARY_RETRY_DELAY_MS * 2 ** Math.min(job.transportRetryCount, 4)),
 							),
 						);
@@ -1642,20 +1721,24 @@ export class SessionLcm {
 							...(resolvedModel ? { resolvedModel } : {}),
 							strategy: job.strategy,
 						};
+						const failureOutcome: SummaryFailureAttemptOutcome = completionError?.category ?? "transport_error";
 						const failed = await this.#enqueue(() =>
 							context.failSummaryJob(
 								job.jobId,
 								job.leaseToken,
-								error instanceof LcmCompletionError ? this.#redact(error.message) : "Summary completion failed",
+								completionError ? this.#redact(completionError.message) : "Summary completion failed",
 								retryDelayMs,
 								provenance,
+								failedAttempt ? { attempt: failedAttempt, outcome: failureOutcome } : undefined,
 							),
 						);
 						if (!failed) return { status: "stale", ...base };
 						terminal = true;
 						return { status: "provider_failed", ...base, retryAt: failureAt + retryDelayMs };
 					}
-					redactedText = this.#redact(output).trim();
+					const dispatched = completion.attempt;
+					providerAttempt = dispatched;
+					redactedText = this.#redact(completion.text).trim();
 					if (!redactedText) {
 						const retryDelayMs = Math.min(
 							300_000,
@@ -1673,6 +1756,7 @@ export class SessionLcm {
 									...(resolvedModel ? { resolvedModel } : {}),
 									strategy: job.strategy,
 								},
+								{ attempt: dispatched, outcome: "empty_output" },
 							),
 						);
 						if (!failed) return { status: "stale", ...base };
@@ -1682,8 +1766,16 @@ export class SessionLcm {
 				}
 
 				if (storeFailed) return { status: "store_failed", ...base, error: firstStoreError };
-				if (leaseLost) return { status: "lease_lost", ...base };
-				if (jobSignal.aborted || this.#disposed || generation !== this.#generation || context !== this.#context) {
+				if (leaseLost) {
+					await settleAttempt(providerAttempt, "lease_lost");
+					return { status: "lease_lost", ...base };
+				}
+				if (jobSignal.aborted || this.#disposed) {
+					await settleAttempt(providerAttempt, "aborted");
+					return { status: "aborted", ...base };
+				}
+				if (generation !== this.#generation || context !== this.#context) {
+					await settleAttempt(providerAttempt, "stale");
 					return { status: "aborted", ...base };
 				}
 				const provenance = {
@@ -1693,7 +1785,11 @@ export class SessionLcm {
 					strategy: job.strategy,
 				};
 				const result = await this.#enqueue(() =>
-					context.completeSummaryJob(job.jobId, job.leaseToken, { redactedText, provenance }),
+					context.completeSummaryJob(job.jobId, job.leaseToken, {
+						redactedText,
+						provenance,
+						...(providerAttempt ? { attempt: providerAttempt } : {}),
+					}),
 				);
 				if (result.accepted) {
 					terminal = true;
@@ -1805,7 +1901,7 @@ export class SessionLcm {
 			return { result: native, projection, terminal: "unfit" };
 		}
 
-		const citedContent = historicalText(projection);
+		const citedContent = historicalText(projection, branch.snapshot.scope);
 		if (!citedContent) {
 			this.#noteProjection(projection, false, attempt);
 			return { result: native, projection, terminal: "unfit" };

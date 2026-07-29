@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const LCM_SCHEMA_VERSION = 6;
+export const LCM_SCHEMA_VERSION = 8;
 
 export class UnsupportedLcmSchemaError extends Error {
 	readonly foundVersion: number;
@@ -388,6 +388,83 @@ function migration6(db: Database): void {
 	`);
 }
 
+/**
+ * Per-attempt provider usage ledger. `job_id` is immutable text rather than a
+ * foreign key: the ledger must outlive terminal payload compaction, 30-day job
+ * GC, and derived rebuild so billed cost stays attributable.
+ */
+function migration7(db: Database): void {
+	db.run(`
+		CREATE TABLE summary_attempts (
+			attempt_id TEXT PRIMARY KEY,
+			job_id TEXT NOT NULL,
+			project_id TEXT NOT NULL,
+			input_hash TEXT NOT NULL,
+			attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+			started_at INTEGER NOT NULL,
+			completed_at INTEGER CHECK (completed_at IS NULL OR completed_at >= started_at),
+			outcome TEXT NOT NULL CHECK (outcome IN ('in_flight','completed','provider_error','transport_error','empty_output','aborted','non_compressing','stale','lease_lost')),
+			model_selector TEXT,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			stage TEXT NOT NULL CHECK (stage IN ('normal','aggressive')),
+			strategy TEXT NOT NULL CHECK (strategy IN ('preserve_details','bullet_points')),
+			prompt_hash TEXT NOT NULL,
+			input_tokens INTEGER CHECK (input_tokens >= 0),
+			output_tokens INTEGER CHECK (output_tokens >= 0),
+			cache_read_tokens INTEGER CHECK (cache_read_tokens >= 0),
+			cache_write_tokens INTEGER CHECK (cache_write_tokens >= 0),
+			total_tokens INTEGER CHECK (total_tokens >= 0),
+			orchestration_input_tokens INTEGER CHECK (orchestration_input_tokens >= 0),
+			orchestration_cache_read_tokens INTEGER CHECK (orchestration_cache_read_tokens >= 0),
+			orchestration_output_tokens INTEGER CHECK (orchestration_output_tokens >= 0),
+			reasoning_tokens INTEGER CHECK (reasoning_tokens >= 0),
+			premium_requests REAL CHECK (premium_requests >= 0),
+			cache_write_5m_tokens INTEGER CHECK (cache_write_5m_tokens >= 0),
+			cache_write_1h_tokens INTEGER CHECK (cache_write_1h_tokens >= 0),
+			server_web_search_requests INTEGER CHECK (server_web_search_requests >= 0),
+			server_web_fetch_requests INTEGER CHECK (server_web_fetch_requests >= 0),
+			cost_input REAL CHECK (cost_input >= 0),
+			cost_output REAL CHECK (cost_output >= 0),
+			cost_cache_read REAL CHECK (cost_cache_read >= 0),
+			cost_cache_write REAL CHECK (cost_cache_write >= 0),
+			cost_total REAL CHECK (cost_total >= 0),
+			CHECK ((outcome = 'in_flight' AND completed_at IS NULL) OR (outcome <> 'in_flight' AND completed_at IS NOT NULL))
+		) STRICT
+	`);
+	db.run("CREATE INDEX summary_attempts_job ON summary_attempts(job_id, started_at)");
+	db.run("CREATE INDEX summary_attempts_project ON summary_attempts(project_id, started_at)");
+	db.run("CREATE INDEX summary_attempts_started ON summary_attempts(started_at)");
+}
+
+/**
+ * Derived branch-local placement index. Immutable `summaries`, `summary_lineage`,
+ * and `summary_children` are untouched: this table only records which ordered
+ * position range of which branch revision a content-addressed summary covers.
+ */
+function migration8(db: Database): void {
+	db.run(`
+		CREATE TABLE branch_summary_spans (
+			branch_row_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+			revision INTEGER NOT NULL CHECK (revision >= 0),
+			level INTEGER NOT NULL CHECK (level >= 0),
+			start_position INTEGER NOT NULL CHECK (start_position >= 0),
+			end_position INTEGER NOT NULL CHECK (end_position > start_position),
+			input_hash TEXT NOT NULL,
+			summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+			frontier INTEGER NOT NULL CHECK (frontier IN (0, 1)),
+			PRIMARY KEY (branch_row_id, revision, level, start_position, end_position)
+		) WITHOUT ROWID, STRICT
+	`);
+	db.run(
+		"CREATE INDEX branch_summary_spans_range ON branch_summary_spans(branch_row_id, revision, start_position, end_position)",
+	);
+	db.run(
+		"CREATE INDEX branch_summary_spans_frontier ON branch_summary_spans(branch_row_id, revision, frontier, start_position)",
+	);
+	db.run("CREATE INDEX branch_summary_spans_input ON branch_summary_spans(input_hash, branch_row_id, revision)");
+}
+
 const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration1,
 	migration2,
@@ -395,6 +472,8 @@ const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration4,
 	migration5,
 	migration6,
+	migration7,
+	migration8,
 ];
 
 export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {

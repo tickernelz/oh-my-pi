@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `packages/coding-agent/bench/lcm-scale.bench.ts`, a credential-free benchmark that charges one canonical journal through Lossless, native context-full compaction, and Snapcompact. It gates projection CPU, latency ratio, lineage-row reads, scheduler passes, coverage integrity, and attempt accounting against a fingerprinted pre-change baseline, and reports per-lane primary, maintenance, total, and break-even cost without asserting that Lossless wins on tokens — at scale a lossless cover is necessarily larger than a lossy summary.
+
+### Changed
+
+- Lossless historical context now sends one executable `lcm-handle:v1` summary token per projected item instead of expanding every covered citation into `source:<id>` text, so `lcm_describe`/`lcm_expand` can act on what the provider actually sees. Provider-visible historical bytes fell 85% on a 200-source branch and 22% on a 10,000-source branch, where per-item handles rather than source lists dominate.
+- `AgentSession` now records the concrete provider attempt for every LCM summary request. `SessionLcmHost.complete` returns `{ text, attempt }`, the dispatch is fenced by `onAttemptStart` so a superseded job never issues billable work, and `lcmComplete()` keeps its text-only contract and original cancellation identity for retrieval callers.
+
 ### Fixed
 
 - `/lcm status` now distinguishes unevaluated, unfitted, and fitted current-branch projections; reports sanitized branch identity, active source/token counts, storage size, and bounded recovery history; and fences concurrent projection attempts so stale requests cannot overwrite current health.

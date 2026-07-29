@@ -17,6 +17,7 @@ import type {
 	LcmContext,
 	LcmContextOptions,
 	LcmFileMetadata,
+	LcmPerformanceCounters,
 	LcmRecoveryCategory,
 	LcmStatus,
 	ProjectedHistoricalItem,
@@ -31,13 +32,19 @@ import type {
 	SourceDescription,
 	SourceEntry,
 	SourceSnapshot,
+	SummaryAttemptOutcome,
 	SummaryAttemptProvenance,
 	SummaryCompletion,
 	SummaryDescription,
 	SummaryExpansion,
 	SummaryExpansionRequest,
+	SummaryFailureAttemptOutcome,
 	SummaryJob,
 	SummaryJobInput,
+	SummaryLocalAttemptOutcome,
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
+	SummaryProviderUsage,
 	SummaryReference,
 	SummaryStage,
 	SummaryStrategy,
@@ -78,14 +85,6 @@ interface NormalizedSnapshot {
 interface BranchRow {
 	id: number;
 	revision: number;
-}
-
-interface BranchScheduleRow extends BranchRow {
-	session_id: string;
-	branch_id: string;
-	summary_token_budget: number | null;
-	fresh_tail_max_sources: number | null;
-	fresh_tail_max_tokens: number | null;
 }
 
 interface CurrentSourceRow {
@@ -134,8 +133,19 @@ interface FileRow {
 	exploration_summary: string;
 }
 
-interface SummaryCandidate extends SummaryRow {
-	lineage: string[];
+interface SpanRow {
+	level: number;
+	start_position: number;
+	end_position: number;
+	input_hash: string;
+	summary_id: string | null;
+	frontier: number;
+}
+
+interface SummaryResolution {
+	inputHash: string;
+	jobId: string;
+	node: SummaryNode | null;
 }
 
 interface SummaryNode {
@@ -180,6 +190,13 @@ interface JobStatusRow {
 
 interface CountRow {
 	count: number;
+}
+
+interface AttemptRow {
+	job_id: string;
+	project_id: string;
+	outcome: string;
+	started_at: number;
 }
 
 interface SearchDocumentRow {
@@ -230,6 +247,64 @@ function contentAddress(parts: readonly string[]): string {
 
 function boundedDiagnostic(value: string): string {
 	return value.slice(0, MAX_STORED_DIAGNOSTIC_LENGTH);
+}
+
+function assertAmount(value: number, name: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		throw new RangeError(`${name} must be a finite number >= 0`);
+	}
+	return value;
+}
+
+function optionalCount(value: number | undefined, name: string): number | null {
+	return value === undefined ? null : assertInteger(value, name, 0);
+}
+
+function optionalAmount(value: number | undefined, name: string): number | null {
+	return value === undefined ? null : assertAmount(value, name);
+}
+
+/**
+ * Ordered `summary_attempts` usage/cost bindings. Absent optional detail and a
+ * missing usage snapshot stay SQL NULL so unknown never reads as measured zero.
+ */
+function attemptUsageBindings(usage: SummaryProviderUsage | undefined): (number | null)[] {
+	if (!usage) return new Array<number | null>(19).fill(null);
+	return [
+		assertInteger(usage.input, "attempt.usage.input", 0),
+		assertInteger(usage.output, "attempt.usage.output", 0),
+		assertInteger(usage.cacheRead, "attempt.usage.cacheRead", 0),
+		assertInteger(usage.cacheWrite, "attempt.usage.cacheWrite", 0),
+		assertInteger(usage.totalTokens, "attempt.usage.totalTokens", 0),
+		optionalCount(usage.orchestration?.input, "attempt.usage.orchestration.input"),
+		optionalCount(usage.orchestration?.cacheRead, "attempt.usage.orchestration.cacheRead"),
+		optionalCount(usage.orchestration?.output, "attempt.usage.orchestration.output"),
+		optionalCount(usage.reasoningTokens, "attempt.usage.reasoningTokens"),
+		optionalAmount(usage.premiumRequests, "attempt.usage.premiumRequests"),
+		optionalCount(usage.cttl?.ephemeral5m, "attempt.usage.cttl.ephemeral5m"),
+		optionalCount(usage.cttl?.ephemeral1h, "attempt.usage.cttl.ephemeral1h"),
+		optionalCount(usage.server?.webSearch, "attempt.usage.server.webSearch"),
+		optionalCount(usage.server?.webFetch, "attempt.usage.server.webFetch"),
+		assertAmount(usage.cost.input, "attempt.usage.cost.input"),
+		assertAmount(usage.cost.output, "attempt.usage.cost.output"),
+		assertAmount(usage.cost.cacheRead, "attempt.usage.cost.cacheRead"),
+		assertAmount(usage.cost.cacheWrite, "attempt.usage.cost.cacheWrite"),
+		assertAmount(usage.cost.total, "attempt.usage.cost.total"),
+	];
+}
+
+function assertProviderAttemptStart(attempt: SummaryProviderAttemptStart, label: string): void {
+	assertIdentifier(attempt.attemptId, `${label}.attemptId`);
+	assertInteger(attempt.startedAt, `${label}.startedAt`, 0);
+	assertIdentifier(attempt.provider, `${label}.provider`);
+	assertIdentifier(attempt.model, `${label}.model`);
+}
+
+function assertProviderAttempt(attempt: SummaryProviderAttempt, label: string): void {
+	assertProviderAttemptStart(attempt, label);
+	if (assertInteger(attempt.completedAt, `${label}.completedAt`, 0) < attempt.startedAt) {
+		throw new RangeError(`${label}.completedAt must not precede ${label}.startedAt`);
+	}
 }
 
 function normalizeOptions(options: LcmContextOptions): InternalOptions {
@@ -1063,6 +1138,13 @@ class SqliteLcmContext implements LcmContext {
 	#ownerGuard: Database | undefined;
 	#closed = false;
 	#quarantined = false;
+	#performance: LcmPerformanceCounters = {
+		projectionCalls: 0,
+		projectionWallMs: 0,
+		projectionCpuMs: 0,
+		projectionLineageRowsRead: 0,
+		schedulerBranchPasses: 0,
+	};
 
 	constructor(db: Database, dbPath: string, options: InternalOptions, ownerGuard: Database | undefined) {
 		this.#db = db;
@@ -1148,6 +1230,22 @@ class SqliteLcmContext implements LcmContext {
 					sameNullable(row.atomic_group_id, entry.atomicGroupId ?? null)
 				);
 			});
+		// Longest unchanged positional prefix, computed BEFORE branch_sources mutates.
+		let unchangedPrefix = 0;
+		while (unchangedPrefix < current.length && unchangedPrefix < snapshot.entries.length) {
+			const row = current[unchangedPrefix]!;
+			const entry = snapshot.entries[unchangedPrefix]!;
+			if (
+				row.position !== unchangedPrefix ||
+				row.entry_id !== entry.entryId ||
+				row.source_key !== entry.sourceKey ||
+				!sameNullable(row.parent_entry_id, entry.parentId) ||
+				!sameNullable(row.atomic_group_id, entry.atomicGroupId ?? null)
+			) {
+				break;
+			}
+			unchangedPrefix++;
+		}
 
 		let insertedSources = 0;
 		let tombstonedSources = 0;
@@ -1198,6 +1296,7 @@ class SqliteLcmContext implements LcmContext {
 			}
 			revision++;
 			this.#db.run("UPDATE branches SET revision = ?, reconciled_at = ? WHERE id = ?", [revision, now, branch.id]);
+			this.#carryForwardSpans(branch.id, branch.revision, revision, unchangedPrefix);
 		}
 
 		if (summarize && typeof summarize === "object") {
@@ -1223,6 +1322,39 @@ class SqliteLcmContext implements LcmContext {
 			queuedJobs: schedule.queued,
 			reusedSummaries: schedule.reused,
 		};
+	}
+
+	/**
+	 * Move spans onto the new revision, keeping only those wholly inside the unchanged
+	 * prefix and truncated to the greatest current atomic boundary within it. An append
+	 * that extends the final atomic group therefore cannot preserve a leaf that now
+	 * splits one indivisible unit.
+	 */
+	#carryForwardSpans(branchRowId: number, oldRevision: number, newRevision: number, unchangedPrefix: number): void {
+		const units = atomicUnits(this.#activeRows(branchRowId));
+		let safePrefix = 0;
+		let boundary = 0;
+		for (const unit of units) {
+			boundary += unit.length;
+			if (boundary > unchangedPrefix) break;
+			safePrefix = boundary;
+		}
+		if (safePrefix > 0) {
+			this.#db.run(
+				`INSERT INTO branch_summary_spans
+					(branch_row_id, revision, level, start_position, end_position, input_hash, summary_id, frontier)
+				 SELECT branch_row_id, ?, level, start_position, end_position, input_hash, summary_id, 0
+				 FROM branch_summary_spans
+				 WHERE branch_row_id = ? AND revision = ? AND end_position <= ?
+				 ON CONFLICT(branch_row_id, revision, level, start_position, end_position) DO NOTHING`,
+				[newRevision, branchRowId, oldRevision, safePrefix],
+			);
+		}
+		this.#db.run("DELETE FROM branch_summary_spans WHERE branch_row_id = ? AND revision = ?", [
+			branchRowId,
+			oldRevision,
+		]);
+		this.#rebuildFrontier(branchRowId, newRevision);
 	}
 
 	#ensureBranch(scope: ContextScope, now: number): BranchRow {
@@ -1351,6 +1483,88 @@ class SqliteLcmContext implements LcmContext {
 			.all(projectId);
 	}
 
+	#branchSpans(branchRowId: number, revision: number): SpanRow[] {
+		return this.#db
+			.query<SpanRow, [number, number]>(
+				`SELECT level, start_position, end_position, input_hash, summary_id, frontier
+				 FROM branch_summary_spans WHERE branch_row_id = ? AND revision = ?
+				 ORDER BY start_position, level, end_position`,
+			)
+			.all(branchRowId, revision);
+	}
+
+	#insertSpan(
+		branchRowId: number,
+		revision: number,
+		span: {
+			level: number;
+			start: number;
+			end: number;
+			inputHash: string;
+			summaryId: string | null;
+			frontier: boolean;
+		},
+	): void {
+		this.#db.run(
+			`INSERT INTO branch_summary_spans
+				(branch_row_id, revision, level, start_position, end_position, input_hash, summary_id, frontier)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(branch_row_id, revision, level, start_position, end_position) DO UPDATE SET
+				input_hash = excluded.input_hash,
+				summary_id = COALESCE(excluded.summary_id, branch_summary_spans.summary_id),
+				frontier = excluded.frontier`,
+			[
+				branchRowId,
+				revision,
+				span.level,
+				span.start,
+				span.end,
+				span.inputHash,
+				span.summaryId,
+				span.frontier ? 1 : 0,
+			],
+		);
+	}
+
+	/** End of the contiguous frontier cover starting at position zero. */
+	#frontierCoverEnd(spans: readonly SpanRow[]): number {
+		let cursor = 0;
+		for (;;) {
+			const next = spans.find(span => span.frontier === 1 && span.start_position === cursor);
+			if (!next) return cursor;
+			cursor = next.end_position;
+		}
+	}
+
+	/**
+	 * Recompute frontier flags for one revision by walking from zero and taking the
+	 * longest completed span at each cursor, falling back to an unresolved leaf, until
+	 * the first gap. Used after copying spans across a revision advance.
+	 */
+	#rebuildFrontier(branchRowId: number, revision: number): void {
+		this.#db.run("UPDATE branch_summary_spans SET frontier = 0 WHERE branch_row_id = ? AND revision = ?", [
+			branchRowId,
+			revision,
+		]);
+		const spans = this.#branchSpans(branchRowId, revision);
+		let cursor = 0;
+		for (;;) {
+			const candidates = spans.filter(span => span.start_position === cursor);
+			if (candidates.length === 0) return;
+			const completed = candidates
+				.filter(span => span.summary_id !== null)
+				.sort((left, right) => right.end_position - left.end_position || right.level - left.level)[0];
+			const chosen = completed ?? candidates.find(span => span.level === 0);
+			if (!chosen) return;
+			this.#db.run(
+				`UPDATE branch_summary_spans SET frontier = 1
+				 WHERE branch_row_id = ? AND revision = ? AND level = ? AND start_position = ? AND end_position = ?`,
+				[branchRowId, revision, chosen.level, chosen.start_position, chosen.end_position],
+			);
+			cursor = chosen.end_position;
+		}
+	}
+
 	#scheduleBranch(
 		branchRowId: number,
 		scope: ContextScope,
@@ -1358,92 +1572,253 @@ class SqliteLcmContext implements LcmContext {
 		now: number,
 		summarize?: Pick<ProjectionRequest, "tokenBudget" | "freshTail">,
 	): ScheduleStats {
-		let rows = this.#db
+		this.#performance.schedulerBranchPasses++;
+		const stats: ScheduleStats = { queued: 0, reused: 0 };
+		const rows = this.#db
 			.query<Pick<ActiveSourceRow, "source_key" | "token_count" | "atomic_group_id">, [number]>(
 				`SELECT bs.source_key, sc.token_count, bs.atomic_group_id
 				 FROM branch_sources bs JOIN source_contents sc ON sc.source_key = bs.source_key
 				 WHERE bs.branch_row_id = ? AND bs.active = 1 ORDER BY bs.position`,
 			)
 			.all(branchRowId);
-		const stats: ScheduleStats = { queued: 0, reused: 0 };
+		if (rows.length === 0) return stats;
+
+		this.#repairUnresolvedSpans(branchRowId, scope, revision, rows, now, stats);
+
+		let tailStart = rows.length;
 		if (summarize) {
-			const tail = selectFreshTail(
+			tailStart = selectFreshTail(
 				rows,
 				summarize.tokenBudget,
 				summarize.freshTail.maxSources,
 				summarize.freshTail.maxTokens,
-			);
-			rows = rows.slice(0, tail.start);
+			).start;
 		}
-		if (rows.length === 0) return stats;
-
-		const chunks: Array<typeof rows> = [];
-		let chunk: typeof rows = [];
-		let chunkTokens = 0;
-		for (const unit of atomicUnits(rows)) {
-			const unitTokens = unit.reduce((total, row) => total + row.token_count, 0);
-			if (
-				chunk.length > 0 &&
-				(chunk.length + unit.length > this.#options.leafMaxSources ||
-					chunkTokens + unitTokens > this.#options.leafMaxTokens)
-			) {
-				chunks.push(chunk);
-				chunk = [];
-				chunkTokens = 0;
+		// An immutable leaf must never be split: pull the boundary back to the start of
+		// any already-scheduled level-0 span the fresh tail would cut through.
+		const existing = this.#branchSpans(branchRowId, revision);
+		for (const span of existing) {
+			if (span.level === 0 && span.start_position < tailStart && span.end_position > tailStart) {
+				tailStart = span.start_position;
 			}
-			chunk.push(...unit);
-			chunkTokens += unitTokens;
 		}
-		if (chunk.length > 0) chunks.push(chunk);
+		if (tailStart <= 0) return stats;
 
-		let nodes: SummaryNode[] = [];
-		let waiting = false;
-		for (const leaf of chunks) {
-			const lineage = leaf.map(row => row.source_key);
-			const resolved = this.#resolveOrQueueJob({
-				projectId: scope.projectId,
-				branchRowId,
-				revision,
-				level: 0,
-				inputs: lineage.map(id => ({ kind: "source" as const, id })),
-				lineage,
-				now,
-				stats,
-			});
-			if (resolved) nodes.push(resolved);
-			else waiting = true;
-		}
-		if (waiting) return stats;
-
-		while (nodes.length > 1) {
-			const next: SummaryNode[] = [];
-			waiting = false;
-			for (let start = 0; start < nodes.length; start += this.#options.condenseFanIn) {
-				const group = nodes.slice(start, start + this.#options.condenseFanIn);
-				if (group.length === 1) {
-					const only = group[0];
-					if (only) next.push(only);
-					continue;
-				}
-				const lineage = group.flatMap(node => node.lineage);
-				const level = Math.max(...group.map(node => node.level)) + 1;
-				const resolved = this.#resolveOrQueueJob({
+		const coverEnd = this.#frontierCoverEnd(existing);
+		if (coverEnd < tailStart) {
+			const eligible = rows.slice(coverEnd, tailStart);
+			let chunkStart = coverEnd;
+			let chunk: typeof rows = [];
+			let chunkTokens = 0;
+			const flush = (): void => {
+				if (chunk.length === 0) return;
+				const lineage = chunk.map(row => row.source_key);
+				const resolution = this.#resolveOrQueueJob({
 					projectId: scope.projectId,
 					branchRowId,
 					revision,
-					level,
-					inputs: group.map(node => ({ kind: "summary" as const, id: node.summaryId })),
+					level: 0,
+					inputs: lineage.map(id => ({ kind: "source" as const, id })),
 					lineage,
 					now,
 					stats,
 				});
-				if (resolved) next.push(resolved);
-				else waiting = true;
+				this.#insertSpan(branchRowId, revision, {
+					level: 0,
+					start: chunkStart,
+					end: chunkStart + chunk.length,
+					inputHash: resolution.inputHash,
+					summaryId: resolution.node?.summaryId ?? null,
+					frontier: true,
+				});
+				chunkStart += chunk.length;
+				chunk = [];
+				chunkTokens = 0;
+			};
+			for (const unit of atomicUnits(eligible)) {
+				const unitTokens = unit.reduce((total, row) => total + row.token_count, 0);
+				if (
+					chunk.length > 0 &&
+					(chunk.length + unit.length > this.#options.leafMaxSources ||
+						chunkTokens + unitTokens > this.#options.leafMaxTokens)
+				) {
+					flush();
+				}
+				chunk.push(...unit);
+				chunkTokens += unitTokens;
 			}
-			if (waiting) return stats;
-			nodes = next;
+			flush();
 		}
+
+		this.#advanceBranchFrontier(branchRowId, scope.projectId, revision, now, stats);
 		return stats;
+	}
+
+	/**
+	 * Restore a current span whose job vanished. The recomputed hash must equal the
+	 * stored one; a mismatch leaves projection unready and fails `doctor()` rather than
+	 * silently relabelling a span.
+	 */
+	#repairUnresolvedSpans(
+		branchRowId: number,
+		scope: ContextScope,
+		revision: number,
+		rows: readonly Pick<ActiveSourceRow, "source_key">[],
+		now: number,
+		stats: ScheduleStats,
+	): void {
+		const broken = this.#db
+			.query<SpanRow, [number, number]>(
+				`SELECT s.level, s.start_position, s.end_position, s.input_hash, s.summary_id, s.frontier
+				 FROM branch_summary_spans s
+				 WHERE s.branch_row_id = ? AND s.revision = ? AND s.summary_id IS NULL
+				   AND NOT EXISTS (
+					SELECT 1 FROM summary_jobs j
+					WHERE j.input_hash = s.input_hash AND j.status IN ('pending', 'leased', 'failed')
+				   )
+				 ORDER BY s.level, s.start_position`,
+			)
+			.all(branchRowId, revision);
+		for (const span of broken) {
+			const inputs =
+				span.level === 0
+					? rows
+							.slice(span.start_position, span.end_position)
+							.map(row => ({ kind: "source" as const, id: row.source_key }))
+					: this.#childSpanInputs(branchRowId, revision, span);
+			if (!inputs) continue;
+			const lineage = rows.slice(span.start_position, span.end_position).map(row => row.source_key);
+			const resolution = this.#resolveOrQueueJob({
+				projectId: scope.projectId,
+				branchRowId,
+				revision,
+				level: span.level,
+				inputs,
+				lineage,
+				now,
+				stats,
+			});
+			if (resolution.inputHash !== span.input_hash) continue;
+			if (resolution.node) {
+				this.#db.run(
+					`UPDATE branch_summary_spans SET summary_id = ?
+					 WHERE branch_row_id = ? AND revision = ? AND level = ? AND start_position = ? AND end_position = ?`,
+					[resolution.node.summaryId, branchRowId, revision, span.level, span.start_position, span.end_position],
+				);
+			}
+		}
+	}
+
+	/** Ordered completed child summary ids exactly covering a parent span, or null. */
+	#childSpanInputs(branchRowId: number, revision: number, span: SpanRow): JobInputSpec[] | null {
+		const children = this.#db
+			.query<SpanRow, [number, number, number, number, number]>(
+				`SELECT level, start_position, end_position, input_hash, summary_id, frontier
+				 FROM branch_summary_spans
+				 WHERE branch_row_id = ? AND revision = ? AND level = ?
+				   AND start_position >= ? AND end_position <= ?
+				 ORDER BY start_position`,
+			)
+			.all(branchRowId, revision, span.level - 1, span.start_position, span.end_position);
+		let cursor = span.start_position;
+		const inputs: JobInputSpec[] = [];
+		for (const child of children) {
+			if (child.start_position !== cursor || child.summary_id === null) return null;
+			inputs.push({ kind: "summary", id: child.summary_id });
+			cursor = child.end_position;
+		}
+		return cursor === span.end_position && inputs.length > 1 ? inputs : null;
+	}
+
+	/**
+	 * Collapse each same-level contiguous frontier run into disjoint exact-fan-in
+	 * parents. Never condenses a partial or singleton group, so no synthetic root is
+	 * manufactured and every parent is reproducible from its ordered children.
+	 */
+	#advanceBranchFrontier(
+		branchRowId: number,
+		projectId: string,
+		revision: number,
+		now: number,
+		stats: ScheduleStats,
+	): void {
+		const fanIn = this.#options.condenseFanIn;
+		for (let pass = 0; pass < 64; pass++) {
+			const frontier = this.#branchSpans(branchRowId, revision).filter(span => span.frontier === 1);
+			let progressed = false;
+			let index = 0;
+			while (index < frontier.length) {
+				const level = frontier[index]!.level;
+				let runEnd = index;
+				while (
+					runEnd + 1 < frontier.length &&
+					frontier[runEnd + 1]!.level === level &&
+					frontier[runEnd + 1]!.start_position === frontier[runEnd]!.end_position
+				) {
+					runEnd++;
+				}
+				const run = frontier.slice(index, runEnd + 1);
+				index = runEnd + 1;
+				for (let start = 0; start + fanIn <= run.length; start += fanIn) {
+					const group = run.slice(start, start + fanIn);
+					if (group.some(child => child.summary_id === null)) continue;
+					const parentStart = group[0]!.start_position;
+					const parentEnd = group.at(-1)!.end_position;
+					const parentLevel = level + 1;
+					const inputs = group.map(child => ({ kind: "summary" as const, id: child.summary_id! }));
+					const existingParent = this.#db
+						.query<{ summary_id: string | null; frontier: number }, [number, number, number, number, number]>(
+							`SELECT summary_id, frontier FROM branch_summary_spans
+							 WHERE branch_row_id = ? AND revision = ? AND level = ?
+							   AND start_position = ? AND end_position = ?`,
+						)
+						.get(branchRowId, revision, parentLevel, parentStart, parentEnd);
+					// A pending parent is not revisited until completion changes state, and an
+					// already-collapsed one must not re-report progress or every pass would run.
+					if (existingParent?.summary_id === null) continue;
+					if (existingParent && existingParent.frontier === 1) continue;
+					const lineage = this.#db
+						.query<{ source_key: string }, [number, number, number]>(
+							`SELECT source_key FROM branch_sources
+							 WHERE branch_row_id = ? AND active = 1 AND position >= ? AND position < ?
+							 ORDER BY position`,
+						)
+						.all(branchRowId, parentStart, parentEnd)
+						.map(row => row.source_key);
+					const resolution = this.#resolveOrQueueJob({
+						projectId,
+						branchRowId,
+						revision,
+						level: parentLevel,
+						inputs,
+						lineage,
+						now,
+						stats,
+					});
+					if (existingParent && resolution.node === null) continue;
+					this.#insertSpan(branchRowId, revision, {
+						level: parentLevel,
+						start: parentStart,
+						end: parentEnd,
+						inputHash: resolution.inputHash,
+						summaryId: resolution.node?.summaryId ?? null,
+						frontier: resolution.node !== null,
+					});
+					if (resolution.node) {
+						for (const child of group) {
+							this.#db.run(
+								`UPDATE branch_summary_spans SET frontier = 0
+								 WHERE branch_row_id = ? AND revision = ? AND level = ?
+								   AND start_position = ? AND end_position = ?`,
+								[branchRowId, revision, child.level, child.start_position, child.end_position],
+							);
+						}
+					}
+					progressed = true;
+				}
+			}
+			if (!progressed) return;
+		}
 	}
 
 	#writeJobPayload(jobId: string, inputs: readonly JobInputSpec[], lineage: readonly string[]): void {
@@ -1480,7 +1855,7 @@ class SqliteLcmContext implements LcmContext {
 		lineage: readonly string[];
 		now: number;
 		stats: ScheduleStats;
-	}): SummaryNode | null {
+	}): SummaryResolution {
 		const inputHash = contentAddress([
 			"lcm-summary-input-v1",
 			params.projectId,
@@ -1492,12 +1867,16 @@ class SqliteLcmContext implements LcmContext {
 				"SELECT summary_id, level FROM summaries WHERE project_id = ? AND input_hash = ?",
 			)
 			.get(params.projectId, inputHash);
+		const jobId = `job_${inputHash}`;
 		if (summary) {
 			params.stats.reused++;
-			return { summaryId: summary.summary_id, level: summary.level, lineage: [...params.lineage] };
+			return {
+				inputHash,
+				jobId,
+				node: { summaryId: summary.summary_id, level: summary.level, lineage: [...params.lineage] },
+			};
 		}
 
-		const jobId = `job_${inputHash}`;
 		const existing = this.#db
 			.query<{ status: string }, [string]>("SELECT status FROM summary_jobs WHERE job_id = ?")
 			.get(jobId);
@@ -1531,10 +1910,23 @@ class SqliteLcmContext implements LcmContext {
 			);
 			params.stats.queued++;
 		}
-		return null;
+		return { inputHash, jobId, node: null };
 	}
 
 	project(request: ProjectionRequest): ContextProjection {
+		const startedWall = Bun.nanoseconds();
+		const startedCpu = process.cpuUsage();
+		try {
+			return this.#projectInternal(request);
+		} finally {
+			const cpu = process.cpuUsage(startedCpu);
+			this.#performance.projectionCalls++;
+			this.#performance.projectionWallMs += (Bun.nanoseconds() - startedWall) / 1e6;
+			this.#performance.projectionCpuMs += (cpu.user + cpu.system) / 1_000;
+		}
+	}
+
+	#projectInternal(request: ProjectionRequest): ContextProjection {
 		this.#assertAvailable();
 		const scope = normalizeScope(request);
 		const tokenBudget = assertInteger(request.tokenBudget, "tokenBudget", 0);
@@ -1569,58 +1961,57 @@ class SqliteLcmContext implements LcmContext {
 			atomicBoundaries.add(boundary);
 		}
 		const tail = selectFreshTail(rows, tokenBudget, maxTailSources, maxTailTokens);
-		const tailStart = tail.start;
-		const tailTokens = tail.tokens;
-
-		const historical: ProjectedHistoricalItem[] = [];
-		const selectedLevelCounts: Record<number, number> = {};
-		const candidates = this.#summaryCandidates(scope.projectId);
-		const byFirstSource = new Map<string, SummaryCandidate[]>();
-		for (const candidate of candidates) {
-			const first = candidate.lineage[0];
-			if (!first) continue;
-			const group = byFirstSource.get(first);
-			if (group) group.push(candidate);
-			else byFirstSource.set(first, [candidate]);
+		let tailStart = tail.start;
+		const spans = this.#db
+			.query<SpanRow & { stable_handle: string; redacted_text: string; token_count: number }, [number, number]>(
+				`SELECT s.level, s.start_position, s.end_position, s.input_hash, s.summary_id, s.frontier,
+					m.stable_handle, m.redacted_text, m.token_count
+				 FROM branch_summary_spans s
+				 JOIN summaries m ON m.summary_id = s.summary_id
+				 WHERE s.branch_row_id = ? AND s.revision = ?
+				 ORDER BY s.start_position, s.end_position DESC, s.level DESC`,
+			)
+			.all(branch.id, branch.revision);
+		// A scheduled leaf is indivisible, so an enlarged fresh tail moves left rather
+		// than cutting one; project-time fitting handles the oversized remainder.
+		for (const span of spans) {
+			if (span.level === 0 && span.start_position < tailStart && span.end_position > tailStart) {
+				tailStart = span.start_position;
+			}
 		}
-		for (const group of byFirstSource.values()) {
+		const tailTokens = rows.slice(tailStart).reduce((total, row) => total + row.token_count, 0);
+		const byStart = new Map<number, typeof spans>();
+		for (const span of spans) {
+			const group = byStart.get(span.start_position);
+			if (group) group.push(span);
+			else byStart.set(span.start_position, [span]);
+		}
+		for (const group of byStart.values()) {
 			group.sort(
 				(left, right) =>
-					right.lineage.length - left.lineage.length ||
+					right.end_position - left.end_position ||
 					right.level - left.level ||
 					left.token_count - right.token_count ||
-					left.summary_id.localeCompare(right.summary_id),
+					left.summary_id!.localeCompare(right.summary_id!),
 			);
 		}
 
+		const historical: ProjectedHistoricalItem[] = [];
+		const selectedLevelCounts: Record<number, number> = {};
 		let cursor = 0;
 		let usedTokens = tailTokens;
 		while (cursor < tailStart) {
-			const row = rows[cursor];
-			if (!row) break;
-			const group = byFirstSource.get(row.source_key) ?? [];
-			let selected: SummaryCandidate | undefined;
-			for (const candidate of group) {
-				if (!atomicBoundaries.has(cursor + candidate.lineage.length)) continue;
-				if (cursor + candidate.lineage.length > tailStart || usedTokens + candidate.token_count > tokenBudget)
-					continue;
-				let matches = true;
-				for (let offset = 0; offset < candidate.lineage.length; offset++) {
-					if (rows[cursor + offset]?.source_key !== candidate.lineage[offset]) {
-						matches = false;
-						break;
-					}
-				}
-				if (matches) {
-					selected = candidate;
-					break;
-				}
-			}
+			const selected = (byStart.get(cursor) ?? []).find(
+				span =>
+					span.end_position <= tailStart &&
+					atomicBoundaries.has(span.end_position) &&
+					usedTokens + span.token_count <= tokenBudget,
+			);
 			if (!selected) break;
-			const coveredRows = rows.slice(cursor, cursor + selected.lineage.length);
+			const coveredRows = rows.slice(selected.start_position, selected.end_position);
 			historical.push({
 				kind: "summary",
-				summaryId: selected.summary_id,
+				summaryId: selected.summary_id!,
 				summaryHandle: selected.stable_handle,
 				level: selected.level,
 				redactedText: selected.redacted_text,
@@ -1629,7 +2020,7 @@ class SqliteLcmContext implements LcmContext {
 				citations: coveredRows.map(source => this.#citation(source)),
 			});
 			selectedLevelCounts[selected.level] = (selectedLevelCounts[selected.level] ?? 0) + 1;
-			cursor += selected.lineage.length;
+			cursor = selected.end_position;
 			usedTokens += selected.token_count;
 		}
 
@@ -1642,67 +2033,33 @@ class SqliteLcmContext implements LcmContext {
 			sourceTokens: rows.reduce((total, row) => total + row.token_count, 0),
 			selectedLevelCounts,
 			coveredSourceCount: cursor,
-			freshSourceCount: tail.count,
+			freshSourceCount: rows.length - tailStart,
 			estimatedTokens: usedTokens,
-			pendingJobs: this.#relevantPendingJobCount(scope.projectId, rows, tailStart),
+			pendingJobs: this.#pendingSpanCount(branch.id, branch.revision, tailStart),
 		};
 	}
 
-	#relevantPendingJobCount(
-		projectId: string,
-		branchRows: readonly Pick<ActiveSourceRow, "source_key" | "atomic_group_id">[],
-		tailStart: number,
-	): number {
-		const rows = this.#db
-			.query<{ job_id: string; source_key: string }, [string]>(
-				`SELECT j.job_id, jl.source_key FROM summary_jobs j
-				 JOIN job_lineage jl ON jl.job_id = j.job_id
-				 WHERE j.project_id = ? AND j.status IN ('pending', 'leased', 'failed')
-				 ORDER BY j.job_id, jl.ordinal`,
+	/**
+	 * Unresolved frontier spans intersecting the historical prefix. A pending parent
+	 * whose completed children already cover its range is excluded: projection can use
+	 * those children while condensation continues in the background.
+	 */
+	#pendingSpanCount(branchRowId: number, revision: number, tailStart: number): number {
+		const unresolved = this.#db
+			.query<SpanRow, [number, number, number]>(
+				`SELECT level, start_position, end_position, input_hash, summary_id, frontier
+				 FROM branch_summary_spans
+				 WHERE branch_row_id = ? AND revision = ? AND summary_id IS NULL
+				   AND frontier = 1 AND start_position < ?
+				 ORDER BY start_position`,
 			)
-			.all(projectId);
-		const lineages = new Map<string, string[]>();
-		for (const row of rows) {
-			const lineage = lineages.get(row.job_id);
-			if (lineage) lineage.push(row.source_key);
-			else lineages.set(row.job_id, [row.source_key]);
-		}
+			.all(branchRowId, revision, tailStart);
 		let count = 0;
-		for (const lineage of lineages.values()) {
-			const start = findAlignedSequence(branchRows, lineage);
-			if (start >= 0 && start + lineage.length <= tailStart) count++;
+		for (const span of unresolved) {
+			if (span.level > 0 && this.#childSpanInputs(branchRowId, revision, span) !== null) continue;
+			count++;
 		}
 		return count;
-	}
-
-	#summaryCandidates(projectId: string): SummaryCandidate[] {
-		const rows = this.#db
-			.query<SummaryRow & { ordinal: number; source_key: string }, [string]>(
-				`SELECT s.summary_id, s.stable_handle, s.input_hash, s.level, s.redacted_text, s.token_count,
-					s.created_at, sl.ordinal, sl.source_key
-				 FROM summaries s JOIN summary_lineage sl ON sl.summary_id = s.summary_id
-				 WHERE s.project_id = ? ORDER BY s.summary_id, sl.ordinal`,
-			)
-			.all(projectId);
-		const candidates: SummaryCandidate[] = [];
-		let current: SummaryCandidate | undefined;
-		for (const row of rows) {
-			if (!current || current.summary_id !== row.summary_id) {
-				current = {
-					summary_id: row.summary_id,
-					stable_handle: row.stable_handle,
-					input_hash: row.input_hash,
-					level: row.level,
-					redacted_text: row.redacted_text,
-					token_count: row.token_count,
-					created_at: row.created_at,
-					lineage: [],
-				};
-				candidates.push(current);
-			}
-			current.lineage.push(row.source_key);
-		}
-		return candidates;
 	}
 
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[] {
@@ -1715,10 +2072,10 @@ class SqliteLcmContext implements LcmContext {
 		const allowFallback = options.allowFallback ?? true;
 		const now = this.#options.now();
 		const transaction = this.#db.transaction(() => {
-			const preferredBranch = this.#preferredBranchRows(preferredScope);
+			const preferredBranchRowId = this.#preferredBranchRowId(preferredScope);
 			const candidates = this.#db
-				.query<Pick<JobRow, "job_id" | "project_id" | "stage">, [number, number]>(
-					`SELECT job_id, project_id, stage FROM summary_jobs
+				.query<Pick<JobRow, "job_id" | "project_id" | "input_hash" | "stage">, [number, number]>(
+					`SELECT job_id, project_id, input_hash, stage FROM summary_jobs
 					 WHERE available_at <= ? AND (
 						status IN ('pending', 'failed') OR
 						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
@@ -1726,56 +2083,27 @@ class SqliteLcmContext implements LcmContext {
 					 ORDER BY level, created_at, job_id`,
 				)
 				.all(now, now);
-			const lineages = this.#groupJobLineages(
-				this.#db
-					.query<{ job_id: string; source_key: string }, [number, number]>(
-						`SELECT jl.job_id, jl.source_key
-						 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
-						 WHERE j.available_at <= ? AND (
-							j.status IN ('pending', 'failed') OR
-							(j.status = 'leased' AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at <= ?)
-						 ) ORDER BY jl.job_id, jl.ordinal`,
-					)
-					.all(now, now),
-			);
-			const activeProjects = allowFallback ? this.#activeBranchesByProject() : new Map();
-			const preferred: Array<{
-				candidate: (typeof candidates)[number];
-				lineage: string[];
-				queueClass: "preferred";
-			}> = [];
-			const fallback: Array<{
-				candidate: (typeof candidates)[number];
-				lineage: string[];
-				queueClass: "fallback";
-			}> = [];
+			const preferred: Array<{ candidate: (typeof candidates)[number]; queueClass: "preferred" }> = [];
+			const fallback: Array<{ candidate: (typeof candidates)[number]; queueClass: "fallback" }> = [];
+			const obsolete: string[] = [];
 			for (const candidate of candidates) {
-				const lineage = lineages.get(candidate.job_id) ?? [];
-				if (
-					preferredBranch?.projectId === candidate.project_id &&
-					findAlignedSequence(preferredBranch.rows, lineage) >= 0
-				) {
-					preferred.push({ candidate, lineage, queueClass: "preferred" });
-				} else if (allowFallback) {
-					fallback.push({ candidate, lineage, queueClass: "fallback" });
-				}
+				const placement = this.#jobSpanClass(candidate.project_id, candidate.input_hash, preferredBranchRowId);
+				if (placement === "preferred") preferred.push({ candidate, queueClass: "preferred" });
+				else if (placement === null) obsolete.push(candidate.job_id);
+				else if (allowFallback) fallback.push({ candidate, queueClass: "fallback" });
+			}
+			for (const jobId of obsolete) {
+				this.#db.run(
+					`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
+						lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
+					[now, jobId],
+				);
+				this.#compactTerminalJob(jobId);
 			}
 
 			const claimed: SummaryJob[] = [];
-			for (const { candidate, lineage, queueClass } of [...preferred, ...fallback]) {
+			for (const { candidate, queueClass } of [...preferred, ...fallback]) {
 				if (claimed.length >= limit) break;
-				if (
-					queueClass === "fallback" &&
-					!this.#lineageActiveSomewhere(candidate.project_id, lineage, activeProjects)
-				) {
-					this.#db.run(
-						`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-							lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
-						[now, candidate.job_id],
-					);
-					this.#compactTerminalJob(candidate.job_id);
-					continue;
-				}
 				const inputs = this.#loadJobInputs(candidate.job_id);
 				if (!inputs) {
 					this.#db.run("UPDATE summary_jobs SET status = 'obsolete', updated_at = ? WHERE job_id = ?", [
@@ -1825,7 +2153,7 @@ class SqliteLcmContext implements LcmContext {
 					leaseToken,
 					leaseExpiresAt,
 					inputs,
-					lineage.length,
+					this.#count("SELECT COUNT(*) AS count FROM job_lineage WHERE job_id = ?", candidate.job_id),
 					inputTokenCount,
 					outputTokenBudget,
 					queueClass,
@@ -1848,42 +2176,29 @@ class SqliteLcmContext implements LcmContext {
 	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback = true): number | null {
 		this.#assertAvailable();
 		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
-		const preferredBranch = this.#preferredBranchRows(scope);
+		const preferredBranchRowId = this.#preferredBranchRowId(scope);
 		const now = this.#options.now();
 		const rows = this.#db
 			.query<
 				{
 					job_id: string;
 					project_id: string;
+					input_hash: string;
 					status: string;
 					available_at: number;
 					lease_expires_at: number | null;
 				},
 				[]
 			>(
-				`SELECT job_id, project_id, status, available_at, lease_expires_at FROM summary_jobs
+				`SELECT job_id, project_id, input_hash, status, available_at, lease_expires_at FROM summary_jobs
 				 WHERE status IN ('pending', 'failed', 'leased')`,
 			)
 			.all();
-		const lineages = this.#groupJobLineages(
-			this.#db
-				.query<{ job_id: string; source_key: string }, []>(
-					`SELECT jl.job_id, jl.source_key
-					 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
-					 WHERE j.status IN ('pending', 'failed', 'leased')
-					 ORDER BY jl.job_id, jl.ordinal`,
-				)
-				.all(),
-		);
-		const activeProjects = allowFallback ? this.#activeBranchesByProject() : new Map();
 		let availableAt: number | null = null;
 		for (const row of rows) {
-			const lineage = lineages.get(row.job_id) ?? [];
-			const isPreferred =
-				preferredBranch?.projectId === row.project_id && findAlignedSequence(preferredBranch.rows, lineage) >= 0;
-			if (!isPreferred) {
-				if (!allowFallback || !this.#lineageActiveSomewhere(row.project_id, lineage, activeProjects)) continue;
-			}
+			const placement = this.#jobSpanClass(row.project_id, row.input_hash, preferredBranchRowId);
+			if (placement === null) continue;
+			if (placement === "fallback" && !allowFallback) continue;
 			const candidateAt = row.status === "leased" ? row.lease_expires_at : row.available_at;
 			if (candidateAt !== null && (availableAt === null || candidateAt < availableAt)) availableAt = candidateAt;
 		}
@@ -1960,39 +2275,49 @@ class SqliteLcmContext implements LcmContext {
 		return inputs;
 	}
 
-	#groupJobLineages(rows: readonly { job_id: string; source_key: string }[]): Map<string, string[]> {
-		const lineages = new Map<string, string[]>();
-		for (const row of rows) {
-			const lineage = lineages.get(row.job_id);
-			if (lineage) lineage.push(row.source_key);
-			else lineages.set(row.job_id, [row.source_key]);
-		}
-		return lineages;
+	/**
+	 * Where a content-addressed job is currently placed. `null` means no current-revision
+	 * span in the project still wants it, so the job is obsolete. Retrieval authorization
+	 * keeps using stored lineage; the frontier is never an authorization shortcut.
+	 */
+	#jobSpanClass(
+		projectId: string,
+		inputHash: string,
+		preferredBranchRowId: number | undefined,
+	): "preferred" | "fallback" | null {
+		const row = this.#db
+			.query<{ total: number; preferred: number }, [number, string, string]>(
+				`SELECT COUNT(*) AS total,
+					MAX(CASE WHEN s.branch_row_id = ? THEN 1 ELSE 0 END) AS preferred
+				 FROM branch_summary_spans s
+				 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+				 WHERE b.project_id = ? AND s.input_hash = ? AND s.summary_id IS NULL`,
+			)
+			.get(preferredBranchRowId ?? -1, projectId, inputHash);
+		if (!row || row.total === 0) return null;
+		return row.preferred === 1 ? "preferred" : "fallback";
 	}
 
-	#activeBranchesByProject(): Map<string, Map<number, Array<{ source_key: string; atomic_group_id: string | null }>>> {
-		const rows = this.#db
-			.query<{ project_id: string; branch_row_id: number; source_key: string; atomic_group_id: string | null }, []>(
-				`SELECT b.project_id, bs.branch_row_id, bs.source_key, bs.atomic_group_id
-				 FROM branch_sources bs JOIN branches b ON b.id = bs.branch_row_id
-				 WHERE bs.active = 1 ORDER BY b.project_id, bs.branch_row_id, bs.position`,
+	#preferredBranchRowId(scope?: ContextScope): number | undefined {
+		if (!scope) return undefined;
+		return this.#db
+			.query<Pick<BranchRow, "id">, [string, string, string]>(
+				"SELECT id FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
 			)
-			.all();
-		const projects = new Map<string, Map<number, Array<{ source_key: string; atomic_group_id: string | null }>>>();
-		for (const row of rows) {
-			let branches = projects.get(row.project_id);
-			if (!branches) {
-				branches = new Map();
-				projects.set(row.project_id, branches);
-			}
-			let branch = branches.get(row.branch_row_id);
-			if (!branch) {
-				branch = [];
-				branches.set(row.branch_row_id, branch);
-			}
-			branch.push({ source_key: row.source_key, atomic_group_id: row.atomic_group_id });
-		}
-		return projects;
+			.get(scope.projectId, scope.sessionId, scope.branchId)?.id;
+	}
+
+	/** Whether any current-revision span in the project still references this summary. */
+	#summaryPlacedInProject(projectId: string, summaryId: string): boolean {
+		return (
+			this.#count(
+				`SELECT COUNT(*) AS count FROM branch_summary_spans s
+				 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+				 WHERE b.project_id = ? AND s.summary_id = ?`,
+				projectId,
+				summaryId,
+			) > 0
+		);
 	}
 
 	#jobLineage(jobId: string): string[] {
@@ -2004,31 +2329,6 @@ class SqliteLcmContext implements LcmContext {
 			.map(row => row.source_key);
 	}
 
-	#preferredBranchRows(scope?: ContextScope): { projectId: string; rows: CurrentSourceRow[] } | null {
-		if (!scope) return null;
-		const branch = this.#db
-			.query<Pick<BranchRow, "id">, [string, string, string]>(
-				"SELECT id FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
-			)
-			.get(scope.projectId, scope.sessionId, scope.branchId);
-		return branch ? { projectId: scope.projectId, rows: this.#activeRows(branch.id) } : null;
-	}
-
-	#lineageActiveSomewhere(
-		projectId: string,
-		lineage: readonly string[],
-		projects: ReadonlyMap<
-			string,
-			ReadonlyMap<number, readonly { source_key: string; atomic_group_id: string | null }[]>
-		> = this.#activeBranchesByProject(),
-	): boolean {
-		if (lineage.length === 0) return false;
-		for (const branch of projects.get(projectId)?.values() ?? []) {
-			if (findAlignedSequence(branch, lineage) >= 0) return true;
-		}
-		return false;
-	}
-
 	summaryJobFailures(preferredScope?: ContextScope): readonly {
 		jobId: string;
 		availableAt: number;
@@ -2036,38 +2336,22 @@ class SqliteLcmContext implements LcmContext {
 	}[] {
 		this.#assertAvailable();
 		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
-		const preferredBranch = this.#preferredBranchRows(scope);
+		const preferredBranchRowId = this.#preferredBranchRowId(scope);
 		const rows = this.#db
-			.query<{ job_id: string; project_id: string; available_at: number }, []>(
-				`SELECT job_id, project_id, available_at FROM summary_jobs
+			.query<{ job_id: string; project_id: string; input_hash: string; available_at: number }, []>(
+				`SELECT job_id, project_id, input_hash, available_at FROM summary_jobs
 				 WHERE status = 'failed' ORDER BY available_at, job_id`,
 			)
 			.all();
-		const lineages = this.#groupJobLineages(
-			this.#db
-				.query<{ job_id: string; source_key: string }, []>(
-					`SELECT jl.job_id, jl.source_key
-					 FROM job_lineage jl JOIN summary_jobs j ON j.job_id = jl.job_id
-					 WHERE j.status = 'failed' ORDER BY jl.job_id, jl.ordinal`,
-				)
-				.all(),
-		);
-		const activeProjects = this.#activeBranchesByProject();
 		const failures: Array<{
 			jobId: string;
 			availableAt: number;
 			queueClass: "preferred" | "fallback";
 		}> = [];
 		for (const row of rows) {
-			const lineage = lineages.get(row.job_id) ?? [];
-			const isPreferred =
-				preferredBranch?.projectId === row.project_id && findAlignedSequence(preferredBranch.rows, lineage) >= 0;
-			if (!isPreferred && !this.#lineageActiveSomewhere(row.project_id, lineage, activeProjects)) continue;
-			failures.push({
-				jobId: row.job_id,
-				availableAt: row.available_at,
-				queueClass: isPreferred ? "preferred" : "fallback",
-			});
+			const placement = this.#jobSpanClass(row.project_id, row.input_hash, preferredBranchRowId);
+			if (placement === null) continue;
+			failures.push({ jobId: row.job_id, availableAt: row.available_at, queueClass: placement });
 		}
 		return failures;
 	}
@@ -2123,6 +2407,28 @@ class SqliteLcmContext implements LcmContext {
 				assertIdentifier(provenance.resolvedModel, "completion.provenance.resolvedModel");
 		}
 		const now = this.#options.now();
+		const attempt = completion.attempt;
+		if (attempt) assertProviderAttempt(attempt, "completion.attempt");
+		const markObsolete = (): void => {
+			this.#db.run(
+				`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
+					lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
+				[now, jobId, leaseToken],
+			);
+			this.#compactTerminalJob(jobId);
+		};
+		// Settles before any job mutation so a late billed response never stays
+		// `in_flight`. A non-null result means the settler overrode the branch intent.
+		const settle = (requested: SummaryAttemptOutcome): CompleteSummaryJobResult | null => {
+			if (!attempt) return null;
+			const settled = this.#settleAttempt(jobId, leaseToken, attempt, requested, now);
+			if (settled === requested) return null;
+			if (settled === "stale") {
+				markObsolete();
+				return { accepted: false, reason: "stale" };
+			}
+			return { accepted: false, reason: "lease_lost" };
+		};
 		const transaction = this.#db.transaction((): CompleteSummaryJobResult => {
 			const job = this.#db
 				.query<JobRow, [string]>(
@@ -2139,7 +2445,7 @@ class SqliteLcmContext implements LcmContext {
 				job.lease_output_budget === null ||
 				job.lease_expires_at <= now
 			) {
-				return { accepted: false, reason: "lease_lost" };
+				return settle("lease_lost") ?? { accepted: false, reason: "lease_lost" };
 			}
 			const strategy = strategyForStage(job.stage);
 			if (provenance && provenance.strategy !== strategy) {
@@ -2149,16 +2455,15 @@ class SqliteLcmContext implements LcmContext {
 			const modelSelector = provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null;
 			const resolvedModel = provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null;
 			const lineage = this.#jobLineage(jobId);
-			if (!this.#lineageActiveSomewhere(job.project_id, lineage)) {
-				this.#db.run(
-					`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-						lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
-					[now, jobId, leaseToken],
-				);
-				this.#compactTerminalJob(jobId);
+			if (!this.#jobPlacementActive(jobId, job.project_id)) {
+				const overridden = settle("stale");
+				if (overridden) return overridden;
+				markObsolete();
 				return { accepted: false, reason: "stale" };
 			}
 			if (tokenCount >= job.lease_input_tokens || tokenCount > job.lease_output_budget) {
+				const overridden = settle("non_compressing");
+				if (overridden) return overridden;
 				const advanced = nextStage(job.stage);
 				if (advanced) {
 					this.#db.run(
@@ -2205,6 +2510,8 @@ class SqliteLcmContext implements LcmContext {
 				return { accepted: false, reason: "deterministic_failed" };
 			}
 
+			const settledCompletion = settle("completed");
+			if (settledCompletion) return settledCompletion;
 			let summary = this.#db
 				.query<{ summary_id: string }, [string, string]>(
 					"SELECT summary_id FROM summaries WHERE project_id = ? AND input_hash = ?",
@@ -2288,45 +2595,83 @@ class SqliteLcmContext implements LcmContext {
 				],
 			);
 			this.#compactTerminalJob(jobId);
-			this.#scheduleProject(job.project_id, now);
+			this.#fillCompletedSpans(job.project_id, job.input_hash, summary.summary_id, jobInputs, now);
 			return { accepted: true, summaryId: summary.summary_id };
 		});
 		return transaction.immediate();
 	}
 
-	#scheduleProject(projectId: string, now: number): ScheduleStats {
-		const branches = this.#db
-			.query<BranchScheduleRow, [string]>(
-				`SELECT id, session_id, branch_id, revision, summary_token_budget,
-					fresh_tail_max_sources, fresh_tail_max_tokens
-				 FROM branches WHERE project_id = ? ORDER BY id`,
+	/**
+	 * Attach a finished summary to every current-revision span that requested it and
+	 * advance only the branches actually affected. An old-revision or mismatched parent
+	 * stays non-frontier; the next reconcile repairs it.
+	 */
+	#fillCompletedSpans(
+		projectId: string,
+		inputHash: string,
+		summaryId: string,
+		jobInputs: readonly JobInputRow[],
+		now: number,
+	): void {
+		const matches = this.#db
+			.query<
+				{ branch_row_id: number; revision: number; level: number; start_position: number; end_position: number },
+				[string, string]
+			>(
+				`SELECT s.branch_row_id, s.revision, s.level, s.start_position, s.end_position
+				 FROM branch_summary_spans s
+				 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+				 WHERE b.project_id = ? AND s.input_hash = ? AND s.summary_id IS NULL
+				 ORDER BY s.branch_row_id, s.level, s.start_position`,
 			)
-			.all(projectId);
-		const total: ScheduleStats = { queued: 0, reused: 0 };
-		for (const branch of branches) {
-			const summarize =
-				branch.summary_token_budget !== null &&
-				branch.fresh_tail_max_sources !== null &&
-				branch.fresh_tail_max_tokens !== null
-					? {
-							tokenBudget: branch.summary_token_budget,
-							freshTail: {
-								maxSources: branch.fresh_tail_max_sources,
-								maxTokens: branch.fresh_tail_max_tokens,
-							},
-						}
-					: undefined;
-			const result = this.#scheduleBranch(
-				branch.id,
-				{ projectId, sessionId: branch.session_id, branchId: branch.branch_id },
-				branch.revision,
-				now,
-				summarize,
+			.all(projectId, inputHash);
+		if (matches.length === 0) return;
+		const orderedInputs = jobInputs.filter(input => input.input_kind === "summary").map(input => input.ref_id);
+		const affected = new Map<number, number>();
+		for (const match of matches) {
+			const span: SpanRow = {
+				level: match.level,
+				start_position: match.start_position,
+				end_position: match.end_position,
+				input_hash: inputHash,
+				summary_id: null,
+				frontier: 0,
+			};
+			let promote = match.level === 0;
+			if (match.level > 0) {
+				const children = this.#childSpanInputs(match.branch_row_id, match.revision, span);
+				promote =
+					children !== null &&
+					children.length === orderedInputs.length &&
+					children.every((child, index) => child.id === orderedInputs[index]);
+			}
+			this.#db.run(
+				`UPDATE branch_summary_spans SET summary_id = ?, frontier = ?
+				 WHERE branch_row_id = ? AND revision = ? AND level = ? AND start_position = ? AND end_position = ?`,
+				[
+					summaryId,
+					promote ? 1 : 0,
+					match.branch_row_id,
+					match.revision,
+					match.level,
+					match.start_position,
+					match.end_position,
+				],
 			);
-			total.queued += result.queued;
-			total.reused += result.reused;
+			if (promote && match.level > 0) {
+				this.#db.run(
+					`UPDATE branch_summary_spans SET frontier = 0
+					 WHERE branch_row_id = ? AND revision = ? AND level = ?
+					   AND start_position >= ? AND end_position <= ?`,
+					[match.branch_row_id, match.revision, match.level - 1, match.start_position, match.end_position],
+				);
+			}
+			if (promote) affected.set(match.branch_row_id, match.revision);
 		}
-		return total;
+		const stats: ScheduleStats = { queued: 0, reused: 0 };
+		for (const [branchRowId, revision] of affected) {
+			this.#advanceBranchFrontier(branchRowId, projectId, revision, now, stats);
+		}
 	}
 
 	failSummaryJob(
@@ -2335,6 +2680,7 @@ class SqliteLcmContext implements LcmContext {
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
+		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
 	): boolean {
 		this.#assertAvailable();
 		assertIdentifier(jobId, "jobId");
@@ -2348,30 +2694,188 @@ class SqliteLcmContext implements LcmContext {
 			if (provenance.resolvedModel !== undefined)
 				assertIdentifier(provenance.resolvedModel, "provenance.resolvedModel");
 		}
+		if (failedAttempt) assertProviderAttempt(failedAttempt.attempt, "failedAttempt.attempt");
 		const now = this.#options.now();
-		const result = this.#db.run(
-			`UPDATE summary_jobs SET status = 'failed', worker_id = NULL, lease_token = NULL,
-				lease_expires_at = NULL, available_at = ?, last_error = ?,
-				transport_retry_count = transport_retry_count + 1,
-				last_strategy = COALESCE(?, last_strategy), last_prompt_hash = COALESCE(?, last_prompt_hash),
-				last_model_selector = COALESCE(?, last_model_selector),
-				last_resolved_model = COALESCE(?, last_resolved_model),
-				last_input_tokens = lease_input_tokens, updated_at = ?
-			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
+		const applyFailure = (): boolean => {
+			const result = this.#db.run(
+				`UPDATE summary_jobs SET status = 'failed', worker_id = NULL, lease_token = NULL,
+					lease_expires_at = NULL, available_at = ?, last_error = ?,
+					transport_retry_count = transport_retry_count + 1,
+					last_strategy = COALESCE(?, last_strategy), last_prompt_hash = COALESCE(?, last_prompt_hash),
+					last_model_selector = COALESCE(?, last_model_selector),
+					last_resolved_model = COALESCE(?, last_resolved_model),
+					last_input_tokens = lease_input_tokens, updated_at = ?
+				 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
+				[
+					now + retryDelayMs,
+					boundedDiagnostic(redactedError),
+					provenance?.strategy ?? null,
+					provenance?.promptHash ?? null,
+					provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null,
+					provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null,
+					now,
+					jobId,
+					leaseToken,
+					now,
+				],
+			);
+			return Number(result.changes) > 0;
+		};
+		if (!failedAttempt) return applyFailure();
+		// Only the requested provider failure retries: a superseded or re-leased job
+		// records its billed attempt without resurrecting obsolete work.
+		const transaction = this.#db.transaction((): boolean => {
+			const settled = this.#settleAttempt(jobId, leaseToken, failedAttempt.attempt, failedAttempt.outcome, now);
+			return settled === failedAttempt.outcome && applyFailure();
+		});
+		return transaction.immediate();
+	}
+
+	/**
+	 * Whether this job is still wanted by a current-revision span. Retrieval
+	 * authorization keeps using stored lineage; this is scheduling and billing only.
+	 */
+	#jobPlacementActive(jobId: string, projectId: string): boolean {
+		const inputHash = this.#db
+			.query<{ input_hash: string }, [string]>("SELECT input_hash FROM summary_jobs WHERE job_id = ?")
+			.get(jobId)?.input_hash;
+		return inputHash !== undefined && this.#jobSpanClass(projectId, inputHash, undefined) !== null;
+	}
+
+	beginSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttemptStart,
+		provenance: SummaryAttemptProvenance,
+	): boolean {
+		this.#assertAvailable();
+		assertIdentifier(jobId, "jobId");
+		assertIdentifier(leaseToken, "leaseToken");
+		assertProviderAttemptStart(attempt, "attempt");
+		assertIdentifier(provenance.promptHash, "provenance.promptHash");
+		if (provenance.modelSelector !== undefined)
+			assertIdentifier(provenance.modelSelector, "provenance.modelSelector");
+		if (provenance.resolvedModel !== undefined)
+			assertIdentifier(provenance.resolvedModel, "provenance.resolvedModel");
+		const now = this.#options.now();
+		const transaction = this.#db.transaction((): boolean => {
+			const job = this.#db
+				.query<
+					Pick<JobRow, "project_id" | "input_hash" | "status" | "lease_token" | "lease_expires_at" | "stage"> & {
+						attempt_count: number;
+					},
+					[string]
+				>(
+					`SELECT project_id, input_hash, status, lease_token, lease_expires_at, stage, attempt_count
+					 FROM summary_jobs WHERE job_id = ?`,
+				)
+				.get(jobId);
+			if (
+				job?.status !== "leased" ||
+				job.lease_token !== leaseToken ||
+				job.lease_expires_at === null ||
+				job.lease_expires_at <= now
+			) {
+				return false;
+			}
+			if (!this.#jobPlacementActive(jobId, job.project_id)) return false;
+			const inserted = this.#db.run(
+				`INSERT INTO summary_attempts
+					(attempt_id, job_id, project_id, input_hash, attempt_count, started_at, outcome,
+					 model_selector, provider, model, stage, strategy, prompt_hash)
+				 VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(attempt_id) DO NOTHING`,
+				[
+					attempt.attemptId,
+					jobId,
+					job.project_id,
+					job.input_hash,
+					Math.max(1, job.attempt_count),
+					attempt.startedAt,
+					provenance.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null,
+					boundedDiagnostic(attempt.provider),
+					boundedDiagnostic(attempt.model),
+					job.stage,
+					provenance.strategy,
+					provenance.promptHash,
+				],
+			);
+			return Number(inserted.changes) > 0;
+		});
+		return transaction.immediate();
+	}
+
+	settleSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttempt,
+		requestedOutcome: SummaryLocalAttemptOutcome,
+	): SummaryAttemptOutcome | null {
+		this.#assertAvailable();
+		assertIdentifier(jobId, "jobId");
+		assertIdentifier(leaseToken, "leaseToken");
+		assertProviderAttempt(attempt, "attempt");
+		const now = this.#options.now();
+		const transaction = this.#db.transaction((): SummaryAttemptOutcome | null =>
+			this.#settleAttempt(jobId, leaseToken, attempt, requestedOutcome, now),
+		);
+		return transaction.immediate();
+	}
+
+	/**
+	 * Finish one `in_flight` ledger row inside the caller's transaction. A lost lease
+	 * outranks a removed placement, which outranks the requested outcome, so billed
+	 * cost is never attributed to a successor attempt. Missing or already-terminal
+	 * rows return null and mutate nothing.
+	 */
+	#settleAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttempt,
+		requestedOutcome: SummaryAttemptOutcome,
+		now: number,
+	): SummaryAttemptOutcome | null {
+		const row = this.#db
+			.query<AttemptRow, [string]>(
+				"SELECT job_id, project_id, outcome, started_at FROM summary_attempts WHERE attempt_id = ?",
+			)
+			.get(attempt.attemptId);
+		if (!row || row.job_id !== jobId || row.outcome !== "in_flight") return null;
+		const job = this.#db
+			.query<Pick<JobRow, "project_id" | "status" | "lease_token" | "lease_expires_at">, [string]>(
+				"SELECT project_id, status, lease_token, lease_expires_at FROM summary_jobs WHERE job_id = ?",
+			)
+			.get(jobId);
+		let outcome: SummaryAttemptOutcome;
+		if (
+			job?.status !== "leased" ||
+			job.lease_token !== leaseToken ||
+			job.lease_expires_at === null ||
+			job.lease_expires_at <= now
+		) {
+			outcome = "lease_lost";
+		} else if (!this.#jobPlacementActive(jobId, job.project_id)) {
+			outcome = "stale";
+		} else {
+			outcome = requestedOutcome;
+		}
+		const changed = this.#db.run(
+			`UPDATE summary_attempts SET completed_at = ?, outcome = ?,
+				input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, total_tokens = ?,
+				orchestration_input_tokens = ?, orchestration_cache_read_tokens = ?, orchestration_output_tokens = ?,
+				reasoning_tokens = ?, premium_requests = ?, cache_write_5m_tokens = ?, cache_write_1h_tokens = ?,
+				server_web_search_requests = ?, server_web_fetch_requests = ?,
+				cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?
+			 WHERE attempt_id = ? AND job_id = ? AND outcome = 'in_flight'`,
 			[
-				now + retryDelayMs,
-				boundedDiagnostic(redactedError),
-				provenance?.strategy ?? null,
-				provenance?.promptHash ?? null,
-				provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null,
-				provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null,
-				now,
+				Math.max(row.started_at, attempt.completedAt),
+				outcome,
+				...attemptUsageBindings(attempt.usage),
+				attempt.attemptId,
 				jobId,
-				leaseToken,
-				now,
 			],
 		);
-		return Number(result.changes) > 0;
+		return Number(changed.changes) > 0 ? outcome : null;
 	}
 
 	search(request: SearchRequest): SearchHit[] {
@@ -2887,6 +3391,7 @@ class SqliteLcmContext implements LcmContext {
 			leafSummaries: this.#count("SELECT COUNT(*) AS count FROM summaries WHERE level = 0"),
 			condensedSummaries: this.#count("SELECT COUNT(*) AS count FROM summaries WHERE level > 0"),
 			jobs: jobCounts,
+			performance: { ...this.#performance },
 		};
 	}
 
@@ -2937,6 +3442,48 @@ class SqliteLcmContext implements LcmContext {
 			);
 			return missing === 0 ? null : `${missing} orphan search document(s)`;
 		});
+		check("branch-summary-spans", () => {
+			const overlap = this.#db
+				.query<{ branch_row_id: number }, []>(
+					`SELECT a.branch_row_id FROM branch_summary_spans a
+					 JOIN branches b ON b.id = a.branch_row_id AND b.revision = a.revision
+					 JOIN branch_summary_spans c
+					   ON c.branch_row_id = a.branch_row_id AND c.revision = a.revision AND c.frontier = 1
+					  AND (c.level <> a.level OR c.start_position <> a.start_position OR c.end_position <> a.end_position)
+					  AND c.start_position < a.end_position AND c.end_position > a.start_position
+					 WHERE a.frontier = 1 LIMIT 1`,
+				)
+				.get();
+			if (overlap) return `branch ${overlap.branch_row_id} has an overlapping frontier`;
+			const mismatch = this.#db
+				.query<{ summary_id: string; expected: number; actual: number }, []>(
+					`SELECT s.summary_id,
+						(s.end_position - s.start_position) AS expected,
+						(SELECT COUNT(*) FROM summary_lineage l WHERE l.summary_id = s.summary_id) AS actual
+					 FROM branch_summary_spans s
+					 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+					 WHERE s.summary_id IS NOT NULL
+					   AND (s.end_position - s.start_position) <>
+						(SELECT COUNT(*) FROM summary_lineage l WHERE l.summary_id = s.summary_id)
+					 LIMIT 1`,
+				)
+				.get();
+			if (mismatch) {
+				return `summary ${mismatch.summary_id} covers ${mismatch.expected} positions but has ${mismatch.actual} lineage rows`;
+			}
+			const gap = this.#db
+				.query<{ branch_row_id: number; start_position: number }, []>(
+					`SELECT s.branch_row_id, s.start_position FROM branch_summary_spans s
+					 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+					 WHERE s.frontier = 1 AND s.start_position > 0 AND NOT EXISTS (
+						SELECT 1 FROM branch_summary_spans p
+						WHERE p.branch_row_id = s.branch_row_id AND p.revision = s.revision
+						  AND p.frontier = 1 AND p.end_position = s.start_position
+					 ) LIMIT 1`,
+				)
+				.get();
+			return gap ? `branch ${gap.branch_row_id} frontier has a gap before position ${gap.start_position}` : null;
+		});
 		check("quarantine", () => (this.#readState().quarantined_at === null ? null : "store is quarantined"));
 		return { ok: checks.every(item => item.ok), checks };
 	}
@@ -2953,6 +3500,7 @@ class SqliteLcmContext implements LcmContext {
 		}
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): RebuildResult => {
+			this.#db.run("DELETE FROM branch_summary_spans");
 			this.#db.run("DELETE FROM summary_jobs");
 			this.#db.run("DELETE FROM summary_children");
 			this.#db.run("DELETE FROM summaries");
@@ -2995,7 +3543,7 @@ class SqliteLcmContext implements LcmContext {
 				if (
 					job.status !== "completed" &&
 					job.status !== "obsolete" &&
-					this.#lineageActiveSomewhere(job.project_id, this.#jobLineage(job.job_id))
+					this.#jobPlacementActive(job.job_id, job.project_id)
 				) {
 					continue;
 				}
@@ -3009,13 +3557,7 @@ class SqliteLcmContext implements LcmContext {
 				)
 				.all(cutoff);
 			for (const summary of summaryCandidates) {
-				const lineage = this.#db
-					.query<{ source_key: string }, [string]>(
-						"SELECT source_key FROM summary_lineage WHERE summary_id = ? ORDER BY ordinal",
-					)
-					.all(summary.summary_id)
-					.map(row => row.source_key);
-				if (this.#lineageActiveSomewhere(summary.project_id, lineage)) continue;
+				if (this.#summaryPlacedInProject(summary.project_id, summary.summary_id)) continue;
 				try {
 					summaries += Number(
 						this.#db.run("DELETE FROM summaries WHERE summary_id = ?", [summary.summary_id]).changes,

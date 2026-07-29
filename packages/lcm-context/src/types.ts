@@ -115,6 +115,47 @@ export interface SummaryAttemptProvenance {
 	strategy: SummaryStrategy;
 }
 
+/** Canonical provider usage and cost for one dispatched summary attempt. */
+export interface SummaryProviderUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+	orchestration?: { input?: number; cacheRead?: number; output?: number };
+	premiumRequests?: number;
+	reasoningTokens?: number;
+	cttl?: { ephemeral5m?: number; ephemeral1h?: number };
+	server?: { webSearch?: number; webFetch?: number };
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+export interface SummaryProviderAttemptStart {
+	attemptId: string;
+	startedAt: number;
+	provider: string;
+	model: string;
+}
+
+export interface SummaryProviderAttempt extends SummaryProviderAttemptStart {
+	completedAt: number;
+	usage?: SummaryProviderUsage;
+}
+
+export type SummaryAttemptOutcome =
+	| "completed"
+	| "provider_error"
+	| "transport_error"
+	| "empty_output"
+	| "aborted"
+	| "non_compressing"
+	| "stale"
+	| "lease_lost";
+
+export type SummaryFailureAttemptOutcome = "provider_error" | "transport_error" | "empty_output";
+
+export type SummaryLocalAttemptOutcome = "aborted" | "stale" | "lease_lost";
+
 export interface ContextProjection {
 	revision: number;
 	/** False means the caller must fail open to its native history path. */
@@ -173,6 +214,8 @@ export interface SummaryCompletion {
 	/** Optional provider measurement; the package also measures text locally and uses the larger value. */
 	tokenCount?: number;
 	provenance?: SummaryAttemptProvenance;
+	/** Dispatched provider attempt whose ledger row this completion settles. */
+	attempt?: SummaryProviderAttempt;
 }
 
 export type CompleteSummaryJobResult =
@@ -273,6 +316,18 @@ export interface JobStatusCounts {
 
 export type LcmRecoveryCategory = "integrity_check" | "corruption" | "unknown";
 
+/**
+ * Process-local, content-free projection and scheduling counters. They reset on
+ * restart and exist so benchmarks can observe hot-path cost without sampling.
+ */
+export interface LcmPerformanceCounters {
+	projectionCalls: number;
+	projectionWallMs: number;
+	projectionCpuMs: number;
+	projectionLineageRowsRead: number;
+	schedulerBranchPasses: number;
+}
+
 export interface LcmStatus {
 	schemaVersion: number;
 	journalMode: string;
@@ -289,6 +344,8 @@ export interface LcmStatus {
 	leafSummaries: number;
 	condensedSummaries: number;
 	jobs: JobStatusCounts;
+	/** Always present on the SQLite context; test fakes may omit it. */
+	performance?: LcmPerformanceCounters;
 }
 
 export interface DoctorCheck {
@@ -331,12 +388,31 @@ export interface LcmContext extends Disposable {
 	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean;
 	releaseSummaryJob(jobId: string, leaseToken: string): boolean;
 	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult;
+	/**
+	 * Record a dispatched provider attempt before it starts. Returns false when the
+	 * lease is stale, the job is no longer placed on a current branch, or the
+	 * attempt id already exists — the caller must then dispatch nothing.
+	 */
+	beginSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttemptStart,
+		provenance: SummaryAttemptProvenance,
+	): boolean;
+	/** Finish an in-flight attempt without mutating job retry state. */
+	settleSummaryAttempt(
+		jobId: string,
+		leaseToken: string,
+		attempt: SummaryProviderAttempt,
+		requestedOutcome: SummaryLocalAttemptOutcome,
+	): SummaryAttemptOutcome | null;
 	failSummaryJob(
 		jobId: string,
 		leaseToken: string,
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
+		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
 	): boolean;
 	search(request: SearchRequest): SearchHit[];
 	searchProject(request: ProjectSearchRequest): SearchHit[];

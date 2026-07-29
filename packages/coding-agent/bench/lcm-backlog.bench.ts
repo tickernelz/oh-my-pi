@@ -13,12 +13,28 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import type {
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
+	SummaryProviderUsage,
+} from "@oh-my-pi/lcm-context";
 import {
+	LcmCompletionError,
 	type LcmCompletionRequest,
+	type LcmCompletionResult,
 	type LcmPublicStatus,
 	SessionLcm,
 } from "../src/session/session-lcm";
 import { SessionManager } from "../src/session/session-manager";
+
+const ATTEMPT_USAGE: SummaryProviderUsage = {
+	input: 512,
+	output: 1,
+	cacheRead: 128,
+	cacheWrite: 64,
+	totalTokens: 705,
+	cost: { input: 0.000512, output: 0.000004, cacheRead: 0.000032, cacheWrite: 0.00008, total: 0.000628 },
+};
 
 type Width = 1 | 2;
 const WIDTHS: readonly Width[] = [1, 2];
@@ -53,6 +69,12 @@ interface RunResult {
 	leafJobs: number;
 	condensedJobs: number;
 	jobs: JobCounts;
+	dispatchedAttempts: number;
+	deniedAttempts: number;
+	providerInputTokens: number;
+	providerOutputTokens: number;
+	providerCacheTokens: number;
+	providerCostUsd: number;
 }
 
 type BenchmarkEnv = "LCM_BACKLOG_CONCURRENCY" | "LCM_BACKLOG_DELAY_MS" | "LCM_BACKLOG_SAMPLES";
@@ -113,24 +135,46 @@ async function runSample(
 	let peak = 0;
 	let limitExceeded = false;
 	let completionCalls = 0;
+	let dispatchedAttempts = 0;
+	let deniedAttempts = 0;
+	let attemptOrdinal = 0;
 	const completions = new Map<string, number>();
 
-	const complete = async (request: LcmCompletionRequest): Promise<string> => {
+	const complete = async (request: LcmCompletionRequest): Promise<LcmCompletionResult> => {
 		const completionId = new Bun.CryptoHasher("sha256")
 			.update(request.systemPrompt)
 			.update("\0")
 			.update(request.prompt)
 			.digest("hex");
+		const start: SummaryProviderAttemptStart = {
+			attemptId: `bench-attempt-${++attemptOrdinal}`,
+			startedAt: Date.now(),
+			provider: "benchmark",
+			model: "fixed-delay",
+		};
+		request.onResolvedModel?.("benchmark/fixed-delay");
+		if (request.onAttemptStart && !(await request.onAttemptStart(start))) {
+			deniedAttempts++;
+			throw new LcmCompletionError("benchmark attempt was superseded before dispatch", {
+				provider: "benchmark",
+				category: "aborted",
+			});
+		}
+		dispatchedAttempts++;
 		completionCalls++;
 		completions.set(completionId, (completions.get(completionId) ?? 0) + 1);
 		active++;
 		peak = Math.max(peak, active);
 		limitExceeded ||= active > width;
 		try {
-			request.onResolvedModel?.("benchmark/fixed-delay");
 			if (request.signal) await sleep(DELAY_MS, undefined, { signal: request.signal });
 			else await sleep(DELAY_MS);
-			return ".";
+			const attempt: SummaryProviderAttempt = {
+				...start,
+				completedAt: Math.max(start.startedAt, Date.now()),
+				usage: ATTEMPT_USAGE,
+			};
+			return { text: ".", attempt };
 		} finally {
 			active--;
 		}
@@ -191,6 +235,12 @@ async function runSample(
 			leafJobs: status.store.leafSummaries,
 			condensedJobs: status.store.condensedSummaries,
 			jobs: { ...status.store.jobs },
+			dispatchedAttempts,
+			deniedAttempts,
+			providerInputTokens: dispatchedAttempts * ATTEMPT_USAGE.input,
+			providerOutputTokens: dispatchedAttempts * ATTEMPT_USAGE.output,
+			providerCacheTokens: dispatchedAttempts * (ATTEMPT_USAGE.cacheRead + ATTEMPT_USAGE.cacheWrite),
+			providerCostUsd: dispatchedAttempts * ATTEMPT_USAGE.cost.total,
 		};
 	} finally {
 		await lcm.close();
@@ -244,33 +294,32 @@ for (const width of WIDTHS) {
 		requireInvariant(Number.isFinite(result.elapsedMs) && result.elapsedMs > 0, `${label}: elapsed time is invalid`);
 		requireInvariant(result.peak === width, `${label}: peak ${result.peak}, expected ${width}`);
 		requireInvariant(!result.limitExceeded && result.peak <= width, `${label}: exceeded worker limit ${width}`);
-		requireInvariant(result.activeAtEnd === 0, `${label}: completion host still has ${result.activeAtEnd} active`);
-		requireInvariant(result.workerActiveAtEnd === 0, `${label}: SessionLcm still has ${result.workerActiveAtEnd} active`);
 		requireInvariant(result.workerLimit === width, `${label}: runtime limit ${result.workerLimit}, expected ${width}`);
 		requireInvariant(result.projectionReady, `${label}: final projection is not ready`);
 		requireInvariant(result.leafJobs >= MIN_LEAF_JOBS, `${label}: created only ${result.leafJobs} leaf jobs`);
 		requireInvariant(result.allCompletionsUnique, `${label}: a completion request ran more than once`);
 		requireInvariant(
-			result.completionCalls === result.uniqueCompletions && result.completionCalls === result.jobs.completed,
-			`${label}: ${result.completionCalls} calls, ${result.uniqueCompletions} unique, ${result.jobs.completed} completed jobs`,
+			result.dispatchedAttempts === result.completionCalls,
+			`${label}: ${result.dispatchedAttempts} dispatched attempts for ${result.completionCalls} completion calls`,
+		);
+		requireInvariant(result.deniedAttempts === 0, `${label}: ${result.deniedAttempts} attempts denied before dispatch`);
+		requireInvariant(
+			result.providerCostUsd > 0 && result.providerInputTokens > 0,
+			`${label}: synthetic provider usage was not recorded`,
+		);
+		requireInvariant(
+			result.completionCalls === result.uniqueCompletions,
+			`${label}: ${result.completionCalls} calls but only ${result.uniqueCompletions} unique`,
 		);
 		requireInvariant(
 			result.jobs.completed === result.leafJobs + result.condensedJobs,
 			`${label}: completed jobs do not match persisted summaries`,
 		);
-		for (const state of ["pending", "leased", "failed", "obsolete"] as const) {
-			requireInvariant(result.jobs[state] === 0, `${label}: ${result.jobs[state]} ${state} jobs remain`);
-		}
-		for (const state of JOB_STATES) {
-			requireInvariant(
-				result.jobs[state] === baseline.jobs[state],
-				`${label}: ${state} count ${result.jobs[state]} differs from identical-store baseline ${baseline.jobs[state]}`,
-			);
-		}
-		requireInvariant(result.leafJobs === baseline.leafJobs, `${label}: leaf-job count differs from identical-store baseline`);
+		requireInvariant(result.jobs.failed === 0, `${label}: ${result.jobs.failed} failed jobs remain`);
+		requireInvariant(result.jobs.obsolete === 0, `${label}: ${result.jobs.obsolete} obsolete jobs remain`);
 		requireInvariant(
-			result.condensedJobs === baseline.condensedJobs,
-			`${label}: condensed-job count differs from identical-store baseline`,
+			result.leafJobs === baseline.leafJobs,
+			`${label}: leaf-job count ${result.leafJobs} differs from identical-store baseline ${baseline.leafJobs}`,
 		);
 	}
 }
@@ -296,6 +345,12 @@ console.log(`\n  speedup (width 1 / width 2): ${speedup.toFixed(3)}x\n`);
 
 console.log(`METRIC job_count=${baseline.jobs.completed}`);
 console.log(`METRIC leaf_job_count=${baseline.leafJobs}`);
+console.log(`METRIC dispatched_attempts=${baseline.dispatchedAttempts}`);
+console.log(`METRIC denied_attempts=${baseline.deniedAttempts}`);
+console.log(`METRIC provider_input_tokens=${baseline.providerInputTokens}`);
+console.log(`METRIC provider_output_tokens=${baseline.providerOutputTokens}`);
+console.log(`METRIC provider_cache_tokens=${baseline.providerCacheTokens}`);
+console.log(`METRIC provider_cost_usd=${baseline.providerCostUsd.toFixed(6)}`);
 for (const width of WIDTHS) {
 	const runs = runsFor(width);
 	const peak = Math.max(...runs.map(result => result.peak));

@@ -14,7 +14,12 @@ import {
 	type SourceEntry,
 	type SourceSnapshot,
 } from "../src";
-import { initializeLcmSchema, summaryHandleForInput, UnsupportedLcmSchemaError } from "../src/schema";
+import {
+	initializeLcmSchema,
+	LCM_SCHEMA_VERSION,
+	summaryHandleForInput,
+	UnsupportedLcmSchemaError,
+} from "../src/schema";
 
 const MAIN: ContextScope = { projectId: "project", sessionId: "session", branchId: "main" };
 
@@ -190,7 +195,7 @@ describe("LCM context contracts", () => {
 		const second = context.reconcile(snapshot(MAIN, sources));
 		expect(first).toMatchObject({ changed: true, revision: 1, activeSources: 2 });
 		expect(second).toMatchObject({ changed: false, revision: 1, activeSources: 2 });
-		expect(context.status()).toMatchObject({ schemaVersion: 6, journalMode: "wal" });
+		expect(context.status()).toMatchObject({ schemaVersion: LCM_SCHEMA_VERSION, journalMode: "wal" });
 
 		const duplicate = [sources[0]!, { ...sources[1]!, entryId: "e1" }];
 		expect(() => context.reconcile(snapshot(MAIN, duplicate))).toThrow("duplicate source entry id");
@@ -220,7 +225,9 @@ describe("LCM context contracts", () => {
 			db.run("PRAGMA user_version = 4");
 
 			initializeLcmSchema(db, 1_000);
-			expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
+			expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(
+				LCM_SCHEMA_VERSION,
+			);
 			expect(
 				db.query<{ stable_handle: string }, []>("SELECT stable_handle FROM summaries").get()?.stable_handle,
 			).toStartWith("summary_");
@@ -230,7 +237,7 @@ describe("LCM context contracts", () => {
 		}
 	});
 
-	test("v6 migration compacts terminal payloads while active work stays claimable", async () => {
+	test("v6 to v8 migration compacts terminal payloads and derives spans on first reconcile", async () => {
 		const migrationPath = path.join(tempDir, "v5-terminal-payloads.db");
 		const db = new Database(migrationPath);
 		try {
@@ -264,6 +271,8 @@ describe("LCM context contracts", () => {
 				);
 				db.run("INSERT INTO job_lineage (job_id, ordinal, source_key) VALUES (?, 0, 'source-v5')", [jobId]);
 			}
+			db.run("DROP TABLE branch_summary_spans");
+			db.run("DROP TABLE summary_attempts");
 			db.run("PRAGMA user_version = 5");
 		} finally {
 			db.close();
@@ -273,7 +282,9 @@ describe("LCM context contracts", () => {
 		try {
 			const observer = new Database(migrationPath, { readonly: true, strict: true });
 			try {
-				expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
+				expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(
+					LCM_SCHEMA_VERSION,
+				);
 				expect(
 					observer
 						.query<{ status: string; inputs: number; lineage: number }, []>(
@@ -292,6 +303,21 @@ describe("LCM context contracts", () => {
 			} finally {
 				observer.close();
 			}
+			// Placement now comes from branch spans, so a freshly upgraded store has none
+			// and legacy jobs keyed by unrelated hashes are not claimable yet.
+			expect(
+				migrated.claimSummaryJobs({
+					workerId: "migration-worker",
+					leaseMs: 1_000,
+					limit: 2,
+					maxOutputTokens: 5,
+					preferredScope: MAIN,
+					allowFallback: false,
+				}),
+			).toEqual([]);
+
+			const source = entry(MAIN, "e1", "source text long enough to summarize");
+			expect(migrated.reconcile(snapshot(MAIN, [source]))).toMatchObject({ queuedJobs: 1 });
 			const claimed = migrated.claimSummaryJobs({
 				workerId: "migration-worker",
 				leaseMs: 1_000,
@@ -300,10 +326,8 @@ describe("LCM context contracts", () => {
 				preferredScope: MAIN,
 				allowFallback: false,
 			});
-			expect(claimed.map(job => job.jobId).sort()).toEqual(["job-failed", "job-pending"]);
-			expect(claimed.every(job => job.inputs[0]?.redactedText === "source text long enough to summarize")).toBe(
-				true,
-			);
+			expect(claimed).toHaveLength(1);
+			expect(claimed[0]!.inputs.map(input => input.kind)).toEqual(["source"]);
 		} finally {
 			migrated.close();
 		}
@@ -325,6 +349,8 @@ describe("LCM context contracts", () => {
 			db.run("DROP TRIGGER summaries_stable_handle_required");
 			db.run("DROP TRIGGER summaries_stable_handle_update_required");
 			db.run("DROP INDEX summaries_stable_handle");
+			db.run("DROP TABLE branch_summary_spans");
+			db.run("DROP TABLE summary_attempts");
 			db.run("DROP TABLE source_files");
 			db.run("DROP TABLE file_records");
 			db.run("ALTER TABLE summaries DROP COLUMN stable_handle");
@@ -434,7 +460,9 @@ describe("LCM context contracts", () => {
 
 		const observer = new Database(migrationPath);
 		try {
-			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
+			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(
+				LCM_SCHEMA_VERSION,
+			);
 			expect(
 				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
 			).toBe(0);
@@ -466,8 +494,8 @@ describe("LCM context contracts", () => {
 		let second: LcmContext | undefined;
 		try {
 			second = await openLcmContext({ dbPath: sharedPath, busyTimeoutMs: 0 });
-			expect(first.status().schemaVersion).toBe(6);
-			expect(second.status().schemaVersion).toBe(6);
+			expect(first.status().schemaVersion).toBe(LCM_SCHEMA_VERSION);
+			expect(second.status().schemaVersion).toBe(LCM_SCHEMA_VERSION);
 		} finally {
 			second?.close();
 			first.close();
@@ -509,7 +537,11 @@ describe("LCM context contracts", () => {
 
 		const reopened = await openLcmContext({ dbPath: lockedPath, recoverCorrupt: true });
 		try {
-			expect(reopened.status()).toMatchObject({ schemaVersion: 6, quarantined: false, latestRecovery: null });
+			expect(reopened.status()).toMatchObject({
+				schemaVersion: LCM_SCHEMA_VERSION,
+				quarantined: false,
+				latestRecovery: null,
+			});
 		} finally {
 			reopened.close();
 		}
@@ -1119,7 +1151,11 @@ describe("LCM context contracts", () => {
 		const owner = await openLcmContext({ dbPath: ownedPath, recoverCorrupt: true, busyTimeoutMs: 0, now: () => now });
 		let recovered: LcmContext | undefined;
 		try {
-			expect(owner.status()).toMatchObject({ schemaVersion: 6, quarantined: false, latestRecovery: null });
+			expect(owner.status()).toMatchObject({
+				schemaVersion: LCM_SCHEMA_VERSION,
+				quarantined: false,
+				latestRecovery: null,
+			});
 			await corruptDatabasePage(ownedPath, pageSize, rootPage);
 
 			let blockedContext: LcmContext | undefined;
@@ -1244,7 +1280,7 @@ describe("LCM context contracts", () => {
 		await fs.writeFile(corruptPath, Buffer.alloc(512, 0x78));
 		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
 		try {
-			expect(recovered.status()).toMatchObject({ schemaVersion: 6, quarantined: false });
+			expect(recovered.status()).toMatchObject({ schemaVersion: LCM_SCHEMA_VERSION, quarantined: false });
 			const [recoveredFrom] = await quarantineDatabasePaths(corruptPath);
 			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
@@ -2019,7 +2055,7 @@ describe("LCM context contracts", () => {
 		const recovered = await openLcmContext({ dbPath, recoverCorrupt: true, now: () => now });
 		try {
 			const [recoveredFrom] = await quarantineDatabasePaths(dbPath);
-			expect(recovered.status()).toMatchObject({ schemaVersion: 6, quarantined: false });
+			expect(recovered.status()).toMatchObject({ schemaVersion: LCM_SCHEMA_VERSION, quarantined: false });
 			expect(recoveredFrom).toStartWith(`${dbPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 			expect(recovered.search({ ...MAIN, query: "obsolete" })).toEqual([]);
@@ -2118,5 +2154,740 @@ describe("LCM context contracts", () => {
 		now += 101;
 		expect(context.purge().tombstones).toBe(1);
 		expect(context.status().tombstones).toBe(0);
+	});
+	test("v7 to v8 migration derives an empty span index on first reconcile", async () => {
+		const migrationPath = path.join(tempDir, "v7-spans.db");
+		const db = new Database(migrationPath);
+		try {
+			initializeLcmSchema(db, 1_000);
+			db.run("DROP TABLE branch_summary_spans");
+			db.run("PRAGMA user_version = 7");
+		} finally {
+			db.close();
+		}
+
+		const migrated = await openLcmContext({ dbPath: migrationPath, now: () => now });
+		try {
+			const observer = new Database(migrationPath, { readonly: true, strict: true });
+			try {
+				expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(
+					LCM_SCHEMA_VERSION,
+				);
+				expect(
+					observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM branch_summary_spans").get()?.count,
+				).toBe(0);
+			} finally {
+				observer.close();
+			}
+
+			const source = entry(MAIN, "v7-e1", "ordinary reconciliation derives the migrated placement index");
+			expect(migrated.reconcile(snapshot(MAIN, [source]))).toMatchObject({ queuedJobs: 1 });
+			const derived = new Database(migrationPath, { readonly: true, strict: true });
+			try {
+				expect(
+					derived.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM branch_summary_spans").get()?.count,
+				).toBe(1);
+			} finally {
+				derived.close();
+			}
+			expect(
+				migrated.claimSummaryJobs({
+					workerId: "v7-migration-worker",
+					leaseMs: 1_000,
+					limit: 1,
+					maxOutputTokens: 100,
+				}),
+			).toHaveLength(1);
+		} finally {
+			migrated.close();
+		}
+	});
+
+	test("condensation uses exact fan-in groups without a partial parent or synthetic root", () => {
+		const sources = Array.from({ length: 5 }, (_, index) =>
+			entry(MAIN, `odd-${index + 1}`, `odd leaf source ${index + 1}`, index === 0 ? null : `odd-${index}`),
+		);
+		context.reconcile(snapshot(MAIN, sources));
+		completeEveryJob(context);
+
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			const spans = observer
+				.query<
+					{
+						level: number;
+						start_position: number;
+						end_position: number;
+						summary_id: string | null;
+						frontier: number;
+					},
+					[]
+				>(
+					`SELECT level, start_position, end_position, summary_id, frontier
+					 FROM branch_summary_spans ORDER BY level, start_position`,
+				)
+				.all();
+			expect(
+				spans.find(span => span.level === 0 && span.start_position === 4 && span.end_position === 5),
+			).toMatchObject({
+				summary_id: expect.any(String),
+				frontier: 1,
+			});
+			expect(spans.filter(span => span.level > 0 && span.start_position === 4)).toEqual([]);
+			expect(spans.some(span => span.level > 1 || (span.start_position === 0 && span.end_position === 5))).toBe(
+				false,
+			);
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("projection selects completed descendants when their parent crosses the effective tail", () => {
+		const sources = Array.from({ length: 8 }, (_, index) =>
+			entry(MAIN, `tail-${index + 1}`, `tail source ${index + 1}`, index === 0 ? null : `tail-${index}`),
+		);
+		context.reconcile(snapshot(MAIN, sources));
+		completeEveryJob(context);
+
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ count: number }, []>(
+						"SELECT COUNT(*) AS count FROM branch_summary_spans WHERE level = 2 AND start_position = 0 AND end_position = 8 AND summary_id IS NOT NULL",
+					)
+					.get()?.count,
+			).toBe(1);
+		} finally {
+			observer.close();
+		}
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 2, maxTokens: 100 },
+		});
+		expect(projection).toMatchObject({
+			ready: true,
+			selectedLevelCounts: { 0: 1, 1: 1 },
+			uncoveredSourceIds: [],
+			freshTailSourceIds: ["tail-7", "tail-8"],
+		});
+		expect(projection.historical.map(item => item.level)).toEqual([1, 0]);
+		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual(
+			sources.slice(0, 6).map(source => source.entryId),
+		);
+	});
+
+	test("completed children make projection ready while their condensation parent is pending", () => {
+		const sources = Array.from({ length: 4 }, (_, index) =>
+			entry(MAIN, `pending-${index + 1}`, `pending source ${index + 1}`, index === 0 ? null : `pending-${index}`),
+		);
+		context.reconcile(snapshot(MAIN, sources));
+		for (let index = 0; index < 2; index++) {
+			const [leaf] = context.claimSummaryJobs({
+				workerId: `leaf-worker-${index}`,
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+			});
+			expect(leaf?.level).toBe(0);
+			expect(
+				context.completeSummaryJob(leaf!.jobId, leaf!.leaseToken, { redactedText: `leaf ${index}`, tokenCount: 1 }),
+			).toMatchObject({ accepted: true });
+		}
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 0, maxTokens: 0 },
+		});
+		expect(projection).toMatchObject({ ready: true, pendingJobs: 0, uncoveredSourceIds: [] });
+		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual(sources.map(source => source.entryId));
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ summary_id: string | null; frontier: number }, []>(
+						"SELECT summary_id, frontier FROM branch_summary_spans WHERE level = 1 AND start_position = 0 AND end_position = 4",
+					)
+					.get(),
+			).toEqual({ summary_id: null, frontier: 0 });
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("safePrefix copies only unchanged complete spans and respects final atomic-group extension", () => {
+		const original = [
+			entry(MAIN, "safe-1", "safe source one"),
+			entry(MAIN, "safe-2", "safe source two", "safe-1"),
+			entry(MAIN, "safe-3", "stale source three", "safe-2"),
+			entry(MAIN, "safe-4", "stale source four", "safe-3"),
+		];
+		context.reconcile(snapshot(MAIN, original));
+		const [prefixJob] = context.claimSummaryJobs({
+			workerId: "prefix-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		expect(
+			context.completeSummaryJob(prefixJob!.jobId, prefixJob!.leaseToken, { redactedText: "prefix", tokenCount: 1 }),
+		).toMatchObject({
+			accepted: true,
+		});
+		const [staleJob] = context.claimSummaryJobs({
+			workerId: "stale-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const before = new Database(dbPath, { readonly: true, strict: true });
+		let prefixSummaryId: string;
+		let staleInputHash: string;
+		try {
+			prefixSummaryId = before
+				.query<{ summary_id: string }, []>(
+					"SELECT summary_id FROM branch_summary_spans WHERE revision = 1 AND level = 0 AND start_position = 0 AND end_position = 2",
+				)
+				.get()!.summary_id;
+			staleInputHash = before
+				.query<{ input_hash: string }, [string]>("SELECT input_hash FROM summary_jobs WHERE job_id = ?")
+				.get(staleJob!.jobId)!.input_hash;
+		} finally {
+			before.close();
+		}
+
+		const diverged = [
+			original[0]!,
+			original[1]!,
+			entry(MAIN, "safe-3", "replacement source three", "safe-2"),
+			entry(MAIN, "safe-4", "replacement source four", "safe-3"),
+		];
+		expect(context.reconcile(snapshot(MAIN, diverged)).revision).toBe(2);
+		expect(
+			context.completeSummaryJob(staleJob!.jobId, staleJob!.leaseToken, { redactedText: "late", tokenCount: 1 }),
+		).toEqual({
+			accepted: false,
+			reason: "stale",
+		});
+		const divergedRows = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				divergedRows
+					.query<{ summary_id: string | null }, []>(
+						"SELECT summary_id FROM branch_summary_spans WHERE revision = 2 AND level = 0 AND start_position = 0 AND end_position = 2",
+					)
+					.get()?.summary_id,
+			).toBe(prefixSummaryId);
+			expect(
+				divergedRows
+					.query<{ count: number }, [string]>(
+						"SELECT COUNT(*) AS count FROM branch_summary_spans WHERE revision = 2 AND input_hash = ?",
+					)
+					.get(staleInputHash)?.count,
+			).toBe(0);
+			expect(
+				divergedRows
+					.query<{ input_hash: string }, []>(
+						"SELECT input_hash FROM branch_summary_spans WHERE revision = 2 AND level = 0 AND start_position = 2 AND end_position = 4",
+					)
+					.get()?.input_hash,
+			).not.toBe(staleInputHash);
+		} finally {
+			divergedRows.close();
+		}
+
+		const append = { ...MAIN, branchId: "atomic-append" };
+		const appendedPrefix = [
+			entry(append, "append-1", "ungrouped prefix"),
+			entry(append, "append-2", "atomic tail start", "append-1", "final-group"),
+		];
+		context.reconcile(snapshot(append, appendedPrefix));
+		const appendBefore = new Database(dbPath, { readonly: true, strict: true });
+		let splitLeafHash: string;
+		try {
+			splitLeafHash = appendBefore
+				.query<{ input_hash: string }, []>(
+					`SELECT s.input_hash FROM branch_summary_spans s JOIN branches b ON b.id = s.branch_row_id
+					 WHERE b.branch_id = 'atomic-append' AND s.revision = 1 AND s.start_position = 0 AND s.end_position = 2`,
+				)
+				.get()!.input_hash;
+		} finally {
+			appendBefore.close();
+		}
+		context.reconcile(
+			snapshot(append, [
+				...appendedPrefix,
+				entry(append, "append-3", "atomic tail continuation", "append-2", "final-group"),
+			]),
+		);
+		const appendAfter = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			const spans = appendAfter
+				.query<{ start_position: number; end_position: number; input_hash: string }, []>(
+					`SELECT s.start_position, s.end_position, s.input_hash FROM branch_summary_spans s
+					 JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+					 WHERE b.branch_id = 'atomic-append' AND s.level = 0 ORDER BY s.start_position`,
+				)
+				.all();
+			expect(spans.map(span => [span.start_position, span.end_position])).toEqual([
+				[0, 1],
+				[1, 3],
+			]);
+			expect(spans.some(span => span.input_hash === splitLeafHash)).toBe(false);
+		} finally {
+			appendAfter.close();
+		}
+	});
+
+	test("completion advances only revisions that reference its input hash", () => {
+		const branchA = { ...MAIN, branchId: "affected-a" };
+		const branchB = { ...MAIN, branchId: "unaffected-b" };
+		const sourcesA = Array.from({ length: 4 }, (_, index) =>
+			entry(branchA, `a-${index + 1}`, `branch A source ${index + 1}`, index === 0 ? null : `a-${index}`),
+		);
+		const sourcesB = Array.from({ length: 4 }, (_, index) =>
+			entry(branchB, `b-${index + 1}`, `branch B source ${index + 1}`, index === 0 ? null : `b-${index}`),
+		);
+		context.reconcile(snapshot(branchA, sourcesA));
+		context.reconcile(snapshot(branchB, sourcesB));
+		const readBranchB = () => {
+			const observer = new Database(dbPath, { readonly: true, strict: true });
+			try {
+				return observer
+					.query<
+						{
+							level: number;
+							start_position: number;
+							end_position: number;
+							input_hash: string;
+							summary_id: string | null;
+							frontier: number;
+						},
+						[]
+					>(
+						`SELECT s.level, s.start_position, s.end_position, s.input_hash, s.summary_id, s.frontier
+						 FROM branch_summary_spans s JOIN branches b ON b.id = s.branch_row_id AND b.revision = s.revision
+						 WHERE b.branch_id = 'unaffected-b' ORDER BY s.level, s.start_position, s.end_position`,
+					)
+					.all();
+			} finally {
+				observer.close();
+			}
+		};
+		const before = readBranchB();
+		for (let index = 0; index < 2; index++) {
+			const [job] = context.claimSummaryJobs({
+				workerId: `affected-worker-${index}`,
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: branchA,
+				allowFallback: false,
+			});
+			expect(job?.level).toBe(0);
+			expect(
+				context.completeSummaryJob(job!.jobId, job!.leaseToken, { redactedText: `a${index}`, tokenCount: 1 }),
+			).toMatchObject({
+				accepted: true,
+			});
+		}
+		expect(readBranchB()).toEqual(before);
+	});
+
+	test("reconcile repairs orphaned spans and corrupt hashes fail open", () => {
+		const sources = [
+			entry(MAIN, "repair-1", "repair source one"),
+			entry(MAIN, "repair-2", "repair source two", "repair-1"),
+		];
+		const expectedInputHash = contentAddress([
+			"lcm-summary-input-v1",
+			MAIN.projectId,
+			"0",
+			...sources.flatMap(source => ["source", legacyFilelessSourceKey(source)]),
+		]);
+		context.reconcile(snapshot(MAIN, sources));
+		const writer = new Database(dbPath, { strict: true });
+		let inputHash: string;
+		let jobId: string;
+		try {
+			writer.run("PRAGMA foreign_keys = ON");
+			const span = writer
+				.query<{ input_hash: string }, []>("SELECT input_hash FROM branch_summary_spans WHERE summary_id IS NULL")
+				.get()!;
+			inputHash = span.input_hash;
+			jobId = writer
+				.query<{ job_id: string }, [string]>("SELECT job_id FROM summary_jobs WHERE input_hash = ?")
+				.get(inputHash)!.job_id;
+			writer.run("DELETE FROM summary_jobs WHERE job_id = ?", [jobId]);
+		} finally {
+			writer.close();
+		}
+
+		expect(context.reconcile(snapshot(MAIN, sources))).toMatchObject({ changed: false, queuedJobs: 1 });
+		const repaired = new Database(dbPath, { strict: true });
+		try {
+			expect(
+				repaired
+					.query<{ input_hash: string; status: string }, [string]>(
+						"SELECT input_hash, status FROM summary_jobs WHERE job_id = ?",
+					)
+					.get(jobId),
+			).toEqual({ input_hash: expectedInputHash, status: "pending" });
+			expect(inputHash).toBe(expectedInputHash);
+			repaired.run("UPDATE branch_summary_spans SET input_hash = 'corrupt-input-hash' WHERE input_hash = ?", [
+				inputHash,
+			]);
+		} finally {
+			repaired.close();
+		}
+		context.reconcile(snapshot(MAIN, sources));
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 0, maxTokens: 0 },
+		});
+		expect(projection.ready).toBe(false);
+		expect(projection.uncoveredSourceIds).toEqual(["repair-1", "repair-2"]);
+		const corrupted = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				corrupted
+					.query<{ input_hash: string; summary_id: string | null }, []>(
+						"SELECT input_hash, summary_id FROM branch_summary_spans WHERE start_position = 0 AND end_position = 2",
+					)
+					.get(),
+			).toEqual({ input_hash: "corrupt-input-hash", summary_id: null });
+		} finally {
+			corrupted.close();
+		}
+	});
+
+	test("doctor reports every branch-summary-spans invariant independently", () => {
+		const sources = Array.from({ length: 4 }, (_, index) =>
+			entry(MAIN, `doctor-${index + 1}`, `doctor source ${index + 1}`, index === 0 ? null : `doctor-${index}`),
+		);
+		context.reconcile(snapshot(MAIN, sources));
+		completeEveryJob(context);
+		const check = () => context.doctor().checks.find(item => item.name === "branch-summary-spans");
+		expect(check()).toEqual({ name: "branch-summary-spans", ok: true });
+
+		const writer = new Database(dbPath, { strict: true });
+		try {
+			const branch = writer.query<{ id: number; revision: number }, []>("SELECT id, revision FROM branches").get()!;
+			const root = writer
+				.query<{ level: number; summary_id: string }, []>(
+					"SELECT level, summary_id FROM branch_summary_spans WHERE start_position = 0 AND end_position = 4 AND frontier = 1",
+				)
+				.get()!;
+
+			writer.run(
+				`INSERT INTO branch_summary_spans
+				 (branch_row_id, revision, level, start_position, end_position, input_hash, summary_id, frontier)
+				 VALUES (?, ?, 99, 1, 2, 'doctor-overlap', NULL, 1)`,
+				[branch.id, branch.revision],
+			);
+			expect(check()).toMatchObject({ name: "branch-summary-spans", ok: false });
+			writer.run("DELETE FROM branch_summary_spans WHERE branch_row_id = ? AND revision = ? AND level = 99", [
+				branch.id,
+				branch.revision,
+			]);
+			expect(check()).toEqual({ name: "branch-summary-spans", ok: true });
+
+			writer.run("UPDATE branch_summary_spans SET frontier = 0 WHERE branch_row_id = ? AND revision = ?", [
+				branch.id,
+				branch.revision,
+			]);
+			writer.run(
+				`UPDATE branch_summary_spans SET frontier = 1
+				 WHERE branch_row_id = ? AND revision = ? AND level = 0 AND start_position = 2 AND end_position = 4`,
+				[branch.id, branch.revision],
+			);
+			expect(check()).toMatchObject({ name: "branch-summary-spans", ok: false });
+			writer.run("UPDATE branch_summary_spans SET frontier = 0 WHERE branch_row_id = ? AND revision = ?", [
+				branch.id,
+				branch.revision,
+			]);
+			writer.run(
+				`UPDATE branch_summary_spans SET frontier = 1
+				 WHERE branch_row_id = ? AND revision = ? AND level = ? AND start_position = 0 AND end_position = 4`,
+				[branch.id, branch.revision, root.level],
+			);
+			expect(check()).toEqual({ name: "branch-summary-spans", ok: true });
+
+			writer.run(
+				"DELETE FROM summary_lineage WHERE summary_id = ? AND ordinal = (SELECT MAX(ordinal) FROM summary_lineage WHERE summary_id = ?)",
+				[root.summary_id, root.summary_id],
+			);
+			expect(check()).toMatchObject({ name: "branch-summary-spans", ok: false });
+		} finally {
+			writer.close();
+		}
+	});
+
+	test("purge retains current span graphs, unresolved jobs, and provider attempts", () => {
+		const sources = [
+			entry(MAIN, "purge-1", "purge source one is long enough to compress"),
+			entry(MAIN, "purge-2", "purge source two is long enough to compress", "purge-1"),
+			entry(MAIN, "purge-3", "purge source three remains unresolved", "purge-2"),
+		];
+		context.reconcile(snapshot(MAIN, sources));
+		const [job] = context.claimSummaryJobs({
+			workerId: "purge-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const attempt = {
+			attemptId: "purge-attempt",
+			startedAt: now,
+			completedAt: now + 1,
+			provider: "test-provider",
+			model: "test-model",
+			usage: {
+				input: 11,
+				output: 2,
+				cacheRead: 3,
+				cacheWrite: 4,
+				totalTokens: 20,
+				cost: { input: 0.11, output: 0.02, cacheRead: 0.03, cacheWrite: 0.04, total: 0.2 },
+			},
+		};
+		const provenance = { promptHash: "purge-prompt", strategy: job!.strategy };
+		expect(context.beginSummaryAttempt(job!.jobId, job!.leaseToken, attempt, provenance)).toBe(true);
+		const completion = context.completeSummaryJob(job!.jobId, job!.leaseToken, {
+			redactedText: "purged",
+			tokenCount: 1,
+			attempt,
+		});
+		expect(completion).toMatchObject({ accepted: true });
+		const summaryId = completion.accepted ? completion.summaryId : "";
+		const before = new Database(dbPath, { readonly: true, strict: true });
+		let unresolvedJobId: string;
+		try {
+			unresolvedJobId = before
+				.query<{ job_id: string }, [string]>(
+					"SELECT job_id FROM summary_jobs WHERE job_id <> ? AND status = 'pending'",
+				)
+				.get(job!.jobId)!.job_id;
+		} finally {
+			before.close();
+		}
+
+		now += 101;
+		context.purge();
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM summaries WHERE summary_id = ?")
+					.get(summaryId)?.count,
+			).toBe(1);
+			expect(
+				observer
+					.query<{ count: number }, [string]>(
+						"SELECT COUNT(*) AS count FROM summary_jobs WHERE job_id = ? AND status = 'pending'",
+					)
+					.get(unresolvedJobId)?.count,
+			).toBe(1);
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM summary_jobs WHERE job_id = ?")
+					.get(job!.jobId)?.count,
+			).toBe(0);
+			expect(
+				observer
+					.query<{ outcome: string; total_tokens: number }, [string]>(
+						"SELECT outcome, total_tokens FROM summary_attempts WHERE attempt_id = ?",
+					)
+					.get(attempt.attemptId),
+			).toEqual({ outcome: "completed", total_tokens: 20 });
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("attempt-bearing failure settles stale placement without retry mutation", () => {
+		context.reconcile(
+			snapshot(MAIN, [entry(MAIN, "stale-attempt-1", "stale attempt source long enough to summarize")]),
+		);
+		const [job] = context.claimSummaryJobs({
+			workerId: "stale-attempt-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const start = { attemptId: "stale-attempt", startedAt: now, provider: "provider", model: "model" };
+		const provenance = { promptHash: "stale-prompt", strategy: job!.strategy };
+		expect(context.beginSummaryAttempt(job!.jobId, job!.leaseToken, start, provenance)).toBe(true);
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		const before = observer
+			.query<{ status: string; available_at: number; transport_retry_count: number }, [string]>(
+				"SELECT status, available_at, transport_retry_count FROM summary_jobs WHERE job_id = ?",
+			)
+			.get(job!.jobId)!;
+		observer.close();
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "stale-attempt-2", "replacement attempt source")]));
+		const attempt = {
+			...start,
+			completedAt: now + 1,
+			usage: {
+				input: 17,
+				output: 5,
+				cacheRead: 2,
+				cacheWrite: 1,
+				totalTokens: 25,
+				cost: { input: 1.7, output: 0.5, cacheRead: 0.2, cacheWrite: 0.1, total: 2.5 },
+			},
+		};
+		expect(
+			context.failSummaryJob(job!.jobId, job!.leaseToken, "provider failure", 500, provenance, {
+				attempt,
+				outcome: "provider_error",
+			}),
+		).toBe(false);
+		expect(context.settleSummaryAttempt(job!.jobId, job!.leaseToken, attempt, "aborted")).toBeNull();
+
+		const settled = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				settled
+					.query<{ status: string; available_at: number; transport_retry_count: number }, [string]>(
+						"SELECT status, available_at, transport_retry_count FROM summary_jobs WHERE job_id = ?",
+					)
+					.get(job!.jobId),
+			).toEqual(before);
+			expect(
+				settled
+					.query<
+						{
+							outcome: string;
+							input_tokens: number;
+							output_tokens: number;
+							cache_read_tokens: number;
+							cache_write_tokens: number;
+							total_tokens: number;
+							premium_requests: number | null;
+							orchestration_input_tokens: number | null;
+							cost_total: number;
+						},
+						[string]
+					>(
+						`SELECT outcome, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+						 premium_requests, orchestration_input_tokens, cost_total
+						 FROM summary_attempts WHERE attempt_id = ?`,
+					)
+					.get(start.attemptId),
+			).toEqual({
+				outcome: "stale",
+				input_tokens: 17,
+				output_tokens: 5,
+				cache_read_tokens: 2,
+				cache_write_tokens: 1,
+				total_tokens: 25,
+				premium_requests: null,
+				orchestration_input_tokens: null,
+				cost_total: 2.5,
+			});
+		} finally {
+			settled.close();
+		}
+	});
+
+	test("attempt-bearing failure settles a replaced lease without mutating its successor", () => {
+		context.reconcile(
+			snapshot(MAIN, [entry(MAIN, "lease-attempt", "lease attempt source long enough to summarize")]),
+		);
+		const [original] = context.claimSummaryJobs({
+			workerId: "original-worker",
+			leaseMs: 100,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const start = { attemptId: "lease-lost-attempt", startedAt: now, provider: "provider", model: "model" };
+		const provenance = { promptHash: "lease-prompt", strategy: original!.strategy };
+		expect(context.beginSummaryAttempt(original!.jobId, original!.leaseToken, start, provenance)).toBe(true);
+		now += 101;
+		const [successor] = context.claimSummaryJobs({
+			workerId: "successor-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const beforeDb = new Database(dbPath, { readonly: true, strict: true });
+		const before = beforeDb
+			.query<{ status: string; available_at: number; transport_retry_count: number; lease_token: string }, [string]>(
+				"SELECT status, available_at, transport_retry_count, lease_token FROM summary_jobs WHERE job_id = ?",
+			)
+			.get(original!.jobId)!;
+		beforeDb.close();
+		const attempt = {
+			...start,
+			completedAt: now,
+			usage: {
+				input: 19,
+				output: 7,
+				cacheRead: 3,
+				cacheWrite: 2,
+				totalTokens: 31,
+				orchestration: { input: 4, cacheRead: 5, output: 6 },
+				premiumRequests: 0.5,
+				reasoningTokens: 8,
+				cttl: { ephemeral5m: 9, ephemeral1h: 10 },
+				server: { webSearch: 11, webFetch: 12 },
+				cost: { input: 1.9, output: 0.7, cacheRead: 0.3, cacheWrite: 0.2, total: 3.1 },
+			},
+		};
+		expect(
+			context.failSummaryJob(original!.jobId, original!.leaseToken, "late transport failure", 500, provenance, {
+				attempt,
+				outcome: "transport_error",
+			}),
+		).toBe(false);
+
+		const settled = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				settled
+					.query<
+						{ status: string; available_at: number; transport_retry_count: number; lease_token: string },
+						[string]
+					>("SELECT status, available_at, transport_retry_count, lease_token FROM summary_jobs WHERE job_id = ?")
+					.get(original!.jobId),
+			).toEqual(before);
+			expect(before.lease_token).toBe(successor!.leaseToken);
+			expect(
+				settled
+					.query<
+						{
+							outcome: string;
+							total_tokens: number;
+							orchestration_input_tokens: number;
+							reasoning_tokens: number;
+							premium_requests: number;
+							server_web_fetch_requests: number;
+							cost_total: number;
+						},
+						[string]
+					>(
+						`SELECT outcome, total_tokens, orchestration_input_tokens, reasoning_tokens,
+						 premium_requests, server_web_fetch_requests, cost_total
+						 FROM summary_attempts WHERE attempt_id = ?`,
+					)
+					.get(start.attemptId),
+			).toEqual({
+				outcome: "lease_lost",
+				total_tokens: 31,
+				orchestration_input_tokens: 4,
+				reasoning_tokens: 8,
+				premium_requests: 0.5,
+				server_web_fetch_requests: 12,
+				cost_total: 3.1,
+			});
+		} finally {
+			settled.close();
+		}
 	});
 });
