@@ -180,6 +180,8 @@ export interface LcmCompletionRequest {
 export interface LcmProjectionLimits {
 	/** Total native request estimate, including stable non-message inputs. */
 	sourceTokens: number;
+	/** Point at which summary work starts, well below {@link softThresholdTokens}. */
+	prewarmThresholdTokens: number;
 	softThresholdTokens: number;
 	hardThresholdTokens: number;
 	tokenBudget: number;
@@ -1929,7 +1931,11 @@ export class SessionLcm {
 		this.#invalidateProjectionForRequest();
 		const limits = this.#host.projectionLimits(messages);
 		if (!limits) return native;
-		if (limits.sourceTokens < limits.softThresholdTokens) return native;
+		// The live request shrinks on every native compaction while the branch LCM must
+		// cover only grows, so arming reads whichever is larger. Ownership below still
+		// reads the live request, which is what actually overflows.
+		const armTokens = Math.max(limits.sourceTokens, this.#currentBranch?.sourceTokens ?? 0);
+		if (armTokens < limits.prewarmThresholdTokens) return native;
 		const atHard = limits.sourceTokens >= limits.hardThresholdTokens;
 		if (limits.tokenBudget < 1 || limits.freshTail.maxSources < 1 || limits.freshTail.maxTokens < 1) {
 			if (atHard) this.#failOpen("unfit", attempt);

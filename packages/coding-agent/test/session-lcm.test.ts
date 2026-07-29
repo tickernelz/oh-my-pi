@@ -398,6 +398,7 @@ function createHarness(
 	registerProject?: SessionLcmOptions["registerProject"],
 	projectionLimits = () => ({
 		sourceTokens: 100,
+		prewarmThresholdTokens: 40,
 		softThresholdTokens: 80,
 		hardThresholdTokens: 100,
 		tokenBudget: 100_000,
@@ -532,6 +533,7 @@ function summaryJob(
 function softProjectionLimits() {
 	return {
 		sourceTokens: 90,
+		prewarmThresholdTokens: 40,
 		softThresholdTokens: 80,
 		hardThresholdTokens: 100,
 		tokenBudget: 80,
@@ -568,11 +570,12 @@ describe("SessionLcm", () => {
 		expect(new LcmCompletionError("invalid", { retryAfterMs: Number.NaN }).retryAfterMs).toBeUndefined();
 	});
 
-	it("returns the exact native input below soft without opening the derived store", async () => {
-		const manager = SessionManager.inMemory("/below-soft");
+	it("returns the exact native input below prewarm without opening the derived store", async () => {
+		const manager = SessionManager.inMemory("/below-prewarm");
 		appendUser(manager, "small", 1);
 		const { lcm, context, complete, openContext } = createHarness(manager, undefined, undefined, undefined, () => ({
-			sourceTokens: 79,
+			sourceTokens: 39,
+			prewarmThresholdTokens: 40,
 			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 80,
@@ -613,6 +616,33 @@ describe("SessionLcm", () => {
 		});
 		completionGate.resolve();
 		await context.summaryCompleted.promise;
+		await lcm.close();
+	});
+
+	it("starts summary work between prewarm and soft", async () => {
+		const manager = SessionManager.inMemory("/prewarm-arming");
+		appendUser(manager, "growing history", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("prewarm"));
+		const { lcm, complete, openContext } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 60,
+			prewarmThresholdTokens: 40,
+			softThresholdTokens: 80,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		const input = manager.buildSessionContext().messages;
+		const result = await lcm.project(input);
+		expect(result.messages).toBe(input);
+		expect(result.owned).toBe(false);
+		expect(openContext).toHaveBeenCalled();
+		await context.summaryCompleted.promise;
+		expect(complete).toHaveBeenCalled();
+		expect(context.reconcileOptions[0]?.summarize).toEqual({
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		});
 		await lcm.close();
 	});
 
@@ -1352,7 +1382,8 @@ describe("SessionLcm", () => {
 		});
 		let atHard = true;
 		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
-			sourceTokens: atHard ? 100 : 79,
+			sourceTokens: atHard ? 100 : 39,
+			prewarmThresholdTokens: 40,
 			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 100_000,
@@ -1369,7 +1400,8 @@ describe("SessionLcm", () => {
 		const superseded = (await lcm.status()).runtime.currentBranch!;
 		expect(superseded.projectionState).toBe("unevaluated");
 		expect(superseded.projection).toBeUndefined();
-		expect((await lcm.status()).runtime.phase).toBe("idle");
+		expect(superseded.sourceTokens).toBeGreaterThan(39);
+		expect((await lcm.status()).runtime.phase).toBe("warming");
 		atHard = true;
 
 		appendUser(manager, "same branch revision", 3);
@@ -1416,6 +1448,7 @@ describe("SessionLcm", () => {
 		let requestCount = 0;
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
 			sourceTokens: requestCount++ === 0 ? 100 : 79,
+			prewarmThresholdTokens: 40,
 			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 100_000,
@@ -1588,6 +1621,7 @@ describe("SessionLcm", () => {
 		};
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
 			sourceTokens: 90,
+			prewarmThresholdTokens: 40,
 			softThresholdTokens: 80,
 			hardThresholdTokens: 100,
 			tokenBudget: 80,

@@ -4241,6 +4241,10 @@ export class AgentSession {
 		const tokenBudget = Math.floor(hardThresholdTokens - nonMessageTokens - 512);
 		return {
 			sourceTokens,
+			// Summary work starts here, not at the soft band: 20% of the window cannot
+			// cover a large branch before the hard deadline, and one oversized entry can
+			// consume that band in a single step.
+			prewarmThresholdTokens: Math.floor(hardThresholdTokens * 0.4),
 			softThresholdTokens: Math.floor(hardThresholdTokens * 0.8),
 			hardThresholdTokens,
 			tokenBudget,

@@ -10,6 +10,8 @@
 
 - Lossless historical context now sends one executable `lcm-handle:v1` summary token per projected item instead of expanding every covered citation into `source:<id>` text, so `lcm_describe`/`lcm_expand` can act on what the provider actually sees. Provider-visible historical bytes fell 85% on a 200-source branch and 22% on a 10,000-source branch, where per-item handles rather than source lists dominate.
 - `AgentSession` now records the concrete provider attempt for every LCM summary request. `SessionLcmHost.complete` returns `{ text, attempt }`, the dispatch is fenced by `onAttemptStart` so a superseded job never issues billable work, and `lcmComplete()` keeps its text-only contract and original cancellation identity for retrieval callers.
+- Lossless summary work now starts at 40% of the compaction threshold instead of 80%, tripling the wall-clock runway before the hard projection deadline. The previous 20% band is measured in tokens while the summary queue drains in seconds, so a single oversized entry could consume it in one step and a fresh session's first crossing failed open to native compaction. Sessions that pass 40% without ever compacting now pay for summaries they may not project.
+- Lossless arming now reads whichever is larger, the live request estimate or the branch source total LCM must cover. Native compaction shrinks the live request while the branch keeps growing, so a long session previously disarmed itself after every compaction and rebuilt the same race. Request ownership still reads the live request, which is what actually overflows.
 
 ### Fixed
 
