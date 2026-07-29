@@ -49,38 +49,57 @@ const SOURCE_DESCRIPTION: SourceDescription = {
 const DESCRIPTION: LcmDescription = { kind: "source", value: SOURCE_DESCRIPTION };
 
 const STORE: NonNullable<LcmPublicStatus["store"]> = {
-	schemaVersion: 5,
+	schemaVersion: 6,
 	journalMode: "wal",
 	quarantined: false,
-	quarantineReason: null,
-	recoveredFrom: null,
 	branches: 2,
 	activeSources: 9,
 	tombstones: 1,
 	leafSummaries: 2,
 	condensedSummaries: 1,
 	jobs: { pending: 2, leased: 1, failed: 1, completed: 4, obsolete: 1 },
+	storage: { databaseBytes: 10_240, walBytes: 2_048, quarantineBytes: 512 },
+	latestRecovery: null,
 };
 
 function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
 	const withoutStore = phase === "disabled" || phase === "uninitialized";
+	const projection = {
+		revision: 7,
+		sourceTokens: 12_000,
+		selectedLevelCounts: { 0: 2, 2: 1 },
+		coveredSourceCount: 6,
+		freshSourceCount: 3,
+		estimatedTokens: 4_000,
+		pendingJobs: 2,
+	};
 	return {
 		runtime: {
 			phase,
 			summaryWorkers:
 				phase === "disabled" ? { active: 0, limit: 0 } : { active: phase === "active" ? 2 : 0, limit: 4 },
 			...(withoutStore ? {} : { summaryModelSelector: "@smol", resolvedSummaryModel: "provider/model" }),
+			...(withoutStore
+				? {}
+				: {
+						currentBranch: {
+							projectId: "opaque-project",
+							sessionId: "opaque-session",
+							branchId: "opaque-branch",
+							revision: 7,
+							activeSources: 3,
+							sourceTokens: 12_000,
+							projectionState:
+								phase === "active"
+									? ("fitted" as const)
+									: phase === "degraded"
+										? ("unfitted" as const)
+										: ("unevaluated" as const),
+							...(phase === "active" || phase === "degraded" ? { projection } : {}),
+						},
+					}),
 			...(phase === "active"
 				? {
-						lastProjection: {
-							revision: 7,
-							sourceTokens: 12_000,
-							selectedLevelCounts: { 0: 2, 2: 1 },
-							coveredSourceCount: 6,
-							freshSourceCount: 3,
-							estimatedTokens: 4_000,
-							pendingJobs: 2,
-						},
 						summaryBackoff: { fallback: 1_900_000_000_000 },
 						lastFailureCategory: "provider" as const,
 						retryAt: 1_900_000_000_000,
@@ -94,15 +113,7 @@ function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
 					}
 				: {}),
 		},
-		...(withoutStore
-			? {}
-			: {
-					store: {
-						...STORE,
-						quarantined: phase === "quarantined",
-						quarantineReason: phase === "quarantined" ? "/private/tenant?token=top-secret" : null,
-					},
-				}),
+		...(withoutStore ? {} : { store: { ...STORE, quarantined: phase === "quarantined" } }),
 	};
 }
 
@@ -130,7 +141,15 @@ function createRuntime(agentDir: string, options: RuntimeOptions = {}) {
 			activeSources: 3,
 			queuedJobs: 1,
 		})),
-		lcmGc: vi.fn(async () => ({ tombstones: 1, jobs: 2, summaries: 3, sourceContents: 4, files: 5 })),
+		lcmGc: vi.fn(async () => ({
+			tombstones: 1,
+			jobs: 2,
+			summaries: 3,
+			sourceContents: 4,
+			files: 5,
+			quarantineFiles: 6,
+			quarantineBytes: 7_168,
+		})),
 		lcmSearch: vi.fn(async (_query: string) => options.hits ?? [HIT]),
 		lcmDescribe: vi.fn(async (_handle: LcmHandle) => DESCRIPTION),
 	};
@@ -250,6 +269,24 @@ describe("/lcm slash command", () => {
 		expect(quarantined.output[0]).not.toContain("top-secret");
 	});
 
+	it("renders unevaluated, unfitted, and fitted projection states distinctly", async () => {
+		const idle = createRuntime(agentDir, { status: statusFor("idle") });
+		const degraded = createRuntime(agentDir, { status: statusFor("degraded") });
+		const active = createRuntime(agentDir, { status: statusFor("active") });
+
+		await executeAcpBuiltinSlashCommand("/lcm status", idle.runtime);
+		await executeAcpBuiltinSlashCommand("/lcm status", degraded.runtime);
+		await executeAcpBuiltinSlashCommand("/lcm status", active.runtime);
+
+		expect(idle.output[0]).toContain(
+			"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",
+		);
+		expect(idle.output[0]).toContain("Projection: unevaluated for the current branch");
+		expect(idle.output[0]).not.toContain("no fitted projection yet");
+		expect(degraded.output[0]).toContain("Projection: unfitted for the current request");
+		expect(active.output[0]).toContain("Projection: fitted to the current request");
+	});
+
 	it("renders disabled workers and an unopened project exactly", async () => {
 		const harness = createRuntime(agentDir, { status: statusFor("disabled"), enabled: false });
 		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
@@ -262,7 +299,8 @@ describe("/lcm slash command", () => {
 				"SQLite WAL: not initialized",
 				"Project jobs: not initialized",
 				"Backoff: preferred until none; fallback until none",
-				"DAG: no fitted projection yet",
+				"Current branch: not initialized",
+				"Projection: unevaluated; no active branch",
 			].join("\n"),
 		]);
 	});
@@ -288,13 +326,15 @@ describe("/lcm slash command", () => {
 				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
 				"Summary model: @smol -> provider/model",
 				"Workers: 2/4 active",
-				"SQLite WAL: enabled; schema: 5",
+				"SQLite WAL: enabled; schema: 6",
 				"Store: 2 branches, 9 active sources, 1 retained tombstones, 3 summary nodes",
 				"Project jobs: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
+				"Storage: 10.0KB database, 2.0KB WAL, 512B quarantine",
 				"Backoff: preferred until none; fallback until 2030-03-17T17:46:40.000Z",
+				"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",
+				"Projection: fitted to the current request; 2 relevant jobs pending",
 				"DAG: depth 3, 3 selected nodes, 6 covered sources, 3 fresh sources",
 				"Estimated tokens: 12000 -> 4000",
-				"Current branch: revision 7; 2 relevant jobs pending",
 				"Last fallback: provider",
 			].join("\n"),
 		]);
@@ -305,7 +345,15 @@ describe("/lcm slash command", () => {
 		unsafe.runtime.summaryModelSelector = "token=top-secret";
 		unsafe.runtime.resolvedSummaryModel = "C:\\private\\secret";
 		unsafe.runtime.summaryBackoff = { preferred: "token=top-secret" as unknown as number };
-		unsafe.store!.recoveredFrom = "/private/recovered.sqlite?token=top-secret";
+		unsafe.runtime.currentBranch!.sessionId = "home/alice/private";
+		unsafe.runtime.currentBranch!.branchId = "branch\ncontrol=top-secret";
+		unsafe.runtime.currentBranch!.projectId = "project-must-not-render";
+		Object.assign(unsafe.store!, {
+			dbPath: "/private/context.sqlite?token=top-secret",
+			recoveredFrom: "/private/recovered.sqlite?token=top-secret",
+			quarantineReason: "/private/quarantine?token=top-secret",
+			latestRecovery: { occurredAt: 1_900_000_000_000, category: "corruption" },
+		});
 		const harness = createRuntime(agentDir, { status: unsafe });
 		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
 		await executeAcpBuiltinSlashCommand("/lcm doctor", harness.runtime);
@@ -318,6 +366,10 @@ describe("/lcm slash command", () => {
 		}
 		expect(harness.output[0]).toContain("Summary model: [redacted] -> [redacted]");
 		expect(harness.output[0]).toContain("Backoff: preferred until none; fallback until none");
+		expect(harness.output[0]).toContain("Current branch: session [redacted]; branch [redacted]");
+		expect(harness.output[0]).not.toContain("project-must-not-render");
+		expect(harness.output[0]).toContain("Storage: 10.0KB database, 2.0KB WAL, 512B quarantine");
+		expect(harness.output[0]).toContain("Derived store recovery: 2030-03-17T17:46:40.000Z; category corruption.");
 		expect(harness.output[1]).toContain("attention required");
 		expect(harness.output[2]).toContain("Native context remains available");
 	});
@@ -341,6 +393,7 @@ describe("/lcm slash command", () => {
 		expect(harness.output[1]).toContain("Session JSONL was not modified");
 		expect(harness.output[2]).toContain("retention-aware GC");
 		expect(harness.output[2]).toContain("5 unreferenced file records");
+		expect(harness.output[2]).toContain("6 expired quarantine artifacts (7.0KB)");
 		expect(harness.output[2]).toContain("Active lineage and authoritative session JSONL were not changed");
 	});
 

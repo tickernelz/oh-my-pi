@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `/lcm status` now distinguishes unevaluated, unfitted, and fitted current-branch projections; reports sanitized branch identity, active source/token counts, storage size, and bounded recovery history; and fences concurrent projection attempts so stale requests cannot overwrite current health.
 - Lossless context now follows effective engine changes on settings/CWD reload, keeps own-session retrieval tools and provider prompts synchronized across Native/Lossless transitions, disposes cleanly on rollback to Native, and sends extension-expanded projected overflows through state-changing promotion/native recovery instead of retrying the same projection.
 - LCM summary scheduling now preserves and propagates the first store failure through direct close, admits preferred work during fallback-only backoff, keeps abort/unfit health deterministic, clears stale fallback annotations on rebind, validates summary-model selectors, and sanitizes rendered file paths and metadata.
 - Hardened Lossless queue recovery, provider backoff, overflow handling, branch switches, and shutdown so interrupted background work remains retryable without blocking foreground turns.

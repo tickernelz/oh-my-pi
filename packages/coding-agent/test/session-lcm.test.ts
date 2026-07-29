@@ -268,12 +268,9 @@ class FakeLcmContext implements LcmContext {
 			job => !this.failureRecords.has(job.jobId),
 		).length;
 		return {
-			dbPath: "/secret/context.sqlite",
-			schemaVersion: 5,
+			schemaVersion: 6,
 			journalMode: "wal",
 			quarantined: false,
-			quarantineReason: null,
-			recoveredFrom: null,
 			branches: 1,
 			activeSources: this.snapshots.at(-1)?.entries.length ?? 0,
 			tombstones: 0,
@@ -286,6 +283,8 @@ class FakeLcmContext implements LcmContext {
 				completed: this.completedJobIds.size,
 				obsolete: 0,
 			},
+			storage: { databaseBytes: 1_024, walBytes: 256, quarantineBytes: 128 },
+			latestRecovery: null,
 		};
 	}
 
@@ -312,7 +311,7 @@ class FakeLcmContext implements LcmContext {
 		this.failureRecords.clear();
 		this.queuedJobs = 0;
 		this.relevantPendingJobs = 0;
-		return { tombstones: 0, jobs, summaries: 0, sourceContents: 0, files: 0 };
+		return { tombstones: 0, jobs, summaries: 0, sourceContents: 0, files: 0, quarantineFiles: 0, quarantineBytes: 0 };
 	}
 
 	close(): void {
@@ -1134,17 +1133,183 @@ describe("SessionLcm", () => {
 		const context = new FakeLcmContext();
 		context.reconcileErrors.push(new Error("LCM store is quarantined"));
 		const baseStatus = context.status.bind(context);
-		context.status = () => ({
-			...baseStatus(),
-			quarantined: true,
-			quarantineReason: "integrity check failed",
-		});
+		context.status = () =>
+			({
+				...baseStatus(),
+				quarantined: true,
+				latestRecovery: { occurredAt: 1_900_000_000_000, category: "corruption" },
+				dbPath: "/private/context.sqlite",
+				recoveredFrom: "/private/recovered.sqlite",
+				quarantineReason: "integrity check failed /private/token=top-secret",
+			}) as LcmStatus;
 		const { lcm } = createHarness(manager, context);
 
 		const status = await lcm.status();
 
 		expect(status.runtime.phase).toBe("quarantined");
-		expect(status.store).toMatchObject({ quarantined: true, quarantineReason: "integrity check failed" });
+		expect(status.store).toMatchObject({
+			quarantined: true,
+			storage: { databaseBytes: 1_024, walBytes: 256, quarantineBytes: 128 },
+			latestRecovery: { occurredAt: 1_900_000_000_000, category: "corruption" },
+		});
+		expect(status.store).not.toHaveProperty("dbPath");
+		expect(status.store).not.toHaveProperty("recoveredFrom");
+		expect(status.store).not.toHaveProperty("quarantineReason");
+		await lcm.close();
+	});
+
+	it("reports active normalized scope health before any projection evaluation", async () => {
+		const manager = SessionManager.inMemory("/active-scope-status");
+		appendUser(manager, "current branch only", 1);
+		const context = new FakeLcmContext();
+		const baseStatus = context.status.bind(context);
+		context.status = () => ({ ...baseStatus(), branches: 41, activeSources: 9_999 });
+		const { lcm } = createHarness(manager, context);
+
+		const status = await lcm.status();
+		const snapshot = context.snapshots.at(-1)!;
+		const sourceTokens = snapshot.entries.reduce(
+			(total, entry) => total + Math.ceil(Buffer.byteLength(entry.redactedText, "utf8") / 4),
+			0,
+		);
+
+		expect(status.store).toMatchObject({ branches: 41, activeSources: 9_999 });
+		expect(status.runtime.currentBranch).toEqual({
+			...snapshot.scope,
+			revision: 1,
+			activeSources: snapshot.entries.length,
+			sourceTokens,
+			projectionState: "unevaluated",
+		});
+		await lcm.close();
+	});
+
+	it("marks an evaluated candidate unfitted only after checking the current request", async () => {
+		const manager = SessionManager.inMemory("/unfitted-status");
+		appendUser(manager, "does not fit", 1);
+		const { lcm } = createHarness(manager);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		const status = await lcm.status();
+
+		expect(result.owned).toBe(false);
+		expect(status.runtime.currentBranch).toMatchObject({
+			projectionState: "unfitted",
+			projection: { revision: 1 },
+		});
+		await lcm.close();
+	});
+
+	it("clears fitted candidates on revision changes and branch rebinds", async () => {
+		const manager = SessionManager.inMemory("/projection-freshness");
+		appendUser(manager, "branch root", 1);
+		appendUser(manager, "original leaf", 2);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		let atHard = true;
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: atHard ? 100 : 79,
+			softThresholdTokens: 80,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 32, maxTokens: 20_000 },
+		}));
+
+		expect((await lcm.project(manager.buildSessionContext().messages)).owned).toBe(true);
+		const fitted = (await lcm.status()).runtime.currentBranch!;
+		expect(fitted.projectionState).toBe("fitted");
+		expect(fitted.projection).toBeDefined();
+
+		atHard = false;
+		expect((await lcm.project(manager.buildSessionContext().messages)).owned).toBe(false);
+		const superseded = (await lcm.status()).runtime.currentBranch!;
+		expect(superseded.projectionState).toBe("unevaluated");
+		expect(superseded.projection).toBeUndefined();
+		expect((await lcm.status()).runtime.phase).toBe("idle");
+		atHard = true;
+
+		appendUser(manager, "same branch revision", 3);
+		const revised = (await lcm.status()).runtime.currentBranch!;
+		expect(revised.branchId).toBe(fitted.branchId);
+		expect(revised.revision).toBeGreaterThan(fitted.revision);
+		expect(revised.projectionState).toBe("unevaluated");
+		expect(revised.projection).toBeUndefined();
+
+		manager.branch(manager.getBranch()[0]!.id);
+		const selected = (await lcm.status()).runtime.currentBranch!;
+		expect(selected.activeSources).toBe(1);
+		expect(selected.revision).toBeGreaterThan(revised.revision);
+		expect(selected.projectionState).toBe("unevaluated");
+		expect(selected.projection).toBeUndefined();
+		appendUser(manager, "forked branch", 4);
+		await lcm.rebind();
+		const rebound = (await lcm.status()).runtime.currentBranch!;
+		expect(rebound.sessionId).toBe(revised.sessionId);
+		expect(rebound.branchId).not.toBe(revised.branchId);
+		expect(rebound.projectionState).toBe("unevaluated");
+		expect(rebound.projection).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("keeps a newer below-threshold request authoritative while an older hard attempt settles", async () => {
+		const manager = SessionManager.inMemory("/projection-attempt-freshness");
+		appendUser(manager, "overlapping request", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("superseded-hard"));
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: context.queuedJobs,
+		});
+		let requestCount = 0;
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: requestCount++ === 0 ? 100 : 79,
+			softThresholdTokens: 80,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 32, maxTokens: 20_000 },
+		}));
+		const completionStarted = Promise.withResolvers<void>();
+		const completionGate = Promise.withResolvers<void>();
+		complete.mockImplementation(async () => {
+			completionStarted.resolve();
+			await completionGate.promise;
+			return "redacted summary";
+		});
+
+		const older = lcm.project(manager.buildSessionContext().messages);
+		await completionStarted.promise;
+		expect((await lcm.project(manager.buildSessionContext().messages)).owned).toBe(false);
+		completionGate.resolve();
+		expect((await older).owned).toBe(false);
+		await settleUntil(() => context.completedJobIds.has("superseded-hard"), "superseded hard completion");
+
+		const status = await lcm.status();
+		expect(status.runtime.currentBranch?.projectionState).toBe("unevaluated");
+		expect(status.runtime.currentBranch?.projection).toBeUndefined();
+		expect(status.runtime.phase).not.toBe("active");
+		expect(status.runtime.lastFailureCategory).toBeUndefined();
+		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
 		await lcm.close();
 	});
 
@@ -1206,7 +1371,8 @@ describe("SessionLcm", () => {
 		await lcm.rebind();
 		const rebound = await lcm.status();
 		expect(rebound.runtime.phase).toBe("idle");
-		expect(rebound.runtime.lastProjection).toBeUndefined();
+		expect(rebound.runtime.currentBranch).toMatchObject({ projectionState: "unevaluated" });
+		expect(rebound.runtime.currentBranch?.projection).toBeUndefined();
 		await lcm.close();
 	});
 
@@ -1315,7 +1481,7 @@ describe("SessionLcm", () => {
 		expect(openContext).toHaveBeenCalledTimes(1);
 		expect(context.snapshots.at(-1)?.entries).toHaveLength(1);
 		expect(collabEntries).toHaveLength(1);
-		expect(await lcm.status()).not.toHaveProperty("dbPath");
+		expect(await lcm.status()).not.toHaveProperty("store.dbPath");
 
 		await manager.newSession();
 		appendUser(manager, "new branch", 2);

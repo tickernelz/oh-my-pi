@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const LCM_SCHEMA_VERSION = 5;
+export const LCM_SCHEMA_VERSION = 6;
 
 export class UnsupportedLcmSchemaError extends Error {
 	readonly foundVersion: number;
@@ -371,7 +371,31 @@ function migration5(db: Database): void {
 	db.run("CREATE INDEX source_files_file ON source_files(file_id, source_key)");
 }
 
-const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [migration1, migration2, migration3, migration4, migration5];
+function migration6(db: Database): void {
+	db.run(`
+		DELETE FROM job_inputs
+		WHERE EXISTS (
+			SELECT 1 FROM summary_jobs job
+			WHERE job.job_id = job_inputs.job_id AND job.status IN ('completed', 'obsolete')
+		)
+	`);
+	db.run(`
+		DELETE FROM job_lineage
+		WHERE EXISTS (
+			SELECT 1 FROM summary_jobs job
+			WHERE job.job_id = job_lineage.job_id AND job.status IN ('completed', 'obsolete')
+		)
+	`);
+}
+
+const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
+	migration1,
+	migration2,
+	migration3,
+	migration4,
+	migration5,
+	migration6,
+];
 
 export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {
 	// The busy handler must be installed before WAL recovery or any migration lock.

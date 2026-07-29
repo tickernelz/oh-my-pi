@@ -116,6 +116,15 @@ async function createLatentlyCorruptDatabase(dbPath: string): Promise<void> {
 	await corruptDatabasePage(dbPath, pageSize, rootPage);
 }
 
+async function quarantineDatabasePaths(dbPath: string): Promise<string[]> {
+	const prefix = `${path.basename(dbPath)}.quarantine-`;
+	const quarantineSuffix = /^(0|[1-9]\d*)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+	return (await fs.readdir(path.dirname(dbPath)))
+		.filter(name => name.startsWith(prefix) && quarantineSuffix.test(name.slice(prefix.length)))
+		.map(name => path.join(path.dirname(dbPath), name))
+		.sort();
+}
+
 describe("LCM SQLite error classification", () => {
 	test("recognizes contention codes, canonical codeless messages, and wrapped causes", () => {
 		expect(isLcmSqliteContentionError(sqliteError("SQLITE_BUSY"))).toBe(true);
@@ -181,7 +190,7 @@ describe("LCM context contracts", () => {
 		const second = context.reconcile(snapshot(MAIN, sources));
 		expect(first).toMatchObject({ changed: true, revision: 1, activeSources: 2 });
 		expect(second).toMatchObject({ changed: false, revision: 1, activeSources: 2 });
-		expect(context.status()).toMatchObject({ schemaVersion: 5, journalMode: "wal" });
+		expect(context.status()).toMatchObject({ schemaVersion: 6, journalMode: "wal" });
 
 		const duplicate = [sources[0]!, { ...sources[1]!, entryId: "e1" }];
 		expect(() => context.reconcile(snapshot(MAIN, duplicate))).toThrow("duplicate source entry id");
@@ -203,18 +212,100 @@ describe("LCM context contracts", () => {
 			db.run(
 				"CREATE TABLE summary_lineage (summary_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_key TEXT NOT NULL)",
 			);
+			db.run("CREATE TABLE summary_jobs (job_id TEXT PRIMARY KEY, status TEXT NOT NULL)");
+			db.run("CREATE TABLE job_inputs (job_id TEXT NOT NULL)");
+			db.run("CREATE TABLE job_lineage (job_id TEXT NOT NULL)");
 			db.run("INSERT INTO summaries (summary_id, project_id, level) VALUES ('sum-v4', 'project', 0)");
 			db.run("INSERT INTO summary_lineage (summary_id, ordinal, source_key) VALUES ('sum-v4', 0, 'source-v4')");
 			db.run("PRAGMA user_version = 4");
 
 			initializeLcmSchema(db, 1_000);
-			expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+			expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
 			expect(
 				db.query<{ stable_handle: string }, []>("SELECT stable_handle FROM summaries").get()?.stable_handle,
 			).toStartWith("summary_");
 			expect(() => db.run("UPDATE summaries SET stable_handle = NULL")).toThrow("summary stable_handle is required");
 		} finally {
 			db.close();
+		}
+	});
+
+	test("v6 migration compacts terminal payloads while active work stays claimable", async () => {
+		const migrationPath = path.join(tempDir, "v5-terminal-payloads.db");
+		const db = new Database(migrationPath);
+		try {
+			initializeLcmSchema(db, 1_000);
+			db.run(
+				`INSERT INTO source_contents
+					(source_key, project_id, content_hash, timestamp_ms, kind, redacted_text, artifact_refs, token_count, created_at)
+				 VALUES ('source-v5', 'project', 'hash-v5', 1, 'message', 'source text long enough to summarize', '[]', 10, 1)`,
+			);
+			const branch = db.run(
+				"INSERT INTO branches (project_id, session_id, branch_id, reconciled_at) VALUES (?, ?, ?, 1)",
+				[MAIN.projectId, MAIN.sessionId, MAIN.branchId],
+			);
+			db.run(
+				`INSERT INTO branch_sources
+					(branch_row_id, entry_id, parent_entry_id, position, source_key, active, created_at)
+				 VALUES (?, 'e1', NULL, 0, 'source-v5', 1, 1)`,
+				[Number(branch.lastInsertRowid)],
+			);
+			for (const status of ["completed", "obsolete", "pending", "failed"] as const) {
+				const jobId = `job-${status}`;
+				db.run(
+					`INSERT INTO summary_jobs
+						(job_id, project_id, input_hash, level, origin_revision, status, available_at, created_at, updated_at)
+					 VALUES (?, 'project', ?, 0, 0, ?, 1, 1, 1)`,
+					[jobId, `hash-${status}`, status],
+				);
+				db.run(
+					"INSERT INTO job_inputs (job_id, ordinal, input_kind, ref_id) VALUES (?, 0, 'source', 'source-v5')",
+					[jobId],
+				);
+				db.run("INSERT INTO job_lineage (job_id, ordinal, source_key) VALUES (?, 0, 'source-v5')", [jobId]);
+			}
+			db.run("PRAGMA user_version = 5");
+		} finally {
+			db.close();
+		}
+
+		const migrated = await openLcmContext({ dbPath: migrationPath, now: () => now });
+		try {
+			const observer = new Database(migrationPath, { readonly: true, strict: true });
+			try {
+				expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
+				expect(
+					observer
+						.query<{ status: string; inputs: number; lineage: number }, []>(
+							`SELECT status,
+								(SELECT COUNT(*) FROM job_inputs input WHERE input.job_id = job.job_id) AS inputs,
+								(SELECT COUNT(*) FROM job_lineage lineage WHERE lineage.job_id = job.job_id) AS lineage
+							 FROM summary_jobs job ORDER BY status`,
+						)
+						.all(),
+				).toEqual([
+					{ status: "completed", inputs: 0, lineage: 0 },
+					{ status: "failed", inputs: 1, lineage: 1 },
+					{ status: "obsolete", inputs: 0, lineage: 0 },
+					{ status: "pending", inputs: 1, lineage: 1 },
+				]);
+			} finally {
+				observer.close();
+			}
+			const claimed = migrated.claimSummaryJobs({
+				workerId: "migration-worker",
+				leaseMs: 1_000,
+				limit: 2,
+				maxOutputTokens: 5,
+				preferredScope: MAIN,
+				allowFallback: false,
+			});
+			expect(claimed.map(job => job.jobId).sort()).toEqual(["job-failed", "job-pending"]);
+			expect(claimed.every(job => job.inputs[0]?.redactedText === "source text long enough to summarize")).toBe(
+				true,
+			);
+		} finally {
+			migrated.close();
 		}
 	});
 
@@ -343,7 +434,7 @@ describe("LCM context contracts", () => {
 
 		const observer = new Database(migrationPath);
 		try {
-			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(5);
+			expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(6);
 			expect(
 				observer.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM recovery_events").get()?.count,
 			).toBe(0);
@@ -375,8 +466,8 @@ describe("LCM context contracts", () => {
 		let second: LcmContext | undefined;
 		try {
 			second = await openLcmContext({ dbPath: sharedPath, busyTimeoutMs: 0 });
-			expect(first.status().schemaVersion).toBe(5);
-			expect(second.status().schemaVersion).toBe(5);
+			expect(first.status().schemaVersion).toBe(6);
+			expect(second.status().schemaVersion).toBe(6);
 		} finally {
 			second?.close();
 			first.close();
@@ -418,7 +509,7 @@ describe("LCM context contracts", () => {
 
 		const reopened = await openLcmContext({ dbPath: lockedPath, recoverCorrupt: true });
 		try {
-			expect(reopened.status()).toMatchObject({ schemaVersion: 5, quarantined: false, recoveredFrom: null });
+			expect(reopened.status()).toMatchObject({ schemaVersion: 6, quarantined: false, latestRecovery: null });
 		} finally {
 			reopened.close();
 		}
@@ -438,13 +529,76 @@ describe("LCM context contracts", () => {
 		}
 	});
 
+	test("status reports only safe storage and recovery diagnostics", async () => {
+		const quarantinePath = `${dbPath}.quarantine-${now - 1_000}-00000000-0000-4000-8000-000000000010`;
+		const incompletePath = `${dbPath}.quarantine-${now - 2_000}-00000000-0000-4000-8000-000000000011`;
+		await Promise.all([
+			fs.writeFile(quarantinePath, Buffer.alloc(11)),
+			fs.writeFile(`${quarantinePath}-wal`, Buffer.alloc(7)),
+			fs.writeFile(`${quarantinePath}-shm`, Buffer.alloc(5)),
+			fs.writeFile(`${incompletePath}-wal`, Buffer.alloc(100)),
+			fs.writeFile(`${dbPath}.quarantine-${now}-not-a-uuid`, Buffer.alloc(100)),
+		]);
+		const rawSecret = `provider token and path must stay private: ${dbPath}`;
+		const observer = new Database(dbPath);
+		try {
+			observer.run("UPDATE store_state SET last_recovery_path = ? WHERE id = 1", [quarantinePath]);
+			observer.run("INSERT INTO recovery_events (quarantine_path, reason, created_at) VALUES (?, ?, ?)", [
+				quarantinePath,
+				"Error: LCM SQLite integrity check failed",
+				now - 2,
+			]);
+			expect(context.status().latestRecovery).toEqual({ occurredAt: now - 2, category: "integrity_check" });
+			observer.run("INSERT INTO recovery_events (quarantine_path, reason, created_at) VALUES (?, ?, ?)", [
+				quarantinePath,
+				"SQLITE_CORRUPT: private database detail",
+				now - 1,
+			]);
+			expect(context.status().latestRecovery).toEqual({ occurredAt: now - 1, category: "corruption" });
+			observer.run(
+				"UPDATE store_state SET quarantined_at = ?, quarantine_reason = ?, last_recovery_path = ? WHERE id = 1",
+				[now, rawSecret, quarantinePath],
+			);
+			observer.run("INSERT INTO recovery_events (quarantine_path, reason, created_at) VALUES (?, ?, ?)", [
+				quarantinePath,
+				rawSecret,
+				now,
+			]);
+		} finally {
+			observer.close();
+		}
+
+		const status = context.status();
+		expect(status).toMatchObject({
+			quarantined: true,
+			storage: { quarantineBytes: 23 },
+			latestRecovery: { occurredAt: now, category: "unknown" },
+		});
+		expect(status.storage.databaseBytes).toBeGreaterThan(0);
+		expect(status.storage.walBytes).toBeGreaterThanOrEqual(0);
+		expect("dbPath" in status).toBe(false);
+		expect("quarantineReason" in status).toBe(false);
+		expect("recoveredFrom" in status).toBe(false);
+		const doctor = context.doctor();
+		expect(doctor.checks.find(check => check.name === "quarantine")).toEqual({
+			name: "quarantine",
+			ok: false,
+			detail: "store is quarantined",
+		});
+		const serialized = JSON.stringify({ status, doctor });
+		expect(serialized).not.toContain(dbPath);
+		expect(serialized).not.toContain(rawSecret);
+		expect(serialized).not.toContain("SQLITE_CORRUPT");
+	});
+
 	test("recoverCorrupt detects latent B-tree corruption before returning a context", async () => {
 		const corruptPath = path.join(tempDir, "latent-corrupt.db");
 		await createLatentlyCorruptDatabase(corruptPath);
 
 		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
 		try {
-			const recoveredFrom = recovered.status().recoveredFrom;
+			const [recoveredFrom] = await quarantineDatabasePaths(corruptPath);
+			expect(recovered.status().latestRecovery).toEqual({ occurredAt: now, category: "integrity_check" });
 			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 		} finally {
@@ -508,7 +662,7 @@ describe("LCM context contracts", () => {
 				).toEqual([]);
 
 				recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
-				const recoveredFrom = recovered.status().recoveredFrom;
+				const [recoveredFrom] = await quarantineDatabasePaths(corruptPath);
 				expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
 				expect(await fs.readFile(`${recoveredFrom!}-wal`)).toEqual(walBytes);
 				expect(await fs.readFile(`${recoveredFrom!}-shm`)).toEqual(shmBytes);
@@ -571,7 +725,7 @@ describe("LCM context contracts", () => {
 		let recovered: LcmContext | undefined;
 		try {
 			recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
-			const recoveredFrom = recovered.status().recoveredFrom;
+			const [recoveredFrom] = await quarantineDatabasePaths(corruptPath);
 			expect(mainForwardAttempts).toBe(2);
 			expect(failedRollback).toBe(true);
 			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
@@ -657,7 +811,7 @@ describe("LCM context contracts", () => {
 
 		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
 		try {
-			expect(recovered.status().recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
+			expect((await quarantineDatabasePaths(corruptPath))[0]).toStartWith(`${corruptPath}.quarantine-${now}-`);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
 		} finally {
 			recovered.close();
@@ -690,7 +844,10 @@ describe("LCM context contracts", () => {
 
 		const recovered = await openLcmContext({ dbPath: recoveredPath, recoverCorrupt: true, now: () => now });
 		try {
-			expect(recovered.status()).toMatchObject({ recoveredFrom: quarantinePath, quarantined: false });
+			expect(recovered.status()).toMatchObject({
+				quarantined: false,
+				latestRecovery: { occurredAt: now, category: "unknown" },
+			});
 			expect(await fs.readFile(quarantinePath)).toEqual(corruptBytes);
 			expect(await fs.readFile(`${quarantinePath}-wal`)).toEqual(walBytes);
 			expect(await fs.readFile(`${quarantinePath}-shm`)).toEqual(shmBytes);
@@ -889,7 +1046,7 @@ describe("LCM context contracts", () => {
 		let recovered: LcmContext | undefined;
 		try {
 			recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
-			expect(recovered.status().recoveredFrom).toBe(durableRecoveryPath);
+			expect((await quarantineDatabasePaths(corruptPath))[0]).toBe(durableRecoveryPath);
 			expect(unlinkAttempts).toBe(2);
 			expect(directorySyncedAfterUnlink).toBe(true);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
@@ -962,7 +1119,7 @@ describe("LCM context contracts", () => {
 		const owner = await openLcmContext({ dbPath: ownedPath, recoverCorrupt: true, busyTimeoutMs: 0, now: () => now });
 		let recovered: LcmContext | undefined;
 		try {
-			expect(owner.status()).toMatchObject({ schemaVersion: 5, quarantined: false, recoveredFrom: null });
+			expect(owner.status()).toMatchObject({ schemaVersion: 6, quarantined: false, latestRecovery: null });
 			await corruptDatabasePage(ownedPath, pageSize, rootPage);
 
 			let blockedContext: LcmContext | undefined;
@@ -994,7 +1151,7 @@ describe("LCM context contracts", () => {
 				busyTimeoutMs: 0,
 				now: () => now,
 			});
-			const recoveredFrom = recovered.status().recoveredFrom;
+			const [recoveredFrom] = await quarantineDatabasePaths(ownedPath);
 			expect(recoveredFrom).toStartWith(`${ownedPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 		} finally {
@@ -1087,8 +1244,8 @@ describe("LCM context contracts", () => {
 		await fs.writeFile(corruptPath, Buffer.alloc(512, 0x78));
 		const recovered = await openLcmContext({ dbPath: corruptPath, recoverCorrupt: true, now: () => now });
 		try {
-			expect(recovered.status()).toMatchObject({ schemaVersion: 5, quarantined: false });
-			const recoveredFrom = recovered.status().recoveredFrom;
+			expect(recovered.status()).toMatchObject({ schemaVersion: 6, quarantined: false });
+			const [recoveredFrom] = await quarantineDatabasePaths(corruptPath);
 			expect(recoveredFrom).toStartWith(`${corruptPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 		} finally {
@@ -1159,6 +1316,82 @@ describe("LCM context contracts", () => {
 		expect(invalidPath).toBeDefined();
 		expect(isLcmSqliteCorruptionError(invalidPath)).toBe(false);
 		expect((await fs.readdir(tempDir)).some(file => file.startsWith("database-directory.quarantine-"))).toBe(false);
+	});
+
+	test("successful completion removes duplicated job payload", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "source text long enough to summarize safely")]));
+		const [claim] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		expect(claim).toBeDefined();
+		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "ok" })).toMatchObject({
+			accepted: true,
+		});
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM job_inputs WHERE job_id = ?")
+					.get(claim!.jobId)?.count,
+			).toBe(0);
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM job_lineage WHERE job_id = ?")
+					.get(claim!.jobId)?.count,
+			).toBe(0);
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("an obsolete compacted job rebuilds both payload tables before requeue", () => {
+		const original = entry(MAIN, "e1", "original source text long enough to summarize");
+		context.reconcile(snapshot(MAIN, [original]));
+		const [claim] = context.claimSummaryJobs({
+			workerId: "first-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		expect(claim).toBeDefined();
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e2", "replacement source text long enough to summarize")]));
+		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "stale" })).toEqual({
+			accepted: false,
+			reason: "stale",
+		});
+
+		context.reconcile(snapshot(MAIN, [original]));
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM job_inputs WHERE job_id = ?")
+					.get(claim!.jobId)?.count,
+			).toBe(1);
+			expect(
+				observer
+					.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM job_lineage WHERE job_id = ?")
+					.get(claim!.jobId)?.count,
+			).toBe(1);
+		} finally {
+			observer.close();
+		}
+		const [requeued] = context.claimSummaryJobs({
+			workerId: "second-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(requeued?.jobId).toBe(claim!.jobId);
+		expect(requeued?.inputs[0]?.redactedText).toBe(original.redactedText);
+		expect(context.completeSummaryJob(requeued!.jobId, requeued!.leaseToken, { redactedText: "ok" })).toMatchObject({
+			accepted: true,
+		});
 	});
 
 	test("a failed completion remains durably retryable without corrupting committed sources", () => {
@@ -1785,8 +2018,8 @@ describe("LCM context contracts", () => {
 
 		const recovered = await openLcmContext({ dbPath, recoverCorrupt: true, now: () => now });
 		try {
-			const recoveredFrom = recovered.status().recoveredFrom;
-			expect(recovered.status()).toMatchObject({ schemaVersion: 5, quarantined: false });
+			const [recoveredFrom] = await quarantineDatabasePaths(dbPath);
+			expect(recovered.status()).toMatchObject({ schemaVersion: 6, quarantined: false });
 			expect(recoveredFrom).toStartWith(`${dbPath}.quarantine-${now}-`);
 			expect(await Bun.file(recoveredFrom!).exists()).toBe(true);
 			expect(recovered.search({ ...MAIN, query: "obsolete" })).toEqual([]);
@@ -1801,6 +2034,80 @@ describe("LCM context contracts", () => {
 		} finally {
 			recovered.close();
 		}
+	});
+
+	test("purge removes only old unreferenced complete quarantine units and is idempotent", async () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "active source remains untouched by storage cleanup")]));
+		const retentionMs = 30 * 24 * 60 * 60_000;
+		const oldTimestamp = now - retentionMs - 1;
+		const oldPath = `${dbPath}.quarantine-${oldTimestamp}-00000000-0000-4000-8000-000000000020`;
+		const recentPath = `${dbPath}.quarantine-${now - retentionMs + 1}-00000000-0000-4000-8000-000000000021`;
+		const latestPath = `${dbPath}.quarantine-${oldTimestamp - 1}-00000000-0000-4000-8000-000000000022`;
+		const pendingPath = `${dbPath}.quarantine-${oldTimestamp - 2}-00000000-0000-4000-8000-000000000023`;
+		const incompletePath = `${dbPath}.quarantine-${oldTimestamp - 3}-00000000-0000-4000-8000-000000000024`;
+		await Promise.all([
+			fs.writeFile(oldPath, Buffer.alloc(11)),
+			fs.writeFile(`${oldPath}-wal`, Buffer.alloc(7)),
+			fs.writeFile(recentPath, Buffer.alloc(13)),
+			fs.writeFile(latestPath, Buffer.alloc(17)),
+			fs.writeFile(`${latestPath}-shm`, Buffer.alloc(5)),
+			fs.writeFile(pendingPath, Buffer.alloc(19)),
+			fs.writeFile(`${pendingPath}-wal`, Buffer.alloc(3)),
+			fs.writeFile(`${incompletePath}-shm`, Buffer.alloc(23)),
+			fs.writeFile(
+				`${dbPath}.quarantine-pending`,
+				JSON.stringify({ quarantinePath: pendingPath, reason: "pending" }),
+			),
+		]);
+		const observer = new Database(dbPath);
+		try {
+			observer.run("UPDATE store_state SET last_recovery_path = ? WHERE id = 1", [latestPath]);
+			observer.run("INSERT INTO recovery_events (quarantine_path, reason, created_at) VALUES (?, 'recovered', ?)", [
+				latestPath,
+				now,
+			]);
+		} finally {
+			observer.close();
+		}
+
+		const before = context.status();
+		const first = context.purge();
+		expect(first).toEqual({
+			tombstones: 0,
+			jobs: 0,
+			summaries: 0,
+			sourceContents: 0,
+			files: 0,
+			quarantineFiles: 2,
+			quarantineBytes: 18,
+		});
+		const afterFirst = context.status();
+		expect({ branches: afterFirst.branches, activeSources: afterFirst.activeSources }).toEqual({
+			branches: before.branches,
+			activeSources: before.activeSources,
+		});
+		expect(await Bun.file(oldPath).exists()).toBe(false);
+		expect(await Bun.file(`${oldPath}-wal`).exists()).toBe(false);
+		for (const retained of [recentPath, latestPath, `${latestPath}-shm`, pendingPath, `${pendingPath}-wal`]) {
+			expect(await Bun.file(retained).exists()).toBe(true);
+		}
+		expect(await Bun.file(`${incompletePath}-shm`).exists()).toBe(true);
+		expect(await Bun.file(`${dbPath}.quarantine-pending`).exists()).toBe(true);
+
+		expect(context.purge()).toEqual({
+			tombstones: 0,
+			jobs: 0,
+			summaries: 0,
+			sourceContents: 0,
+			files: 0,
+			quarantineFiles: 0,
+			quarantineBytes: 0,
+		});
+		const after = context.status();
+		expect({ branches: after.branches, activeSources: after.activeSources }).toEqual({
+			branches: before.branches,
+			activeSources: before.activeSources,
+		});
 	});
 
 	test("tombstones remain until the configured retention horizon and are then purged", () => {

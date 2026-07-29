@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { initializeLcmSchema, LCM_SCHEMA_VERSION, summaryHandleForInput, UnsupportedLcmSchemaError } from "./schema";
@@ -17,6 +17,7 @@ import type {
 	LcmContext,
 	LcmContextOptions,
 	LcmFileMetadata,
+	LcmRecoveryCategory,
 	LcmStatus,
 	ProjectedHistoricalItem,
 	ProjectionRequest,
@@ -44,6 +45,7 @@ import type {
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 const DEFAULT_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const DEFAULT_QUARANTINE_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const DEFAULT_LEAF_MAX_SOURCES = 24;
 const DEFAULT_LEAF_MAX_TOKENS = 4_000;
 const DEFAULT_CONDENSE_FAN_IN = 4;
@@ -191,6 +193,11 @@ interface StateRow {
 	quarantined_at: number | null;
 	quarantine_reason: string | null;
 	last_recovery_path: string | null;
+}
+
+interface RecoveryEventRow {
+	reason: string;
+	created_at: number;
 }
 
 function assertInteger(value: number, name: string, minimum: number): number {
@@ -601,6 +608,120 @@ function isValidDatabaseQuarantinePath(dbPath: string, quarantinePath: string): 
 	);
 }
 
+interface DatabaseQuarantineFile {
+	path: string;
+	bytes: number;
+}
+
+interface DatabaseQuarantineUnit {
+	path: string;
+	timestamp: number;
+	files: readonly DatabaseQuarantineFile[];
+}
+
+function regularFileBytes(filePath: string): number {
+	try {
+		const stats = lstatSync(filePath);
+		return stats.isFile() ? stats.size : 0;
+	} catch {
+		return 0;
+	}
+}
+
+function databaseQuarantineTimestamp(dbPath: string, quarantinePath: string): number | undefined {
+	if (!isValidDatabaseQuarantinePath(dbPath, quarantinePath)) return undefined;
+	const prefix = `${path.basename(path.normalize(dbPath))}.quarantine-`;
+	const suffix = path.basename(quarantinePath).slice(prefix.length);
+	return Number(suffix.slice(0, -37));
+}
+
+function databaseQuarantineUnits(dbPath: string): DatabaseQuarantineUnit[] {
+	const normalizedDatabasePath = path.normalize(dbPath);
+	const directory = path.dirname(normalizedDatabasePath);
+	const databaseName = path.basename(normalizedDatabasePath);
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+	} catch {
+		return [];
+	}
+	const units = new Map<
+		string,
+		{ timestamp: number; valid: boolean; hasMain: boolean; files: DatabaseQuarantineFile[] }
+	>();
+	for (const entry of entries) {
+		if (!entry.name.startsWith(`${databaseName}.quarantine-`)) continue;
+		const sidecar = DATABASE_QUARANTINE_SIDECAR_SUFFIXES.find(suffix => entry.name.endsWith(suffix));
+		const mainName = sidecar === undefined ? entry.name : entry.name.slice(0, -sidecar.length);
+		const quarantinePath = path.join(directory, mainName);
+		const timestamp = databaseQuarantineTimestamp(normalizedDatabasePath, quarantinePath);
+		if (timestamp === undefined) continue;
+		let unit = units.get(quarantinePath);
+		if (!unit) {
+			unit = { timestamp, valid: true, hasMain: false, files: [] };
+			units.set(quarantinePath, unit);
+		}
+		if (!entry.isFile()) {
+			unit.valid = false;
+			continue;
+		}
+		const filePath = path.join(directory, entry.name);
+		const bytes = regularFileBytes(filePath);
+		if (bytes === 0) {
+			try {
+				if (!lstatSync(filePath).isFile()) unit.valid = false;
+			} catch {
+				unit.valid = false;
+			}
+		}
+		if (!unit.valid) continue;
+		unit.files.push({ path: filePath, bytes });
+		if (sidecar === undefined) unit.hasMain = true;
+	}
+	return [...units.entries()]
+		.filter(([, unit]) => unit.valid && unit.hasMain)
+		.map(([quarantinePath, unit]) => ({ path: quarantinePath, timestamp: unit.timestamp, files: unit.files }))
+		.sort((left, right) => left.timestamp - right.timestamp || left.path.localeCompare(right.path));
+}
+
+function pendingDatabaseQuarantineTarget(dbPath: string): string | null | undefined {
+	const markerPath = pendingDatabaseQuarantinePath(dbPath);
+	let serialized: Buffer;
+	try {
+		const stats = lstatSync(markerPath);
+		if (!stats.isFile() || stats.size > MAX_PENDING_DATABASE_QUARANTINE_BYTES) return null;
+		serialized = readFileSync(markerPath);
+	} catch (error) {
+		return isMissingFile(error) ? undefined : null;
+	}
+	try {
+		const parsed: unknown = JSON.parse(serialized.toString("utf8"));
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			!("quarantinePath" in parsed) ||
+			typeof parsed.quarantinePath !== "string" ||
+			!isValidDatabaseQuarantinePath(dbPath, parsed.quarantinePath) ||
+			!("reason" in parsed) ||
+			typeof parsed.reason !== "string" ||
+			parsed.reason.length > MAX_STORED_DIAGNOSTIC_LENGTH
+		) {
+			return null;
+		}
+		return parsed.quarantinePath;
+	} catch {
+		return null;
+	}
+}
+
+function recoveryCategory(reason: string): LcmRecoveryCategory {
+	if (reason.includes("LCM SQLite integrity check failed")) return "integrity_check";
+	if (/SQLITE_(?:CORRUPT|NOTADB|IOERR_CORRUPTFS)|corrupt|malformed|not a database/i.test(reason)) {
+		return "corruption";
+	}
+	return "unknown";
+}
+
 async function publishPendingDatabaseQuarantine(dbPath: string, pending: PendingDatabaseQuarantine): Promise<void> {
 	const markerPath = pendingDatabaseQuarantinePath(dbPath);
 	const payload = Buffer.from(JSON.stringify(pending), "utf8");
@@ -971,6 +1092,10 @@ class SqliteLcmContext implements LcmContext {
 		return row;
 	}
 
+	hasRecordedRecovery(quarantinePath: string): boolean {
+		return this.#readState().last_recovery_path === quarantinePath;
+	}
+
 	recordRecovery(quarantinePath: string, reason: string): void {
 		const now = this.#options.now();
 		const transaction = this.#db.transaction(() => {
@@ -1321,6 +1446,31 @@ class SqliteLcmContext implements LcmContext {
 		return stats;
 	}
 
+	#writeJobPayload(jobId: string, inputs: readonly JobInputSpec[], lineage: readonly string[]): void {
+		for (let ordinal = 0; ordinal < inputs.length; ordinal++) {
+			const input = inputs[ordinal];
+			if (!input) continue;
+			this.#db.run("INSERT INTO job_inputs (job_id, ordinal, input_kind, ref_id) VALUES (?, ?, ?, ?)", [
+				jobId,
+				ordinal,
+				input.kind,
+				input.id,
+			]);
+		}
+		for (let ordinal = 0; ordinal < lineage.length; ordinal++) {
+			this.#db.run("INSERT INTO job_lineage (job_id, ordinal, source_key) VALUES (?, ?, ?)", [
+				jobId,
+				ordinal,
+				lineage[ordinal]!,
+			]);
+		}
+	}
+
+	#compactTerminalJob(jobId: string): void {
+		this.#db.run("DELETE FROM job_inputs WHERE job_id = ?", [jobId]);
+		this.#db.run("DELETE FROM job_lineage WHERE job_id = ?", [jobId]);
+	}
+
 	#resolveOrQueueJob(params: {
 		projectId: string;
 		branchRowId: number;
@@ -1369,25 +1519,11 @@ class SqliteLcmContext implements LcmContext {
 					params.now,
 				],
 			);
-			for (let ordinal = 0; ordinal < params.inputs.length; ordinal++) {
-				const input = params.inputs[ordinal];
-				if (!input) continue;
-				this.#db.run("INSERT INTO job_inputs (job_id, ordinal, input_kind, ref_id) VALUES (?, ?, ?, ?)", [
-					jobId,
-					ordinal,
-					input.kind,
-					input.id,
-				]);
-			}
-			for (let ordinal = 0; ordinal < params.lineage.length; ordinal++) {
-				this.#db.run("INSERT INTO job_lineage (job_id, ordinal, source_key) VALUES (?, ?, ?)", [
-					jobId,
-					ordinal,
-					params.lineage[ordinal]!,
-				]);
-			}
+			this.#writeJobPayload(jobId, params.inputs, params.lineage);
 			params.stats.queued++;
 		} else if (existing.status === "obsolete" || existing.status === "completed") {
+			this.#compactTerminalJob(jobId);
+			this.#writeJobPayload(jobId, params.inputs, params.lineage);
 			this.#db.run(
 				`UPDATE summary_jobs SET status = 'pending', origin_branch_row_id = ?, origin_revision = ?,
 					available_at = ?, result_summary_id = NULL, updated_at = ? WHERE job_id = ?`,
@@ -1637,6 +1773,7 @@ class SqliteLcmContext implements LcmContext {
 							lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
 						[now, candidate.job_id],
 					);
+					this.#compactTerminalJob(candidate.job_id);
 					continue;
 				}
 				const inputs = this.#loadJobInputs(candidate.job_id);
@@ -1645,6 +1782,7 @@ class SqliteLcmContext implements LcmContext {
 						now,
 						candidate.job_id,
 					]);
+					this.#compactTerminalJob(candidate.job_id);
 					continue;
 				}
 				const inputTokenCount = inputs.reduce((total, input) => total + input.tokenCount, 0);
@@ -1654,6 +1792,7 @@ class SqliteLcmContext implements LcmContext {
 						"UPDATE summary_jobs SET status = 'obsolete', last_error = 'input too small to compress', updated_at = ? WHERE job_id = ?",
 						[now, candidate.job_id],
 					);
+					this.#compactTerminalJob(candidate.job_id);
 					continue;
 				}
 				const leaseToken = crypto.randomUUID();
@@ -1698,6 +1837,7 @@ class SqliteLcmContext implements LcmContext {
 							lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
 						[now, candidate.job_id, leaseToken],
 					);
+					this.#compactTerminalJob(candidate.job_id);
 				}
 			}
 			return claimed;
@@ -2015,6 +2155,7 @@ class SqliteLcmContext implements LcmContext {
 						lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
 					[now, jobId, leaseToken],
 				);
+				this.#compactTerminalJob(jobId);
 				return { accepted: false, reason: "stale" };
 			}
 			if (tokenCount >= job.lease_input_tokens || tokenCount > job.lease_output_budget) {
@@ -2060,6 +2201,7 @@ class SqliteLcmContext implements LcmContext {
 						leaseToken,
 					],
 				);
+				this.#compactTerminalJob(jobId);
 				return { accepted: false, reason: "deterministic_failed" };
 			}
 
@@ -2145,6 +2287,7 @@ class SqliteLcmContext implements LcmContext {
 					leaseToken,
 				],
 			);
+			this.#compactTerminalJob(jobId);
 			this.#scheduleProject(job.project_id, now);
 			return { accepted: true, summaryId: summary.summary_id };
 		});
@@ -2716,13 +2859,28 @@ class SqliteLcmContext implements LcmContext {
 		}
 		const schema = this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get();
 		const journal = this.#db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
+		const databasePath = databaseFilePath(this.#dbPath);
+		const quarantineUnits = databasePath ? databaseQuarantineUnits(databasePath) : [];
+		const recovery = this.#db
+			.query<RecoveryEventRow, []>(
+				"SELECT reason, created_at FROM recovery_events ORDER BY created_at DESC, id DESC LIMIT 1",
+			)
+			.get();
 		return {
-			dbPath: this.#dbPath,
 			schemaVersion: schema?.user_version ?? 0,
 			journalMode: journal?.journal_mode ?? "unknown",
 			quarantined: state.quarantined_at !== null,
-			quarantineReason: state.quarantine_reason,
-			recoveredFrom: state.last_recovery_path,
+			storage: {
+				databaseBytes: databasePath ? regularFileBytes(databasePath) : 0,
+				walBytes: databasePath ? regularFileBytes(`${databasePath}-wal`) : 0,
+				quarantineBytes: quarantineUnits.reduce(
+					(total, unit) => total + unit.files.reduce((unitTotal, file) => unitTotal + file.bytes, 0),
+					0,
+				),
+			},
+			latestRecovery: recovery
+				? { occurredAt: recovery.created_at, category: recoveryCategory(recovery.reason) }
+				: null,
 			branches: this.#count("SELECT COUNT(*) AS count FROM branches"),
 			activeSources: this.#count("SELECT COUNT(*) AS count FROM branch_sources WHERE active = 1"),
 			tombstones: this.#count("SELECT COUNT(*) AS count FROM branch_sources WHERE active = 0"),
@@ -2779,10 +2937,7 @@ class SqliteLcmContext implements LcmContext {
 			);
 			return missing === 0 ? null : `${missing} orphan search document(s)`;
 		});
-		check("quarantine", () => {
-			const state = this.#readState();
-			return state.quarantined_at === null ? null : (state.quarantine_reason ?? "store is quarantined");
-		});
+		check("quarantine", () => (this.#readState().quarantined_at === null ? null : "store is quarantined"));
 		return { ok: checks.every(item => item.ok), checks };
 	}
 
@@ -2887,9 +3042,45 @@ class SqliteLcmContext implements LcmContext {
 					WHERE NOT EXISTS (SELECT 1 FROM source_files sf WHERE sf.file_id = file_records.file_id)
 				`).changes,
 			);
-			return { tombstones, jobs, summaries, sourceContents, files };
+			return { tombstones, jobs, summaries, sourceContents, files, quarantineFiles: 0, quarantineBytes: 0 };
 		});
-		return transaction.immediate();
+		const result = transaction.immediate();
+		const databasePath = databaseRecoveryFilePath(this.#dbPath);
+		if (!databasePath) return result;
+		const pendingPath = pendingDatabaseQuarantineTarget(databasePath);
+		if (pendingPath === null) return result;
+		const latestRecoveryPath = this.#readState().last_recovery_path;
+		const latestRecoveryEventPath = this.#db
+			.query<{ quarantine_path: string }, []>(
+				"SELECT quarantine_path FROM recovery_events ORDER BY created_at DESC, id DESC LIMIT 1",
+			)
+			.get()?.quarantine_path;
+		const quarantineCutoff = now - DEFAULT_QUARANTINE_RETENTION_MS;
+		let quarantineFiles = 0;
+		let quarantineBytes = 0;
+		for (const unit of databaseQuarantineUnits(databasePath)) {
+			if (
+				unit.timestamp >= quarantineCutoff ||
+				unit.path === pendingPath ||
+				unit.path === latestRecoveryPath ||
+				unit.path === latestRecoveryEventPath
+			) {
+				continue;
+			}
+			const files = [...unit.files].sort(
+				(left, right) => Number(left.path === unit.path) - Number(right.path === unit.path),
+			);
+			for (const file of files) {
+				try {
+					unlinkSync(file.path);
+					quarantineFiles++;
+					quarantineBytes += file.bytes;
+				} catch {
+					break;
+				}
+			}
+		}
+		return { ...result, quarantineFiles, quarantineBytes };
 	}
 
 	#count(sql: string, ...bindings: SQLQueryBindings[]): number {
@@ -2995,7 +3186,7 @@ export async function openLcmContext(options: LcmContextOptions): Promise<LcmCon
 					const pending = await recoverPendingDatabaseQuarantine(databasePath);
 					if (pending) {
 						context = await createSqliteLcmContextWithRetry(options.dbPath, normalized, true, false);
-						if (context.status().recoveredFrom !== pending.quarantinePath) {
+						if (!context.hasRecordedRecovery(pending.quarantinePath)) {
 							context.recordRecovery(pending.quarantinePath, pending.reason);
 						} else {
 							context.flushRecoveryProvenance();

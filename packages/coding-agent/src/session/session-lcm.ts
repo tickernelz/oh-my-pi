@@ -89,20 +89,48 @@ export interface LcmProjectionAggregate {
 	pendingJobs: number;
 }
 
+export type LcmProjectionState = "unevaluated" | "unfitted" | "fitted";
+
+export interface LcmCurrentBranchStatus {
+	projectId: string;
+	sessionId: string;
+	branchId: string;
+	revision: number;
+	activeSources: number;
+	sourceTokens: number;
+	projectionState: LcmProjectionState;
+	projection?: LcmProjectionAggregate;
+}
+
 export interface LcmRuntimeStatus {
 	phase: LcmRuntimePhase;
 	summaryWorkers: { active: number; limit: number };
 	summaryBackoff?: { preferred?: number; fallback?: number };
 	summaryModelSelector?: string;
 	resolvedSummaryModel?: string;
-	lastProjection?: LcmProjectionAggregate;
+	currentBranch?: LcmCurrentBranchStatus;
 	lastFailureCategory?: LcmFallbackCategory;
 	retryAt?: number;
 }
 
+export type LcmPublicStoreStatus = Pick<
+	LcmStatus,
+	| "schemaVersion"
+	| "journalMode"
+	| "quarantined"
+	| "branches"
+	| "activeSources"
+	| "tombstones"
+	| "leafSummaries"
+	| "condensedSummaries"
+	| "jobs"
+	| "storage"
+	| "latestRecovery"
+>;
+
 export interface LcmPublicStatus {
 	runtime: LcmRuntimeStatus;
-	store?: Omit<LcmStatus, "dbPath">;
+	store?: LcmPublicStoreStatus;
 }
 
 export interface LcmCompletionRequest {
@@ -551,6 +579,13 @@ function projectionAggregate(projection: ContextProjection): LcmProjectionAggreg
 	};
 }
 
+function normalizedSourceTokens(snapshot: SourceSnapshot): number {
+	return snapshot.entries.reduce(
+		(total, entry) => total + Math.ceil(Buffer.byteLength(entry.redactedText, "utf8") / 4),
+		0,
+	);
+}
+
 function summaryPromptHash(systemPrompt: string, userPrompt: string): string {
 	return new Bun.CryptoHasher("sha256").update(systemPrompt).update("\0").update(userPrompt).digest("hex");
 }
@@ -709,6 +744,7 @@ export class SessionLcm {
 	#summaryProgressVersion = 0;
 	#summaryProgressSignal = Promise.withResolvers<void>();
 	#lastProjectionRequest: ProjectionRequest | undefined;
+	#projectionAttempt = 0;
 	#summaryWakeTimer: NodeJS.Timeout | undefined;
 	#summaryWakeAt: number | undefined;
 	#summaryWakeTask: Promise<void> | undefined;
@@ -717,7 +753,7 @@ export class SessionLcm {
 	#unsubscribeDurableEntries: (() => void) | undefined;
 	#registeredJournalKey: string | undefined;
 	#runtimePhase: LcmRuntimePhase = "uninitialized";
-	#lastProjection: LcmProjectionAggregate | undefined;
+	#currentBranch: LcmCurrentBranchStatus | undefined;
 	#lastFailureCategory: LcmFallbackCategory | undefined;
 	#pendingFallbackCategory: LcmFallbackCategory | undefined;
 	#retryAt: number | undefined;
@@ -778,7 +814,7 @@ export class SessionLcm {
 					}),
 			summaryModelSelector: this.#summaryModel ?? "@smol",
 			...(this.#resolvedSummaryModel ? { resolvedSummaryModel: this.#resolvedSummaryModel } : {}),
-			...(this.#lastProjection ? { lastProjection: this.#lastProjection } : {}),
+			...(this.#currentBranch ? { currentBranch: this.#currentBranch } : {}),
 			...(this.#lastFailureCategory ? { lastFailureCategory: this.#lastFailureCategory } : {}),
 			...(this.#retryAt === undefined ? {} : { retryAt: this.#retryAt }),
 		};
@@ -790,11 +826,35 @@ export class SessionLcm {
 
 	#clearActiveBranch(): void {
 		this.#activeBranch = undefined;
+		this.#currentBranch = undefined;
 		this.#activeFileReferences.clear();
 	}
 
-	#activateBranch(normalized: NormalizedBranch): void {
+	#activateBranch(normalized: NormalizedBranch, revision: number): void {
+		const previous = this.#currentBranch;
+		const sameRevision =
+			this.#activeBranch?.anchor === normalized.anchor &&
+			previous?.projectId === normalized.snapshot.scope.projectId &&
+			previous.sessionId === normalized.snapshot.scope.sessionId &&
+			previous.branchId === normalized.snapshot.scope.branchId &&
+			previous.revision === revision;
 		this.#activeBranch = normalized;
+		this.#currentBranch = sameRevision
+			? {
+					...previous,
+					activeSources: normalized.snapshot.entries.length,
+					sourceTokens: normalizedSourceTokens(normalized.snapshot),
+				}
+			: {
+					...normalized.snapshot.scope,
+					revision,
+					activeSources: normalized.snapshot.entries.length,
+					sourceTokens: normalizedSourceTokens(normalized.snapshot),
+					projectionState: "unevaluated",
+				};
+		if (!sameRevision && this.#runtimePhase === "active") {
+			this.#runtimePhase = this.#lastProjectionRequest ? "warming" : "idle";
+		}
 		this.#activeFileReferences = normalized.fileReferences;
 	}
 
@@ -825,14 +885,42 @@ export class SessionLcm {
 		return this.#preferredUnfit || this.#preferredFailures.size > 0;
 	}
 
-	#failOpen(category: LcmFallbackCategory): void {
+	#failOpen(category: LcmFallbackCategory, attempt: number): void {
+		if (attempt !== this.#projectionAttempt) return;
 		this.#noteFailure(category, this.#retryAt);
 		this.#pendingFallbackCategory = category;
 	}
 
-	#noteProjection(projection: ContextProjection, active: boolean): void {
-		this.#lastProjection = projectionAggregate(projection);
-		if (!active) {
+	#invalidateProjectionForRequest(): void {
+		const currentBranch = this.#currentBranch;
+		if (!currentBranch || currentBranch.projectionState === "unevaluated") return;
+		this.#currentBranch = {
+			projectId: currentBranch.projectId,
+			sessionId: currentBranch.sessionId,
+			branchId: currentBranch.branchId,
+			revision: currentBranch.revision,
+			activeSources: currentBranch.activeSources,
+			sourceTokens: currentBranch.sourceTokens,
+			projectionState: "unevaluated",
+		};
+		if (this.#runtimePhase === "active") {
+			this.#runtimePhase = this.#hasPreferredHealthFailure()
+				? "degraded"
+				: this.#summaryTask || this.#summaryWakeTask || this.#activeSummaryJobs.size > 0
+					? "warming"
+					: "idle";
+		}
+	}
+	#noteProjection(projection: ContextProjection, fitted: boolean, attempt: number): void {
+		const currentBranch = this.#currentBranch;
+		if (attempt !== this.#projectionAttempt || !currentBranch || currentBranch.revision !== projection.revision)
+			return;
+		this.#currentBranch = {
+			...currentBranch,
+			projectionState: fitted ? "fitted" : "unfitted",
+			projection: projectionAggregate(projection),
+		};
+		if (!fitted) {
 			this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
 			return;
 		}
@@ -1066,7 +1154,6 @@ export class SessionLcm {
 			tokenBudget: request.limits.tokenBudget,
 			freshTail: request.limits.freshTail,
 		});
-		this.#lastProjection = projectionAggregate(projection);
 		return projection;
 	}
 
@@ -1099,8 +1186,8 @@ export class SessionLcm {
 					this.#dirty = true;
 					continue;
 				}
-				context.reconcile(normalized.snapshot, { summarize });
-				this.#activateBranch(normalized);
+				const reconcileResult = context.reconcile(normalized.snapshot, { summarize });
+				this.#activateBranch(normalized, reconcileResult.revision);
 				this.#syncSummaryFailures(context);
 				reconciled = true;
 				const scope = normalized.snapshot.scope;
@@ -1108,11 +1195,8 @@ export class SessionLcm {
 					summarize === false
 						? this.#projectForScheduling(context)
 						: context.project({ ...scope, tokenBudget: summarize.tokenBudget, freshTail: summarize.freshTail });
-				if (projection) {
-					this.#lastProjection = projectionAggregate(projection);
-					if (this.#runtimePhase !== "active") {
-						this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
-					}
+				if (projection && this.#runtimePhase !== "active") {
+					this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
 				}
 				const allowFallback = projection === undefined || projection.pendingJobs === 0;
 				const preferredRetryAt = this.#maxFailureDeadline(this.#preferredFailures);
@@ -1646,37 +1730,58 @@ export class SessionLcm {
 		return outcome;
 	}
 
-	#projectCurrent(messages: readonly AgentMessage[], limits: LcmProjectionLimits): ProjectionCheck {
+	#projectCurrent(messages: readonly AgentMessage[], limits: LcmProjectionLimits, attempt: number): ProjectionCheck {
 		const native: ProjectAttempt = { messages: messages as AgentMessage[], owned: false };
+		if (attempt !== this.#projectionAttempt) return { result: native };
 		const context = this.#context;
 		const branch = this.#activeBranch;
 		if (!context || !branch || this.#dirty) return { result: native, terminal: "store" };
-		const projection = context.project({
+		let projection = context.project({
 			...branch.snapshot.scope,
 			tokenBudget: limits.tokenBudget,
 			freshTail: limits.freshTail,
 		});
-		this.#noteProjection(projection, false);
+		if (this.#currentBranch?.revision !== projection.revision) {
+			const reconciled = context.reconcile(branch.snapshot, {
+				summarize: { tokenBudget: limits.tokenBudget, freshTail: limits.freshTail },
+			});
+			this.#activateBranch(branch, reconciled.revision);
+			this.#syncSummaryFailures(context);
+			projection = context.project({
+				...branch.snapshot.scope,
+				tokenBudget: limits.tokenBudget,
+				freshTail: limits.freshTail,
+			});
+		}
+		if (this.#currentBranch?.revision !== projection.revision) {
+			return { result: native, projection, terminal: "store" };
+		}
 		if (projection.pendingJobs > 0 && !this.#summaryRetryDeferred && !this.#summaryTask && !this.#summaryWakeTask) {
 			this.#startSummaryJobs();
 		}
-		if (projection.pendingJobs > 0) return { result: native, projection };
+		if (projection.pendingJobs > 0) {
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection };
+		}
 		if (!projection.ready || projection.uncoveredSourceIds.length > 0) {
-			return {
-				result: native,
-				projection,
-				...(projection.pendingJobs === 0 ? { terminal: "unfit" as const } : {}),
-			};
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection, terminal: "unfit" };
 		}
 
 		if (projection.historical.length === 0) {
-			if (!this.#host.projectionFits(messages)) return { result: native, projection, terminal: "unfit" };
-			this.#noteProjection(projection, true);
+			if (!this.#host.projectionFits(messages)) {
+				this.#noteProjection(projection, false, attempt);
+				return { result: native, projection, terminal: "unfit" };
+			}
+			this.#noteProjection(projection, true, attempt);
 			return { result: { messages: messages as AgentMessage[], owned: true, projection }, projection };
 		}
 
 		const firstUserSourceId = branch.firstUserSourceId;
-		if (!firstUserSourceId) return { result: native, projection, terminal: "unfit" };
+		if (!firstUserSourceId) {
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection, terminal: "unfit" };
+		}
 		const wanted = new Set(projection.freshTailSourceIds);
 		wanted.add(firstUserSourceId);
 		const projected: AgentMessage[] = [];
@@ -1689,37 +1794,49 @@ export class SessionLcm {
 			projected.push(item.message);
 		}
 		if (foundFresh !== projection.freshTailSourceIds.length || firstUserIndex < 0) {
+			this.#noteProjection(projection, false, attempt);
 			return { result: native, projection, terminal: "unfit" };
 		}
 
 		projected.push(...liveSuffix(messages, this.#host.sessionManager.buildSessionContext()));
 		const activeFinalUserIndex = projected.findLastIndex(message => message.role === "user");
 		if (activeFinalUserIndex <= firstUserIndex || projected[firstUserIndex + 1]?.role === "toolResult") {
+			this.#noteProjection(projection, false, attempt);
 			return { result: native, projection, terminal: "unfit" };
 		}
 
 		const citedContent = historicalText(projection);
-		if (!citedContent) return { result: native, projection, terminal: "unfit" };
+		if (!citedContent) {
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection, terminal: "unfit" };
+		}
 		const firstUser = projected[firstUserIndex]!;
 		projected.splice(
 			firstUserIndex + 1,
 			0,
 			createHistoricalContextMessage({ redactedCitedContent: citedContent, timestamp: firstUser.timestamp }),
 		);
-		if (!this.#host.projectionFits(projected)) return { result: native, projection, terminal: "unfit" };
-		this.#noteProjection(projection, true);
+		if (!this.#host.projectionFits(projected)) {
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection, terminal: "unfit" };
+		}
+		this.#noteProjection(projection, true, attempt);
 		return { result: { messages: projected, owned: true, projection }, projection };
 	}
 
 	async #attemptProjection(messages: readonly AgentMessage[], signal?: AbortSignal): Promise<ProjectAttempt> {
 		const native: ProjectAttempt = { messages: messages as AgentMessage[], owned: false };
 		if (this.#disposed || signal?.aborted) return native;
+		const attempt = ++this.#projectionAttempt;
+		const isCurrent = (): boolean => attempt === this.#projectionAttempt && !this.#disposed;
+		this.#lastProjectionRequest = undefined;
+		this.#invalidateProjectionForRequest();
 		const limits = this.#host.projectionLimits(messages);
 		if (!limits) return native;
 		if (limits.sourceTokens < limits.softThresholdTokens) return native;
 		const atHard = limits.sourceTokens >= limits.hardThresholdTokens;
 		if (limits.tokenBudget < 1 || limits.freshTail.maxSources < 1 || limits.freshTail.maxTokens < 1) {
-			if (atHard) this.#failOpen("unfit");
+			if (atHard) this.#failOpen("unfit", attempt);
 			return native;
 		}
 
@@ -1734,47 +1851,54 @@ export class SessionLcm {
 		});
 		if (!atHard) {
 			void reconcile.catch(error => {
-				logger.debug("LCM background reconcile failed", { error: errorLabel(error) });
+				if (isCurrent()) logger.debug("LCM background reconcile failed", { error: errorLabel(error) });
 			});
 			return native;
 		}
 
 		const deadline = this.#now() + this.#hardWaitMs;
 		try {
-			if (!(await this.#waitWithinDeadline(reconcile, signal, deadline))) {
-				if (!signal?.aborted) this.#failOpen("deadline");
+			const reconciledWithinDeadline = await this.#waitWithinDeadline(reconcile, signal, deadline);
+			if (!isCurrent() || signal?.aborted) return native;
+			if (!reconciledWithinDeadline) {
+				this.#failOpen("deadline", attempt);
 				return native;
 			}
-			if (!(await reconcile) || signal?.aborted) {
-				if (!signal?.aborted) this.#failOpen(this.#lastFailureCategory ?? "store");
+			if (!(await reconcile)) {
+				if (isCurrent() && !signal?.aborted) this.#failOpen(this.#lastFailureCategory ?? "store", attempt);
 				return native;
 			}
+			if (!isCurrent() || signal?.aborted) return native;
 
-			while (!signal?.aborted) {
+			while (!signal?.aborted && isCurrent()) {
 				const progressVersion = this.#summaryProgressVersion;
 				const settlement = this.#summaryProgressSignal.promise;
-				const check = await this.#enqueue(() => this.#projectCurrent(messages, limits));
+				const check = await this.#enqueue(() => this.#projectCurrent(messages, limits, attempt));
+				if (!isCurrent()) return native;
 				if (check.result.owned) return check.result;
 				if (check.terminal) {
-					this.#failOpen(check.terminal);
+					this.#failOpen(check.terminal, attempt);
 					return native;
 				}
 				if (progressVersion !== this.#summaryProgressVersion) continue;
 				const background = this.#summaryTask ?? this.#summaryWakeTask;
 				if (!background) {
-					this.#failOpen(this.#lastFailureCategory ?? "unfit");
+					this.#failOpen(this.#lastFailureCategory ?? "unfit", attempt);
 					return native;
 				}
 				const progress = Promise.race([background, settlement]);
-				if (!(await this.#waitWithinDeadline(progress, signal, deadline))) {
-					if (!signal?.aborted) this.#failOpen(this.#lastFailureCategory === "provider" ? "provider" : "deadline");
+				const progressedWithinDeadline = await this.#waitWithinDeadline(progress, signal, deadline);
+				if (!isCurrent() || signal?.aborted) return native;
+				if (!progressedWithinDeadline) {
+					this.#failOpen(this.#lastFailureCategory === "provider" ? "provider" : "deadline", attempt);
 					return native;
 				}
 			}
 			return native;
 		} catch (error) {
+			if (!isCurrent() || signal?.aborted) return native;
 			logger.warn("LCM projection failed; using native context", { error: errorLabel(error) });
-			if (!signal?.aborted) this.#failOpen("store");
+			this.#failOpen("store", attempt);
 			return native;
 		}
 	}
@@ -1793,6 +1917,7 @@ export class SessionLcm {
 	async rebind(): Promise<void> {
 		if (this.#disposed) return;
 		this.#generation++;
+		this.#projectionAttempt++;
 		this.#dirty = true;
 		this.#summaryRestartRequested = false;
 		this.#deferReconcileUntilSummarySettles = false;
@@ -1800,7 +1925,6 @@ export class SessionLcm {
 		this.#pendingFallbackCategory = undefined;
 		this.#preferredUnfit = false;
 		this.#lastProjectionRequest = undefined;
-		this.#lastProjection = undefined;
 		this.#runtimePhase = "idle";
 		this.#clearActiveBranch();
 		const drain = this.#summaryTask;
@@ -1816,14 +1940,34 @@ export class SessionLcm {
 	}
 
 	async status(): Promise<LcmPublicStatus> {
-		await this.#requestReconcile(true);
+		const manager = this.#host.sessionManager;
+		const cwd = manager.getCwd();
+		const activeAnchor = branchAnchor(manager, manager.getBranch());
+		if (this.#dirty || !this.#context || this.#boundCwd !== cwd || this.#activeBranch?.anchor !== activeAnchor) {
+			await this.#requestReconcile(true);
+		} else {
+			this.#startSummaryJobs();
+		}
 		return this.#enqueue(() => {
 			const context = this.#context;
 			if (!context || this.#boundCwd !== this.#host.sessionManager.getCwd()) {
 				return { runtime: this.#runtimeStatus() };
 			}
 			this.#syncSummaryFailures(context);
-			const { dbPath: _dbPath, ...store } = context.status();
+			const contextStatus = context.status();
+			const store: LcmPublicStoreStatus = {
+				schemaVersion: contextStatus.schemaVersion,
+				journalMode: contextStatus.journalMode,
+				quarantined: contextStatus.quarantined,
+				branches: contextStatus.branches,
+				activeSources: contextStatus.activeSources,
+				tombstones: contextStatus.tombstones,
+				leafSummaries: contextStatus.leafSummaries,
+				condensedSummaries: contextStatus.condensedSummaries,
+				jobs: contextStatus.jobs,
+				storage: contextStatus.storage,
+				latestRecovery: contextStatus.latestRecovery,
+			};
 			if (store.quarantined) this.#runtimePhase = "quarantined";
 			return { runtime: this.#runtimeStatus(), store };
 		});
@@ -1842,7 +1986,8 @@ export class SessionLcm {
 			try {
 				const normalized = this.#normalizeActiveBranch(project);
 				const result = context.rebuild([normalized.snapshot]);
-				this.#activateBranch(normalized);
+				const reconciled = context.reconcile(normalized.snapshot, { summarize: false });
+				this.#activateBranch(normalized, reconciled.revision);
 				this.#syncSummaryFailures(context);
 				this.#dirty = false;
 				if (result.queuedJobs > 0) this.#startSummaryJobs();
@@ -1880,8 +2025,10 @@ export class SessionLcm {
 							);
 						}),
 				);
-				if (activeRebuilt) this.#activateBranch(active);
-				else this.#clearActiveBranch();
+				if (activeRebuilt) {
+					const reconciled = context.reconcile(activeSnapshot, { summarize: false });
+					this.#activateBranch(active, reconciled.revision);
+				} else this.#clearActiveBranch();
 				this.#syncSummaryFailures(context);
 				this.#dirty = !activeRebuilt;
 				if (result.queuedJobs > 0) this.#startSummaryJobs();
@@ -2024,6 +2171,7 @@ export class SessionLcm {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#generation++;
+		this.#projectionAttempt++;
 		this.#summaryRestartRequested = false;
 		this.#deferReconcileUntilSummarySettles = false;
 		this.#summaryRetryDeferred = false;

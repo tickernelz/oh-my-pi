@@ -1,5 +1,6 @@
 import type { DoctorReport, PurgeResult, RebuildResult } from "@oh-my-pi/lcm-context";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { formatBytes } from "@oh-my-pi/pi-utils";
 import type { LcmPublicStatus } from "../session/session-lcm";
 import { commandConsumed, parseSubcommand, usage } from "../slash-commands/helpers/parse";
 import type {
@@ -21,7 +22,7 @@ const LCM_REBUILD_USAGE =
 
 export const LCM_SUBCOMMANDS: SubcommandDef[] = [
 	{ name: "status", description: "Show Lossless runtime, projection, and derived-store health" },
-	{ name: "doctor", description: "Refresh the current projection and run derived-store integrity checks" },
+	{ name: "doctor", description: "Reconcile the current branch and run derived-store diagnostics" },
 	{
 		name: "rebuild",
 		description: "Rebuild from authoritative JSONL with explicit scope",
@@ -59,6 +60,11 @@ function safeIdentifier(value: string | undefined): string {
 	return truncateToWidth(text, TRUNCATE_LENGTHS.LONG);
 }
 
+function safeOpaqueIdentifier(value: string | undefined): string {
+	const identifier = safeIdentifier(value);
+	return identifier.includes("/") || identifier.includes("\\") ? "[redacted]" : identifier;
+}
+
 function formatBackoff(retryAt: number | undefined): string {
 	if (
 		typeof retryAt !== "number" ||
@@ -93,6 +99,9 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 		lines.push(
 			`Project jobs: ${store.jobs.pending} pending, ${store.jobs.leased} running, ${store.jobs.failed} failed, ${store.jobs.completed} completed, ${store.jobs.obsolete} obsolete`,
 		);
+		lines.push(
+			`Storage: ${formatBytes(store.storage.databaseBytes)} database, ${formatBytes(store.storage.walBytes)} WAL, ${formatBytes(store.storage.quarantineBytes)} quarantine`,
+		);
 	} else {
 		lines.push("SQLite WAL: not initialized");
 		lines.push("Project jobs: not initialized");
@@ -100,18 +109,37 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 	lines.push(
 		`Backoff: preferred until ${formatBackoff(runtime.summaryBackoff?.preferred)}; fallback until ${formatBackoff(runtime.summaryBackoff?.fallback)}`,
 	);
-	const projection = runtime.lastProjection;
-	if (projection) {
-		const selectedLevels = Object.entries(projection.selectedLevelCounts).filter(([, count]) => count > 0);
-		const depth = selectedLevels.length === 0 ? 0 : Math.max(...selectedLevels.map(([level]) => Number(level))) + 1;
-		const nodes = selectedLevels.reduce((total, [, count]) => total + count, 0);
-		lines.push(
-			`DAG: depth ${depth}, ${nodes} selected nodes, ${projection.coveredSourceCount} covered sources, ${projection.freshSourceCount} fresh sources`,
-		);
-		lines.push(`Estimated tokens: ${projection.sourceTokens} -> ${projection.estimatedTokens}`);
-		lines.push(`Current branch: revision ${projection.revision}; ${projection.pendingJobs} relevant jobs pending`);
+
+	const branch = runtime.currentBranch;
+	if (!branch) {
+		lines.push("Current branch: not initialized");
+		lines.push("Projection: unevaluated; no active branch");
 	} else {
-		lines.push("DAG: no fitted projection yet");
+		lines.push(
+			`Current branch: session ${safeOpaqueIdentifier(branch.sessionId)}; branch ${safeOpaqueIdentifier(branch.branchId)}; revision ${branch.revision}; ${branch.activeSources} active sources; ${branch.sourceTokens} source tokens`,
+		);
+		if (branch.projectionState === "unevaluated") {
+			lines.push("Projection: unevaluated for the current branch");
+		} else if (branch.projectionState === "unfitted") {
+			lines.push(
+				`Projection: unfitted for the current request${branch.projection ? `; ${branch.projection.pendingJobs} relevant jobs pending` : ""}`,
+			);
+		} else {
+			const projection = branch.projection;
+			if (projection) {
+				const selectedLevels = Object.entries(projection.selectedLevelCounts).filter(([, count]) => count > 0);
+				const depth =
+					selectedLevels.length === 0 ? 0 : Math.max(...selectedLevels.map(([level]) => Number(level))) + 1;
+				const nodes = selectedLevels.reduce((total, [, count]) => total + count, 0);
+				lines.push(`Projection: fitted to the current request; ${projection.pendingJobs} relevant jobs pending`);
+				lines.push(
+					`DAG: depth ${depth}, ${nodes} selected nodes, ${projection.coveredSourceCount} covered sources, ${projection.freshSourceCount} fresh sources`,
+				);
+				lines.push(`Estimated tokens: ${projection.sourceTokens} -> ${projection.estimatedTokens}`);
+			} else {
+				lines.push("Projection: fitted to the current request; details unavailable");
+			}
+		}
 	}
 	if (runtime.lastFailureCategory) lines.push(`Last fallback: ${runtime.lastFailureCategory}`);
 	if (store?.quarantined || runtime.phase === "quarantined") {
@@ -119,7 +147,11 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 	} else if (runtime.phase === "degraded") {
 		lines.push("Lossless projection is degraded; native compaction remains active.");
 	}
-	if (store?.recoveredFrom) lines.push("Derived store recovery: completed.");
+	if (store?.latestRecovery) {
+		lines.push(
+			`Derived store recovery: ${formatBackoff(store.latestRecovery.occurredAt)}; category ${store.latestRecovery.category}.`,
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -141,7 +173,7 @@ export function formatLcmRebuild(result: RebuildResult, scope: "current" | "proj
 }
 
 export function formatLcmGc(result: PurgeResult): string {
-	return `LCM retention-aware GC removed ${result.tombstones} eligible tombstones, ${result.jobs} eligible jobs, ${result.summaries} unreferenced summaries, ${result.sourceContents} unreferenced source contents, and ${result.files} unreferenced file records. Active lineage and authoritative session JSONL were not changed.`;
+	return `LCM retention-aware GC removed ${result.tombstones} eligible tombstones, ${result.jobs} eligible jobs, ${result.summaries} unreferenced summaries, ${result.sourceContents} unreferenced source contents, ${result.files} unreferenced file records, and ${result.quarantineFiles} expired quarantine artifacts (${formatBytes(result.quarantineBytes)}). Active lineage and authoritative session JSONL were not changed.`;
 }
 
 async function formatLcmProjects(agentDir: string): Promise<string> {

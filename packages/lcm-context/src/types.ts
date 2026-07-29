@@ -271,13 +271,18 @@ export interface JobStatusCounts {
 	obsolete: number;
 }
 
+export type LcmRecoveryCategory = "integrity_check" | "corruption" | "unknown";
+
 export interface LcmStatus {
-	dbPath: string;
 	schemaVersion: number;
 	journalMode: string;
 	quarantined: boolean;
-	quarantineReason: string | null;
-	recoveredFrom: string | null;
+	storage: {
+		databaseBytes: number;
+		walBytes: number;
+		quarantineBytes: number;
+	};
+	latestRecovery: { occurredAt: number; category: LcmRecoveryCategory } | null;
 	branches: number;
 	activeSources: number;
 	tombstones: number;
@@ -303,6 +308,8 @@ export interface PurgeResult {
 	summaries: number;
 	sourceContents: number;
 	files: number;
+	quarantineFiles: number;
+	quarantineBytes: number;
 }
 
 export interface RebuildResult {
