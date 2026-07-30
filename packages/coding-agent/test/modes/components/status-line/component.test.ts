@@ -131,7 +131,9 @@ describe("StatusLineComponent", () => {
 			}) as unknown as AgentSession,
 		);
 
-		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		// Generous width: the cost segment is droppable under width pressure, and the
+		// checkout's branch name is part of the line, so a tight width tests layout not cost.
+		const stripped = statusLine.getTopBorder(300).content.replace(/\x1b\[[0-9;]*m/g, "");
 		expect(stripped).toContain("$2.67 (sub) + $0.41 (adv) + $1.10 (lcm)");
 	});
 
@@ -144,7 +146,7 @@ describe("StatusLineComponent", () => {
 			}) as unknown as AgentSession,
 		);
 
-		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		const stripped = statusLine.getTopBorder(300).content.replace(/\x1b\[[0-9;]*m/g, "");
 		expect(stripped).toContain("$2.67 (sub) + $0.41 (adv)");
 		expect(stripped).not.toContain("(lcm)");
 	});
