@@ -44,6 +44,7 @@ import {
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
 	normalizeLcmBranch,
+	normalizeLcmHardProjectionWaitMs,
 	SessionLcm,
 	type SessionLcmOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
@@ -98,6 +99,8 @@ class FakeLcmContext implements LcmContext {
 	lastCompletion: SummaryCompletion | undefined;
 	job: SummaryJob | undefined;
 	now = 1_000_000;
+	priorSpend = 0;
+	readonly priorSpendCalls: Array<{ sessionId: string; before: number }> = [];
 	maxLeased = 0;
 	projectImpl: (request: ProjectionRequest, snapshot: SourceSnapshot) => ContextProjection = (_request, snapshot) => ({
 		revision: 1,
@@ -201,6 +204,11 @@ class FakeLcmContext implements LcmContext {
 			}
 		}
 		return delays.length === 0 ? null : Math.min(...delays);
+	}
+
+	priorSummarySpendUsd(sessionId: string, before: number): number {
+		this.priorSpendCalls.push({ sessionId, before });
+		return this.priorSpend;
 	}
 
 	summaryJobFailures() {
@@ -408,6 +416,8 @@ function createHarness(
 	projectRoot?: string,
 	maxConcurrentSummaries = 1,
 	projectionFits: (messages: AgentMessage[]) => boolean = () => true,
+	peerPollMs?: number,
+	hardProjectionWaitMs?: number,
 ) {
 	const complete = vi.fn(async (_request: LcmCompletionRequest) => "redacted summary");
 	let attemptOrdinal = 0;
@@ -455,6 +465,7 @@ function createHarness(
 		{
 			summaryModel: "@smol",
 			maxConcurrentSummaries,
+			hardProjectionWaitMs,
 			registerProject,
 			dependencies: {
 				openContext,
@@ -467,6 +478,7 @@ function createHarness(
 					};
 				},
 				hardWaitMs,
+				peerPollMs,
 				now: () => context.now,
 			},
 		},
@@ -1061,7 +1073,7 @@ describe("SessionLcm", () => {
 		await Promise.all([context.summaryFailed.promise, heldStarted.promise]);
 		await flushScheduler();
 		const backedOff = await lcm.status();
-		expect(backedOff.runtime.summaryBackoff).toEqual({ fallback: context.now + 30_000 });
+		expect(backedOff.runtime.summaryBackoff).toEqual({ fallback: context.now + 2_000 });
 		const preferredClaimStart = context.claimCalls.length;
 
 		context.queueJobs(summaryJob("new-preferred-with-capacity"));
@@ -1119,10 +1131,10 @@ describe("SessionLcm", () => {
 		expect(context.completedJobIds.has("failing-sibling")).toBe(false);
 		expect(context.failureRecords.get("failing-sibling")).toEqual({
 			jobId: "failing-sibling",
-			availableAt: context.now + 30_000,
+			availableAt: context.now + 2_000,
 			queueClass: "preferred",
 		});
-		expect(status.runtime.summaryBackoff).toEqual({ preferred: context.now + 30_000 });
+		expect(status.runtime.summaryBackoff).toEqual({ preferred: context.now + 2_000 });
 		expect(status.runtime.lastFailureCategory).toBe("provider");
 		await lcm.close();
 	});
@@ -1214,8 +1226,8 @@ describe("SessionLcm", () => {
 	it("uses the larger retry hint or capped exponential transport delay", async () => {
 		const cases = [
 			{ retry: 0, hint: 45_000, expected: 45_000 },
-			{ retry: 3, hint: undefined, expected: 240_000 },
-			{ retry: 9, hint: undefined, expected: 300_000 },
+			{ retry: 3, hint: undefined, expected: 16_000 },
+			{ retry: 9, hint: undefined, expected: 32_000 },
 		] as const;
 		for (const testCase of cases) {
 			const manager = SessionManager.inMemory(`/retry-delay-${testCase.retry}`);
@@ -1631,6 +1643,236 @@ describe("SessionLcm", () => {
 		expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(2_048);
 		expect(Buffer.byteLength(output, "utf8")).toBeLessThan(Buffer.byteLength(inputText, "utf8"));
 		await lcm.close();
+	});
+
+	it("scales the deterministic fallback to the leased budget instead of a fixed 512 tokens", async () => {
+		const manager = SessionManager.inMemory("/deterministic-budget");
+		appendUser(manager, "deterministic", 1);
+		const context = new FakeLcmContext();
+		const inputText = "x".repeat(19_388);
+		context.queuedJobs = 1;
+		context.job = {
+			...summaryJob("deterministic-budget"),
+			inputs: [{ kind: "source", id: "source-deterministic", redactedText: inputText, tokenCount: 4_847 }],
+			inputTokenCount: 4_847,
+			outputTokenBudget: 1_212,
+			stage: "deterministic",
+			strategy: "deterministic_truncate",
+		};
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		await lcm.project(manager.buildSessionContext().messages);
+		await context.summaryCompleted.promise;
+		expect(complete).not.toHaveBeenCalled();
+		const bytes = Buffer.byteLength(context.lastCompletion?.redactedText ?? "", "utf8");
+		// The old fixed cap would have produced 512 * 4 bytes; the leased budget is 1212.
+		expect(bytes).toBeGreaterThan(512 * 4);
+		expect(bytes).toBeLessThanOrEqual(1_212 * 4);
+		expect(bytes).toBeLessThan(Buffer.byteLength(inputText, "utf8"));
+		await lcm.close();
+	});
+
+	it("tells a condensation job its inputs are already summaries and leaves leaf prompts alone", async () => {
+		for (const level of [0, 1]) {
+			const manager = SessionManager.inMemory(`/condense-${level}`);
+			appendUser(manager, "condense", 1);
+			const context = new FakeLcmContext();
+			context.queuedJobs = 1;
+			context.job = {
+				...summaryJob(`condense-${level}`),
+				kind: level > 0 ? "condensed" : "leaf",
+				level,
+				inputs: [
+					{
+						kind: level > 0 ? "summary" : "source",
+						id: `input-${level}`,
+						redactedText: "safe historical facts",
+						tokenCount: 8,
+					},
+				],
+			};
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			await lcm.project(manager.buildSessionContext().messages);
+			await context.summaryCompleted.promise;
+			expect(complete).toHaveBeenCalledTimes(1);
+			const prompt = complete.mock.calls[0]![0].prompt;
+			if (level > 0) expect(prompt).toContain("The inputs below are already summaries");
+			else expect(prompt).not.toContain("The inputs below are already summaries");
+			await lcm.close();
+		}
+	});
+
+	it("asks the provider for exactly the leased budget, whatever the transport does with it", async () => {
+		for (const capHonoring of [true, false]) {
+			const manager = SessionManager.inMemory(`/budget-request-${capHonoring}`);
+			appendUser(manager, "budget request", 1);
+			const context = new FakeLcmContext();
+			context.queuedJobs = 1;
+			context.job = {
+				...summaryJob(`budget-${capHonoring}`),
+				inputs: [{ kind: "source", id: "source-budget", redactedText: "safe historical facts", tokenCount: 4_847 }],
+				inputTokenCount: 4_847,
+				outputTokenBudget: 2_424,
+			};
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			// A cap-stripping wire returns more than it was asked for; the request is identical either way.
+			complete.mockImplementation(async request =>
+				"y".repeat((capHonoring ? request.maxOutputTokens : Math.ceil(request.maxOutputTokens * 1.28)) * 4),
+			);
+			await lcm.project(manager.buildSessionContext().messages);
+			await context.summaryCompleted.promise;
+			expect(complete).toHaveBeenCalledTimes(1);
+			// Not the flat SUMMARY_MAX_OUTPUT_TOKENS: the request carries the job's leased budget.
+			expect(complete.mock.calls[0]![0].maxOutputTokens).toBe(2_424);
+			expect(complete.mock.calls[0]![0].prompt).toContain("at most 2424 tokens");
+			await lcm.close();
+		}
+	});
+
+	it("re-projects on the poll tick so a peer commit lands before the foreground deadline", async () => {
+		const manager = SessionManager.inMemory("/peer-progress-poll");
+		const first = appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		// One job exists but is permanently unclaimable here: a peer holds it, and the only
+		// local wake is that peer's lease expiry, far past the foreground deadline. The local
+		// worker pool emits a couple of settle signals and then goes quiet forever, so
+		// reaching the eighth read is only possible by repeated poll ticks re-reading the store.
+		context.queueJobs(summaryJob("peer-held"));
+		context.deferredClaims = Number.MAX_SAFE_INTEGER;
+		context.nextDelayMs = 600_000;
+		const readsBeforePeerCommit = 8;
+		let reads = 0;
+		const notReady = context.projectImpl;
+		context.projectImpl = (request, snapshot) => {
+			// The peer commits partway through, emitting no local signal of any kind.
+			if (++reads < readsBeforePeerCommit) return notReady(request, snapshot);
+			const old = snapshot.entries[1]!;
+			const fresh = snapshot.entries.at(-1)!;
+			return {
+				revision: 2,
+				ready: true,
+				historical: [
+					{
+						kind: "summary",
+						summaryId: "summary-peer",
+						summaryHandle: "summary_handle_peer",
+						level: 0,
+						redactedText: "facts committed by a peer process",
+						tokenCount: 2,
+						sourceIds: [old.entryId],
+						citations: [
+							{
+								...snapshot.scope,
+								sourceId: old.entryId,
+								sourceKey: "source-key-peer",
+								contentHash: old.contentHash,
+								position: 1,
+							},
+						],
+						files: [],
+					},
+				],
+				freshTailSourceIds: [fresh.entryId],
+				uncoveredSourceIds: [],
+				sourceTokens: 90,
+				selectedLevelCounts: { 0: 1 },
+				coveredSourceCount: 1,
+				freshSourceCount: 1,
+				estimatedTokens: 12,
+				pendingJobs: 0,
+			};
+		};
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			500,
+			undefined,
+			undefined,
+			undefined,
+			5,
+		);
+		try {
+			const result = await lcm.project(manager.buildSessionContext().messages);
+			expect(result.owned).toBe(true);
+			expect(result.messages[0]).toBe(first);
+			expect(reads).toBeGreaterThanOrEqual(readsBeforePeerCommit);
+			// The peer did the work; this session never dispatched a completion.
+			expect(complete).not.toHaveBeenCalled();
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("normalizes the configured projection wait to the supported window", () => {
+		expect(normalizeLcmHardProjectionWaitMs(undefined)).toBe(60_000);
+		expect(normalizeLcmHardProjectionWaitMs(30_000)).toBe(30_000);
+		expect(normalizeLcmHardProjectionWaitMs(15_000)).toBe(15_000);
+		// Hand-written config is clamped to the supported window at both ends.
+		expect(normalizeLcmHardProjectionWaitMs(1_000)).toBe(15_000);
+		expect(normalizeLcmHardProjectionWaitMs(600_000)).toBe(60_000);
+		// Anything that is not a finite integer falls back to the default.
+		expect(normalizeLcmHardProjectionWaitMs(30_000.5)).toBe(60_000);
+		expect(normalizeLcmHardProjectionWaitMs(Number.NaN)).toBe(60_000);
+		expect(normalizeLcmHardProjectionWaitMs("30000")).toBe(60_000);
+		expect(normalizeLcmHardProjectionWaitMs(null)).toBe(60_000);
+	});
+
+	it("seeds this session's prior LCM spend from the ledger at bind and stamps the session on attempts", async () => {
+		const manager = SessionManager.inMemory("/prior-spend");
+		appendUser(manager, "prior spend", 1);
+		const context = new FakeLcmContext();
+		context.priorSpend = 1.1;
+		context.queueJobs(summaryJob("stamped"));
+		const { lcm } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await context.summaryCompleted.promise;
+			expect(lcm.priorSpendUsd()).toBe(1.1);
+			// Scoped to this session and bounded by the process epoch, so live spend is not double counted.
+			expect(context.priorSpendCalls[0]?.sessionId).toBe(manager.getSessionId());
+			expect(context.priorSpendCalls[0]?.before).toBeGreaterThan(0);
+			expect(context.attemptRows.get("attempt-1")?.provenance.sessionId).toBe(manager.getSessionId());
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("lets the injected wait seam outrank the configured projection wait", async () => {
+		const manager = SessionManager.inMemory("/wait-precedence");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("never-ready"));
+		context.deferredClaims = Number.MAX_SAFE_INTEGER;
+		context.nextDelayMs = 600_000;
+		// A 60 s configured wait must not override the 20 ms injected seam: if precedence
+		// inverted, this projection would block for a full minute instead of failing open.
+		// The poll stays at its production interval so the 20 ms deadline is what expires.
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			20,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			60_000,
+		);
+		try {
+			const result = await lcm.project(manager.buildSessionContext().messages);
+			expect(result.owned).toBe(false);
+			expect(lcm.takePendingFallbackCategory()).toBe("deadline");
+		} finally {
+			await lcm.close();
+		}
 	});
 	it("opens lazily, coexists with collab append, backfills, rebinds, disposes, and hides dbPath", async () => {
 		const manager = SessionManager.inMemory("/worktree-a");

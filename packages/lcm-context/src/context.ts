@@ -612,11 +612,24 @@ function strategyForStage(stage: SummaryStage): SummaryStrategy {
 	}
 }
 
+/** Measured natural compression of the summary model at condensation levels is ~2x. */
+const CONDENSE_TARGET_RATIO = 2;
+/**
+ * Absolute ceiling on one accepted summary node, in local (bytes/4) tokens. Bounds prompt
+ * growth regardless of stage, caller cap, or provider overshoot, and is the one value both
+ * the budget formula and the acceptance predicate clamp against.
+ */
+const SUMMARY_NODE_TOKEN_CEILING = 4_096;
+/** The codex wire drops max_output_tokens, so the cap is advisory there; measured overshoot is <=1.28x. */
+const ACCEPT_OVERSHOOT_RATIO = 1.3;
+
 function outputBudgetForStage(stage: SummaryStage, maxOutputTokens: number, inputTokenCount: number): number {
-	const normalBudget = Math.min(maxOutputTokens, inputTokenCount - 1);
+	const natural = Math.ceil(inputTokenCount / CONDENSE_TARGET_RATIO);
+	const normalBudget = Math.min(inputTokenCount - 1, SUMMARY_NODE_TOKEN_CEILING, Math.max(maxOutputTokens, natural));
 	if (stage === "normal") return normalBudget;
-	if (stage === "aggressive") return Math.min(inputTokenCount - 1, Math.max(1, Math.floor(normalBudget / 2)));
-	return Math.min(512, inputTokenCount - 1);
+	// Aggressive halves the ask; deterministic truncation always compresses, so it keeps
+	// the aggressive budget instead of collapsing to 512 and destroying the node.
+	return Math.min(inputTokenCount - 1, Math.max(1, Math.floor(normalBudget / 2)));
 }
 
 function nextStage(stage: SummaryStage): SummaryStage | null {
@@ -2351,6 +2364,19 @@ class SqliteLcmContext implements LcmContext {
 		return availableAt === null ? null : Math.max(0, availableAt - now);
 	}
 
+	/** Summary spend already recorded for this session strictly before `before`, in USD. */
+	priorSummarySpendUsd(sessionId: string, before: number): number {
+		this.#assertAvailable();
+		assertIdentifier(sessionId, "sessionId");
+		return (
+			this.#db
+				.query<{ total: number }, [string, number]>(
+					"SELECT COALESCE(SUM(cost_total), 0) AS total FROM summary_attempts WHERE session_id = ? AND started_at < ?",
+				)
+				.get(sessionId, assertInteger(before, "before", 0))?.total ?? 0
+		);
+	}
+
 	#loadClaimedJob(
 		jobId: string,
 		leaseToken: string,
@@ -2607,7 +2633,12 @@ class SqliteLcmContext implements LcmContext {
 				markObsolete();
 				return { accepted: false, reason: "stale" };
 			}
-			if (tokenCount >= job.lease_input_tokens || tokenCount > job.lease_output_budget) {
+			const acceptCap = Math.min(
+				job.lease_input_tokens - 1,
+				SUMMARY_NODE_TOKEN_CEILING,
+				Math.ceil(job.lease_output_budget * ACCEPT_OVERSHOOT_RATIO),
+			);
+			if (tokenCount > acceptCap) {
 				const overridden = settle("non_compressing");
 				if (overridden) return overridden;
 				const advanced = nextStage(job.stage);
@@ -2903,6 +2934,7 @@ class SqliteLcmContext implements LcmContext {
 			assertIdentifier(provenance.modelSelector, "provenance.modelSelector");
 		if (provenance.resolvedModel !== undefined)
 			assertIdentifier(provenance.resolvedModel, "provenance.resolvedModel");
+		if (provenance.sessionId !== undefined) assertIdentifier(provenance.sessionId, "provenance.sessionId");
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): boolean => {
 			const job = this.#db
@@ -2928,8 +2960,8 @@ class SqliteLcmContext implements LcmContext {
 			const inserted = this.#db.run(
 				`INSERT INTO summary_attempts
 					(attempt_id, job_id, project_id, input_hash, attempt_count, started_at, outcome,
-					 model_selector, provider, model, stage, strategy, prompt_hash)
-				 VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?, ?, ?, ?, ?, ?)
+					 model_selector, provider, model, stage, strategy, prompt_hash, session_id)
+				 VALUES (?, ?, ?, ?, ?, ?, 'in_flight', ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT(attempt_id) DO NOTHING`,
 				[
 					attempt.attemptId,
@@ -2944,6 +2976,7 @@ class SqliteLcmContext implements LcmContext {
 					job.stage,
 					provenance.strategy,
 					provenance.promptHash,
+					provenance.sessionId ? boundedDiagnostic(provenance.sessionId) : null,
 				],
 			);
 			return Number(inserted.changes) > 0;

@@ -1985,7 +1985,8 @@ describe("LCM context contracts", () => {
 			maxOutputTokens: 2,
 		});
 		expect(claim?.inputTokenCount).toBeGreaterThan(claim?.outputTokenBudget ?? 0);
-		expect(claim?.outputTokenBudget).toBe(2);
+		// The nominal cap is a floor now: the ratio-derived budget wins when it is larger.
+		expect(claim?.outputTokenBudget).toBe(Math.ceil(claim!.inputTokenCount / 2));
 		expect(
 			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: sourceText, tokenCount: 1 }),
 		).toEqual({
@@ -2006,6 +2007,164 @@ describe("LCM context contracts", () => {
 		).toMatchObject({
 			accepted: true,
 		});
+	});
+
+	test("stage budgets track input size under a hard node ceiling", () => {
+		// ceil(19388/4) = 4847 estimated tokens in one leaf.
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const [normal] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(normal?.inputTokenCount).toBe(4_847);
+		expect(normal?.outputTokenBudget).toBe(2_424);
+		// 3,200 estimated tokens compresses the input but clears ceil(2424 * 1.3) = 3152.
+		expect(
+			context.completeSummaryJob(normal!.jobId, normal!.leaseToken, { redactedText: "y".repeat(12_800) }),
+		).toEqual({ accepted: false, reason: "escalated", stage: "aggressive" });
+
+		const [aggressive] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(aggressive?.outputTokenBudget).toBe(1_212);
+		expect(
+			context.completeSummaryJob(aggressive!.jobId, aggressive!.leaseToken, { redactedText: "y".repeat(8_000) }),
+		).toEqual({ accepted: false, reason: "escalated", stage: "deterministic" });
+
+		// Deterministic keeps the aggressive budget instead of collapsing to 512.
+		const [deterministic] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(deterministic?.outputTokenBudget).toBe(1_212);
+	});
+
+	test("the node ceiling, not the tolerance, bounds an oversized atomic leaf", () => {
+		// ceil(70920/4) = 17730 tokens: one indivisible unit far above any leaf chunk target.
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(70_920))]));
+		const [normal] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(normal?.inputTokenCount).toBe(17_730);
+		expect(normal?.outputTokenBudget).toBe(4_096);
+		// 4,500 tokens sits below ceil(4096 * 1.3) = 5325 and is still rejected by the ceiling.
+		expect(
+			context.completeSummaryJob(normal!.jobId, normal!.leaseToken, { redactedText: "y".repeat(18_000) }),
+		).toEqual({ accepted: false, reason: "escalated", stage: "aggressive" });
+
+		const [aggressive] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(aggressive?.outputTokenBudget).toBe(2_048);
+	});
+
+	test("accepts a cap-honoring completion exactly at the leased budget", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const [claim] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(claim?.outputTokenBudget).toBe(2_424);
+		expect(
+			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "y".repeat(2_424 * 4) }),
+		).toMatchObject({ accepted: true });
+		expect(
+			context.project({ ...MAIN, tokenBudget: 4_000, freshTail: { maxSources: 0, maxTokens: 0 } }).historical[0]
+				?.tokenCount,
+		).toBe(2_424);
+	});
+
+	test("accepts bounded overshoot and still projects a complete cover", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const [claim] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		expect(claim?.outputTokenBudget).toBe(2_424);
+		// 2,600 tokens overshoots the budget 1.07x, inside ceil(2424 * 1.3) = 3152.
+		expect(
+			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "y".repeat(10_400) }),
+		).toMatchObject({ accepted: true });
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 4_000,
+			freshTail: { maxSources: 0, maxTokens: 0 },
+		});
+		expect(projection.ready).toBe(true);
+		expect(projection.historical).toHaveLength(1);
+		expect(projection.historical[0]?.tokenCount).toBe(2_600);
+		expect(projection.uncoveredSourceIds).toEqual([]);
+		expect(projection.pendingJobs).toBe(0);
+	});
+
+	test("a peer handle's completion becomes visible to another open handle with no local signal", async () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const peer = await openLcmContext({
+			dbPath,
+			leafChunk: { maxSources: 2, maxTokens: 10_000 },
+			condenseFanIn: 2,
+			tombstoneRetentionMs: 100,
+			now: () => now,
+			regexEngine: TEST_REGEX_ENGINE,
+		});
+		try {
+			const [leased] = peer.claimSummaryJobs({
+				workerId: "peer",
+				leaseMs: 600_000,
+				limit: 1,
+				maxOutputTokens: 2_048,
+			});
+			expect(leased).toBeDefined();
+
+			// The local handle can neither claim the peer's job nor learn anything sooner than
+			// the peer lease expiry, so a wake-only strategy would sleep for the full 600 s.
+			expect(
+				context.claimSummaryJobs({ workerId: "local", leaseMs: 60_000, limit: 1, maxOutputTokens: 2_048 }),
+			).toEqual([]);
+			expect(context.nextSummaryJobDelayMs(MAIN)).toBe(600_000);
+			const before = context.project({
+				...MAIN,
+				tokenBudget: 4_000,
+				freshTail: { maxSources: 0, maxTokens: 0 },
+			});
+			expect(before.historical).toEqual([]);
+			expect(before.pendingJobs).toBe(1);
+
+			expect(
+				peer.completeSummaryJob(leased!.jobId, leased!.leaseToken, { redactedText: "y".repeat(4_000) }),
+			).toMatchObject({ accepted: true });
+
+			// Re-reading is the only notification that exists across handles.
+			const after = context.project({
+				...MAIN,
+				tokenBudget: 4_000,
+				freshTail: { maxSources: 0, maxTokens: 0 },
+			});
+			expect(after.historical).toHaveLength(1);
+			expect(after.historical[0]?.tokenCount).toBe(1_000);
+			expect(after.pendingJobs).toBe(0);
+			expect(after.uncoveredSourceIds).toEqual([]);
+		} finally {
+			peer.close();
+		}
 	});
 
 	test("completion rejects lineage that became misaligned with a branch atomic group", () => {
@@ -2308,6 +2467,8 @@ describe("LCM context contracts", () => {
 		try {
 			initializeLcmSchema(db, 1_000);
 			db.run("DROP TABLE branch_summary_spans");
+			// v7 predates session attribution, so the synthetic database must not carry it either.
+			db.run("ALTER TABLE summary_attempts DROP COLUMN session_id");
 			db.run("PRAGMA user_version = 7");
 		} finally {
 			db.close();
@@ -2345,6 +2506,85 @@ describe("LCM context contracts", () => {
 					maxOutputTokens: 100,
 				}),
 			).toHaveLength(1);
+		} finally {
+			migrated.close();
+		}
+	});
+
+	test("attributes attempt spend to its session and excludes anything at or after the epoch", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const [job] = context.claimSummaryJobs({
+			workerId: "worker",
+			leaseMs: 60_000,
+			limit: 1,
+			maxOutputTokens: 2_048,
+		});
+		const usage = {
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+			cost: { input: 0.2, output: 0.05, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+		};
+		expect(
+			context.beginSummaryAttempt(
+				job!.jobId,
+				job!.leaseToken,
+				{ attemptId: "attempt-s1", startedAt: now, provider: "p", model: "m" },
+				{ promptHash: "hash-s1", sessionId: "s1", strategy: "preserve_details" },
+			),
+		).toBe(true);
+		expect(
+			context.completeSummaryJob(job!.jobId, job!.leaseToken, {
+				redactedText: "y".repeat(4_000),
+				attempt: { attemptId: "attempt-s1", startedAt: now, completedAt: now, provider: "p", model: "m", usage },
+			}),
+		).toMatchObject({ accepted: true });
+
+		// Only this session's rows count, and only those started before the epoch.
+		expect(context.priorSummarySpendUsd("s1", now + 1)).toBeCloseTo(0.25, 10);
+		expect(context.priorSummarySpendUsd("s2", now + 1)).toBe(0);
+		expect(context.priorSummarySpendUsd("s1", now)).toBe(0);
+	});
+
+	test("v8 to v9 migration adds session attribution and leaves historic attempts unattributed", async () => {
+		const migrationPath = path.join(tempDir, "v8-attempt-sessions.db");
+		const db = new Database(migrationPath);
+		try {
+			initializeLcmSchema(db, 1_000);
+			db.run("ALTER TABLE summary_attempts DROP COLUMN session_id");
+			db.run(
+				`INSERT INTO summary_attempts
+					(attempt_id, job_id, project_id, input_hash, attempt_count, started_at, completed_at, outcome,
+					 provider, model, stage, strategy, prompt_hash, cost_total)
+				 VALUES ('legacy-attempt', 'legacy-job', 'project', 'legacy-hash', 1, 10, 20, 'completed',
+					 'p', 'm', 'normal', 'preserve_details', 'legacy-prompt', 0.5)`,
+			);
+			db.run("PRAGMA user_version = 8");
+		} finally {
+			db.close();
+		}
+
+		const migrated = await openLcmContext({ dbPath: migrationPath, now: () => now });
+		try {
+			const observer = new Database(migrationPath, { readonly: true, strict: true });
+			try {
+				expect(observer.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(
+					LCM_SCHEMA_VERSION,
+				);
+				expect(
+					observer
+						.query<{ session_id: string | null; cost_total: number }, []>(
+							"SELECT session_id, cost_total FROM summary_attempts WHERE attempt_id = 'legacy-attempt'",
+						)
+						.get(),
+				).toEqual({ session_id: null, cost_total: 0.5 });
+			} finally {
+				observer.close();
+			}
+			// A historic row belongs to no session, so it is never billed to one.
+			expect(migrated.priorSummarySpendUsd("s1", now + 1)).toBe(0);
 		} finally {
 			migrated.close();
 		}

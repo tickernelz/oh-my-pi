@@ -2144,6 +2144,36 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"context.lossless.hardProjectionWaitMs": {
+		type: "number",
+		default: 60_000,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Projection Wait",
+			description:
+				"Longest a turn may block at the hard compaction threshold while the lossless projection finishes covering history. On expiry the turn falls back to native compaction.",
+			options: [
+				{
+					value: "15000",
+					label: "Fail Fast",
+					description: "Give up after 15 seconds; highest native fallback rate.",
+				},
+				{
+					value: "30000",
+					label: "Balanced",
+					description: "About two waves of background condensation at typical latency.",
+				},
+				{
+					value: "60000",
+					label: "Patient",
+					description: "About four waves; fewest native fallbacks, longest worst-case stall.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
 	"context.lossless.trackFileAboveTokens": {
 		type: "number",
 		default: 25_000,

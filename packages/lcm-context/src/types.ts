@@ -125,6 +125,8 @@ export type SummaryStrategy = "preserve_details" | "bullet_points" | "determinis
 export interface SummaryAttemptProvenance {
 	promptHash: string;
 	modelSelector?: string;
+	/** Session that dispatched the attempt, so its spend survives a resume. */
+	sessionId?: string;
 	resolvedModel?: string;
 	strategy: SummaryStrategy;
 }
@@ -400,6 +402,8 @@ export interface LcmContext extends Disposable {
 	project(request: ProjectionRequest): ContextProjection;
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[];
 	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback?: boolean): number | null;
+	/** Summary spend already recorded for this session strictly before `before`, in USD. */
+	priorSummarySpendUsd(sessionId: string, before: number): number;
 	summaryJobFailures(preferredScope?: ContextScope): readonly {
 		jobId: string;
 		availableAt: number;

@@ -8,6 +8,8 @@
 - Added a deterministic type-aware exploration summary for `@`-mentioned files whose bytes are too large or too binary to auto-read. SQLite files report tables, row counts, and schema; JSON/JSONL report root shape and top-level keys with value types; CSV/TSV report columns; code reports top-level declarations; anything else reports leading lines. The dispatcher never calls a model, so identical bytes always describe identically and the result is safe to persist as LCM file metadata.
 - Added `mode: "regex"` to `lcm_search`, backed by the linear-time Rust engine. Text mode remains FTS5 token conjunction, where `alpha|beta` means `"alpha" AND "beta"`; regex mode honors alternation, anchors, and ordering as written.
 - Added `context.lossless.trackFileAboveTokens` (default 25,000). While Lossless is active, an `@`-mentioned text file estimated above that size is registered in the derived store with a content hash and a deterministic exploration summary. Its truncated head still reaches the model unchanged — the setting adds durable identity, it does not withhold content. The file handle is not injected at mention time; it surfaces once a projected summary lists it, or when `lcm_describe` is called on a covering source. Previously a 1.4 MB CSV was auto-read, truncated to a bounded head, and then left no trace in LCM at all, so nothing recorded that the file had been seen once its message was compacted.
+- Added `context.lossless.hardProjectionWaitMs` (Fail Fast 15,000 / Balanced 30,000 / Patient 60,000, default 60,000), the longest a turn may block at the hard compaction threshold before failing open to native compaction. It was previously a fixed 30,000 ms constant with no setting.
+- Added an `(lcm)` component to the status-line cost segment, so a session renders `$11.18 + $1.47 (adv) + $1.10 (lcm)`. LCM summary and recall completions are isolated oneshots whose usage never reaches `getUsageStatistics().cost`, so this spend was previously invisible in-session; the bucket is additive and cannot double-count the primary total. Background summarization is restored from the derived ledger on resume; recall is counted for the live process only.
 
 ### Changed
 
@@ -19,6 +21,10 @@
 - Lossless historical context now annotates each projected summary with the handles of files its compacted sources referenced, capped at three per summary and twelve per projection, so the model keeps file awareness after compaction instead of only recovering it through `lcm_describe`.
 - Removed `LcmProjectionLimits.softThresholdTokens`. It was computed at 80% of the hard threshold but never read: the live gates are the 40% prewarm point and the hard threshold, so the field only misdescribed the control loop.
 - Exploration summaries now state how the file reached the model. A skipped file still reads `contents not loaded into context.`; a large file whose head was inlined reads `a truncated head was inlined; the remainder was not loaded.` The previous wording claimed nothing was loaded, which would have been false for the newly tracked files.
+- The hard projection wait now defaults to 60,000 ms instead of 30,000 ms, roughly doubling the background work that can land before a turn gives up, and the wait is now spent re-reading the store rather than idling.
+- The first summary retry after a transient provider failure now waits 2 s instead of 30 s, growing 2/4/8/16/32 s. A 30 s first retry equalled the entire foreground window, so one hiccup guaranteed that turn fell back to native compaction no matter what else succeeded. An explicit provider `Retry-After` still wins.
+- The deterministic summary fallback now truncates to the job's leased output budget instead of a hardcoded 512 tokens, which had silently ignored the budget it was given.
+- A condensation job (level >= 1) now tells the model its inputs are already summaries and to consolidate rather than re-expand child detail. The prompt previously asked for `preserve_details` at every level, which is what produced the weakest compression exactly where inputs are densest.
 
 ### Fixed
 
@@ -30,6 +36,7 @@
 - Lossless projection now preserves live user, developer, file-mention, and assistant messages when their persistence metadata collides with older same-millisecond content.
 - Lossless projection fit checks now charge the serialized historical payload and warning before admitting provider requests near the context limit.
 - Lossless now arms its hard projection wait at strictly greater than the compaction threshold, matching native `shouldCompact`. At exact equality native leaves the request alone, so the previous `>=` blocked the turn for up to 30 seconds to build a projection nothing was going to use.
+- The hard projection wait now polls the derived store about once a second instead of waiting only on local worker signals. The store is project-scoped and shared across OMP processes, but a peer's completion raises no local signal and `nextSummaryJobDelayMs` schedules the wake at that peer's `lease_expires_at` — up to ten minutes out — so a session could sleep out its entire foreground window and fall back to native compaction while the summary it needed had already been committed seconds in.
 - Added server-name autocomplete for `/mcp` commands (`enable`, `disable`, `test`, `remove`, `reconnect`, `reauth`, `unauth`) using configured and runtime-discovered MCP servers.
 - Added `--from-claude` and `--from-codex` session imports, also available from `/resume @claude` and `/resume @codex`.
 

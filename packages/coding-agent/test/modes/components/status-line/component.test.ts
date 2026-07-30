@@ -10,8 +10,9 @@ function makeSessionWithLastMessage(
 	{
 		cost = 0,
 		advisorCost = 0,
+		lcmCost = 0,
 		usingSubscription = false,
-	}: { cost?: number; advisorCost?: number; usingSubscription?: boolean } = {},
+	}: { cost?: number; advisorCost?: number; lcmCost?: number; usingSubscription?: boolean } = {},
 ) {
 	return {
 		messages: lastMessage ? [lastMessage] : [],
@@ -49,6 +50,7 @@ function makeSessionWithLastMessage(
 			advisors: advisorCost > 0 ? [{ name: "test", status: "running" as const }] : [],
 		}),
 		getAdvisorCost: () => advisorCost,
+		getLcmCost: () => lcmCost,
 		isFastModeActive: () => false,
 		configuredThinkingLevel: () => undefined,
 		modelRegistry: {
@@ -117,5 +119,33 @@ describe("StatusLineComponent", () => {
 		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
 		expect(stripped).toContain("$2.67 (sub)");
 		expect(stripped).not.toContain("(adv)");
+	});
+
+	it("renders primary, advisor, and LCM costs as separate components", () => {
+		const statusLine = new StatusLineComponent(
+			makeSessionWithLastMessage(null, false, {
+				cost: 2.67,
+				advisorCost: 0.41,
+				lcmCost: 1.1,
+				usingSubscription: true,
+			}) as unknown as AgentSession,
+		);
+
+		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		expect(stripped).toContain("$2.67 (sub) + $0.41 (adv) + $1.10 (lcm)");
+	});
+
+	it("omits LCM cost when the session never dispatched an LCM request", () => {
+		const statusLine = new StatusLineComponent(
+			makeSessionWithLastMessage(null, false, {
+				cost: 2.67,
+				advisorCost: 0.41,
+				usingSubscription: true,
+			}) as unknown as AgentSession,
+		);
+
+		const stripped = statusLine.getTopBorder(120).content.replace(/\x1b\[[0-9;]*m/g, "");
+		expect(stripped).toContain("$2.67 (sub) + $0.41 (adv)");
+		expect(stripped).not.toContain("(lcm)");
 	});
 });

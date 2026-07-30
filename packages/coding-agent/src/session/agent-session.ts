@@ -472,6 +472,8 @@ export class AgentSession {
 	#pendingPrimaryRequestUsedLcm = false;
 	#inflightPrimaryRequestUsedLcm = false;
 	readonly #lcmProjectedPrimaryResponses = new WeakSet<AssistantMessage>();
+	/** Live LCM provider spend for this process; the durable remainder lives in the LCM ledger. */
+	#lcmSpendUsd = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -4366,6 +4368,7 @@ export class AgentSession {
 		this.#lcm?.configure({
 			summaryModel: this.settings.get("context.lossless.summaryModel"),
 			maxConcurrentSummaries: this.settings.get("context.lossless.maxConcurrentSummaries"),
+			hardProjectionWaitMs: this.settings.get("context.lossless.hardProjectionWaitMs"),
 		});
 	}
 
@@ -4473,11 +4476,16 @@ export class AgentSession {
 			provider: model.provider,
 			model: model.id,
 		};
-		const finishedAttempt = (usage?: SummaryProviderUsage): SummaryProviderAttempt => ({
-			...attemptStart,
-			completedAt: Math.max(attemptStart.startedAt, Date.now()),
-			...(usage ? { usage } : {}),
-		});
+		const finishedAttempt = (usage?: SummaryProviderUsage): SummaryProviderAttempt => {
+			// Every terminal path of this method calls this exactly once, so summary and recall
+			// spend is counted here whether the attempt succeeded, failed, or was rejected.
+			if (usage) this.#lcmSpendUsd += usage.cost.total;
+			return {
+				...attemptStart,
+				completedAt: Math.max(attemptStart.startedAt, Date.now()),
+				...(usage ? { usage } : {}),
+			};
+		};
 		const isolatedProviderState = new Map<string, ProviderSessionState>();
 		try {
 			const systemPrompt = this.#obfuscateTextForProvider(request.systemPrompt) ?? request.systemPrompt;
@@ -8922,6 +8930,10 @@ export class AgentSession {
 	/** Return cumulative cost recorded for the current session's advisor activity. */
 	getAdvisorCost(): number {
 		return this.#advisors.getAdvisorCost();
+	}
+	/** Return cumulative cost recorded for this session's LCM summary and recall activity. */
+	getLcmCost(): number {
+		return (this.#lcm?.priorSpendUsd() ?? 0) + this.#lcmSpendUsd;
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.

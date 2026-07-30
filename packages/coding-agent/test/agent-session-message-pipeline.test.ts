@@ -1504,6 +1504,8 @@ describe("AgentSession message pipeline", () => {
 			usage: { input: 11, output: 7, cacheRead: 3, cacheWrite: 2 },
 			costUsd: 1.25,
 		});
+		// The status line reads this: a dispatched LCM request must move the session's LCM cost.
+		expect(session.getLcmCost()).toBeCloseTo(1.25, 8);
 		expect(manager.getBranch()).toHaveLength(0);
 	});
 

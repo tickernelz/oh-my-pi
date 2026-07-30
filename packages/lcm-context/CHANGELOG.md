@@ -12,6 +12,7 @@
 - Added `SearchRequest.mode: "regex"`, a bounded linear-time alternative to FTS token conjunction. The package keeps zero runtime dependencies, so the host injects the matcher through `LcmContextOptions.regexEngine`; without one, regex mode throws instead of silently returning nothing. A scan streams candidates in insertion order, stops at the first full page, and examines at most 20,000 authorized branch documents.
 - Added `SearchHit.position` and `SearchHit.coveringSummaryHandle`, resolved from the current revision's `branch_summary_spans` so a source match reports the summary node that presently covers it. The lowest-level containing span wins, which is the most specific cover.
 - Added `ProjectedHistoricalItem.files`, the de-duplicated file metadata of every source a projected summary compacted, so callers can keep file awareness in the active context. It is filled by one query per projection rather than one per item, preserving the branch-span projection latency.
+- Added schema v9 session attribution on `summary_attempts` plus `priorSummarySpendUsd(sessionId, before)`, so a resumed session can restore its own LCM spend from the ledger instead of restarting the total at zero. Pre-v9 rows stay `NULL` and are never billed to a session.
 
 ### Changed
 
@@ -20,6 +21,9 @@
 - A projection now becomes ready on a complete leaf cover instead of waiting for the whole condensation tree, so background condensation no longer gates foreground readiness. `summary_lineage` and `summary_children` remain immutable provenance and continue to authorize retrieval.
 - Existing v6/v7 stores upgrade lazily: migrations create empty attempt and span tables, and the first authoritative reconcile derives current spans. Until then projection is unready and native behavior owns the request.
 - A file's `explorationSummary` no longer participates in the content-addressed source key. It is derived descriptive metadata, so including it meant that improving a file description minted new source keys and discarded every cached summary that referenced the file. Reconciling an otherwise identical entry now keeps its source key and refreshes `file_records.exploration_summary` in place, including when branch placement is unchanged.
+- A summary job's output budget now scales with its input instead of a flat 2,048-token cap: `min(input - 1, 4096, max(callerCap, ceil(input / 2)))`. A summary model condenses already-summarized inputs by roughly 2x, so the flat cap demanded 2.4x on a large parent and 8.7x on an indivisible oversized leaf and was routinely missed.
+- Completion acceptance now rejects only on a single cap, `min(input - 1, 4096, ceil(budget * 1.3))`, rather than on the leased budget exactly. The budget is a request, not an invariant — some provider wires strip output-cap fields entirely — so summaries that overshot the ask while still compressing their input were being discarded and escalated, spending two extra calls to reach a worse result. Monotonic shrink and the 4,096-token node ceiling remain hard invariants, so the DAG still converges and cover cost stays bounded.
+- The terminal deterministic stage now keeps the aggressive budget instead of collapsing to 512 tokens. Truncation always compresses, so the old floor discarded most of a node's content without protecting any invariant, and it did the most damage at condensation levels where inputs are densest.
 
 ### Fixed
 

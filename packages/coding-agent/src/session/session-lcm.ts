@@ -55,11 +55,13 @@ import type { SessionManager } from "./session-manager";
 import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 
 const SUMMARY_LEASE_MS = 10 * 60_000;
-const SUMMARY_RETRY_DELAY_MS = 30_000;
+const SUMMARY_RETRY_DELAY_MS = 2_000;
 /** Longest provider-requested delay retained by the durable summary scheduler. */
 const SUMMARY_RETRY_AFTER_MAX_MS = 24 * 60 * 60_000;
 const SUMMARY_MAX_OUTPUT_TOKENS = 2_048;
-const HARD_PROJECTION_WAIT_MS = 30_000;
+const HARD_PROJECTION_WAIT_MS = 60_000;
+/** The project store is shared across processes and peer completions raise no local signal. */
+const PEER_PROGRESS_POLL_MS = 1_000;
 const SQLITE_CONTENTION_DELAYS_MS = [100, 200, 400] as const;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -123,6 +125,12 @@ export function normalizeLcmMaxConcurrentSummaries(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
 		? Math.max(1, Math.min(4, value))
 		: 1;
+}
+
+export function normalizeLcmHardProjectionWaitMs(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
+		? Math.max(15_000, Math.min(60_000, value))
+		: HARD_PROJECTION_WAIT_MS;
 }
 
 export interface LcmProjectionAggregate {
@@ -234,6 +242,7 @@ export interface SessionLcmDependencies {
 	openContext?: typeof openLcmContext;
 	resolveProject?: typeof resolveLcmProject;
 	hardWaitMs?: number;
+	peerPollMs?: number;
 	now?: () => number;
 }
 
@@ -241,6 +250,7 @@ export interface SessionLcmOptions {
 	agentDir?: string;
 	summaryModel?: string;
 	maxConcurrentSummaries?: number;
+	hardProjectionWaitMs?: number;
 	registerProject?: (project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>;
 	dependencies?: SessionLcmDependencies;
 }
@@ -685,7 +695,7 @@ function utf8Prefix(text: string, maxBytes: number): string {
 }
 
 function deterministicSummary(job: SummaryJob): string {
-	const byteBudget = Math.min(512, job.inputTokenCount - 1) * 4;
+	const byteBudget = job.outputTokenBudget * 4;
 	let remaining = byteBudget;
 	const parts: string[] = [];
 	for (const input of job.inputs) {
@@ -798,8 +808,12 @@ export class SessionLcm {
 	readonly #registerProject:
 		| ((project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>)
 		| undefined;
-	readonly #hardWaitMs: number;
+	#hardWaitMs: number;
+	readonly #hardWaitFixed: boolean;
+	readonly #peerPollMs: number;
 	readonly #now: () => number;
+	readonly #spendEpoch: number;
+	#priorSpendUsd = 0;
 	readonly #workerId = `omp-lcm:${Bun.randomUUIDv7()}`;
 
 	#context: LcmContext | undefined;
@@ -850,8 +864,13 @@ export class SessionLcm {
 		this.#openContext = options.dependencies?.openContext ?? openLcmContext;
 		this.#resolveProject = options.dependencies?.resolveProject ?? resolveLcmProject;
 		this.#registerProject = options.registerProject;
-		this.#hardWaitMs = Math.max(1, options.dependencies?.hardWaitMs ?? HARD_PROJECTION_WAIT_MS);
+		this.#hardWaitFixed = options.dependencies?.hardWaitMs !== undefined;
+		this.#hardWaitMs = this.#hardWaitFixed
+			? Math.max(1, options.dependencies?.hardWaitMs ?? HARD_PROJECTION_WAIT_MS)
+			: normalizeLcmHardProjectionWaitMs(options.hardProjectionWaitMs);
+		this.#peerPollMs = Math.max(1, options.dependencies?.peerPollMs ?? PEER_PROGRESS_POLL_MS);
 		this.#now = options.dependencies?.now ?? Date.now;
+		this.#spendEpoch = this.#now();
 		this.#unsubscribeDurableEntries = host.sessionManager.subscribeToDurableEntries(() => {
 			this.#dirty = true;
 			if (this.#project && !this.#disposed) void this.#registerJournalHint(this.#project);
@@ -862,13 +881,21 @@ export class SessionLcm {
 		return !this.#disposed;
 	}
 
-	configure(options: Pick<SessionLcmOptions, "summaryModel" | "maxConcurrentSummaries">): void {
+	configure(
+		options: Pick<SessionLcmOptions, "summaryModel" | "maxConcurrentSummaries" | "hardProjectionWaitMs">,
+	): void {
 		const nextModel = typeof options.summaryModel === "string" ? options.summaryModel.trim() || undefined : undefined;
 		if (nextModel !== this.#summaryModel) this.#resolvedSummaryModel = undefined;
 		this.#summaryModel = nextModel;
 		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
+		if (!this.#hardWaitFixed) this.#hardWaitMs = normalizeLcmHardProjectionWaitMs(options.hardProjectionWaitMs);
 		this.#signalSummaryCapacity();
 		if (this.#context) this.#startSummaryJobs();
+	}
+
+	/** Summary spend this session recorded before the current process, from the durable ledger. */
+	priorSpendUsd(): number {
+		return this.#priorSpendUsd;
 	}
 
 	takePendingFallbackCategory(): LcmFallbackCategory | undefined {
@@ -1212,6 +1239,11 @@ export class SessionLcm {
 		}
 
 		this.#context = context;
+		try {
+			this.#priorSpendUsd = context.priorSummarySpendUsd(this.#host.sessionManager.getSessionId(), this.#spendEpoch);
+		} catch (error) {
+			logger.debug("LCM prior spend unavailable", { error: errorLabel(error) });
+		}
 		this.#project = project;
 		this.#boundCwd = cwd;
 		this.#runtimePhase = "idle";
@@ -1694,11 +1726,17 @@ export class SessionLcm {
 					const systemPrompt = prompt.render(lcmSummarySystemPrompt);
 					const userPrompt = prompt.render(lcmSummaryUserPrompt, {
 						aggressive: job.stage === "aggressive",
+						condense: job.level >= 1,
 						maxOutputTokens: job.outputTokenBudget,
 						inputs: job.inputs.map(input => ({ kind: input.kind, id: input.id, text: input.redactedText })),
 					});
 					promptHash = summaryPromptHash(systemPrompt, userPrompt);
-					const startProvenance = { promptHash, modelSelector: summaryModel, strategy: job.strategy };
+					const startProvenance = {
+						promptHash,
+						modelSelector: summaryModel,
+						sessionId: this.#host.sessionManager.getSessionId(),
+						strategy: job.strategy,
+					};
 					let completion: LcmCompletionResult;
 					try {
 						completion = await this.#host.complete({
@@ -2036,7 +2074,7 @@ export class SessionLcm {
 					this.#failOpen(this.#lastFailureCategory ?? "unfit", attempt);
 					return native;
 				}
-				const progress = Promise.race([background, settlement]);
+				const progress = Promise.race([background, settlement, Bun.sleep(this.#peerPollMs)]);
 				const progressedWithinDeadline = await this.#waitWithinDeadline(progress, signal, deadline);
 				if (!isCurrent() || signal?.aborted) return native;
 				if (!progressedWithinDeadline) {

@@ -6,6 +6,9 @@ Use terse bullet points. Keep only essential facts, current state, constraints, 
 Preserve concrete details and causal context while removing repetition and conversational filler.
 {{/if}}
 
+{{#if condense}}The inputs below are already summaries. Consolidate them: merge overlapping facts, keep decisions, current state, constraints, unresolved errors, and next actions, and do not re-expand detail that the child summaries already condensed.
+{{/if}}
+
 <lcm-history>
 {{#list inputs join="\n\n"}}[{{kind}} {{id}}]
 {{text}}{{/list}}

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const LCM_SCHEMA_VERSION = 8;
+export const LCM_SCHEMA_VERSION = 9;
 
 export class UnsupportedLcmSchemaError extends Error {
 	readonly foundVersion: number;
@@ -465,6 +465,11 @@ function migration8(db: Database): void {
 	db.run("CREATE INDEX branch_summary_spans_input ON branch_summary_spans(input_hash, branch_row_id, revision)");
 }
 
+/** Existing rows stay NULL on purpose: historic attempts are not attributed to any session. */
+function migration9(db: Database): void {
+	db.run("ALTER TABLE summary_attempts ADD COLUMN session_id TEXT");
+}
+
 const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration1,
 	migration2,
@@ -474,6 +479,7 @@ const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration6,
 	migration7,
 	migration8,
+	migration9,
 ];
 
 export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {
