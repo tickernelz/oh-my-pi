@@ -34,4 +34,4 @@ test("auth-broker wire schemas construct only on first validation", async () => 
 	} finally {
 		await tempDir.remove().catch(() => {});
 	}
-});
+}, 60_000);

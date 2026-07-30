@@ -35,6 +35,7 @@ import {
 	pathRecoveredFromTagMessage,
 	type RevealedLine,
 	unseenLinesMessage,
+	writeDriftWarning,
 } from "./messages";
 import { MismatchError } from "./mismatch";
 import { detectLineEnding, type LineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./normalize";
@@ -98,7 +99,13 @@ export interface PatchSectionResult {
 	persisted: string;
 	/** Final text that the {@link Filesystem} actually wrote (may differ if the FS transformed it). */
 	written: string;
-	/** 4-hex content-hash tag for `after`. Use to anchor follow-up edits. */
+	/**
+	 * 4-hex content-hash tag. Hashes the content the {@link Filesystem}
+	 * reports actually landed on disk (see `written`), which normally equals
+	 * `after` but can diverge when the write path transforms content (e.g. an
+	 * ACP-bridge write reformatted by the client's format-on-save). Use to
+	 * anchor follow-up edits.
+	 */
 	fileHash: string;
 	/** Hashline section header (`[path#tag]`) of the post-edit content. */
 	header: string;
@@ -488,8 +495,31 @@ export class Patcher {
 		}
 
 		const write: WriteResult = await this.fs.writeText(section.path, persisted);
-		const fileHash = this.#recordFullSnapshot(canonicalPath, after);
 		const op = exists ? "update" : "create";
+
+		// `write.text` is the FS adapter's report of what actually landed on
+		// disk (see `WriteResult`), which for an ACP-bridge write can diverge
+		// from `after` when the client transforms content on save (e.g.
+		// format-on-save reformatting indentation the tool never touched).
+		// Keying the snapshot on `after` unconditionally would record a hash
+		// for content that no longer exists on disk: the next `read` sees the
+		// drifted file, tag validation misses, and hunk resolution proceeds
+		// against a baseline the file has already left — the mechanism behind
+		// "single-line edit reformats the whole file". Re-derive the recorded
+		// text from what was actually persisted and hash THAT.
+		//
+		// Deliberately does NOT touch `after` (or the diff/`newText` derived
+		// from it downstream): `after` stays the content this section asked
+		// for, so the model-visible diff stays scoped to the intended hunk
+		// instead of ballooning to a whole-file diff against a formatter's
+		// output on every drifted write. The drift itself is a warning, not a
+		// diff — an O(1) signal instead of an O(file-size) one. Comparing the
+		// normalized forms (rather than raw `write.text`/`persisted`) avoids a
+		// false "drift" purely from BOM/line-ending restoration asymmetry.
+		const recorded = normalizeToLF(stripBom(write.text).text);
+		const driftedOnWrite = recorded !== after;
+		const fileHash = this.#recordFullSnapshot(canonicalPath, recorded);
+		const allWarnings = driftedOnWrite ? [...warnings, writeDriftWarning(section.path)] : warnings;
 
 		return {
 			path: section.path,
@@ -503,7 +533,7 @@ export class Patcher {
 			header: formatHashlineHeader(section.path, fileHash),
 			firstChangedLine: applyResult.firstChangedLine,
 			blockResolutions: applyResult.blockResolutions,
-			warnings,
+			warnings: allWarnings,
 		};
 	}
 

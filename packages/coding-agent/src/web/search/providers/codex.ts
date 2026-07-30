@@ -114,7 +114,28 @@ function getDefaultModelCandidates(): CodexModelCandidate[] {
 	return fallbackModel ? [{ modelId: fallbackModel.id, catalogModel: fallbackModel }] : [{ modelId: FALLBACK_MODEL }];
 }
 
+/**
+ * Raised when Codex produced an answer without invoking the hosted `web_search`
+ * tool. GPT-5.6 Responses-Lite models receive `tool_choice: "auto"` (the forced
+ * hosted choice is invalid under the lite shape — see #5771 / #5772), so the
+ * model may skip searching and return a plain completion. A search command must
+ * not present that as a successful, search-backed result (#6988); this advances
+ * the candidate chain to a model that will search, or surfaces a clear failure
+ * when the model was explicitly configured.
+ */
+class CodexNoWebSearchError extends SearchProviderError {
+	constructor() {
+		super(
+			"codex",
+			"Codex returned a completion without running web search (no web_search_call event); refusing to treat a non-search answer as a search result",
+			502,
+		);
+		this.name = "CodexNoWebSearchError";
+	}
+}
+
 function shouldRetryWithNextDefaultModel(error: unknown): boolean {
+	if (error instanceof CodexNoWebSearchError) return true;
 	if (!(error instanceof SearchProviderError)) return false;
 	if (error.provider !== "codex" || error.status !== 400) return false;
 	return /model is not supported|requested model is not supported|not supported when using codex with a chatgpt account/i.test(
@@ -472,10 +493,18 @@ async function callCodexSearch(
 	let model = requestedModel;
 	let requestId = "";
 	let usage: { inputTokens: number; outputTokens: number; totalTokens: number } | undefined;
+	// Evidence that the hosted web_search tool actually ran. Lite models get
+	// `tool_choice: "auto"` and may answer without searching (#6988); a search
+	// command must reject that rather than return a non-search completion.
+	let webSearchInvoked = false;
 
 	for await (const rawEvent of readSseJson<Record<string, unknown>>(response.body, options.signal)) {
 		const eventType = typeof rawEvent.type === "string" ? rawEvent.type : "";
 		if (!eventType) continue;
+
+		if (eventType.startsWith("response.web_search_call")) {
+			webSearchInvoked = true;
+		}
 
 		if (eventType === "response.output_text.delta") {
 			const delta = typeof rawEvent.delta === "string" ? rawEvent.delta : "";
@@ -485,6 +514,7 @@ async function callCodexSearch(
 		} else if (eventType === "response.output_item.done") {
 			const item = rawEvent.item as CodexResponseItem | undefined;
 			if (!item) continue;
+			if (item.type === "web_search_call") webSearchInvoked = true;
 
 			// Handle text message content and extract sources from annotations
 			if (item.type === "message" && item.content) {
@@ -536,6 +566,10 @@ async function callCodexSearch(
 			const errorMessage = resp?.error?.message ?? "Request failed";
 			throw new SearchProviderError("codex", `Codex request failed: ${errorMessage}`, 500);
 		}
+	}
+
+	if (!webSearchInvoked) {
+		throw new CodexNoWebSearchError();
 	}
 
 	const finalAnswer = answerParts.join("\n\n").trim();

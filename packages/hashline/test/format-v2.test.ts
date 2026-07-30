@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { applyEdits, parsePatch, parsePatchStreaming } from "@oh-my-pi/hashline";
+import { applyEdits, parseLid, parsePatch, parsePatchStreaming, Tokenizer } from "@oh-my-pi/hashline";
 
 function applyPatch(text: string, diff: string): string {
 	return applyEdits(text, parsePatch(diff).edits).text;
@@ -70,6 +70,19 @@ describe("hashline format v4", () => {
 	it("validates insert anchors against file bounds", () => {
 		const edits = parsePatch("INS.PRE 4:\n+x").edits;
 		expect(() => applyEdits("a\nb", edits)).toThrow(/Line 4 does not exist/);
+	});
+
+	it("rejects unsafe line numbers before expanding ranges", () => {
+		const unsafe = String(Number.MAX_SAFE_INTEGER + 1);
+		expect(parseLid(String(Number.MAX_SAFE_INTEGER), 1)).toEqual({ line: Number.MAX_SAFE_INTEGER });
+		expect(() => parseLid(unsafe, 1)).toThrow();
+		expect(new Tokenizer().isOp(`SWAP ${unsafe}.=${unsafe}:`)).toBe(false);
+	});
+
+	it("rejects safe-integer ranges above the expansion limit", () => {
+		expect(() => parsePatch("SWAP 1.=100001:\n+x")).toThrow(
+			/replace range spans 100001 lines; the maximum is 100000/,
+		);
 	});
 
 	it("ignores deleting the trailing blank sentinel of a newline-terminated file", () => {

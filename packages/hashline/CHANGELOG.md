@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented CPU and memory exhaustion in streaming previews by rejecting line anchors above Number.MAX_SAFE_INTEGER and ranges spanning more than 100,000 lines.
+- Fixed an issue where recorded snapshot tags desynced from disk when the filesystem transformed content on write (e.g., auto-formatting on save), which previously caused subsequent edits to incorrectly reformat unrelated parts of the file. `Patcher.commit` now correctly keys the returned file hash and snapshot on the actual content written to disk and issues a warning when a drift is detected.
+
 ## [17.1.5] - 2026-07-27
 
 ### Changed

@@ -142,14 +142,6 @@ function createStrictGrammarTooLargeError(): Error {
 	return error;
 }
 
-// Azure Foundry-style rejection: no invalid_request_error wrapper, the gateway
-// just names the missing feature for the hosted model deployment.
-function createStructuredOutputsUnsupportedError(): Error {
-	const error = new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}');
-	(error as Error & { status: number }).status = 400;
-	return error;
-}
-
 function createOtherInvalidRequestError(): Error {
 	const error = new Error(
 		'400 {"type":"error","error":{"type":"invalid_request_error","message":"Some other validation error."},"request_id":"req_test"}',
@@ -1225,7 +1217,23 @@ describe("anthropic stream envelope handling", () => {
 		expect(strictFlags).toEqual([[true], [false], [false]]);
 	});
 
-	it("retries without strict tools when the endpoint rejects structured outputs for the model", async () => {
+	it.each([
+		[
+			"unsupported structured outputs",
+			Object.assign(new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}'), {
+				status: 400,
+			}),
+		],
+		[
+			"an unsupported strict field",
+			Object.assign(
+				new Error(
+					'400 {"error":{"message":"{\\"message\\":\\"tools.2.custom.strict: Extra inputs are not permitted\\"}"}}',
+				),
+				{ status: 400 },
+			),
+		],
+	])("retries without strict tools when the endpoint rejects %s", async (_case, rejection) => {
 		const toolContext: Context = {
 			...context,
 			tools: [
@@ -1244,7 +1252,7 @@ describe("anthropic stream envelope handling", () => {
 			attempt += 1;
 			strictFlags.push(getStrictFlags(params));
 			if (attempt === 1) {
-				return createRejectedMockRequest(createStructuredOutputsUnsupportedError()) as never;
+				return createRejectedMockRequest(rejection) as never;
 			}
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
 		});

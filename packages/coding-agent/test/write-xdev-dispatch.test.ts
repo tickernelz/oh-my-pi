@@ -19,6 +19,7 @@ import {
 	type XdevState,
 	xdevDocs,
 	xdevDocsAll,
+	xdevEntries,
 } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
@@ -289,6 +290,63 @@ describe("read and write route xd:// device URLs", () => {
 		expect(rendered).toContain("Tokyo: 22°C");
 		expect(backgroundPrefix).not.toBe("");
 		expect(lines.some(line => line.includes(backgroundPrefix))).toBe(true);
+	});
+
+	// Dynamic device summaries are third-party text inlined into the system
+	// prompt. A character bound is not a byte bound: a multi-byte summary passes
+	// several times the intended budget, and cutting a byte budget by character
+	// index splits code points.
+	it("bounds dynamic device summaries in UTF-8 bytes on a code point boundary", () => {
+		const multiByteTail = "あ".repeat(XDEV_EXTERNAL_DESCRIPTION_CAP);
+		const dynamicDevice: AgentTool = {
+			name: "mcp__weather__forecast",
+			label: "Forecast",
+			description: "Weather forecast for a place.",
+			summary: `Napoved\u0007\u2028vremena ${multiByteTail}`,
+			parameters: type({ query: "string" }),
+			async execute() {
+				return { content: [{ type: "text", text: "" }] };
+			},
+		};
+		const builtInDevice: AgentTool = {
+			name: "weather",
+			label: "Weather",
+			description: "Weather for a place.",
+			summary: `Gets the weather ${multiByteTail}`,
+			parameters: type({ query: "string" }),
+			async execute() {
+				return { content: [{ type: "text", text: "" }] };
+			},
+		};
+		const xdev = createTestXdevState([builtInDevice, dynamicDevice], ["weather"]);
+		const entries = new Map(xdevEntries(xdev).map(entry => [entry.name, entry]));
+
+		const dynamic = entries.get("mcp__weather__forecast");
+		if (!dynamic) throw new Error("expected the dynamic device entry");
+		expect(dynamic.dynamic).toBe(true);
+		// Control characters and Unicode line separators collapse to a space
+		// instead of reaching the prompt.
+		expect(dynamic.summary.startsWith("Napoved vremena ")).toBe(true);
+		expect(dynamic.summary.endsWith("…")).toBe(true);
+
+		const body = dynamic.summary.slice(0, -1);
+		const bodyBytes = Buffer.byteLength(body, "utf-8");
+		const summaryBytes = Buffer.byteLength(dynamic.summary, "utf-8");
+		expect(summaryBytes).toBeLessThanOrEqual(XDEV_EXTERNAL_DESCRIPTION_CAP);
+		// The ellipsis is inside the byte budget, and the cut backs off at most
+		// one code point rather than splitting the character at the boundary.
+		expect(bodyBytes).toBeLessThanOrEqual(XDEV_EXTERNAL_DESCRIPTION_CAP - Buffer.byteLength("…", "utf-8"));
+		expect(bodyBytes).toBeGreaterThan(XDEV_EXTERNAL_DESCRIPTION_CAP - 6);
+		expect(body.endsWith("あ")).toBe(true);
+		// A split code point would decode to U+FFFD and fail the round trip.
+		expect(Buffer.from(body, "utf-8").toString("utf-8")).toBe(body);
+
+		// The same boolean drives the cap and the flag, so a built-in device is
+		// never capped and never reported as untrusted.
+		const builtIn = entries.get("weather");
+		if (!builtIn) throw new Error("expected the built-in device entry");
+		expect(builtIn.dynamic).toBe(false);
+		expect(builtIn.summary).toBe(`Gets the weather ${multiByteTail}`);
 	});
 
 	it("docsAll inlines small device docs and falls back to a listing past the caps", async () => {

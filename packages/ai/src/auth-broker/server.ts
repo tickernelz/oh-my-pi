@@ -33,6 +33,8 @@ import type {
 	SnapshotStreamSnapshotEvent,
 } from "./types";
 import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -40,6 +42,8 @@ import {
 	DEFAULT_STREAM_KEEPALIVE_MS,
 } from "./types";
 import { getAuthBrokerWireSchemas } from "./wire-schema-resource";
+
+const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
 
 export interface AuthBrokerServerOptions {
 	/** Underlying credential storage (wraps the local SQLite store on the broker). */
@@ -62,6 +66,11 @@ export interface AuthBrokerServerOptions {
 	 * without long sleeps. Default {@link DEFAULT_STREAM_KEEPALIVE_MS}.
 	 */
 	streamKeepaliveMs?: number;
+	/**
+	 * Override cross-process SQLite change polling in milliseconds.
+	 * Internal-only — tests use a short interval. Default 250ms.
+	 */
+	externalChangePollMs?: number;
 }
 
 export interface AuthBrokerServerHandle {
@@ -90,6 +99,15 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	const match = header.match(/^Bearer\s+(.+)$/i);
 	if (!match) return false;
 	return tokens.has(match[1].trim());
+}
+
+function supportsCodexMeterBlockScopes(req: Request): boolean {
+	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
+	return (
+		capabilities
+			?.split(",")
+			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
+	);
 }
 
 /**
@@ -136,6 +154,7 @@ function snapshotHeaders(generation: number): Record<string, string> {
 	return {
 		ETag: `"${generation}"`,
 		"Cache-Control": "no-store",
+		Vary: AUTH_BROKER_CAPABILITIES_HEADER,
 	};
 }
 
@@ -172,11 +191,18 @@ function delayResult(ms: number): { promise: Promise<"timeout">; cancel: () => v
 class GenerationGate {
 	readonly #storage: AuthStorage;
 	readonly #unsubscribe: () => void;
+	readonly #pollTimer: NodeJS.Timeout;
+	#pollInFlight = false;
 	#waiters: Map<number, Set<() => void>> = new Map();
 
-	constructor(storage: AuthStorage) {
+	constructor(storage: AuthStorage, pollIntervalMs: number) {
 		this.#storage = storage;
 		this.#unsubscribe = storage.onGenerationChanged(generation => this.#wake(generation));
+		this.#pollTimer = setInterval(() => {
+			void this.#pollExternalChanges();
+		}, pollIntervalMs);
+		this.#pollTimer.unref?.();
+		void this.#pollExternalChanges();
 	}
 
 	waitForChange(afterGeneration: number, signal: AbortSignal): Promise<"changed" | "aborted"> {
@@ -208,11 +234,24 @@ class GenerationGate {
 	}
 
 	close(): void {
+		clearInterval(this.#pollTimer);
 		this.#unsubscribe();
 		for (const waiters of this.#waiters.values()) {
 			for (const resolve of waiters) resolve();
 		}
 		this.#waiters.clear();
+	}
+
+	async #pollExternalChanges(): Promise<void> {
+		if (this.#pollInFlight) return;
+		this.#pollInFlight = true;
+		try {
+			await this.#storage.pollExternalChanges();
+		} catch (error) {
+			logger.debug("Auth broker external store change poll failed", { error: String(error) });
+		} finally {
+			this.#pollInFlight = false;
+		}
 	}
 
 	#wake(generation: number): void {
@@ -278,9 +317,46 @@ function compareCredentialBlockSnapshots(a: CredentialBlockSnapshot, b: Credenti
 	return a.blockedUntilMs - b.blockedUntilMs;
 }
 
+const CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
+const CODEX_LEGACY_PROJECTED_BLOCK_SCOPES = new Set(["chat", "spark", "shared"]);
+
+/**
+ * Older clients only consult the Codex `shared` scope. Keep SQLite canonical
+ * state meter-scoped, but conservatively collapse those scopes on their wire
+ * view so any active meter block remains visible to them.
+ */
+function projectCredentialBlocksForLegacyClient(blocks: readonly CredentialBlockSnapshot[]): CredentialBlockSnapshot[] {
+	const projected: CredentialBlockSnapshot[] = [];
+	let shared: CredentialBlockSnapshot | undefined;
+	for (const block of blocks) {
+		if (
+			block.providerKey !== CODEX_BLOCK_PROVIDER_KEY ||
+			!CODEX_LEGACY_PROJECTED_BLOCK_SCOPES.has(block.blockScope)
+		) {
+			projected.push(block);
+			continue;
+		}
+		const updatedAtMs =
+			block.updatedAtMs === undefined
+				? shared?.updatedAtMs
+				: shared?.updatedAtMs === undefined
+					? block.updatedAtMs
+					: Math.max(shared.updatedAtMs, block.updatedAtMs);
+		shared = {
+			providerKey: CODEX_BLOCK_PROVIDER_KEY,
+			blockScope: "shared",
+			blockedUntilMs: Math.max(shared?.blockedUntilMs ?? 0, block.blockedUntilMs),
+			...(updatedAtMs !== undefined ? { updatedAtMs } : {}),
+		};
+	}
+	if (shared) projected.push(shared);
+	return projected;
+}
+
 function buildCredentialBlockGroups(
 	blocks: readonly StoredCredentialBlock[],
 	serverNowMs: number,
+	clientSupportsCodexMeterBlockScopes: boolean,
 ): Map<number, CredentialBlockSnapshot[]> {
 	const byCredentialId = new Map<number, CredentialBlockSnapshot[]>();
 	for (const block of blocks) {
@@ -298,16 +374,30 @@ function buildCredentialBlockGroups(
 			byCredentialId.set(block.credentialId, [snapshotBlock]);
 		}
 	}
-	for (const credentialBlocks of byCredentialId.values()) credentialBlocks.sort(compareCredentialBlockSnapshots);
+	for (const [credentialId, credentialBlocks] of byCredentialId) {
+		const projected = clientSupportsCodexMeterBlockScopes
+			? credentialBlocks
+			: projectCredentialBlocksForLegacyClient(credentialBlocks);
+		projected.sort(compareCredentialBlockSnapshots);
+		byCredentialId.set(credentialId, projected);
+	}
 	return byCredentialId;
 }
 
-function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | undefined): SnapshotResponse {
+function buildSnapshot(
+	storage: AuthStorage,
+	refresher: AuthBrokerRefresher | undefined,
+	clientSupportsCodexMeterBlockScopes: boolean,
+): SnapshotResponse {
 	const serverNowMs = Date.now();
 	const base = storage.exportSnapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
 	const credentialIds = base.credentials.map(entry => entry.id);
-	const blocksByCredentialId = buildCredentialBlockGroups(storage.listCredentialBlocks(credentialIds), serverNowMs);
+	const blocksByCredentialId = buildCredentialBlockGroups(
+		storage.listCredentialBlocks(credentialIds),
+		serverNowMs,
+		clientSupportsCodexMeterBlockScopes,
+	);
 	const credentials: SnapshotEntry[] = base.credentials.map(entry => {
 		const blocks = blocksByCredentialId.get(entry.id);
 		const rotatesInMs = computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs);
@@ -331,12 +421,13 @@ async function serveSnapshot(
 	peer: string,
 ): Promise<Response> {
 	await storage.reload();
+	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
 	let currentGeneration = storage.getGeneration();
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -356,7 +447,7 @@ async function serveSnapshot(
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
 	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -402,6 +493,7 @@ function serveSnapshotStream(
 ): Response {
 	const encoder = new TextEncoder();
 	const openedAt = Date.now();
+	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
 	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
@@ -459,7 +551,7 @@ function serveSnapshotStream(
 				pendingBumps = 0;
 				await storage.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher);
+				const snapshot = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -514,7 +606,7 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await storage.reload();
-			const initial = buildSnapshot(storage, refresher);
+			const initial = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -542,6 +634,7 @@ function serveSnapshotStream(
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
 			"X-Accel-Buffering": "no",
+			Vary: AUTH_BROKER_CAPABILITIES_HEADER,
 		},
 	});
 }
@@ -552,6 +645,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	const tokens = new Set<string>(opts.bearerTokens);
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
+	const externalChangePollMs = opts.externalChangePollMs ?? DEFAULT_EXTERNAL_CHANGE_POLL_MS;
 
 	const refresher = opts.disableRefresher
 		? undefined
@@ -561,7 +655,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				refreshIntervalMs: opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS,
 			});
 	refresher?.start();
-	const generationGate = new GenerationGate(opts.storage);
+	const generationGate = new GenerationGate(opts.storage, externalChangePollMs);
 
 	const server = Bun.serve({
 		hostname: bind.hostname,

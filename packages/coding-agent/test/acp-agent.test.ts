@@ -199,7 +199,13 @@ class FakeAgentSession {
 	}
 
 	async setModel(model: Model): Promise<void> {
+		const isChanging = this.model?.provider !== model.provider || this.model?.id !== model.id;
 		this.model = model;
+		if (isChanging) {
+			for (const listener of this.#listeners) {
+				listener({ type: "model_changed" } as AgentSessionEvent);
+			}
+		}
 	}
 
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
@@ -895,6 +901,83 @@ describe("ACP agent", () => {
 			| { currentValue?: unknown }
 			| undefined;
 		expect(thinkingOption?.currentValue).toBe("high");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("pushes config_option_update when the model changes internally", async () => {
+		// Internal callers (prewalk hand-offs, retry-fallback, model cycling)
+		// change AgentSession's model directly without going through the ACP
+		// setSessionConfigOption surface. Once the session-lifetime subscription
+		// is installed, those changes must surface to clients as
+		// `config_option_update` — otherwise a client's model indicator (e.g.
+		// Zed's status bar) goes stale the moment prewalk hands off to a
+		// cheaper model mid-session.
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await waitForBootstrapGuard();
+
+		const updatesBefore = harness.updates.length;
+		await session.setModel(TEST_MODELS[1]!);
+
+		const pushedAfter = harness.updates.slice(updatesBefore);
+		const configUpdates = pushedAfter.filter(
+			notification =>
+				notification.sessionId === created.sessionId &&
+				notification.update.sessionUpdate === "config_option_update",
+		);
+		expect(configUpdates.length).toBeGreaterThanOrEqual(1);
+		expectAcpNotifications(configUpdates);
+		const firstUpdate = configUpdates[0]!.update;
+		if (firstUpdate.sessionUpdate !== "config_option_update") {
+			throw new Error("expected config_option_update");
+		}
+		const modelConfig = firstUpdate.configOptions.find(option => option.id === "model") as
+			| { currentValue?: unknown }
+			| undefined;
+		expect(modelConfig?.currentValue).toBe(`${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`);
+
+		// Setting to the same model must not produce a redundant notification.
+		const updatesBeforeRedundant = harness.updates.length;
+		await session.setModel(TEST_MODELS[1]!);
+		expect(harness.updates.length).toBe(updatesBeforeRedundant);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("emits a single config_option_update per setSessionConfigOption(model) call", async () => {
+		// Client-initiated model changes flow through #setModelById, which now
+		// changes the session model and fires `model_changed`, letting the
+		// lifetime subscription push the notification. The ACP surface must not
+		// also push a duplicate `config_option_update` of its own.
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await waitForBootstrapGuard();
+
+		const updatesBefore = harness.updates.length;
+		const response = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+		});
+
+		const configUpdates = harness.updates
+			.slice(updatesBefore)
+			.filter(
+				notification =>
+					notification.sessionId === created.sessionId &&
+					notification.update.sessionUpdate === "config_option_update",
+			);
+		expect(configUpdates.length).toBe(1);
+		expectAcpNotifications(configUpdates);
+
+		const modelOption = response.configOptions.find(option => option.id === "model") as
+			| { currentValue?: unknown }
+			| undefined;
+		expect(modelOption?.currentValue).toBe(`${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

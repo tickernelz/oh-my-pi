@@ -44,6 +44,8 @@ export interface Args {
 	advisor?: boolean;
 	continue?: boolean;
 	resume?: string | true;
+	fromClaude?: boolean;
+	fromCodex?: boolean;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
@@ -227,6 +229,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.alias = arg.slice("--alias=".length);
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
+		} else if (arg === "--from-claude") {
+			result.fromClaude = true;
+		} else if (arg === "--from-codex") {
+			result.fromCodex = true;
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--no-tools") {

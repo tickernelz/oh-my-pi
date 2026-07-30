@@ -7,6 +7,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -109,6 +110,7 @@ describe("createAgentSession session storage isolation", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		LocalProtocolHandler.resetOverrideForTests();
 		for (const tempDir of tempDirs.splice(0)) {
 			removeSyncWithRetries(tempDir);
 		}
@@ -147,6 +149,49 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	});
+	it("keeps subagent local:// mappings from replacing the process-global override", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-local-override-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const globalOptions = {
+			getArtifactsDir: () => path.join(tempDir, "active-artifacts"),
+			getSessionId: () => "active-session",
+		};
+		const subagentOptions = {
+			getArtifactsDir: () => path.join(tempDir, "parent-artifacts"),
+			getSessionId: () => "parent-session",
+		};
+		LocalProtocolHandler.setOverride(globalOptions);
+
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			toolNames: [],
+			enableMCP: false,
+			enableLsp: false,
+			agentRegistry: new AgentRegistry(),
+			agentId: "Tan-local-override-test",
+			agentDisplayName: "tan",
+			parentTaskPrefix: "Tan-local-override-test",
+			parentAgentId: "Main",
+			localProtocolOptions: subagentOptions,
+		});
+
+		try {
+			expect(LocalProtocolHandler.resolveOptions()).toBe(globalOptions);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("does not replace a newer registry generation when creation expected the id to be absent", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-generation-cas-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

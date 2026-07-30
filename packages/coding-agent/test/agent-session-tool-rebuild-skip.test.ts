@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	collectMountedMCPToolRoutes,
@@ -102,6 +102,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		lazyWrite?: boolean;
 		/** Scripted mock model responses; enables driving `session.prompt()`. */
 		responses?: MockResponseSource;
+		/** Persisted history seeded into the agent, e.g. to model a resumed session. */
+		initialMessages?: AgentMessage[];
 	}
 
 	function newSession(
@@ -133,7 +135,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 						? [readTool, initialMcp as unknown as AgentTool]
 						: [readTool, writeTool, initialMcp as unknown as AgentTool]
 					: [readTool, initialMcp as unknown as AgentTool],
-				messages: [],
+				messages: options.initialMessages ?? [],
 			},
 			convertToLlm,
 			streamFn: mock
@@ -924,6 +926,139 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(notices[0]).toContain("xd://mcp__nucleus_search");
 		expect(notices[0]).not.toContain("mcp__nucleus_fetch");
 		expect(notices[0]).not.toContain("No longer mounted");
+	});
+
+	it.each([
+		{
+			priorNotice: {
+				role: "custom",
+				customType: "xdev-mount-notice",
+				content: "The xd:// device inventory changed.\n\nxd://mcp__nucleus_search became available.",
+				details: { added: ["mcp__nucleus_search"], removed: [] },
+				attribution: "agent",
+				display: false,
+				timestamp: 1,
+			} satisfies AgentMessage,
+		},
+		{
+			priorNotice: {
+				role: "custom",
+				customType: "xdev-mount-notice",
+				content: `<system-notice>
+The xd:// device inventory changed.
+These tools became available:
+- xd://mcp__nucleus_search — Search nucleus
+- xd://mcp__retired — Retired device
+Read \`xd://<tool>\` for docs + JSON schema before first use; write the JSON args object to \`xd://<tool>\` to execute.
+No longer mounted (writes to these devices will fail):
+- xd://mcp__retired
+Configured inline device docs:
+These tools became available:
+- xd://mcp__nucleus_fetch — This is inline documentation, not an inventory entry.
+</system-notice>`,
+				attribution: "agent",
+				display: false,
+				timestamp: 1,
+			} satisfies AgentMessage,
+		},
+	])("does not re-announce devices a resumed session already announced in history", async ({ priorNotice }) => {
+		// Model a process resume / host reconnect: persisted history already carries
+		// a mount notice for mcp__nucleus_search, but the fresh in-memory mount set
+		// starts empty. When the device reconnects, the notice must NOT re-splice a
+		// redundant developer message — doing so busts the provider prompt-cache
+		// prefix and re-bills the whole suffix on metered providers.
+		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+			initialMessages: [priorNotice],
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+
+		// The already-announced device reconnects: no new notice is spliced in.
+		await session.refreshMCPTools([search]);
+		await session.prompt("hello");
+		const afterReconnect = session.agent.state.messages.filter(
+			message => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(afterReconnect).toHaveLength(1);
+		expect(mountNoticesIn(contexts[0])).toHaveLength(1); // only the pre-existing history notice
+
+		// A genuinely new device still announces, and only for itself.
+		await session.refreshMCPTools([search, fetch]);
+		await session.prompt("again");
+		const afterNewDevice = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(afterNewDevice).toHaveLength(2);
+		const fetchNotice = afterNewDevice[1];
+		const fetchText = typeof fetchNotice.content === "string" ? fetchNotice.content : "";
+		expect(fetchText).toContain("xd://mcp__nucleus_fetch");
+		expect(fetchText).not.toContain("xd://mcp__nucleus_search");
+	});
+
+	it("re-announces a device after the transcript is replaced by /new", async () => {
+		const xdev = createTestXdevState();
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev,
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+
+		// Announce the device in the original transcript.
+		await session.refreshMCPTools([search]);
+		await session.prompt("hello");
+		expect(
+			session.agent.state.messages.filter(
+				message => message.role === "custom" && message.customType === "xdev-mount-notice",
+			),
+		).toHaveLength(1);
+
+		// /new swaps in a fresh transcript that no longer carries the notice. A
+		// resume/reconnect rebuilds the mount set from scratch, so model the device
+		// dropping out across the boundary.
+		await session.newSession();
+		xdev.mountedNames.clear();
+
+		// The same device reconnects into the new transcript: because the announced
+		// baseline was reset with the transcript, it must announce again (otherwise
+		// the new conversation never learns the device is available).
+		await session.refreshMCPTools([search]);
+		await session.prompt("world");
+		const newTranscriptNotices = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(newTranscriptNotices).toHaveLength(1);
+		const text = typeof newTranscriptNotices[0].content === "string" ? newTranscriptNotices[0].content : "";
+		expect(text).toContain("xd://mcp__nucleus_search");
+	});
+
+	it("preserves an undelivered mount notice across a branch that does not rebuild the prompt", async () => {
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["ok"] }, { content: ["ok"] }],
+		});
+		session.subscribe(() => {});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+
+		// A user turn establishes a branch point.
+		await session.prompt("first");
+		// The device mounts but the user branches before the next prompt consumes
+		// its queued notice. `branch()` does not rebuild the base system prompt, so
+		// the delta is the only channel that can tell the branched transcript the
+		// device exists.
+		await session.refreshMCPTools([search]);
+		const branchable = session.getUserMessagesForBranching();
+		expect(branchable.length).toBeGreaterThan(0);
+		await session.branch(branchable[0].entryId);
+
+		await session.prompt("second");
+		const notices = session.agent.state.messages.filter(
+			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
+		);
+		expect(notices).toHaveLength(1);
+		const text = typeof notices[0].content === "string" ? notices[0].content : "";
+		expect(text).toContain("xd://mcp__nucleus_search");
 	});
 
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {

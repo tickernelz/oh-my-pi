@@ -5,6 +5,30 @@
 ### Fixed
 
 - Fixed healthy broker-sourced Codex usage leaving a remote gateway credential blocked until expiry: reconciliation now awaits a scoped broker delete fenced by the exact expiry and monotonic row version it inspected, so a concurrent newer 429 block is preserved.
+### Added
+
+- Added first-class parentTurnId support for nested Codex requests, allowing stream options and metadata helpers to accept and safely propagate the initiating turn's ID.
+- Added preservation of the Codex `encrypted_function_args` plaintext-collaboration marker on replayed function calls, keeping server-marked plaintext tool arguments from being reinterpreted as encrypted on subsequent turns.
+
+### Changed
+
+- Codex turn metadata now reserves the codex-rs `code_mode_tool_names` key, preventing caller-supplied client metadata extras from colliding with the core-owned field.
+- Codex SSE requests to the official endpoint now use zstd-compressed bodies by default to match the official client, which can be disabled with PI_CODEX_ZSTD=0.
+- API-key validation now preserves provider HTTP status and retry headers, allowing authentication, rate-limit, and server failures to retain their original error classifications.
+
+### Fixed
+
+- Fixed Novita login rejecting valid API keys belonging to Developer and Basic team members by validating against the chat completions endpoint instead of the billing balance endpoint.
+- Fixed Cursor resource_exhausted errors being incorrectly classified as QUOTA_EXHAUSTED (which caused 30-minute credential blocks), mapping them to MODEL_CAPACITY_EXHAUSTED with a shorter backoff instead.
+- Fixed a crash in Amazon Bedrock and Devin providers when Context.systemPrompt is passed as a bare string.
+- Fixed aborted usage-limit recovery incorrectly blocking credentials or waiting on local usage fetches after the session had already changed.
+- Fixed Codex WebSocket sessions echoing stale or missing turn states by capturing x-codex-turn-state refreshes from response metadata event headers.
+- Fixed Harmony-dialect models (e.g., gpt-5.x, openai-codex) failing with invalid_prompt or "Request blocked" errors by escaping reserved control tokens in untrusted user and tool-result text.
+- Fixed named forced tool_choice not being enforced on string-only OpenAI-compatible hosts (such as llama.cpp and LM Studio) by narrowing the advertised tools to the forced tool.
+- Fixed direct Anthropic Claude Opus requests failing with HTTP 400 when the endpoint rejects strict tool fields.
+- Fixed usage-based credential ranking for Anthropic accounts where a missing long-window (7-day) metric was incorrectly treated as a short-window metric.
+- Fixed legacy Codex usage blocks continuing to gate all models after per-meter backoff was introduced, splitting the old shared scope into independent chat and spark blocks while maintaining backward compatibility with older clients and database schemas.
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed

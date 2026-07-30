@@ -610,6 +610,56 @@ describe("OpenAI responses history payload", () => {
 		expect(collectResponsesInputImageDetails(openaiInput)).toEqual(["original"]);
 	});
 
+	it("preserves encrypted_function_args on replayed Codex function calls", () => {
+		// codex-rs #35845: an empty `encrypted_function_args` array marks plaintext
+		// collaboration arguments; the marker must survive replay verbatim or the
+		// backend would treat the replayed arguments as encrypted.
+		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+		const nativeItems = [
+			{
+				type: "function_call",
+				id: "fc_plaintext_1",
+				call_id: "call_plaintext_collab",
+				name: "send_message",
+				namespace: "collaboration",
+				arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+				encrypted_function_args: [],
+				status: "completed",
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_plaintext_collab",
+				output: "delivered",
+			},
+		];
+		const context: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback should not be replayed" }],
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					model: codexModel.id,
+					usage: issue5002ZeroUsage,
+					stopReason: "stop",
+					providerPayload: createOpenAIResponsesHistoryPayload("openai-codex", nativeItems),
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		};
+
+		const input = convertCodexResponsesMessages(codexModel, context);
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_plaintext_collab")).toEqual({
+			type: "function_call",
+			call_id: "call_plaintext_collab",
+			name: "send_message",
+			namespace: "collaboration",
+			arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+			encrypted_function_args: [],
+		});
+	});
+
 	it("prepends multiple OpenAI developer instructions in order without changing prompt cache key routing", async () => {
 		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const payload = (await captureResponsesPayload(

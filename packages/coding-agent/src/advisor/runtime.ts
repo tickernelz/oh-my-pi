@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { raceWithSignal } from "@oh-my-pi/pi-ai/utils/abort";
 import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
@@ -47,7 +48,7 @@ export interface AdvisorRuntimeHost {
 	 * recovery path must never replay the full primary transcript.
 	 * Optional: hosts that omit it get no proactive maintenance.
 	 */
-	maintainContext?(incomingTokens: number): Promise<boolean>;
+	maintainContext?(incomingTokens: number, signal: AbortSignal): Promise<boolean>;
 	/**
 	 * Called immediately before each `agent.prompt(batch)` cycle. Lets the host
 	 * clear per-update advisor state — currently the one-advise-per-update gate
@@ -67,6 +68,7 @@ export interface AdvisorRuntimeHost {
 	onTurnError?(
 		error: unknown,
 		failedMessages: readonly AgentMessage[],
+		signal: AbortSignal,
 	): Promise<boolean | undefined> | boolean | undefined;
 	/** Called after a successful advisor turn so the host can finish fallback lifecycle reporting. */
 	onTurnSuccess?(): Promise<void> | void;
@@ -285,6 +287,9 @@ export class AdvisorRuntime {
 	#advisorRegexSecretValues = new Set<string>();
 	#pending: PendingDelta[] = [];
 	#busy = false;
+	#sessionTransitionPaused = false;
+	#promptInFlight: Promise<void> | undefined;
+	#iterationAbort: AbortController | undefined;
 	#backlog = 0;
 	#consecutiveFailures = 0;
 	#failureNotified = false;
@@ -428,6 +433,7 @@ export class AdvisorRuntime {
 	}
 
 	dispose(): void {
+		this.#iterationAbort?.abort("advisor disposed");
 		this.disposed = true;
 		this.#epoch++;
 		this.#pending = [];
@@ -490,6 +496,31 @@ export class AdvisorRuntime {
 		});
 	}
 
+	/** Stop new advisor work and wait only for the active prompt's recorder-visible events. */
+	pauseForSessionTransition(): Promise<void> {
+		if (!this.#sessionTransitionPaused) {
+			this.#sessionTransitionPaused = true;
+			this.#wakeAllWaiters();
+			this.#iterationAbort?.abort("advisor session transition");
+			try {
+				this.agent.abort("advisor session transition");
+			} catch {}
+		}
+		return (
+			this.#promptInFlight?.then(
+				() => {},
+				() => {},
+			) ?? Promise.resolve()
+		);
+	}
+
+	/** Continue queued work after a session transition rolls back or preserves the conversation. */
+	resumeAfterSessionTransition(): void {
+		if (!this.#sessionTransitionPaused) return;
+		this.#sessionTransitionPaused = false;
+		if (!this.#quotaExhausted && !this.#halted) void this.#drain();
+	}
+
 	/**
 	 * Re-prime the advisor after a history rewrite (compaction, session
 	 * switch/resume, branch). Clears the advisor's own (non-persisted) context
@@ -498,7 +529,9 @@ export class AdvisorRuntime {
 	 * leaving it blind to everything before the rewrite.
 	 */
 	reset(): void {
+		this.#iterationAbort?.abort("advisor reset");
 		this.#epoch++;
+		this.#sessionTransitionPaused = false;
 		this.#quotaExhausted = false;
 		this.#halted = false;
 		this.#failing = false;
@@ -696,6 +729,7 @@ export class AdvisorRuntime {
 		epoch: number,
 		initial: PendingDelta[],
 		recoveringOverflow: boolean,
+		signal: AbortSignal,
 	): Promise<{
 		batch: string | null;
 		rawMessages: AgentMessage[];
@@ -712,11 +746,12 @@ export class AdvisorRuntime {
 		let wip = initial.at(-1)?.wip ?? false;
 
 		for (let round = 0; round < MAX_COALESCE_ROUNDS; round++) {
+			if (this.#sessionTransitionPaused) break;
 			if (this.host.maintainContext) {
 				const incomingTokens = estimateTokens({ role: "user", content: batchText, timestamp: Date.now() });
 				let shouldResetContext = false;
 				try {
-					shouldResetContext = await this.host.maintainContext(incomingTokens);
+					shouldResetContext = await this.host.maintainContext(incomingTokens, signal);
 				} catch (err) {
 					logger.debug("advisor context maintenance failed", { err: String(err) });
 				}
@@ -733,6 +768,7 @@ export class AdvisorRuntime {
 					// remain queued and ship as their own subsequent batch.
 					if (round > 0) {
 						const lateItems = this.#pending.splice(0);
+						initial.push(...lateItems);
 						turns += lateItems.reduce((sum, b) => sum + b.turns, 0);
 						if (lateItems.length > 0) {
 							wip = lateItems.at(-1)!.wip;
@@ -769,6 +805,7 @@ export class AdvisorRuntime {
 			// update WIP state, and re-check the maintenance budget.
 			const late = this.#pending.splice(0);
 			if (late.length === 0) break;
+			initial.push(...late);
 			batchText = [batchText, ...late.map(b => b.text)].join("\n\n");
 			rawMessages = rawMessages.concat(late.flatMap(b => b.rawMessages));
 			turns += late.reduce((sum, b) => sum + b.turns, 0);
@@ -802,10 +839,10 @@ export class AdvisorRuntime {
 	}
 
 	async #drain(): Promise<void> {
-		if (this.#busy) return;
+		if (this.#busy || this.#sessionTransitionPaused) return;
 		this.#busy = true;
 		try {
-			while (!this.disposed && this.#pending.length) {
+			while (!this.disposed && !this.#sessionTransitionPaused && this.#pending.length) {
 				let popped: PendingDelta[];
 				if (this.#pending[0]?.overflowRecovery) {
 					const recovery = this.#pending.shift();
@@ -814,6 +851,8 @@ export class AdvisorRuntime {
 				} else {
 					popped = this.#pending.splice(0);
 				}
+				const iterationAbort = new AbortController();
+				this.#iterationAbort = iterationAbort;
 				const epoch = this.#epoch;
 				for (const delta of popped) {
 					if (delta.renderRevision === this.#renderRevision) continue;
@@ -822,10 +861,19 @@ export class AdvisorRuntime {
 					delta.renderRevision = this.#renderRevision;
 				}
 				const recoveringOverflow = popped.some(delta => delta.overflowRecovery === true);
-				const result = await this.#collectAndMaintainBatch(epoch, popped, recoveringOverflow);
+				const result = await this.#collectAndMaintainBatch(
+					epoch,
+					popped,
+					recoveringOverflow,
+					iterationAbort.signal,
+				);
 
 				// Epoch was invalidated during batch collection; restart the loop.
 				if (result === null) continue;
+				if (this.#sessionTransitionPaused) {
+					this.#pending.unshift(...popped);
+					continue;
+				}
 
 				const { batch, rawMessages, finalTurns, wip, resetContext } = result;
 
@@ -847,7 +895,13 @@ export class AdvisorRuntime {
 					// Reset the host's per-update advisor state (one-advise-per-update
 					// gate) before each model cycle so the new batch starts fresh.
 					this.host.beginAdvisorUpdate?.();
-					await this.agent.prompt(batch);
+					const prompt = this.agent.prompt(batch);
+					this.#promptInFlight = prompt;
+					try {
+						await prompt;
+					} finally {
+						if (this.#promptInFlight === prompt) this.#promptInFlight = undefined;
+					}
 					// Agent.#runLoop catches provider/stream failures internally and
 					// resolves prompt() cleanly with stopReason: "error". Treat that
 					// as a failed turn so endpoint rejections trip the retry path.
@@ -868,12 +922,17 @@ export class AdvisorRuntime {
 					this.#consecutiveQuarantines = 0;
 					if (this.host.onTurnSuccess) {
 						try {
-							await this.host.onTurnSuccess();
+							await raceWithSignal(Promise.resolve(this.host.onTurnSuccess()), iterationAbort.signal);
 						} catch (hookErr) {
 							logger.debug("advisor onTurnSuccess hook failed", { err: String(hookErr) });
 						}
 					}
 				} catch (err) {
+					if (this.#sessionTransitionPaused) {
+						this.#rollbackFailedTurn(messageSnapshot);
+						this.#pending.unshift(...popped);
+						continue;
+					}
 					// reset()/dispose() aborts the in-flight prompt; treat it as a
 					// reset, not a transient failure — drop the stale batch.
 					if (this.#epoch !== epoch) continue;
@@ -902,9 +961,17 @@ export class AdvisorRuntime {
 					logger.debug("advisor turn failed", { err: String(err) });
 					let recovered = false;
 					try {
-						recovered = (await this.host.onTurnError?.(err, failedMessages)) === true;
+						recovered =
+							(await raceWithSignal(
+								Promise.resolve(this.host.onTurnError?.(err, failedMessages, iterationAbort.signal)),
+								iterationAbort.signal,
+							)) === true;
 					} catch (hookErr) {
 						logger.debug("advisor onTurnError hook failed", { err: String(hookErr) });
+					}
+					if (this.#sessionTransitionPaused) {
+						this.#pending.unshift(...popped);
+						continue;
 					}
 					if (err instanceof AdvisorOutputQuarantinedError) {
 						// A quarantine discards the advisor's whole turn before dispatch, so
@@ -1020,7 +1087,15 @@ export class AdvisorRuntime {
 								wip,
 								overflowRecovery: recoveringOverflow || undefined,
 							});
-							await Bun.sleep(this.retryDelayMs);
+							if (this.retryDelayMs <= 0) {
+								await Bun.sleep(0);
+							} else {
+								try {
+									await raceWithSignal(Bun.sleep(this.retryDelayMs), iterationAbort.signal);
+								} catch (sleepError) {
+									if (!iterationAbort.signal.aborted) throw sleepError;
+								}
+							}
 						}
 					}
 				}
@@ -1031,6 +1106,7 @@ export class AdvisorRuntime {
 				}
 			}
 		} finally {
+			this.#iterationAbort = undefined;
 			this.#busy = false;
 		}
 	}

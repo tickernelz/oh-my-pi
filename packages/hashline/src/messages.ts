@@ -290,6 +290,23 @@ export const HEADTAIL_DRIFT_WARNING =
 	"Applied the `INS.HEAD:`/`INS.TAIL:` edit despite a stale snapshot tag (file changed since your read) — head/tail position is content-independent. Re-read if the drift was unexpected.";
 
 /**
+ * The `Filesystem` reported that what actually landed on disk differs from
+ * what was written (see `WriteResult.text`) — most commonly an ACP-connected
+ * editor reformatting the buffer on save (e.g. `format_on_save` with tab/space
+ * settings that don't match the file). The recorded snapshot is re-keyed on
+ * the real, post-write content so the next edit's tag validation matches
+ * reality instead of silently drifting.
+ */
+export function writeDriftWarning(path: string): string {
+	return (
+		`${path}: the file on disk after this write differs from what was sent — the client ` +
+		"(editor/IDE) likely reformatted it on save (e.g. format-on-save, tab/space settings). " +
+		"The returned snapshot reflects the actual file; re-read before further edits if the " +
+		"extra changes were unexpected."
+	);
+}
+
+/**
  * Section omitted the mandatory snapshot tag. Shared by the apply
  * ({@link Patcher.prepare}) and preview/diff paths so both stay in lockstep.
  */

@@ -176,7 +176,7 @@ describe("SelectorController.handleResumeSession preflight flush", () => {
 		expect(hide).toHaveBeenCalledTimes(1);
 	});
 
-	it("closes the selector and restores editor focus when switching rejects after preflight", async () => {
+	it("surfaces the error, closes the selector and restores editor focus when switching rejects after preflight", async () => {
 		const session: SessionInfo = {
 			path: "/tmp/rejected-resume.jsonl",
 			id: "rejected-resume",
@@ -220,10 +220,11 @@ describe("SelectorController.handleResumeSession preflight flush", () => {
 
 		selector!.handleInput("\n");
 		expect(selectionPromise).toBeDefined();
-		await expect(selectionPromise!).rejects.toBe(switchError);
+		await selectionPromise!;
 
 		expect(ctx.settings.flush).toHaveBeenCalledTimes(1);
 		expect(switchSession).toHaveBeenCalledWith(session.path);
+		expect(ctx.showError).toHaveBeenCalledWith(switchError.message);
 		expect(hide).toHaveBeenCalledTimes(1);
 		expect(setFocus).toHaveBeenLastCalledWith(editor);
 	});

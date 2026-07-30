@@ -99,6 +99,12 @@ export default class Index extends Command {
 			char: "r",
 			description: "Resume a session (by ID prefix, path, or picker if omitted)",
 		}),
+		"from-claude": Flags.boolean({
+			description: "Import a Claude Code session into OMP",
+		}),
+		"from-codex": Flags.boolean({
+			description: "Import a Codex session into OMP",
+		}),
 		"session-dir": Flags.string({
 			description: "Directory for session storage and lookup",
 		}),

@@ -1164,25 +1164,26 @@ describe("AgentSession retry delay cap", () => {
 
 					if (streamCalls === 1) {
 						const thinking = { type: "thinking" as const, thinking: "partial thought" };
-						const text = { type: "text" as const, text: "partial text" };
+						// No visible text: a committed text block makes the failed turn
+						// replay-unsafe (turn-recovery #hasReplayUnsafeOutput), which would
+						// correctly suppress this retry. The delay-cap contract under test
+						// needs a replay-safe partial turn, so only thinking plus an
+						// incomplete (never toolcall_end'd) tool call is emitted.
 						const toolCall: ToolCall = {
 							type: "toolCall",
 							id: "tc-incomplete",
 							name: "bash",
 							arguments: { command: "bun probe-archive3.ts" },
 						};
-						partial.content.push(thinking, text, toolCall);
+						partial.content.push(thinking, toolCall);
 						stream.push({ type: "start", partial });
 						stream.push({ type: "thinking_start", contentIndex: 0, partial });
 						stream.push({ type: "thinking_delta", contentIndex: 0, delta: thinking.thinking, partial });
 						stream.push({ type: "thinking_end", contentIndex: 0, content: thinking.thinking, partial });
-						stream.push({ type: "text_start", contentIndex: 1, partial });
-						stream.push({ type: "text_delta", contentIndex: 1, delta: text.text, partial });
-						stream.push({ type: "text_end", contentIndex: 1, content: text.text, partial });
-						stream.push({ type: "toolcall_start", contentIndex: 2, partial });
+						stream.push({ type: "toolcall_start", contentIndex: 1, partial });
 						stream.push({
 							type: "toolcall_delta",
-							contentIndex: 2,
+							contentIndex: 1,
 							delta: JSON.stringify(toolCall.arguments),
 							partial,
 						});
@@ -1481,6 +1482,57 @@ describe("AgentSession retry delay cap", () => {
 		const last = lastAssistant(session);
 		expect(last.stopReason).toBe("aborted");
 		expect(last.content).toContainEqual({ type: "text", text: "partial" });
+	});
+
+	it("records visible-text usage limits without replaying the failed turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const usageLimitError =
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}';
+		const mock = createMockModel({
+			responses: [{ content: ["Already visible"], stopReason: "error", errorMessage: usageLimitError }],
+		});
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const usageLimitSpy = vi.spyOn(authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+		});
+
+		await session.prompt("Trigger visible usage limit");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(1);
+		expect(usageLimitSpy).toHaveBeenCalledTimes(1);
+		expect(retryStartEvents).toHaveLength(0);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.content).toContainEqual({ type: "text", text: "Already visible" });
 	});
 
 	it("does not auto-retry empty reasonless aborts once the session is disposing", async () => {
