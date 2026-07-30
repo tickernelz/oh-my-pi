@@ -2152,7 +2152,34 @@ export const SETTINGS_SCHEMA = {
 			group: "Lossless LCM",
 			label: "Track Files Above Tokens",
 			description:
-				"Estimated-token size above which an @-mentioned text file is also registered in the LCM store with a deterministic exploration summary. The truncated head still reaches the model; this only adds durable identity. The file handle is not injected on mention: it surfaces once a projected summary lists it, or when lcm_describe is called on a covering source. Use -1 to disable.",
+				"Estimated-token size above which an @-mentioned text file is also registered in the LCM store with a deterministic exploration summary. Its truncated head is still sent unchanged; this only adds durable identity. The file handle is not injected on mention: it surfaces once a projected summary lists it, or when lcm_describe is called on a covering source.",
+			options: [
+				{
+					value: "-1",
+					label: "Off",
+					description: "Never register mentioned files; only skipped ones get metadata.",
+				},
+				{
+					value: "10000",
+					label: "Aggressive",
+					description: "About 40 KB. Tracks most mentioned source files.",
+				},
+				{
+					value: "25000",
+					label: "Balanced",
+					description: "About 100 KB. Tracks datasets and generated files.",
+				},
+				{
+					value: "50000",
+					label: "Relaxed",
+					description: "About 200 KB. Tracks only clearly oversized files.",
+				},
+				{
+					value: "100000",
+					label: "Minimal",
+					description: "About 400 KB. Near-off without losing the largest files.",
+				},
+			],
 			condition: "losslessContextActive",
 		},
 	},
