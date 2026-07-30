@@ -2144,6 +2144,19 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"context.lossless.trackFileAboveTokens": {
+		type: "number",
+		default: 25_000,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Track Files Above Tokens",
+			description:
+				"Estimated-token size above which an @-mentioned text file is also registered in the LCM store with a deterministic exploration summary. The truncated head still reaches the model; this only adds durable identity. The file handle is not injected on mention: it surfaces once a projected summary lists it, or when lcm_describe is called on a covering source. Use -1 to disable.",
+			condition: "losslessContextActive",
+		},
+	},
+
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",

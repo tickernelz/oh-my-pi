@@ -5442,13 +5442,19 @@ export class AgentSession {
 			// Auto-read @filepath mentions
 			const fileMentions = extractFileMentions(expandedText);
 			if (fileMentions.length > 0) {
+				// Same signal as hashSkippedFiles: LCM file identity is only worth computing
+				// when the derived store will actually index it.
+				const losslessFileTracking =
+					this.lcmEnabled ||
+					(this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless");
 				const fileMentionMessages = await generateFileMentionMessages(fileMentions, this.sessionManager.getCwd(), {
 					autoResizeImages: this.settings.get("images.autoResize"),
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
-					hashSkippedFiles:
-						this.lcmEnabled ||
-						(this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless"),
+					hashSkippedFiles: losslessFileTracking,
+					...(losslessFileTracking
+						? { trackFileAboveTokens: this.settings.get("context.lossless.trackFileAboveTokens") }
+						: {}),
 				});
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));

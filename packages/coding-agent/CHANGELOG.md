@@ -7,6 +7,7 @@
 - Added `packages/coding-agent/bench/lcm-scale.bench.ts`, a credential-free benchmark that charges one canonical journal through Lossless, native context-full compaction, and Snapcompact. It gates projection CPU, latency ratio, lineage-row reads, scheduler passes, coverage integrity, and attempt accounting against a fingerprinted pre-change baseline, and reports per-lane primary, maintenance, total, and break-even cost without asserting that Lossless wins on tokens — at scale a lossless cover is necessarily larger than a lossy summary.
 - Added a deterministic type-aware exploration summary for `@`-mentioned files whose bytes are too large or too binary to auto-read. SQLite files report tables, row counts, and schema; JSON/JSONL report root shape and top-level keys with value types; CSV/TSV report columns; code reports top-level declarations; anything else reports leading lines. The dispatcher never calls a model, so identical bytes always describe identically and the result is safe to persist as LCM file metadata.
 - Added `mode: "regex"` to `lcm_search`, backed by the linear-time Rust engine. Text mode remains FTS5 token conjunction, where `alpha|beta` means `"alpha" AND "beta"`; regex mode honors alternation, anchors, and ordering as written.
+- Added `context.lossless.trackFileAboveTokens` (default 25,000). While Lossless is active, an `@`-mentioned text file estimated above that size is registered in the derived store with a content hash and a deterministic exploration summary. Its truncated head still reaches the model unchanged — the setting adds durable identity, it does not withhold content. The file handle is not injected at mention time; it surfaces once a projected summary lists it, or when `lcm_describe` is called on a covering source. Previously a 1.4 MB CSV was auto-read, truncated to a bounded head, and then left no trace in LCM at all, so nothing recorded that the file had been seen once its message was compacted.
 
 ### Changed
 
@@ -17,6 +18,7 @@
 - `lcm_search` now groups source matches under the summary node currently covering them, and labels regex results by match order rather than a BM25 rank that does not apply to them.
 - Lossless historical context now annotates each projected summary with the handles of files its compacted sources referenced, capped at three per summary and twelve per projection, so the model keeps file awareness after compaction instead of only recovering it through `lcm_describe`.
 - Removed `LcmProjectionLimits.softThresholdTokens`. It was computed at 80% of the hard threshold but never read: the live gates are the 40% prewarm point and the hard threshold, so the field only misdescribed the control loop.
+- Exploration summaries now state how the file reached the model. A skipped file still reads `contents not loaded into context.`; a large file whose head was inlined reads `a truncated head was inlined; the remainder was not loaded.` The previous wording claimed nothing was loaded, which would have been false for the newly tracked files.
 
 ### Fixed
 

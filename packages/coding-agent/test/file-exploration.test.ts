@@ -32,16 +32,16 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(absolutePath, {
 			byteSize,
 			fileType: "csv",
-			skippedReason: "tooLarge",
+			kind: "skippedLarge",
 		});
 
 		expect(summary).toContain("Columns (3): id, name, email");
 		expect(summary).toStartWith("csv, ");
 		expect(summary).toContain("contents not loaded into context.");
 		// Determinism is what makes this output safe to persist as file metadata.
-		expect(
-			await buildExplorationSummary(absolutePath, { byteSize, fileType: "csv", skippedReason: "tooLarge" }),
-		).toBe(summary);
+		expect(await buildExplorationSummary(absolutePath, { byteSize, fileType: "csv", kind: "skippedLarge" })).toBe(
+			summary,
+		);
 	});
 
 	test("reports JSONL record keys with their value types", async () => {
@@ -53,7 +53,7 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(absolutePath, {
 			byteSize,
 			fileType: "jsonl",
-			skippedReason: "tooLarge",
+			kind: "skippedLarge",
 		});
 
 		expect(summary).toContain("Record keys: a (number), b (string), c (array), d (null)");
@@ -68,7 +68,7 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(absolutePath, {
 			byteSize,
 			fileType: "json",
-			skippedReason: "tooLarge",
+			kind: "skippedLarge",
 		});
 
 		expect(summary).toContain("Root: object");
@@ -98,7 +98,7 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(absolutePath, {
 			byteSize,
 			fileType: "ts",
-			skippedReason: "tooLarge",
+			kind: "skippedLarge",
 		});
 
 		expect(summary).toContain("export function alpha(value: number) {");
@@ -119,7 +119,7 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(absolutePath, {
 			byteSize,
 			fileType: "binary",
-			skippedReason: "binary",
+			kind: "skippedBinary",
 		});
 
 		expect(summary).toContain("Tables (1):");
@@ -134,9 +134,24 @@ describe("buildExplorationSummary", () => {
 		const summary = await buildExplorationSummary(path.join(dir, "missing.csv"), {
 			byteSize: 1_024,
 			fileType: "csv",
-			skippedReason: "tooLarge",
+			kind: "skippedLarge",
+		});
+		expect(summary).toBe("csv, 1.0KB; contents not loaded into context.");
+	});
+
+	test("a truncated head gets a truthful header instead of the reference-only wording", async () => {
+		const { absolutePath, byteSize } = await writeTempFile("wide.csv", "id,name\n1,a\n2,b\n");
+
+		const truncated = await buildExplorationSummary(absolutePath, {
+			byteSize,
+			fileType: "csv",
+			kind: "truncatedHead",
 		});
 
-		expect(summary).toBe("csv, 1.0KB; contents not loaded into context.");
+		expect(truncated).toStartWith("csv, ");
+		expect(truncated).toContain("a truncated head was inlined; the remainder was not loaded.");
+		expect(truncated).not.toContain("contents not loaded into context.");
+		// The body is unchanged: only the header wording depends on how the file reached the model.
+		expect(truncated).toContain("Columns (2): id, name");
 	});
 });

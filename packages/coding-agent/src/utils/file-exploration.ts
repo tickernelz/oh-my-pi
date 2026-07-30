@@ -210,11 +210,7 @@ async function textBody(absolutePath: string): Promise<string[]> {
 	return lines.length > 0 ? ["First lines:", ...lines] : ["Empty or whitespace-only prefix."];
 }
 
-async function explorationBody(
-	absolutePath: string,
-	extension: string,
-	skippedReason: "tooLarge" | "binary",
-): Promise<string[]> {
+async function explorationBody(absolutePath: string, extension: string, kind: FileExplorationKind): Promise<string[]> {
 	if (await isSqliteFile(absolutePath)) return sqliteBody(absolutePath);
 	if (extension === "jsonl" || extension === "ndjson") {
 		const body = await jsonlBody(absolutePath);
@@ -229,22 +225,36 @@ async function explorationBody(
 		if (body) return body;
 		return await textBody(absolutePath);
 	}
-	if (skippedReason === "binary") return [];
+	if (kind === "skippedBinary") return [];
 	return await textBody(absolutePath);
 }
 
 /**
- * Bounded, deterministic description of a file that was skipped during auto-read.
+ * How the file reached the model, which decides the truthful header wording.
+ *
+ * - `skippedLarge` / `skippedBinary`: no bytes entered the context.
+ * - `truncatedHead`: a bounded head was inlined; the rest was not.
+ */
+export type FileExplorationKind = "skippedLarge" | "skippedBinary" | "truncatedHead";
+
+const HEADER_SUFFIX: Record<FileExplorationKind, string> = {
+	skippedLarge: "contents not loaded into context.",
+	skippedBinary: "contents not loaded into context.",
+	truncatedHead: "a truncated head was inlined; the remainder was not loaded.",
+};
+
+/**
+ * Bounded, deterministic description of a file the model cannot see in full.
  * Never throws: a failure degrades to the header line alone.
  */
 export async function buildExplorationSummary(
 	absolutePath: string,
-	info: { byteSize: number; fileType: string; skippedReason: "tooLarge" | "binary" },
+	info: { byteSize: number; fileType: string; kind: FileExplorationKind },
 ): Promise<string> {
-	const header = `${info.fileType}, ${formatBytes(info.byteSize)}; contents not loaded into context.`;
+	const header = `${info.fileType}, ${formatBytes(info.byteSize)}; ${HEADER_SUFFIX[info.kind]}`;
 	let body: string[] = [];
 	try {
-		body = await explorationBody(absolutePath, path.extname(absolutePath).slice(1).toLowerCase(), info.skippedReason);
+		body = await explorationBody(absolutePath, path.extname(absolutePath).slice(1).toLowerCase(), info.kind);
 	} catch {
 		body = [];
 	}

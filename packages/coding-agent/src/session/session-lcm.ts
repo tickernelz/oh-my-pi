@@ -468,7 +468,12 @@ function serializeMessage(message: AgentMessage, refs: Set<string>): string | un
 	}
 }
 
-function referenceOnlyFileMetadata(
+/**
+ * File metadata for one `fileMention`. Covers files whose bytes were skipped entirely and
+ * large files that were auto-read but registered so their identity survives compaction.
+ * Gated on `explorationSummary`, not on `contentHash`: skipped binaries hash too.
+ */
+function mentionFileMetadata(
 	message: Extract<AgentMessage, { role: "fileMention" }>,
 	projectId: string,
 	redact: (text: string) => string,
@@ -476,13 +481,13 @@ function referenceOnlyFileMetadata(
 ): LcmFileMetadata[] {
 	const metadata: LcmFileMetadata[] = [];
 	for (const file of message.files) {
-		if (!file.skippedReason) continue;
+		if (!file.skippedReason && file.explorationSummary === undefined) continue;
 		const safePath = redact(file.path);
 		const byteSize = Math.max(0, file.byteSize ?? 0);
 		const contentHash =
 			file.contentHash ??
 			new Bun.CryptoHasher("sha256")
-				.update(`legacy-reference\0${safePath}\0${byteSize}\0${file.skippedReason}`)
+				.update(`legacy-reference\0${safePath}\0${byteSize}\0${file.skippedReason ?? "tracked"}`)
 				.digest("hex");
 		const fileId = `file_${new Bun.CryptoHasher("sha256")
 			.update(`${projectId}\0${safePath}\0${contentHash}`)
@@ -743,8 +748,7 @@ function normalizeLcmBranchState(
 		if (serialized === undefined) continue;
 		const redactedText = redact(serialized);
 		const contentHash = new Bun.CryptoHasher("sha256").update(redactedText).digest("hex");
-		const files =
-			message.role === "fileMention" ? referenceOnlyFileMetadata(message, projectId, redact, activeFiles) : [];
+		const files = message.role === "fileMention" ? mentionFileMetadata(message, projectId, redact, activeFiles) : [];
 		const source: SourceEntry = {
 			...scope,
 			entryId: entry.id,

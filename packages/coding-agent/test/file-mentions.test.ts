@@ -146,4 +146,52 @@ describe("generateFileMentionMessages path resolution", () => {
 		expect(lcmMessage.files[0]?.content).toBe(nativeMessage.files[0]?.content);
 		expect(lcmMessage.files[0]?.contentHash).toMatch(/^[a-f0-9]{64}$/);
 	});
+
+	test("tracks a large auto-read file without replacing its truncated head", async () => {
+		const cwd = await createTempDir();
+		const header = "id,name,email\n";
+		const rows = Array.from({ length: 40_000 }, (_, index) => `${index},name${index},u${index}@example.com\n`);
+		const csv = header + rows.join("");
+		await Bun.write(path.join(cwd, "big.csv"), csv);
+		const byteSize = Buffer.byteLength(csv, "utf8");
+		// Comfortably under the 5 MiB auto-read cap, comfortably over a 25k-token budget.
+		expect(byteSize).toBeLessThan(5 * 1024 * 1024);
+		expect(Math.ceil(byteSize / 4)).toBeGreaterThan(25_000);
+
+		const untracked = await generateFileMentionMessages(["big.csv"], cwd);
+		const untrackedFile = untracked[0]?.role === "fileMention" ? untracked[0].files[0] : undefined;
+		expect(untrackedFile?.explorationSummary).toBeUndefined();
+		expect(untrackedFile?.contentHash).toBeUndefined();
+
+		const tracked = await generateFileMentionMessages(["big.csv"], cwd, {
+			hashSkippedFiles: true,
+			trackFileAboveTokens: 25_000,
+		});
+		const trackedFile = tracked[0]?.role === "fileMention" ? tracked[0].files[0] : undefined;
+
+		// The head is the point: tracking adds identity, it does not replace content.
+		expect(trackedFile?.content).toBe(untrackedFile?.content);
+		expect(trackedFile?.content).toContain("id,name,email");
+		expect(trackedFile?.skippedReason).toBeUndefined();
+
+		expect(trackedFile?.byteSize).toBe(byteSize);
+		expect(trackedFile?.contentHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(trackedFile?.explorationSummary).toContain("Columns (3): id, name, email");
+		expect(trackedFile?.explorationSummary).toContain("a truncated head was inlined");
+	});
+
+	test("leaves a file under the tracking threshold untouched", async () => {
+		const cwd = await createTempDir();
+		await Bun.write(path.join(cwd, "small.csv"), "id,name\n1,a\n");
+
+		const messages = await generateFileMentionMessages(["small.csv"], cwd, {
+			hashSkippedFiles: true,
+			trackFileAboveTokens: 25_000,
+		});
+		const file = messages[0]?.role === "fileMention" ? messages[0].files[0] : undefined;
+
+		expect(file?.content).toContain("1,a");
+		expect(file?.explorationSummary).toBeUndefined();
+		expect(file?.contentHash).toBeUndefined();
+	});
 });

@@ -43,6 +43,7 @@ import {
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
+	normalizeLcmBranch,
 	SessionLcm,
 	type SessionLcmOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
@@ -2129,6 +2130,44 @@ describe("SessionLcm", () => {
 			{ kind: "file", reference: { ...scope, fileId: "file_2" } },
 		]);
 		await lcm.close();
+	});
+
+	it("indexes a large auto-read file as LCM metadata while keeping its head in the source text", () => {
+		const manager = SessionManager.inMemory("/tracked-file-mention");
+		appendUser(manager, "look at the dataset", 1);
+		manager.appendMessage({
+			role: "fileMention",
+			files: [
+				{
+					path: "data/big.csv",
+					content: "id,name,email\n1,ada,ada@example.com\n[truncated]",
+					lineCount: 40_001,
+					byteSize: 1_400_000,
+					contentHash: "c".repeat(64),
+					explorationSummary: "csv, 1.4MB; a truncated head was inlined.\nColumns (3): id, name, email",
+				},
+			],
+			timestamp: 2,
+		});
+
+		const snapshot = normalizeLcmBranch(manager, "tracked-project", text => text);
+		const mention = snapshot.entries.find(source => (source.files?.length ?? 0) > 0);
+		expect(mention).toBeDefined();
+
+		// No `skippedReason`, so the head must survive into the indexed source text.
+		expect(mention?.redactedText).toContain("id,name,email");
+		expect(mention?.redactedText).not.toContain("reference-only");
+
+		// And the file is still registered, which is what lets a projected summary carry its handle.
+		expect(mention?.files).toHaveLength(1);
+		expect(mention?.files?.[0]).toMatchObject({
+			contentHash: "c".repeat(64),
+			path: "data/big.csv",
+			fileType: "csv",
+			byteSize: 1_400_000,
+		});
+		expect(mention?.files?.[0]?.explorationSummary).toContain("Columns (3): id, name, email");
+		expect(mention?.files?.[0]?.fileId).toMatch(/^file_[a-f0-9]{64}$/);
 	});
 
 	it("fails open to the exact native input when handle-bearing history does not fit", async () => {
