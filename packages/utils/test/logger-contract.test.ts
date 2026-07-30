@@ -252,26 +252,22 @@ describe("central logger transport lifecycle", () => {
 	// on an unloaded runner — bun's 5 s default test timeout SIGTERMed the
 	// probe (exit 143) whenever CI runners shared cores. The contract is
 	// order + drain, not latency; give it an explicit budget.
-	test(
-		"preserves burst order and drains on close and natural child exit",
-		async () => {
-			for (const scenario of ["burst-close", "burst-natural"] as const) {
-				const result = await runScenario(scenario);
-				expect(result.stdout).toBe("");
-				expect(result.stderr).toBe("");
-				const text = (await readSingleLog(result.primaryDir)).text;
-				expect(text.endsWith(os.EOL)).toBe(true);
-				const lines = text.split(os.EOL);
-				expect(lines.pop()).toBe("");
-				expect(lines).toHaveLength(1_000);
-				for (const [index, line] of lines.entries()) {
-					const entry = JSON.parse(line) as { message: string; index: number };
-					expect(entry).toMatchObject({ message: scenario, index });
-				}
+	test("preserves burst order and drains on close and natural child exit", async () => {
+		for (const scenario of ["burst-close", "burst-natural"] as const) {
+			const result = await runScenario(scenario);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toBe("");
+			const text = (await readSingleLog(result.primaryDir)).text;
+			expect(text.endsWith(os.EOL)).toBe(true);
+			const lines = text.split(os.EOL);
+			expect(lines.pop()).toBe("");
+			expect(lines).toHaveLength(1_000);
+			for (const [index, line] of lines.entries()) {
+				const entry = JSON.parse(line) as { message: string; index: number };
+				expect(entry).toMatchObject({ message: scenario, index });
 			}
-		},
-		30_000,
-	);
+		}
+	}, 30_000);
 
 	test("runs local console output before sinks and isolates throwing or disposed sinks", async () => {
 		const result = await runScenario("sink-order");

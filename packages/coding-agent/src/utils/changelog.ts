@@ -281,7 +281,7 @@ export function selectStartupChangelog(
 		return emptyStartupSelection(false);
 	}
 	if (compareVersions(parsedLastVersion, parsedCurrentVersion) === 0) {
-		return { markdown: undefined, persistCurrentVersion: true, truncated: false, selectedEntries: 0 };
+		return emptyStartupSelection(true);
 	}
 
 	const allNewEntries = getNewEntries(entries, markerVersion);
