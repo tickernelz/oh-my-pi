@@ -411,7 +411,7 @@ const patchStrategy: EditStreamingStrategy<PatchArgs> = {
 			if (typeof edit?.diff !== "string") continue;
 			// `create` ops carry full file content in `diff` with no +/- markers;
 			// pass that content through whole.
-			const added = extractAddedLines(edit.diff, true);
+			const added = extractAddedLines(edit.diff, edit.op === "create");
 			digest = digest === undefined ? added : `${digest}\n${added}`;
 		}
 		return digest;

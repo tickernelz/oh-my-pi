@@ -1466,6 +1466,44 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshed.contextWindow).toBe(16384);
 		expect(refreshed.maxTokens).toBe(16384);
 		expect(registry.find("llama.cpp", "cold-preset")?.contextWindow).toBe(16384);
+
+		await authStorage.set("projection-provider", {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		});
+		try {
+			registry.registerProvider(
+				"projection-provider",
+				{
+					api: "anthropic-messages",
+					baseUrl: "https://example.invalid/",
+					models: [
+						{
+							id: "projection-model",
+							name: "Projection Model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+						},
+					],
+					oauth: {
+						name: "Projection OAuth",
+						login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+						refreshToken: async credentials => credentials,
+						getApiKey: credentials => credentials.access,
+						modifyModels: models => models,
+					},
+				},
+				"ext://metadata-projection",
+			);
+			expect(registry.find("llama.cpp", "cold-preset")?.contextWindow).toBe(16384);
+		} finally {
+			registry.clearSourceRegistrations("ext://metadata-projection");
+		}
 	});
 
 	test("llama.cpp selected model refresh patches newly loaded meta n_ctx and unlimited output limit", async () => {

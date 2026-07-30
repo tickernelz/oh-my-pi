@@ -4000,6 +4000,128 @@ describe("advisor", () => {
 			expect(promptInputs[1]).toContain("new-conversation");
 			expect(promptInputs[1]).not.toContain("old-conversation");
 		});
+
+		it("retries the interrupted batch after a session transition rolls back", async () => {
+			const promptInputs: string[] = [];
+			const firstPromptStarted = Promise.withResolvers<void>();
+			let rejectInFlight: ((reason?: unknown) => void) | undefined;
+			const agent: AdvisorAgent = {
+				prompt: input => {
+					promptInputs.push(input);
+					if (promptInputs.length > 1) return Promise.resolve();
+					const gate = Promise.withResolvers<void>();
+					rejectInFlight = gate.reject;
+					firstPromptStarted.resolve();
+					return gate.promise;
+				},
+				abort: () => rejectInFlight?.(new Error("session transition")),
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "keep me", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			});
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted.promise;
+			await runtime.pauseForSessionTransition();
+			expect(promptInputs).toHaveLength(1);
+
+			runtime.resumeAfterSessionTransition();
+			await settleUntil(() => runtime.backlog === 0);
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[1]).toContain("keep me");
+		});
+
+		it.each(["success", "error"] as const)(
+			"releases blocked %s hooks so reset can run replacement work",
+			async hookKind => {
+				const hookStarted = Promise.withResolvers<void>();
+				const releaseHook = Promise.withResolvers<void>();
+				const replacementPromptStarted = Promise.withResolvers<void>();
+				let promptCalls = 0;
+				let hookCalls = 0;
+				const blockHook = async () => {
+					if (++hookCalls !== 1) return;
+					hookStarted.resolve();
+					await releaseHook.promise;
+				};
+				const agent: AdvisorAgent = {
+					prompt: async () => {
+						promptCalls++;
+						if (promptCalls === 1 && hookKind === "error") throw new Error("provider failure");
+						if (promptCalls === 2) replacementPromptStarted.resolve();
+					},
+					abort: () => {},
+					reset: () => {},
+					state: { messages: [] },
+				};
+				const runtime = new AdvisorRuntime(agent, {
+					snapshotMessages: () => [],
+					enqueueAdvice: () => {},
+					...(hookKind === "success"
+						? { onTurnSuccess: blockHook }
+						: {
+								onTurnError: async () => {
+									await blockHook();
+									return false;
+								},
+							}),
+				});
+
+				runtime.onTurnEnd([{ role: "user", content: "old session", timestamp: 1 } as AgentMessage]);
+				await hookStarted.promise;
+				const pause = runtime.pauseForSessionTransition();
+				const pausedQuickly = await Promise.race([pause.then(() => true), Bun.sleep(50).then(() => false)]);
+				runtime.reset();
+				runtime.onTurnEnd([{ role: "user", content: "replacement session", timestamp: 2 } as AgentMessage]);
+				const replacementRan = await Promise.race([
+					replacementPromptStarted.promise.then(() => true),
+					Bun.sleep(50).then(() => false),
+				]);
+				releaseHook.resolve();
+				await pause;
+				runtime.dispose();
+
+				expect(pausedQuickly).toBe(true);
+				expect(replacementRan).toBe(true);
+			},
+		);
+		it("aborts retry backoff before pausing for a session transition", async () => {
+			const recoveryStarted = Promise.withResolvers<void>();
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					throw new Error("provider failure");
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => [],
+					enqueueAdvice: () => {},
+					onTurnError: () => {
+						recoveryStarted.resolve();
+						return false;
+					},
+				},
+				250,
+			);
+
+			runtime.onTurnEnd([{ role: "user", content: "retry me", timestamp: 1 } as AgentMessage]);
+			await recoveryStarted.promise;
+			await Bun.sleep(0);
+			const pause = runtime.pauseForSessionTransition();
+			const pausedQuickly = await Promise.race([pause.then(() => true), Bun.sleep(50).then(() => false)]);
+			if (!pausedQuickly) await pause;
+			runtime.dispose();
+
+			expect(pausedQuickly).toBe(true);
+		});
 	});
 
 	describe("AdvisorRuntime quota classification", () => {
@@ -4105,6 +4227,11 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBeGreaterThan(0);
 			expect(promptInputs).toHaveLength(1);
 			expect(promptInputs[0]).toContain("quota-turn");
+
+			await runtime.pauseForSessionTransition();
+			runtime.resumeAfterSessionTransition();
+			await Promise.resolve();
+			expect(promptInputs).toHaveLength(1);
 
 			// After reset() clears the quota pause, the next onTurnEnd drains the
 			// retained batch — proving it was never lost.
@@ -4268,15 +4395,22 @@ describe("advisor", () => {
 			};
 			let quotaNotified = 0;
 			let hookInvocations = 0;
+			const maintenanceSignals: AbortSignal[] = [];
 			const { promise: hookEntered, resolve: allowHook } = Promise.withResolvers<void>();
-			const { promise: hookProceed, resolve: proceedHook } = Promise.withResolvers<void>();
 			const host: AdvisorRuntimeHost = {
 				snapshotMessages: () => [],
 				enqueueAdvice: () => {},
-				onTurnError: async () => {
+				maintainContext: async (_incomingTokens, signal) => {
+					maintenanceSignals.push(signal);
+					return false;
+				},
+				onTurnError: async (_error, _failedMessages, signal) => {
 					hookInvocations++;
 					allowHook();
-					await hookProceed;
+					const hookAborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => hookAborted.resolve(), { once: true });
+					await hookAborted.promise;
+					signal.throwIfAborted();
 					return false;
 				},
 				notifyQuotaExhausted: () => {
@@ -4289,16 +4423,48 @@ describe("advisor", () => {
 			await hookEntered;
 			runtime.reset();
 			runtime.onTurnEnd([{ role: "user", content: "fresh-turn", timestamp: 2 } as AgentMessage]);
-			proceedHook();
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(hookInvocations).toBe(1);
 			expect(promptInputs).toHaveLength(2);
 			expect(promptInputs[0]).toContain("stale-turn");
 			expect(promptInputs[1]).toContain("fresh-turn");
+			expect(maintenanceSignals).toHaveLength(2);
+			expect(maintenanceSignals[0]?.aborted).toBe(true);
+			expect(maintenanceSignals[1]?.aborted).toBe(false);
 			expect(runtime.quotaExhausted).toBe(false);
 			expect(runtime.backlog).toBe(0);
 			expect(quotaNotified).toBe(0);
+		});
+		it("aborts the active recovery hook when disposed", async () => {
+			const hookEntered = Promise.withResolvers<void>();
+			let recoverySignal!: AbortSignal;
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					throw new Error("provider failure");
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => [],
+				enqueueAdvice: () => {},
+				onTurnError: async (_error, _failedMessages, signal) => {
+					recoverySignal = signal;
+					hookEntered.resolve();
+					const hookAborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => hookAborted.resolve(), { once: true });
+					await hookAborted.promise;
+					signal.throwIfAborted();
+				},
+			});
+
+			runtime.onTurnEnd([{ role: "user", content: "stale-turn", timestamp: 1 } as AgentMessage]);
+			await hookEntered.promise;
+			runtime.dispose();
+
+			expect(recoverySignal.aborted).toBe(true);
 		});
 		it("uses generic failure path when switched retry hits a non-quota error", async () => {
 			const promptInputs: string[] = [];

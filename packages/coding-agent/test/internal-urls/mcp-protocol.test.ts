@@ -73,6 +73,20 @@ describe("McpProtocolHandler", () => {
 		await expect(router.resolve("mcp://test://missing")).rejects.toThrow("server-a");
 	});
 
+	it("lists resource templates alongside concrete resources when no server matches", async () => {
+		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
+		resources.set("server-a", {
+			resources: [{ uri: "example://items/open", name: "open-item" }],
+			templates: [{ uriTemplate: "example://items/{id}", name: "item-template" }],
+		});
+		const manager = createMockManager({ servers: ["server-a"], resources });
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
+
+		await expect(router.resolve("mcp://example://missing")).rejects.toThrow("example://items/open");
+		await expect(router.resolve("mcp://example://missing")).rejects.toThrow("example://items/{id}");
+	});
+
 	it("reads resource by exact URI match", async () => {
 		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
 		resources.set("my-server", {

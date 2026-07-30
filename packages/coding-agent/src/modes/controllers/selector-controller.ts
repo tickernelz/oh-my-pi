@@ -42,6 +42,13 @@ import {
 import type { InteractiveModeContext } from "../../modes/types";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import {
+	createForeignSessionStore,
+	foreignSessionInfoToSessionInfo,
+	foreignSessionSourceName,
+	persistForeignSession,
+} from "../../session/foreign-session-import";
+import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -87,7 +94,7 @@ import { PluginSelectorComponent } from "../components/plugin-selector";
 import { ResetUsageSelectorComponent } from "../components/reset-usage-selector";
 import { renderSegmentTrack } from "../components/segment-track";
 import { SessionAccountSelectorComponent } from "../components/session-account-selector";
-import { SessionSelectorComponent } from "../components/session-selector";
+import { SessionSelectorComponent, type SessionSelectorOptions } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TranscriptBlock } from "../components/transcript-container";
@@ -1364,20 +1371,87 @@ export class SelectorController {
 		return result;
 	}
 
-	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.list(
-			this.ctx.sessionManager.getCwd(),
-			this.ctx.sessionManager.getSessionDir(),
-		);
-		// Always open in current-folder scope; the empty-state hint in SessionList
-		// invites the user to Tab into all-projects rather than silently surfacing
-		// every project's history when the cwd has nothing to resume. See #3099.
-		const historyStorage = this.ctx.historyStorage;
-		const historyMatcher = historyStorage ? (query: string) => historyStorage.matchingSessionIds(query) : undefined;
+	async showSessionSelector(source?: ForeignSessionSource): Promise<void> {
+		let sessions: SessionInfo[];
+		let onSelectSession: (session: SessionInfo) => Promise<boolean>;
+		let selectorOptions: SessionSelectorOptions;
+
+		if (source) {
+			const sourceName = foreignSessionSourceName(source);
+			const store = createForeignSessionStore(source);
+			let foreignSessions: ForeignSessionInfo[];
+			try {
+				foreignSessions = await store.list();
+			} catch (error) {
+				this.ctx.showError(
+					`Failed to list ${sourceName} sessions: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+			if (foreignSessions.length === 0) {
+				this.ctx.showWarning(`No ${sourceName} sessions found`);
+				return;
+			}
+			const foreignByPath = new Map(foreignSessions.map(session => [session.path, session]));
+			sessions = foreignSessions.map(foreignSessionInfoToSessionInfo);
+			onSelectSession = async session => {
+				try {
+					await this.ctx.settings.flush();
+				} catch (error) {
+					this.ctx.showError(
+						`Failed to save pending settings: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					return false;
+				}
+				const foreignSession = foreignByPath.get(session.path);
+				if (!foreignSession) throw new Error(`Selected ${sourceName} session is no longer available`);
+				const imported = await persistForeignSession(store, foreignSession, {
+					fallbackCwd: this.ctx.sessionManager.getCwd(),
+					suppressBreadcrumb: true,
+				});
+				const sessionFile = imported.getSessionFile();
+				if (!sessionFile) throw new Error(`Failed to persist ${sourceName} session`);
+				await imported.close();
+				return await this.handleResumeSession(sessionFile, { settingsFlushed: true });
+			};
+			selectorOptions = {
+				title: `Import ${sourceName} Session`,
+				scopeLabel: false,
+				showCwd: true,
+			};
+		} else {
+			sessions = await SessionManager.list(
+				this.ctx.sessionManager.getCwd(),
+				this.ctx.sessionManager.getSessionDir(),
+			);
+			const historyStorage = this.ctx.historyStorage;
+			const historyMatcher = historyStorage
+				? (query: string) => historyStorage.matchingSessionIds(query)
+				: undefined;
+			onSelectSession = session => this.handleResumeSession(session.path);
+			selectorOptions = {
+				onDelete: async (session: SessionInfo) => {
+					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
+						return false;
+					}
+					const storage = new FileSessionStorage();
+					try {
+						await storage.deleteSessionWithArtifacts(session.path);
+						return true;
+					} catch (error) {
+						throw new Error(
+							`Failed to delete session: ${error instanceof Error ? error.message : String(error)}`,
+							{ cause: error },
+						);
+					}
+				},
+				historyMatcher,
+				loadAllSessions: () => SessionManager.listAll(),
+			};
+		}
+
 		// Keep the fullscreen picker on the alternate buffer while a selected
-		// session is loaded and its transcript is rebuilt. Closing it first exposes
-		// the stale normal buffer for the entire async switch on terminals without
-		// effective synchronized output.
+		// session is loaded and its transcript is rebuilt.
 		let overlayHandle: OverlayHandle | undefined;
 		const done = () => {
 			overlayHandle?.hide();
@@ -1390,43 +1464,27 @@ export class SelectorController {
 				selector.lockInput();
 				let keepOpen = false;
 				try {
-					const success = await this.handleResumeSession(session.path);
+					const success = await onSelectSession(session);
 					if (!success) {
 						keepOpen = true;
 						selector.unlockInput();
 						this.ctx.ui.requestRender();
 					}
+				} catch (error) {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				} finally {
 					if (!keepOpen) done();
 				}
 			},
-			() => {
-				done();
-			},
+			done,
 			() => {
 				// Release the alt buffer before teardown: shutdown() awaits flush/save/
-				// dispose/drain before stop() leaves the alt screen, so without this the
-				// fullscreen picker would freeze on screen for that window on Ctrl+C.
+				// dispose/drain before stop() leaves the alt screen.
 				done();
 				void this.ctx.shutdown();
 			},
 			{
-				onDelete: async (session: SessionInfo) => {
-					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
-						return false;
-					}
-					const storage = new FileSessionStorage();
-					try {
-						await storage.deleteSessionWithArtifacts(session.path);
-						return true;
-					} catch (err) {
-						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
-							cause: err,
-						});
-					}
-				},
-				historyMatcher,
-				loadAllSessions: () => SessionManager.listAll(),
+				...selectorOptions,
 				getTerminalRows: () => this.ctx.ui.terminal.rows,
 				fillHeight: true,
 			},

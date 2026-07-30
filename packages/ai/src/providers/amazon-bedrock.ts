@@ -29,7 +29,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types";
-import { normalizeToolCallId, resolveCacheRetention } from "../utils";
+import { normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
 import {
 	clearStreamingPartialJson,
 	kStreamingBlockIndex,
@@ -752,10 +752,10 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 }
 
 function buildSystemPrompt(
-	systemPrompt: readonly string[] | undefined,
+	systemPrompt: readonly string[] | string | undefined,
 	promptCachePolicy: BedrockPromptCachePolicy,
 ): SystemContent[] | undefined {
-	const prompts = systemPrompt?.map(prompt => prompt.toWellFormed()).filter(prompt => prompt.length > 0) ?? [];
+	const prompts = normalizeSystemPrompts(systemPrompt);
 	if (prompts.length === 0) return undefined;
 
 	const blocks: SystemContent[] = prompts.map(prompt => ({ text: prompt }));

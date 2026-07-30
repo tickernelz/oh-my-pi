@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added response-level OSC 11 appearance subscriptions to help terminal consumers distinguish confirmed unchanged background classifications from missing replies.
+
+### Fixed
+
+- Fixed native Windows terminal panes freezing their host during forced closure by skipping the stdout-drain wait after ConPTY disconnects.
+- Fixed high CPU usage in the Loader spinner during idle waits by optimizing text wrapping and caching during frame updates.
+- Fixed hash-prefixed UUIDs in prose being misclassified as 8-digit CSS colors and receiving spurious swatches.
+- Fixed unbounded memory growth and potential host freezes when a PTY consumer stalls by capping the pending stdout backlog and treating undrained consumers as a disconnect.
+
 ## [17.1.8] - 2026-07-28
 
 ### Fixed

@@ -1378,6 +1378,14 @@ export function getPackageDir(): string {
 // check during validation (issue #6583).
 export { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 
+// Same barrel gap for two more legacy package-root exports: pi re-exported the
+// `CONFIG_DIR_NAME` constant and the CLI parser `parseArgs`. In omp
+// `CONFIG_DIR_NAME` lives in `@oh-my-pi/pi-utils` and `parseArgs` in
+// `../cli/args`, neither of which the barrel below forwards, so legacy
+// extensions importing either fail Bun's static export check during validation.
+export { CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils";
+export { parseArgs } from "../cli/args";
+
 export * from "../index";
 export { formatBytes as formatSize } from "../tools/render-utils";
 export { copyToClipboard } from "../utils/clipboard";

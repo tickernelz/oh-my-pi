@@ -24,7 +24,11 @@ import {
 	type LateDiagnosticsFile,
 	LateDiagnosticsMessageComponent,
 } from "../../modes/components/late-diagnostics-message";
-import { ReadToolGroupComponent, readArgsCollapseIntoGroup } from "../../modes/components/read-tool-group";
+import {
+	groupedReadUsageCallIds,
+	ReadToolGroupComponent,
+	readArgsCollapseIntoGroup,
+} from "../../modes/components/read-tool-group";
 import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
@@ -318,29 +322,38 @@ export class UiHelpers {
 		let readGroup: ReadToolGroupComponent | null = null;
 		const readToolCallArgs = new Map<string, Record<string, unknown>>();
 		const readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
-		// The per-turn token-usage row (display.showTokenUsage) must land below the
-		// turn's tool blocks. Read tool blocks are only created when their toolResult
-		// message is processed (below), so appending the row in the assistant branch
-		// would place it above a read run. Defer instead: stash the usage on the
-		// assistant message, then flush it once the turn's tools are placed — right
-		// before the next non-toolResult message and at end of rebuild — sealing the
-		// read run so the row sits under it. Mirrors the live path, where the read
-		// group is created during streaming and the row is appended below it.
+		// Defer per-turn metrics until the turn's tool results have materialized.
+		// Read-only invisible turns attach the metrics to their shared compact
+		// group; every other turn keeps the standalone row below its tool blocks.
 		let pendingUsage: Usage | undefined;
 		let pendingUsageDuration: number | undefined;
 		let pendingUsageTtft: number | undefined;
 		let pendingUsageTimestamp: number | undefined;
+		let pendingReadUsageCallIds: string[] | undefined;
 		const flushPendingUsage = () => {
 			if (!pendingUsage) return;
-			readGroup?.seal();
-			readGroup = null;
-			this.ctx.chatContainer.addChild(
-				createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
-			);
+			const usageAttached =
+				pendingReadUsageCallIds !== undefined &&
+				(readGroup?.attachUsage(
+					pendingReadUsageCallIds,
+					pendingUsage,
+					pendingUsageDuration,
+					pendingUsageTtft,
+					pendingUsageTimestamp,
+				) ??
+					false);
+			if (!usageAttached) {
+				readGroup?.seal();
+				readGroup = null;
+				this.ctx.chatContainer.addChild(
+					createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
+				);
+			}
 			pendingUsage = undefined;
 			pendingUsageDuration = undefined;
 			pendingUsageTtft = undefined;
 			pendingUsageTimestamp = undefined;
+			pendingReadUsageCallIds = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
 		// bookkeeping: a `hub` wait that found every watched job still running is
@@ -546,6 +559,7 @@ export class UiHelpers {
 				pendingUsageDuration = message.duration;
 				pendingUsageTtft = message.ttft;
 				pendingUsageTimestamp = message.timestamp;
+				pendingReadUsageCallIds = pendingUsage ? groupedReadUsageCallIds(message) : undefined;
 			} else if (message.role === "toolResult") {
 				if (options.preservedLiveToolCallIds?.has(message.toolCallId)) continue;
 				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
@@ -613,6 +627,8 @@ export class UiHelpers {
 					}
 				}
 			} else {
+				readGroup?.seal();
+				readGroup = null;
 				// A user prompt closes the displacement window, same as the live path.
 				if (message.role === "user") resolveWaitingPoll();
 				if (message.role === "user") resolveTodoSnapshot();
@@ -739,14 +755,13 @@ export class UiHelpers {
 	showNewVersionNotification(newVersion: string): void {
 		const block = new TranscriptBlock();
 		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));
+		const title = "Update Available";
+		const prefix = `New version ${newVersion} is available. Run: `;
+		const command = "omp update";
 		block.addChild(
-			new Text(
-				theme.bold(theme.fg("warning", "Update Available")) +
-					"\n" +
-					theme.fg("muted", `New version ${newVersion} is available. Run: `) +
-					theme.fg("accent", "omp update"),
-				1,
-				0,
+			new Text(`${title}\n${prefix}${command}`, 1, 0).setStyleFn(
+				() =>
+					`${theme.bold(theme.fg("warning", title))}\n${theme.fg("muted", prefix)}${theme.fg("accent", command)}`,
 			),
 		);
 		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));

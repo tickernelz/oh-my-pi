@@ -1751,6 +1751,21 @@ describe("Inline color swatches", () => {
 		expect(code.includes("■")).toBe(false);
 	});
 
+	it("does not swatch hash-prefixed UUIDs in prose", () => {
+		const uuid = new Markdown(
+			"Use feedback ID #6635765d-4a44-4a5e-a536-a8b72b0395b5 for testing.",
+			0,
+			0,
+			defaultMarkdownTheme,
+		)
+			.render(80)
+			.join("");
+		expect(uuid.includes("■")).toBe(false);
+
+		const color = new Markdown("Use color #6635765d.", 0, 0, defaultMarkdownTheme).render(80).join("");
+		expect(color.includes(swatchFor("6635765d"))).toBeTruthy();
+	});
+
 	it("uses the theme's colorSwatch symbol when provided", () => {
 		const themed = { ...defaultMarkdownTheme, symbols: { ...defaultMarkdownTheme.symbols, colorSwatch: "▢" } };
 		const out = new Markdown("Accent #C5FFD6.", 0, 0, themed).render(80).join("\n");

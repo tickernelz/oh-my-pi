@@ -20,6 +20,9 @@ import {
 import { stripOneLeadingHashlinePrefix } from "./prefixes";
 import { type BlockTarget, cloneCursor, type ParsedRange, type Token, Tokenizer } from "./tokenizer";
 import type { Anchor, BlockSpan, Cursor, Edit, FileOp } from "./types";
+
+/** Bounds parser amplification before the target file's line count is available. */
+const MAX_EXPANDED_RANGE_LINES = 100_000;
 /** Parser error carrying enough range metadata for source-aware diagnostic enrichment. */
 export class InvalidAbsoluteRangeError extends Error {
 	/** Patch-language line containing the invalid range header. */
@@ -46,16 +49,26 @@ export class InvalidAbsoluteRangeError extends Error {
 	}
 }
 
-function validateRangeOrder(range: ParsedRange, lineNum: number, op: AbsoluteRangeOp): void {
+function validateRange(range: ParsedRange, lineNum: number, op: AbsoluteRangeOp): void {
+	if (
+		!Number.isSafeInteger(range.start.line) ||
+		range.start.line < 1 ||
+		!Number.isSafeInteger(range.end.line) ||
+		range.end.line < 1
+	) {
+		throw new Error(
+			`line ${lineNum}: ${op} range endpoints must be positive safe integers; got ${range.start.line} and ${range.end.line}.`,
+		);
+	}
 	if (range.end.line < range.start.line) {
 		throw new InvalidAbsoluteRangeError(lineNum, range.start.line, range.end.line, op);
 	}
-}
-
-function expandRange(range: ParsedRange): Anchor[] {
-	const anchors: Anchor[] = [];
-	for (let line = range.start.line; line <= range.end.line; line++) anchors.push({ line });
-	return anchors;
+	const span = range.end.line - range.start.line + 1;
+	if (span > MAX_EXPANDED_RANGE_LINES) {
+		throw new Error(
+			`line ${lineNum}: ${op} range spans ${span} lines; the maximum is ${MAX_EXPANDED_RANGE_LINES}. Split it into smaller hunks.`,
+		);
+	}
 }
 
 function isSkippableCommentLine(line: string): boolean {
@@ -195,7 +208,7 @@ export class Executor {
 			case "op-block":
 				this.#discardPendingSkippableComments();
 				if (token.target.kind === "replace" || token.target.kind === "delete") {
-					validateRangeOrder(token.target.range, token.lineNum, token.target.kind);
+					validateRange(token.target.range, token.lineNum, token.target.kind);
 				}
 				if (token.target.kind === "rem") {
 					this.#flushPending();
@@ -438,6 +451,10 @@ export class Executor {
 		this.#edits.push({ kind: "delete", anchor: { ...anchor }, lineNum, index: this.#editIndex++ });
 	}
 
+	#pushDeleteRange(range: ParsedRange, lineNum: number): void {
+		for (let line = range.start.line; line <= range.end.line; line++) this.#pushDelete({ line }, lineNum);
+	}
+
 	#pushBlock(anchor: Anchor, payloads: readonly PayloadRow[], lineNum: number, mode?: "insert_after"): void {
 		this.#edits.push({
 			kind: "block",
@@ -461,7 +478,7 @@ export class Executor {
 		this.#stripBarePrefixesIfUniform(payloads);
 		this.#pending = undefined;
 		if (target.kind === "delete") {
-			for (const anchor of expandRange(target.range)) this.#pushDelete(anchor, lineNum);
+			this.#pushDeleteRange(target.range, lineNum);
 			return;
 		}
 		if (target.kind === "delete_block") {
@@ -481,7 +498,7 @@ export class Executor {
 		}
 		if (payloads.length === 0) {
 			if (target.kind === "replace") {
-				for (const anchor of expandRange(target.range)) this.#pushDelete(anchor, lineNum);
+				this.#pushDeleteRange(target.range, lineNum);
 				return;
 			}
 			throw new Error(`line ${lineNum}: ${EMPTY_INSERT}`);
@@ -489,7 +506,7 @@ export class Executor {
 		if (target.kind === "replace") {
 			const cursor: Cursor = { kind: "before_anchor", anchor: { ...target.range.start } };
 			this.#emitPayloadRows(cursor, payloads, lineNum, "replacement");
-			for (const anchor of expandRange(target.range)) this.#pushDelete(anchor, lineNum);
+			this.#pushDeleteRange(target.range, lineNum);
 			return;
 		}
 		if (target.kind === "insert_before") {

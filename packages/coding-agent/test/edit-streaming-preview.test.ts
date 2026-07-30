@@ -334,6 +334,11 @@ describe("matcherDigest", () => {
 				edits: [{ diff: " ctx\n-removed line\n+added line\n" }],
 			}),
 		).toBe("added line");
+		expect(
+			EDIT_MODE_STRATEGIES.patch.matcherDigest({
+				edits: [{ op: "delete", diff: " ctx\n-removed line\n" }],
+			}),
+		).toBe("");
 		const createContent = "full file content\nwith no diff markers\n";
 		expect(
 			EDIT_MODE_STRATEGIES.patch.matcherDigest({

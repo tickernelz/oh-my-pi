@@ -226,6 +226,12 @@ function detectStrictModeSupport(provider: string, baseUrl: string): boolean {
  */
 const LOCAL_OPENAI_COMPAT_PROVIDERS = new Set(["llama.cpp", "lm-studio", "vllm", "ollama"]);
 
+/** Hosts that accept only none/auto/required rather than a named tool-choice object. */
+const STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS: Record<string, true> = {
+	"llama.cpp": true,
+	"lm-studio": true,
+};
+
 /**
  * Local proxy providers that share the loopback-default baseUrl but forward
  * to an unrelated upstream (OpenAI, Anthropic, …) rather than running a
@@ -481,7 +487,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(spec.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
 		supportsForcedToolChoice: !requiresEnabledThinking,
-		supportsNamedToolChoice: provider !== "llama.cpp",
+		supportsNamedToolChoice: STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS[provider] !== true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: isMistral,
@@ -686,7 +692,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		disableReasoningOnToolChoice: isDeepseekFamily && reasoningCapable && !isOpenRouter,
 		supportsToolChoice: true,
 		supportsForcedToolChoice: true,
-		supportsNamedToolChoice: true,
+		supportsNamedToolChoice: STRING_ONLY_NAMED_TOOL_CHOICE_PROVIDERS[spec.provider] !== true,
 		reasoningContentField: "reasoning_content",
 		requiresReasoningContentForToolCalls:
 			(isKimiModel || (isDeepseekFamily && reasoningCapable) || (isOpenRouter && reasoningCapable)) &&

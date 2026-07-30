@@ -132,6 +132,7 @@ function scanLineNumber(line: string, index: number, end: number): NumberScan | 
 		const code = line.charCodeAt(nextIndex);
 		if (!isDigitCode(code)) break;
 		lineNumber = lineNumber * 10 + (code - CHAR_ZERO);
+		if (!Number.isSafeInteger(lineNumber)) return null;
 		nextIndex++;
 	}
 	return { line: lineNumber, nextIndex };

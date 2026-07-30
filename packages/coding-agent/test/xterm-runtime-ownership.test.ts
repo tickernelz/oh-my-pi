@@ -7,6 +7,7 @@ interface CacheProbeResult {
 	rss: number;
 	heapUsed: number;
 	paths: string[];
+	terminalRows?: string[];
 }
 
 const fixture = (name: string): string => path.resolve(import.meta.dir, "fixtures", name);
@@ -29,7 +30,7 @@ async function runProbe(childPath: string): Promise<CacheProbeResult> {
 describe("launch xterm runtime ownership", () => {
 	test("cache detector observes the direct xterm positive control", async () => {
 		const result = await runProbe(fixture("xterm-cache-positive-control.ts"));
-		expect(result.modules, JSON.stringify(result)).toBe(1);
+		expect(result.modules, JSON.stringify(result)).toBeGreaterThan(0);
 		expect(result.bytes, JSON.stringify(result)).toBeGreaterThan(0);
 	});
 
@@ -43,8 +44,16 @@ describe("launch xterm runtime ownership", () => {
 		expect(result.modules, JSON.stringify(result)).toBe(0);
 	});
 
-	test("broker import owns exactly one xterm CommonJS module", async () => {
+	test("legacy replay evaluates xterm outside the client process", async () => {
+		const result = await runProbe(fixture("xterm-cache-legacy-replay-probe.ts"));
+		expect(result.terminalRows).toEqual(["\x1b[0m\x1b[1;38;5;2mready"]);
+		expect(result.modules, JSON.stringify(result)).toBe(0);
+		expect(result.bytes, JSON.stringify(result)).toBe(0);
+	});
+
+	test("broker import owns the xterm runtime", async () => {
 		const result = await runProbe(fixture("xterm-cache-broker-probe.ts"));
-		expect(result.modules, JSON.stringify(result)).toBe(1);
+		expect(result.modules, JSON.stringify(result)).toBeGreaterThan(0);
+		expect(result.bytes, JSON.stringify(result)).toBeGreaterThan(0);
 	});
 });

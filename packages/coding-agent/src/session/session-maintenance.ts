@@ -1399,7 +1399,11 @@ export class SessionMaintenance {
 		}
 	}
 
-	async resolveContextPromotionTarget(currentModel: Model, contextWindow: number): Promise<Model | undefined> {
+	async resolveContextPromotionTarget(
+		currentModel: Model,
+		contextWindow: number,
+		signal?: AbortSignal,
+	): Promise<Model | undefined> {
 		const availableModels = this.#host.modelRegistry.getAvailable();
 		if (availableModels.length === 0) return undefined;
 
@@ -1407,7 +1411,7 @@ export class SessionMaintenance {
 		if (!candidate) return undefined;
 		if (modelsAreEqual(candidate, currentModel)) return undefined;
 		if (candidate.contextWindow == null || candidate.contextWindow <= contextWindow) return undefined;
-		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal });
 		if (!apiKey) return undefined;
 		return candidate;
 	}

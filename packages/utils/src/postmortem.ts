@@ -319,14 +319,20 @@ export function cleanup(): Promise<void> {
 	return runCleanup(Reason.MANUAL);
 }
 
-async function runQuit(code: number, exitMode: "guarded" | "native"): Promise<void> {
+/** Controls how manual process shutdown handles terminal output. */
+export interface QuitOptions {
+	/** Wait for buffered stdout before exiting; disable after the terminal has disconnected. */
+	drainStdout?: boolean;
+}
+
+async function runQuit(code: number, exitMode: "guarded" | "native", options: QuitOptions = {}): Promise<void> {
 	await runCleanup(Reason.MANUAL);
 
 	if (!isMainThread) {
 		return; // Workers: cleanup done, let worker exit naturally
 	}
 
-	if (process.stdout.writableLength > 0) {
+	if (options.drainStdout !== false && process.stdout.writableLength > 0) {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		process.stdout.once("drain", resolve);
 		await Promise.race([promise, Bun.sleep(5000)]);
@@ -343,9 +349,9 @@ async function runQuit(code: number, exitMode: "guarded" | "native"): Promise<vo
 /**
  * Runs all cleanup callbacks and exits through the current `process.exit`.
  *
- * In main thread: waits for stdout drain, then calls `process.exit()`.
+ * In main thread: waits for stdout drain unless disabled, then calls `process.exit()`.
  * In workers: runs cleanup only (process.exit would kill entire process).
  */
-export function quit(code: number = 0): Promise<void> {
-	return runQuit(code, "guarded");
+export function quit(code: number = 0, options: QuitOptions = {}): Promise<void> {
+	return runQuit(code, "guarded", options);
 }

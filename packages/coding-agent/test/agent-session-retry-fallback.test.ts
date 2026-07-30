@@ -669,12 +669,89 @@ describe("AgentSession retry fallback", () => {
 		]);
 		expect(advisorFailures).toEqual([]);
 
+		const getApiKey = vi.spyOn(modelRegistry, "getApiKey");
 		const afterCooldown = Date.now() + 2_000;
 		vi.spyOn(Date, "now").mockReturnValue(afterCooldown);
 		await session.prompt("Complete another primary turn after the advisor cooldown");
 		await session.waitForIdle();
+		expect(getApiKey).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: advisorPrimary.provider, id: advisorPrimary.id }),
+			expect.any(String),
+			{ signal: expect.any(AbortSignal) },
+		);
 
 		expect(requestedAdvisorModels).toEqual([advisorPrimarySelector, advisorFallbackSelector, advisorPrimarySelector]);
+		expect(session.getAdvisorAgent()?.state.model).toMatchObject({
+			provider: advisorPrimary.provider,
+			id: advisorPrimary.id,
+		});
+	});
+
+	it("ignores late advisor fallback credentials after a session transition", async () => {
+		const mainModel = getBundledModel("openai", "gpt-4o-mini");
+		const advisorPrimary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const advisorFallback = getBundledModel("openai", "gpt-4o");
+		if (!mainModel || !advisorPrimary || !advisorFallback) {
+			throw new Error("Expected bundled advisor fallback models to exist");
+		}
+
+		const mainMock = createMockModel({ responses: [{ content: ["Primary complete"] }] });
+		const advisorMock = createMockModel({
+			responses: [{ throw: "service unavailable: 503 overloaded" }],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: mainModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mainMock.stream,
+		});
+		const advisorPrimarySelector = `${advisorPrimary.provider}/${advisorPrimary.id}`;
+		const advisorFallbackSelector = `${advisorFallback.provider}/${advisorFallback.id}`;
+		const settings = Settings.isolated({
+			"advisor.syncBacklog": "1",
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[advisorPrimarySelector]: [advisorFallbackSelector],
+			},
+		});
+		settings.setModelRole("advisor", advisorPrimarySelector);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: advisorMock.stream,
+		});
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		const credentialStarted = Promise.withResolvers<void>();
+		const releaseCredential = Promise.withResolvers<void>();
+		const credentialReturned = Promise.withResolvers<void>();
+		let credentialSignal: AbortSignal | undefined;
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, _sessionId, options) => {
+			if (model.provider === advisorFallback.provider && model.id === advisorFallback.id) {
+				credentialSignal = options?.signal;
+				credentialStarted.resolve();
+				await releaseCredential.promise;
+				credentialReturned.resolve();
+			}
+			return `${model.provider}-test-key`;
+		});
+
+		await session.prompt("Trigger advisor fallback");
+		await credentialStarted.promise;
+		await session.newSession();
+		releaseCredential.resolve();
+		await credentialReturned.promise;
+		await Bun.sleep(0);
+
+		expect(credentialSignal?.aborted).toBe(true);
 		expect(session.getAdvisorAgent()?.state.model).toMatchObject({
 			provider: advisorPrimary.provider,
 			id: advisorPrimary.id,
@@ -1284,7 +1361,7 @@ describe("AgentSession retry fallback", () => {
 				if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
 					primaryAttempts += 1;
 					mock.push({
-						content: ["Classifier declined this turn."],
+						content: [{ type: "thinking", thinking: "Classifier evaluation before refusal." }],
 						stopReason: "error",
 						stopDetails: refusalDetails,
 						errorMessage: "Refusal (cyber): Classifier declined this turn.",
@@ -2903,10 +2980,7 @@ describe("AgentSession retry fallback", () => {
 		const mock = createMockModel({
 			responses: [
 				{
-					content: [
-						{ type: "thinking", thinking: "Thinking before malformed function call..." },
-						{ type: "text", text: "Text before malformed function call..." },
-					],
+					content: [{ type: "thinking", thinking: "Thinking before malformed function call..." }],
 					stopReason: "error",
 					errorMessage: malformedError,
 				},
@@ -2969,7 +3043,7 @@ describe("AgentSession retry fallback", () => {
 		const errorMessage = "Provider returned error finish_reason";
 		const mock = createMockModel({
 			responses: [
-				{ content: ["partial output before gateway error"], stopReason: "error", errorMessage },
+				{ content: ["   "], stopReason: "error", errorMessage },
 				{ content: ["Recovered after provider finish_reason error"] },
 			],
 		});
@@ -3035,7 +3109,7 @@ describe("AgentSession retry fallback", () => {
 		const errorMessage = "Provider returned error finish_reason";
 		const mock = createMockModel({
 			responses: [
-				{ content: ["partial output before gateway error"], stopReason: "error", errorMessage },
+				{ content: ["   "], stopReason: "error", errorMessage },
 				{ content: ["Recovered after tail rebuild"] },
 			],
 		});

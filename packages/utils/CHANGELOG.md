@@ -9,6 +9,8 @@
 ### Fixed
 
 - Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
+- Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
+
 ## [17.1.8] - 2026-07-28
 
 ### Added

@@ -27,6 +27,7 @@ const fileOperationLocks = new Map<string, Promise<void>>();
 /** Negative cache of recent init failures so a broken server fails fast instead of re-spawning per call. */
 const INIT_FAILURE_BACKOFF_MS = 3 * 60 * 1000;
 const initFailures = new Map<string, { at: number; message: string }>();
+const READER_EXIT_GRACE_MS = 100;
 
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
@@ -303,6 +304,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 
 	const framer = new MessageFramer(Buffer.from(client.messageBuffer));
 
+	let readerFailed = false;
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
@@ -391,6 +393,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 			}
 		}
 	} catch (err) {
+		readerFailed = true;
 		// Connection closed or error - reject all pending requests
 		for (const pending of Array.from(client.pendingRequests.values())) {
 			pending.reject(new Error(`LSP connection closed: ${err}`));
@@ -401,6 +404,9 @@ async function startMessageReader(client: LspClient): Promise<void> {
 		client.messageBuffer = framer.remainder();
 		reader.releaseLock();
 		client.isReading = false;
+		if (!readerFailed && client.proc.exitCode === null) {
+			await waitForExit(client, READER_EXIT_GRACE_MS);
+		}
 		// Reader exited while the server process is still alive (unrecoverable
 		// read error or bad stream state): nothing will route responses anymore,
 		// so tear the client down — the next call respawns instead of timing out.
@@ -676,6 +682,15 @@ const PROJECT_LOAD_TIMEOUT_MS = 15_000;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 const EXIT_TIMEOUT_MS = 1_000;
 
+function clientKey(config: ServerConfig, cwd: string): string {
+	return `${config.command}:${cwd}`;
+}
+
+/** Allow an explicit user reload to retry a matching initialization failure immediately. */
+export function clearInitializationFailure(config: ServerConfig, cwd: string): void {
+	initFailures.delete(clientKey(config, cwd));
+}
+
 /**
  * Get or create an LSP client for the given server configuration and working directory.
  * @param config - Server configuration
@@ -692,7 +707,7 @@ export async function getOrCreateClient(
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<LspClient> {
-	const key = `${config.command}:${cwd}`;
+	const key = clientKey(config, cwd);
 
 	// Check if client already exists
 	const existingClient = clients.get(key);
@@ -865,13 +880,13 @@ export async function getActiveOrPendingClient(
 	signal?: AbortSignal,
 ): Promise<LspClient | undefined> {
 	throwIfAborted(signal);
-	const client = clients.get(`${config.command}:${cwd}`);
+	const client = clients.get(clientKey(config, cwd));
 	if (client) {
 		client.lastActivity = Date.now();
 		return client;
 	}
 
-	const pending = clientLocks.get(`${config.command}:${cwd}`);
+	const pending = clientLocks.get(clientKey(config, cwd));
 	if (!pending) return undefined;
 	try {
 		return await untilAborted(signal, pending);

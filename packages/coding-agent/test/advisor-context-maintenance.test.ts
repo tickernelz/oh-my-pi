@@ -19,6 +19,7 @@ const OUTPUT_TOKENS = 150;
 interface MaintenanceHarness {
 	advisor: Agent;
 	advisorMock: MockModel;
+	modelRegistry: ModelRegistry;
 	settings: Settings;
 }
 
@@ -44,7 +45,7 @@ describe("AgentSession advisor context maintenance", () => {
 		await tempDir.remove();
 	});
 
-	function createHarness(): MaintenanceHarness {
+	function createHarness(contextPromotionTarget?: string, contextPromotionEnabled = false): MaintenanceHarness {
 		const primaryMock = createMockModel({
 			provider: "anthropic",
 			responses: [{ content: ["primary complete"] }],
@@ -54,12 +55,13 @@ describe("AgentSession advisor context maintenance", () => {
 			contextWindow: CONTEXT_WINDOW,
 			responses: [{ content: ["advisor reviewed current update"] }],
 		});
+		Object.assign(advisorMock, { contextPromotionTarget });
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const settings = Settings.isolated({
 			"advisor.syncBacklog": "1",
 			"compaction.enabled": true,
 			"compaction.strategy": "context-full",
-			"contextPromotion.enabled": false,
+			"contextPromotion.enabled": contextPromotionEnabled,
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -85,7 +87,7 @@ describe("AgentSession advisor context maintenance", () => {
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model =>
 			model === primaryMock ? "test-key" : undefined,
 		);
-		return { advisor, advisorMock, settings };
+		return { advisor, advisorMock, modelRegistry, settings };
 	}
 
 	function usageAnchor(advisorMock: MockModel, timestamp: number, cost = 0): AssistantMessage {
@@ -144,6 +146,44 @@ describe("AgentSession advisor context maintenance", () => {
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 	});
 
+	it("ignores late context-promotion credentials after a session transition", async () => {
+		const promotion = createMockModel({
+			id: "advisor-promotion-target",
+			provider: "anthropic",
+			contextWindow: CONTEXT_WINDOW + 1,
+		});
+		const { advisor, advisorMock, modelRegistry } = createHarness(`${promotion.provider}/${promotion.id}`, true);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([advisor.state.model, promotion]);
+		const credentialStarted = Promise.withResolvers<void>();
+		const releaseCredential = Promise.withResolvers<void>();
+		const credentialReturned = Promise.withResolvers<void>();
+		let credentialSignal: AbortSignal | undefined;
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, _sessionId, options) => {
+			if (model === promotion) {
+				credentialSignal = options?.signal;
+				credentialStarted.resolve();
+				await releaseCredential.promise;
+				credentialReturned.resolve();
+			}
+			return "test-key";
+		});
+		advisor.emitExternalEvent({
+			type: "message_end",
+			message: usageAnchor(advisorMock, Date.now() - 1_000),
+		});
+
+		const prompt = session.prompt("trigger advisor context promotion");
+		await credentialStarted.promise;
+		await session.newSession();
+		releaseCredential.resolve();
+		await credentialReturned.promise;
+		await prompt;
+		await Bun.sleep(0);
+
+		expect(credentialSignal?.aborted).toBe(true);
+		expect(session.getAdvisorAgent()?.state.model).toBe(advisorMock);
+	});
+
 	it("includes advisor system prompt and tool schemas in the local maintenance floor", async () => {
 		const { advisor, advisorMock, settings } = createHarness();
 		const seed: AgentMessage = { role: "user", content: "small stored advisor message", timestamp: 1 };
@@ -199,7 +239,7 @@ describe("AgentSession advisor context maintenance", () => {
 		expect(sentContext).not.toContain("fresh post-compaction output");
 	});
 
-	it("forwards the advisor session metadata to overflow compaction requests", async () => {
+	it("forwards compaction metadata and aborts transitions without fallback or re-prime", async () => {
 		// Regression for #6625 review: advisor overflow compaction issues a direct
 		// `compact(...)` request that bypasses the advisor `Agent`, so the metadata
 		// resolver installed on the agent never runs for it. The direct call must
@@ -208,6 +248,9 @@ describe("AgentSession advisor context maintenance", () => {
 		// API lets the compaction one-shot's `completeSimple` route to it so the
 		// summarization request actually reaches the mock (and its recorded calls).
 		registerMockApi();
+		const compactionStarted = Promise.withResolvers<void>();
+		const releaseCompaction = Promise.withResolvers<void>();
+		let fallbackCalls = 0;
 		const primaryMock = createMockModel({
 			provider: "anthropic",
 			responses: [{ content: ["primary complete"] }],
@@ -215,7 +258,28 @@ describe("AgentSession advisor context maintenance", () => {
 		const advisorMock = createMockModel({
 			provider: "anthropic",
 			contextWindow: CONTEXT_WINDOW,
-			handler: () => ({ content: ["bounded advisor summary"] }),
+			handler: async (context, options) => {
+				if (!JSON.stringify(context.messages).includes("<conversation>")) {
+					return { content: ["advisor reviewed current update"] };
+				}
+				compactionStarted.resolve();
+				const signal = options?.signal;
+				if (!signal) throw new Error("Expected compaction abort signal");
+				const compactionAborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => compactionAborted.resolve(), { once: true });
+				await Promise.race([releaseCompaction.promise, compactionAborted.promise]);
+				signal.throwIfAborted();
+				return { content: ["bounded advisor summary"] };
+			},
+		});
+		const fallbackMock = createMockModel({
+			id: "advisor-compaction-fallback",
+			provider: "anthropic",
+			contextWindow: CONTEXT_WINDOW,
+			handler: () => {
+				fallbackCalls++;
+				return { content: ["unexpected fallback"] };
+			},
 		});
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const settings = Settings.isolated({
@@ -242,9 +306,10 @@ describe("AgentSession advisor context maintenance", () => {
 		const advisor = session.getAdvisorAgent();
 		if (!advisor?.sessionId) throw new Error("Expected advisor agent with a provider session id");
 		advisor.setModel(advisorMock);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([advisorMock, fallbackMock]);
 		// Unlike the recovery-branch harness, the advisor holds usable credentials
 		// so maintenance runs the LLM summarization compaction path.
-		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		const getApiKey = vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
 
 		// Two accumulated turns so compaction has older history to summarize while
 		// retaining the most recent one (a single message would be fully retained,
@@ -253,8 +318,24 @@ describe("AgentSession advisor context maintenance", () => {
 			usageAnchor(advisorMock, Date.now() - 2_000),
 			usageAnchor(advisorMock, Date.now() - 1_000),
 		);
+		const previousAdvisorMessages = [...advisor.state.messages];
 
-		await session.prompt("small current update");
+		const prompt = session.prompt("small current update");
+		await compactionStarted.promise;
+		const failure = new Error("new session failed");
+		vi.spyOn(session.sessionManager, "newSession").mockRejectedValue(failure);
+		const transition = session.newSession();
+		try {
+			await expect(transition).rejects.toThrow(failure);
+			expect(fallbackCalls).toBe(0);
+			expect(advisor.state.messages).toEqual(previousAdvisorMessages);
+			expect(getApiKey).toHaveBeenCalledWith(advisorMock, advisor.sessionId, {
+				signal: expect.any(AbortSignal),
+			});
+		} finally {
+			releaseCompaction.resolve();
+			await prompt;
+		}
 
 		// A summarization compaction one-shot actually ran (its prompt wraps the
 		// conversation in <conversation> tags).
@@ -262,6 +343,7 @@ describe("AgentSession advisor context maintenance", () => {
 			JSON.stringify(call.context.messages).includes("<conversation>"),
 		);
 		expect(compactionCalls.length).toBeGreaterThan(0);
+		expect(compactionCalls.every(call => call.options?.signal instanceof AbortSignal)).toBe(true);
 
 		// Every advisor request — the compaction one-shot and the advisor turn —
 		// carries the advisor's own provider session id via metadata.user_id.

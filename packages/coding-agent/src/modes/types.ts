@@ -20,6 +20,7 @@ import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
+import type { ForeignSessionSource } from "../session/foreign-session-store";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
@@ -384,7 +385,7 @@ export interface InteractiveModeContext {
 	showUserMessageSelector(): void;
 	showCopySelector(): void;
 	showTreeSelector(): void;
-	showSessionSelector(): void;
+	showSessionSelector(source?: ForeignSessionSource): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;

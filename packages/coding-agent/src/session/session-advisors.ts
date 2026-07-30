@@ -183,6 +183,8 @@ export interface SessionAdvisorsOptions {
 	configs?: AdvisorConfig[];
 	streamFn?: StreamFn;
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	/** Advisor spend already persisted for this session, restored on resume. */
+	initialCosts?: ReadonlyMap<string, number>;
 }
 
 /** Options accepted when an advisor injects a primary-session message. */
@@ -221,7 +223,11 @@ export interface SessionAdvisorsHost {
 	hasPendingNextTurnMessages(): boolean;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
 	effectiveServiceTier(model: Model): ServiceTier | undefined;
-	resolveContextPromotionTarget(currentModel: Model, contextWindow: number): Promise<Model | undefined>;
+	resolveContextPromotionTarget(
+		currentModel: Model,
+		contextWindow: number,
+		signal: AbortSignal,
+	): Promise<Model | undefined>;
 	resolveCompactionModelCandidates(preferredModel: Model | null | undefined, availableModels: Model[]): Model[];
 	resolveRetryFallbackRole(currentSelector: string, currentModel?: Model | null): string | undefined;
 	findRetryFallbackCandidates(
@@ -272,6 +278,7 @@ export class SessionAdvisors {
 		this.#advisorConfigs = options.configs;
 		this.#advisorStreamFn = options.streamFn;
 		this.#transformProviderContext = options.transformProviderContext;
+		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
@@ -313,6 +320,15 @@ export class SessionAdvisors {
 		this.#stopAdvisorRuntime();
 	}
 
+	/**
+	 * Pause advisor work while old-session recorder feeds remain attached, then
+	 * detach only after any active prompt has settled.
+	 */
+	async drainAndDetachRecorders(): Promise<void> {
+		await Promise.all(this.#advisors.map(advisor => advisor.runtime.pauseForSessionTransition()));
+		await this.detachAndCloseRecorders();
+	}
+
 	/** Detaches and drains recorder feeds before transcript artifacts are removed. */
 	async detachAndCloseRecorders(): Promise<void> {
 		const closes: Promise<void>[] = [];
@@ -325,6 +341,14 @@ export class SessionAdvisors {
 		await Promise.all(closes);
 	}
 
+	/** Reattach recorder feeds and resume work after a rolled-back or preserving transition. */
+	reattachRecorderFeeds(): void {
+		for (const advisor of this.#advisors) {
+			if (!advisor.agentUnsubscribe) this.#attachAdvisorRecorderFeed(advisor);
+			advisor.runtime.resumeAfterSessionTransition();
+		}
+	}
+
 	/** Re-primes advisor transcript views across a conversation boundary. */
 	resetSessionState(options: { preserveCost?: boolean } = {}): void {
 		this.#resetAdvisorSessionState(options.preserveCost === true);
@@ -333,6 +357,11 @@ export class SessionAdvisors {
 	/** Drop the recorded spend once a conversation boundary has committed. */
 	clearCost(): void {
 		this.#advisorCosts.clear();
+	}
+
+	/** Replace the ledger with the spend recorded for the session becoming active. */
+	restoreCost(costs: ReadonlyMap<string, number>): void {
+		this.#advisorCosts = new Map(costs);
 	}
 
 	/**
@@ -784,10 +813,12 @@ export class SessionAdvisors {
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
 				enqueueAdvice: (note, severity) => this.#routeAdvice(advisorRef, note, severity),
-				maintainContext: incomingTokens => this.#maintainAdvisorContext(advisorRef, incomingTokens),
+				maintainContext: (incomingTokens, signal) =>
+					this.#maintainAdvisorContext(advisorRef, incomingTokens, signal),
 				obfuscator: this.#host.obfuscator,
 				beginAdvisorUpdate: () => advisorRef.emissionGuard.beginUpdate(),
-				onTurnError: (error, failedMessages) => this.#recoverAdvisorTurn(advisorRef, error, failedMessages),
+				onTurnError: (error, failedMessages, signal) =>
+					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
@@ -1015,7 +1046,7 @@ export class SessionAdvisors {
 	}
 
 	/** Restore an advisor's configured primary once its fallback cooldown expires. */
-	async #maybeRestoreAdvisorRetryFallbackPrimary(advisor: ActiveAdvisor): Promise<void> {
+	async #maybeRestoreAdvisorRetryFallbackPrimary(advisor: ActiveAdvisor, signal: AbortSignal): Promise<void> {
 		const fallback = advisor.retryFallback;
 		if (!fallback || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") return;
 
@@ -1043,8 +1074,9 @@ export class SessionAdvisors {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel) return;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId);
+		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
 		if (!apiKey) return;
+		signal.throwIfAborted();
 
 		const thinkingToApply =
 			advisor.thinkingLevel === fallback.lastAppliedThinkingLevel
@@ -1064,6 +1096,7 @@ export class SessionAdvisors {
 		advisor: ActiveAdvisor,
 		error: unknown,
 		failedMessages: readonly AgentMessage[],
+		signal: AbortSignal,
 	): Promise<boolean> {
 		if (error instanceof AdvisorOutputQuarantinedError) return false;
 
@@ -1086,6 +1119,7 @@ export class SessionAdvisors {
 					retryAfterMs: extractRetryHint(undefined, message),
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,
+					signal,
 				},
 			);
 			return outcome.switched;
@@ -1117,6 +1151,7 @@ export class SessionAdvisors {
 					retryAfterMs,
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,
+					signal,
 				},
 			);
 			if (outcome.switched) return true;
@@ -1134,8 +1169,9 @@ export class SessionAdvisors {
 			const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 			const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 			if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId);
+			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 			if (!apiKey) continue;
+			signal.throwIfAborted();
 
 			const originalThinkingLevel = advisor.thinkingLevel;
 			const requestedThinkingLevel = selector.thinkingLevel ?? originalThinkingLevel;
@@ -1163,13 +1199,18 @@ export class SessionAdvisors {
 		return false;
 	}
 
-	async #promoteAdvisorContextModel(advisor: ActiveAdvisor, currentModel: Model): Promise<boolean> {
+	async #promoteAdvisorContextModel(
+		advisor: ActiveAdvisor,
+		currentModel: Model,
+		signal: AbortSignal,
+	): Promise<boolean> {
 		const promotionSettings = this.#host.settings.getGroup("contextPromotion");
 		if (!promotionSettings.enabled) return false;
 		const contextWindow = currentModel.contextWindow ?? 0;
 		if (contextWindow <= 0) return false;
-		const targetModel = await this.#host.resolveContextPromotionTarget(currentModel, contextWindow);
+		const targetModel = await this.#host.resolveContextPromotionTarget(currentModel, contextWindow, signal);
 		if (!targetModel) return false;
+		signal.throwIfAborted();
 
 		// Preserve this advisor's own thinking level (a configured `model:...:high`
 		// keeps its suffix across a promotion); only the model changes.
@@ -1193,8 +1234,12 @@ export class SessionAdvisors {
 		}
 	}
 
-	async #maintainAdvisorContext(advisor: ActiveAdvisor, incomingTokens: number): Promise<boolean> {
-		await this.#maybeRestoreAdvisorRetryFallbackPrimary(advisor);
+	async #maintainAdvisorContext(
+		advisor: ActiveAdvisor,
+		incomingTokens: number,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		await this.#maybeRestoreAdvisorRetryFallbackPrimary(advisor, signal);
 		const agent = advisor.agent;
 
 		const compactionSettings = this.#host.settings.getGroup("compaction");
@@ -1229,7 +1274,7 @@ export class SessionAdvisors {
 		}
 
 		// 1. Try promotion first
-		if (await this.#promoteAdvisorContextModel(advisor, advisorModel)) {
+		if (await this.#promoteAdvisorContextModel(advisor, advisorModel, signal)) {
 			// Promotion succeeded, check if new model has enough space
 			const newModel = agent.state.model;
 			const newWindow = newModel.contextWindow ?? 0;
@@ -1307,7 +1352,7 @@ export class SessionAdvisors {
 		});
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId);
+			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
 			if (!apiKey) continue;
 			// The advisor overflow-compaction one-shot bypasses the advisor `Agent`,
 			// so its installed metadata resolver never runs. Emit the same
@@ -1324,7 +1369,7 @@ export class SessionAdvisors {
 					candidate,
 					this.#host.modelRegistry.resolver(candidate, advisorProviderSessionId),
 					undefined,
-					undefined,
+					signal,
 					{
 						thinkingLevel: advisorCompactionThinkingLevel,
 						convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
@@ -1339,6 +1384,7 @@ export class SessionAdvisors {
 				);
 				break;
 			} catch (error) {
+				if (signal.aborted) throw error;
 				lastError = error;
 			}
 		}

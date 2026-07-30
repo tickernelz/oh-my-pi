@@ -1461,6 +1461,30 @@ export class SessionManager {
 		await this.#rewriteAtomically();
 	}
 
+	/** Persist this session's transcript as a newly identified OMP session. */
+	async persistCopy(
+		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionManager> {
+		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
+		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
+		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#resetToNewSession();
+		manager.#sessionName = this.#sessionName;
+		manager.#titleSource = this.#titleSource;
+		manager.#titleUpdatedAt = this.#titleUpdatedAt;
+		manager.#header.title = this.#sessionName;
+		manager.#header.titleSource = this.#titleSource;
+		manager.#additionalDirectories = [...this.#additionalDirectories];
+		manager.#header.additionalDirectories =
+			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
+		manager.#entries = structuredClone(this.#entries);
+		manager.#index.rebuild(manager.#entries);
+		manager.#forceFileCreation = true;
+		await manager.#rewriteAtomically();
+		return manager;
+	}
+
 	/**
 	 * Stage a synchronous group of entry appends and publish the resulting full
 	 * journal with one atomic replace. A failed publish removes only the staged

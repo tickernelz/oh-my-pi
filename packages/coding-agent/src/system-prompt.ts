@@ -540,8 +540,8 @@ export interface BuildSystemPromptOptions {
 	renderMermaid?: boolean;
 	/** Pre-resolved nested active repo context. Undefined resolves from cwd. */
 	activeRepoContext?: ActiveRepoContext | null;
-	/** Tools mounted under `xd://`; renders the protocol section when non-empty. */
-	xdevTools?: Array<{ name: string; summary: string }>;
+	/** Tools mounted under `xd://`; renders the protocol section when non-empty. `dynamic` marks external devices whose summary is third-party metadata. */
+	xdevTools?: Array<{ name: string; summary: string; dynamic?: boolean }>;
 	/** Full docs + JSON schema for every `xd://`-mounted tool, inlined into the protocol section so no discovery `read` is needed. */
 	xdevDocs?: string;
 	/** Whether Auto-QA grievance reporting is enabled; renders the `xd://report_issue` note. */
@@ -870,6 +870,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		includeWorkspaceTree,
 		renderMermaid,
 		xdevTools,
+		hasDynamicXdevTools: xdevTools.some(mounted => mounted.dynamic === true),
 		xdevDocs,
 		autoQaEnabled,
 	};

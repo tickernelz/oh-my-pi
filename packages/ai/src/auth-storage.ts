@@ -375,6 +375,13 @@ export interface CredentialRefreshLeaseFence {
 
 export interface AuthCredentialStore {
 	close(): void;
+	/**
+	 * Stateful probe for commits made by another process to the backing store.
+	 * Returns true once per observed change.
+	 */
+	pollExternalChanges?(): boolean;
+	/** Record the current auth revision after a local mutation already notified consumers. */
+	acknowledgeLocalChanges?(): void;
 	/** Optional hook to notify the underlying store that usage report cache is stale. */
 	invalidateUsageCache?(signal?: AbortSignal): Promise<void>;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
@@ -1350,6 +1357,19 @@ export class AuthStorage {
 		return this.#generation;
 	}
 
+	/**
+	 * Reload state after another process commits to the backing store, then
+	 * notify snapshot consumers even when only credential blocks changed.
+	 */
+	async pollExternalChanges(): Promise<boolean> {
+		const pollExternalChanges = this.#store.pollExternalChanges?.bind(this.#store);
+		if (!pollExternalChanges?.()) return false;
+		const previousGeneration = this.#generation;
+		await this.reload();
+		if (this.#generation === previousGeneration) this.#bumpGeneration("external-store");
+		return true;
+	}
+
 	onGenerationChanged(listener: (generation: number) => void): () => void {
 		this.#generationListeners.add(listener);
 		return () => {
@@ -1363,6 +1383,7 @@ export class AuthStorage {
 
 	#bumpGeneration(reason: string): void {
 		this.#generation += 1;
+		this.#store.acknowledgeLocalChanges?.();
 		for (const listener of [...this.#generationListeners]) {
 			try {
 				listener(this.#generation);
@@ -1998,7 +2019,6 @@ export class AuthStorage {
 			const windows = usage ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
-			const secondaryTarget = secondary ?? primary;
 			ranked.push({
 				selection,
 				usage,
@@ -2007,9 +2027,9 @@ export class AuthStorage {
 				blockedUntil,
 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary) ?? false,
 				planPriority: 0,
-				secondaryUsed: this.#normalizeUsageFraction(secondaryTarget),
+				secondaryUsed: this.#normalizeUsageFraction(secondary),
 				secondaryRequiredDrain: this.#computeWindowRequiredDrain(
-					secondaryTarget,
+					secondary,
 					nowMs,
 					strategy.windowDefaults.secondaryMs,
 				),
@@ -4209,7 +4229,10 @@ export class AuthStorage {
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
 		if (credentialType === "oauth" && target.credential.type === "oauth" && strategy) {
-			const report = await this.#getUsageReport(provider, target.credential, options);
+			const report = await raceUsageWithSignal(
+				this.#getUsageReport(provider, target.credential, options),
+				options?.signal,
+			);
 			if (report) {
 				const scopedLimits = this.#getScopedUsageLimits(strategy, report, rankingContext);
 				if (this.#isUsageLimitReached(scopedLimits)) {
@@ -4220,6 +4243,7 @@ export class AuthStorage {
 				}
 			}
 		}
+		options?.signal?.throwIfAborted();
 
 		// Usage lookup may refresh, disable, or remove a row. Re-resolve its
 		// durable id before applying positional in-memory and persisted blocks.
@@ -4455,7 +4479,6 @@ export class AuthStorage {
 			const windows = usage ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
-			const secondaryTarget = secondary ?? primary;
 			ranked.push({
 				selection,
 				usage,
@@ -4464,9 +4487,9 @@ export class AuthStorage {
 				blockedUntil,
 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary) ?? false,
 				planPriority: getOpenAICodexPlanPriority(usage, args.planRequirement),
-				secondaryUsed: this.#normalizeUsageFraction(secondaryTarget),
+				secondaryUsed: this.#normalizeUsageFraction(secondary),
 				secondaryRequiredDrain: this.#computeWindowRequiredDrain(
-					secondaryTarget,
+					secondary,
 					nowMs,
 					strategy.windowDefaults.secondaryMs,
 				),
@@ -6414,8 +6437,11 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 6;
+const AUTH_SCHEMA_VERSION = 7;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
+const LEGACY_CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
+const LEGACY_CODEX_BLOCK_SCOPE = "shared";
+const CODEX_METER_BLOCK_SCOPES = ["chat", "spark"] as const;
 
 /**
  * SQLite's busy result code family — base `SQLITE_BUSY` plus the extended
@@ -6708,11 +6734,17 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#lastUsageHistoryStmt: Statement;
 	#listUsageHistoryStmt: Statement;
 	#updateUsageHistoryStmt: Statement;
+	#dataVersion: number;
+	#authRevision: number;
+	#localAuthRevision: number;
 	#closed = false;
 
 	constructor(db: Database) {
 		this.#db = db;
 		this.#initializeSchema();
+		this.#dataVersion = this.#readDataVersion();
+		this.#authRevision = this.#readAuthRevision();
+		this.#localAuthRevision = this.#readLocalAuthRevision();
 
 		this.#listActiveStmt = this.#db.prepare(
 			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
@@ -6776,7 +6808,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			"SELECT blocked_until_ms, updated_at FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ? AND blocked_until_ms > ?",
 		);
 		this.#listCredentialBlocksByCredentialStmt = this.#db.prepare(
-			"SELECT credential_id, provider_key, block_scope, blocked_until_ms, updated_at FROM auth_credential_blocks WHERE credential_id = ? AND blocked_until_ms > ? ORDER BY provider_key ASC, block_scope ASC",
+			`SELECT credential_id, provider_key, block_scope, blocked_until_ms, updated_at
+			FROM auth_credential_blocks
+			WHERE credential_id = ? AND blocked_until_ms > ?
+				AND NOT (provider_key = ? AND block_scope = ?)
+			ORDER BY provider_key ASC, block_scope ASC`,
 		);
 		this.#upsertCredentialBlockStmt = this.#db.prepare(
 			`INSERT INTO auth_credential_blocks (credential_id, provider_key, block_scope, blocked_until_ms, updated_at)
@@ -6960,6 +6996,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#createAuthCredentialsTable();
 			this.#createAuthCredentialBlocksTable();
 			this.#createAuthCredentialRefreshLeasesTable();
+			this.#createAuthCredentialBlockCompatibilityObjects();
+			this.#createAuthChangeTrackingObjects();
 			this.#writeAuthSchemaVersion(AUTH_SCHEMA_VERSION);
 			return;
 		}
@@ -6978,6 +7016,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#createAuthCredentialIndexes();
 		this.#createAuthCredentialBlocksTable();
 		this.#createAuthCredentialRefreshLeasesTable();
+		if (schemaVersion <= AUTH_SCHEMA_VERSION) {
+			this.#createAuthCredentialBlockCompatibilityObjects();
+		}
+		this.#createAuthChangeTrackingObjects();
 		this.#backfillCredentialIdentityKeys();
 		// Rewriting an already-current version row is a no-op write transaction
 		// on every boot; only persist when the recorded version actually changes.
@@ -7075,6 +7117,208 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		`);
 	}
 
+	#createAuthChangeTrackingObjects(): void {
+		this.#db.run(`
+			CREATE TABLE IF NOT EXISTS auth_change_revision (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				revision INTEGER NOT NULL
+			);
+			INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0);
+			CREATE TEMP TABLE IF NOT EXISTS auth_local_change_revision (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				revision INTEGER NOT NULL
+			);
+			INSERT OR IGNORE INTO auth_local_change_revision (id, revision) VALUES (1, 0);
+		`);
+		for (const table of ["auth_credentials", "auth_credential_blocks"] as const) {
+			for (const event of ["INSERT", "UPDATE", "DELETE"] as const) {
+				this.#db.run(`
+					CREATE TRIGGER IF NOT EXISTS auth_change_revision_${table}_${event.toLowerCase()}
+					AFTER ${event} ON ${table}
+					BEGIN
+						UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1;
+					END;
+				`);
+				this.#db.run(`
+					CREATE TEMP TRIGGER IF NOT EXISTS auth_local_change_revision_${table}_${event.toLowerCase()}
+					AFTER ${event} ON main.${table}
+					BEGIN
+						UPDATE auth_local_change_revision SET revision = revision + 1 WHERE id = 1;
+					END;
+				`);
+			}
+		}
+	}
+
+	#createAuthCredentialBlockMirrorGuardTable(): void {
+		this.#db.run(`
+			CREATE TABLE IF NOT EXISTS auth_credential_block_mirror_guard (
+				credential_id INTEGER PRIMARY KEY
+			) WITHOUT ROWID;
+		`);
+	}
+
+	/**
+	 * Keep a physical Codex `shared` row for pre-meter binaries that read this
+	 * database directly. Meter rows are canonical for current code. The guard
+	 * suppresses feedback while triggers update the compatibility projection.
+	 */
+	#createAuthCredentialBlockCompatibilityTriggers(): void {
+		for (const event of ["INSERT", "UPDATE"] as const) {
+			const eventName = event.toLowerCase();
+			this.#db.run(`
+				CREATE TRIGGER IF NOT EXISTS auth_codex_shared_${eventName}_to_meters
+				AFTER ${event} ON auth_credential_blocks
+				WHEN NEW.provider_key = 'openai-codex:oauth'
+					AND NEW.block_scope = 'shared'
+					AND NOT EXISTS (
+						SELECT 1 FROM auth_credential_block_mirror_guard
+						WHERE credential_id = NEW.credential_id
+					)
+				BEGIN
+					INSERT OR IGNORE INTO auth_credential_block_mirror_guard (credential_id)
+					VALUES (NEW.credential_id);
+					INSERT INTO auth_credential_blocks (
+						credential_id,
+						provider_key,
+						block_scope,
+						blocked_until_ms,
+						updated_at
+					)
+					VALUES (
+						NEW.credential_id,
+						NEW.provider_key,
+						'chat',
+						NEW.blocked_until_ms,
+						NEW.updated_at
+					)
+					ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+						blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
+						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+					INSERT INTO auth_credential_blocks (
+						credential_id,
+						provider_key,
+						block_scope,
+						blocked_until_ms,
+						updated_at
+					)
+					VALUES (
+						NEW.credential_id,
+						NEW.provider_key,
+						'spark',
+						NEW.blocked_until_ms,
+						NEW.updated_at
+					)
+					ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+						blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
+						updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+					DELETE FROM auth_credential_block_mirror_guard
+					WHERE credential_id = NEW.credential_id;
+				END;
+
+				CREATE TRIGGER IF NOT EXISTS auth_codex_meter_${eventName}_to_shared
+				AFTER ${event} ON auth_credential_blocks
+				WHEN NEW.provider_key = 'openai-codex:oauth'
+					AND NEW.block_scope IN ('chat', 'spark')
+					AND NOT EXISTS (
+						SELECT 1 FROM auth_credential_block_mirror_guard
+						WHERE credential_id = NEW.credential_id
+					)
+				BEGIN
+					INSERT OR IGNORE INTO auth_credential_block_mirror_guard (credential_id)
+					VALUES (NEW.credential_id);
+					DELETE FROM auth_credential_blocks
+					WHERE credential_id = NEW.credential_id
+						AND provider_key = NEW.provider_key
+						AND block_scope = 'shared';
+					INSERT INTO auth_credential_blocks (
+						credential_id,
+						provider_key,
+						block_scope,
+						blocked_until_ms,
+						updated_at
+					)
+					SELECT
+						NEW.credential_id,
+						NEW.provider_key,
+						'shared',
+						MAX(blocked_until_ms),
+						MAX(updated_at)
+					FROM auth_credential_blocks
+					WHERE credential_id = NEW.credential_id
+						AND provider_key = NEW.provider_key
+						AND block_scope IN ('chat', 'spark')
+					GROUP BY credential_id, provider_key;
+					DELETE FROM auth_credential_block_mirror_guard
+					WHERE credential_id = NEW.credential_id;
+				END;
+			`);
+		}
+
+		this.#db.run(`
+			CREATE TRIGGER IF NOT EXISTS auth_codex_shared_delete_to_meters
+			AFTER DELETE ON auth_credential_blocks
+			WHEN OLD.provider_key = 'openai-codex:oauth'
+				AND OLD.block_scope = 'shared'
+				AND NOT EXISTS (
+					SELECT 1 FROM auth_credential_block_mirror_guard
+					WHERE credential_id = OLD.credential_id
+				)
+			BEGIN
+				INSERT OR IGNORE INTO auth_credential_block_mirror_guard (credential_id)
+				VALUES (OLD.credential_id);
+				DELETE FROM auth_credential_blocks
+				WHERE credential_id = OLD.credential_id
+					AND provider_key = OLD.provider_key
+					AND block_scope IN ('chat', 'spark');
+				DELETE FROM auth_credential_block_mirror_guard
+				WHERE credential_id = OLD.credential_id;
+			END;
+
+			CREATE TRIGGER IF NOT EXISTS auth_codex_meter_delete_to_shared
+			AFTER DELETE ON auth_credential_blocks
+			WHEN OLD.provider_key = 'openai-codex:oauth'
+				AND OLD.block_scope IN ('chat', 'spark')
+				AND NOT EXISTS (
+					SELECT 1 FROM auth_credential_block_mirror_guard
+					WHERE credential_id = OLD.credential_id
+				)
+			BEGIN
+				INSERT OR IGNORE INTO auth_credential_block_mirror_guard (credential_id)
+				VALUES (OLD.credential_id);
+				DELETE FROM auth_credential_blocks
+				WHERE credential_id = OLD.credential_id
+					AND provider_key = OLD.provider_key
+					AND block_scope = 'shared';
+				INSERT INTO auth_credential_blocks (
+					credential_id,
+					provider_key,
+					block_scope,
+					blocked_until_ms,
+					updated_at
+				)
+				SELECT
+					OLD.credential_id,
+					OLD.provider_key,
+					'shared',
+					MAX(blocked_until_ms),
+					MAX(updated_at)
+				FROM auth_credential_blocks
+				WHERE credential_id = OLD.credential_id
+					AND provider_key = OLD.provider_key
+					AND block_scope IN ('chat', 'spark')
+				GROUP BY credential_id, provider_key;
+				DELETE FROM auth_credential_block_mirror_guard
+				WHERE credential_id = OLD.credential_id;
+			END;
+		`);
+	}
+
+	#createAuthCredentialBlockCompatibilityObjects(): void {
+		this.#createAuthCredentialBlockMirrorGuardTable();
+		this.#createAuthCredentialBlockCompatibilityTriggers();
+	}
+
 	#createAuthCredentialRefreshLeasesTable(): void {
 		SqliteAuthCredentialStore.#ensureAuthCredentialRefreshLeasesTable(this.#db);
 	}
@@ -7094,6 +7338,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 		if (fromVersion < 6) {
 			this.#migrateAuthSchemaV5ToV6();
+		}
+		if (fromVersion < 7) {
+			this.#migrateAuthSchemaV6ToV7();
 		}
 	}
 
@@ -7193,6 +7440,77 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#createAuthCredentialRefreshLeasesTable();
 		});
 		migrate();
+	}
+
+	#migrateAuthSchemaV6ToV7(): void {
+		const migrate = this.#db.transaction(() => {
+			this.#createAuthCredentialBlocksTable();
+			this.#createAuthCredentialBlockMirrorGuardTable();
+			this.#db.run(`
+				DELETE FROM auth_credential_block_mirror_guard;
+				INSERT OR IGNORE INTO auth_credential_block_mirror_guard (credential_id)
+				SELECT DISTINCT credential_id
+				FROM auth_credential_blocks
+				WHERE provider_key = 'openai-codex:oauth'
+					AND block_scope IN ('chat', 'spark', 'shared');
+
+				INSERT INTO auth_credential_blocks (
+					credential_id,
+					provider_key,
+					block_scope,
+					blocked_until_ms,
+					updated_at
+				)
+				SELECT credential_id, provider_key, 'chat', blocked_until_ms, updated_at
+				FROM auth_credential_blocks
+				WHERE provider_key = 'openai-codex:oauth'
+					AND block_scope = 'shared'
+				ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+					blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
+					updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+
+				INSERT INTO auth_credential_blocks (
+					credential_id,
+					provider_key,
+					block_scope,
+					blocked_until_ms,
+					updated_at
+				)
+				SELECT credential_id, provider_key, 'spark', blocked_until_ms, updated_at
+				FROM auth_credential_blocks
+				WHERE provider_key = 'openai-codex:oauth'
+					AND block_scope = 'shared'
+				ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+					blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
+					updated_at = MAX(auth_credential_blocks.updated_at, excluded.updated_at);
+
+				INSERT INTO auth_credential_blocks (
+					credential_id,
+					provider_key,
+					block_scope,
+					blocked_until_ms,
+					updated_at
+				)
+				SELECT
+					credential_id,
+					provider_key,
+					'shared',
+					MAX(blocked_until_ms),
+					MAX(updated_at)
+				FROM auth_credential_blocks
+				WHERE provider_key = 'openai-codex:oauth'
+					AND block_scope IN ('chat', 'spark')
+				GROUP BY credential_id, provider_key
+				ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+					blocked_until_ms = excluded.blocked_until_ms,
+					updated_at = excluded.updated_at;
+
+				DELETE FROM auth_credential_block_mirror_guard;
+			`);
+			this.#createAuthCredentialBlockCompatibilityTriggers();
+			this.#writeAuthSchemaVersion(7);
+		});
+		migrate.immediate();
 	}
 
 	#backfillCredentialIdentityKeys(): void {
@@ -7463,7 +7781,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					id,
 					expectedData,
 				) as { changes: number });
-		if (result.changes !== 1) return false;
+		if (result.changes === 0) return false;
 		if (provider) {
 			this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
 		}
@@ -7502,7 +7820,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			: (this.#deleteIfMatchesStmt.run(normalizeDisabledCause(disabledCause), id, expectedData) as {
 					changes: number;
 				});
-		return result.changes === 1;
+		return result.changes > 0;
 	}
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
 		try {
@@ -7549,7 +7867,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	getCredentialBlock(credentialId: number, providerKey: string, blockScope: string): number | undefined {
 		const nowMs = Date.now();
-		this.#deleteExpiredCredentialBlocksStmt.run(nowMs);
+		const isCodexBlock = providerKey === LEGACY_CODEX_BLOCK_PROVIDER_KEY;
+		// Current callers use meter scopes. The physical shared row exists only
+		// for direct SQLite readers from pre-meter releases.
+		if (isCodexBlock && blockScope === LEGACY_CODEX_BLOCK_SCOPE) {
+			return undefined;
+		}
+		if (!isCodexBlock) this.#deleteExpiredCredentialBlocksStmt.run(nowMs);
 		const row = this.#getCredentialBlockStmt.get(credentialId, providerKey, blockScope, nowMs) as
 			| { blocked_until_ms?: number; updated_at?: number }
 			| undefined;
@@ -7558,7 +7882,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 	getCredentialBlockReconcileAfter(credentialId: number, providerKey: string, blockScope: string): number | undefined {
 		const nowMs = Date.now();
-		this.#deleteExpiredCredentialBlocksStmt.run(nowMs);
+		const isCodexBlock = providerKey === LEGACY_CODEX_BLOCK_PROVIDER_KEY;
+		if (isCodexBlock && blockScope === LEGACY_CODEX_BLOCK_SCOPE) {
+			return undefined;
+		}
+		if (!isCodexBlock) this.#deleteExpiredCredentialBlocksStmt.run(nowMs);
 		const row = this.#getCredentialBlockStmt.get(credentialId, providerKey, blockScope, nowMs) as
 			| { blocked_until_ms?: number; updated_at?: number }
 			| undefined;
@@ -7572,16 +7900,33 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	upsertCredentialBlock(block: StoredCredentialBlock): void {
-		this.#upsertCredentialBlockStmt.run(
-			block.credentialId,
-			block.providerKey,
-			block.blockScope,
-			block.blockedUntilMs,
-		);
-		this.#credentialBlockReconcileAfter.set(
-			`${block.credentialId}\0${block.providerKey}\0${block.blockScope}`,
-			Math.min(block.blockedUntilMs, Date.now() + USAGE_REPORT_TTL_MS),
-		);
+		const isLegacyCodexBlock =
+			block.providerKey === LEGACY_CODEX_BLOCK_PROVIDER_KEY && block.blockScope === LEGACY_CODEX_BLOCK_SCOPE;
+		const blockScopes = isLegacyCodexBlock ? CODEX_METER_BLOCK_SCOPES : [block.blockScope];
+		const upsert = this.#db.transaction(() => {
+			for (const blockScope of blockScopes) {
+				this.#upsertCredentialBlockStmt.run(
+					block.credentialId,
+					block.providerKey,
+					blockScope,
+					block.blockedUntilMs,
+				);
+			}
+		});
+		upsert.immediate();
+
+		const reconcileAfterMs = Math.min(block.blockedUntilMs, Date.now() + USAGE_REPORT_TTL_MS);
+		for (const blockScope of blockScopes) {
+			this.#credentialBlockReconcileAfter.set(
+				`${block.credentialId}\0${block.providerKey}\0${blockScope}`,
+				reconcileAfterMs,
+			);
+		}
+		if (isLegacyCodexBlock) {
+			this.#credentialBlockReconcileAfter.delete(
+				`${block.credentialId}\0${block.providerKey}\0${LEGACY_CODEX_BLOCK_SCOPE}`,
+			);
+		}
 	}
 
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void {
@@ -7625,7 +7970,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		for (const credentialId of credentialIds) {
 			if (seenCredentialIds.has(credentialId)) continue;
 			seenCredentialIds.add(credentialId);
-			const rows = this.#listCredentialBlocksByCredentialStmt.all(credentialId, nowMs) as CredentialBlockRow[];
+			const rows = this.#listCredentialBlocksByCredentialStmt.all(
+				credentialId,
+				nowMs,
+				LEGACY_CODEX_BLOCK_PROVIDER_KEY,
+				LEGACY_CODEX_BLOCK_SCOPE,
+			) as CredentialBlockRow[];
 			for (const row of rows) {
 				blocks.push({
 					credentialId: row.credential_id,
@@ -7950,6 +8300,50 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	 */
 	deleteProvider(provider: string): void {
 		this.deleteAuthCredentialsForProvider(provider, "deleted by user");
+	}
+
+	/**
+	 * SQLite increments `data_version` when another connection commits. Own
+	 * writes leave it unchanged and already notify AuthStorage directly.
+	 */
+	pollExternalChanges(): boolean {
+		this.#acknowledgeLocalAuthChanges();
+		const dataVersion = this.#readDataVersion();
+		if (dataVersion === this.#dataVersion) return false;
+		this.#dataVersion = dataVersion;
+		const authRevision = this.#readAuthRevision();
+		if (authRevision === this.#authRevision) return false;
+		this.#authRevision = authRevision;
+		return true;
+	}
+
+	acknowledgeLocalChanges(): void {
+		this.#acknowledgeLocalAuthChanges();
+	}
+
+	#acknowledgeLocalAuthChanges(): void {
+		const localAuthRevision = this.#readLocalAuthRevision();
+		this.#authRevision += localAuthRevision - this.#localAuthRevision;
+		this.#localAuthRevision = localAuthRevision;
+	}
+
+	#readDataVersion(): number {
+		const row = this.#db.query("PRAGMA data_version").get() as { data_version?: number } | null;
+		return row?.data_version ?? 0;
+	}
+
+	#readAuthRevision(): number {
+		const row = this.#db.query("SELECT revision FROM auth_change_revision WHERE id = 1").get() as {
+			revision?: number;
+		} | null;
+		return row?.revision ?? 0;
+	}
+
+	#readLocalAuthRevision(): number {
+		const row = this.#db.query("SELECT revision FROM auth_local_change_revision WHERE id = 1").get() as {
+			revision?: number;
+		} | null;
+		return row?.revision ?? 0;
 	}
 
 	close(): void {
