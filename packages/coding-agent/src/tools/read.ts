@@ -735,6 +735,8 @@ export interface ReadToolDetails {
 	method?: string;
 	notes?: string[];
 	meta?: OutputMeta;
+	/** Full on-disk byte size recorded before applying a file range. */
+	fileSize?: number;
 	/** Raw text + start line for user-visible TUI rendering, set when content is text-like.
 	 * Mirrors the same lines the model receives but without hashline/line-number prefixes,
 	 * so the TUI can render the file content with its own gutter without re-parsing the formatted text. */
@@ -2959,6 +2961,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 		}
 
+		details.fileSize = fileSize;
 		this.#markMarkdownContentType(details, absolutePath);
 		if (suffixResolution) {
 			details.suffixResolution = suffixResolution;

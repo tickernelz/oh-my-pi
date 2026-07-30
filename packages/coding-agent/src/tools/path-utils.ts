@@ -520,6 +520,94 @@ export function resolveToCwd(filePath: string, cwd: string): string {
 	return path.resolve(cwd, expanded);
 }
 
+/**
+ * Resolve a path that MUST stay inside `cwd`, or `null` when it would escape.
+ *
+ * {@link resolveToCwd} deliberately honors absolute paths, `~`, and `..` —
+ * correct for a path a user typed, wrong for one a remote peer supplied.
+ * Callers handling untrusted input (Cursor's `download_path`) use this instead:
+ * only a non-empty relative path landing under the live cwd is accepted, so
+ * neither `/etc/passwd` nor `../../escape` can be written through.
+ *
+ * The lexical check alone is not containment: a symlink inside the workspace
+ * can point anywhere, so `out/config` under a `ws/out -> /elsewhere` link is
+ * relative, `..`-free, and still writes outside. Both the target and its
+ * deepest existing ancestor are therefore realpath-resolved — the ancestor
+ * because a download names a file that does not exist yet, so the link in its
+ * path is the only thing that can be resolved before the write.
+ *
+ * The cwd itself is rejected: a download names a file, never the directory.
+ */
+export function confineToWorkspace(filePath: string, cwd: string): string | null {
+	if (!filePath || path.isAbsolute(filePath)) return null;
+	// `~` expands to an absolute path, and an internal URL is not a filesystem
+	// target at all; neither is a relative workspace path.
+	if (filePath.startsWith("~") || isInternalUrlPath(filePath)) return null;
+	const root = path.resolve(cwd);
+	const resolved = path.resolve(root, filePath);
+	if (!isUnderRootLexical(resolved, root)) return null;
+
+	// A workspace reached through a link of its own is legitimate (/tmp on
+	// macOS), so the real root is the comparison basis. An unresolvable root is
+	// not a workspace to contain anything in.
+	const realRoot = tryRealpath(root);
+	if (!realRoot) return null;
+
+	// An existing target is authoritative: resolve it outright.
+	const realTarget = tryRealpath(resolved);
+	if (realTarget) return isUnderRootLexical(realTarget, realRoot) ? resolved : null;
+
+	// `realpath` also fails on a *dangling* link, and a write follows that link
+	// to wherever it points. Chasing the chain to decide would mean
+	// reimplementing symlink resolution (multi-hop, relative hops, loops, and
+	// a TOCTOU window against a link that can be re-pointed between the check
+	// and the write). A download names a file to create, so a path that is
+	// already an unresolvable link is refused outright — the one shape where
+	// "cannot tell where this lands" is the whole answer.
+	if (isSymlink(resolved)) return null;
+
+	// Otherwise walk up to the deepest ancestor that does exist and check that,
+	// then re-apply the segments below it. Those segments are `..`-free by the
+	// lexical check above, so they cannot climb back out.
+	let ancestor = path.dirname(resolved);
+	const tail: string[] = [path.basename(resolved)];
+	for (;;) {
+		const real = tryRealpath(ancestor);
+		if (real) {
+			return isUnderRootLexical(path.join(real, ...tail.reverse()), realRoot) ? resolved : null;
+		}
+		const parent = path.dirname(ancestor);
+		// Ran past the root without finding anything real: the workspace itself
+		// resolved above, so this cannot happen unless it vanished mid-check.
+		if (parent === ancestor || !isUnderRootLexical(ancestor, root)) return null;
+		tail.push(path.basename(ancestor));
+		ancestor = parent;
+	}
+}
+
+/** Whether `target` is a strict descendant of `root`, ignoring symlinks. */
+function isUnderRootLexical(target: string, root: string): boolean {
+	const relative = path.relative(root, target);
+	return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function tryRealpath(target: string): string | null {
+	try {
+		return fs.realpathSync.native(target);
+	} catch {
+		return null;
+	}
+}
+
+/** Whether the path itself is a symlink, without following it. */
+function isSymlink(target: string): boolean {
+	try {
+		return fs.lstatSync(target).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
 export function formatPathRelativeToCwd(
 	filePath: string,
 	cwd: string,

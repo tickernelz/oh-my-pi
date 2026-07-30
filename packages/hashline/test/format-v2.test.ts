@@ -15,17 +15,17 @@ describe("hashline format v4", () => {
 
 	it("deletes a single source line", () => {
 		const text = "a\nb\nc";
-		expect(applyPatch(text, "DEL 2")).toBe("a\nc");
+		expect(applyPatch(text, "CUT 2")).toBe("a\nc");
 	});
 
 	it("deletes a concrete range", () => {
 		const text = "a\nb\nc\nd";
-		expect(applyPatch(text, "DEL 2.=3")).toBe("a\nd");
+		expect(applyPatch(text, "CUT 2.=3")).toBe("a\nd");
 	});
 
 	it("accepts a single dot between integer range endpoints", () => {
 		const text = "a\nb\nc\nd";
-		expect(applyPatch(text, "DEL 2.3")).toBe("a\nd");
+		expect(applyPatch(text, "CUT 2.3")).toBe("a\nd");
 		expect(applyPatch(text, "SWAP 2.3:\n+middle")).toBe("a\nmiddle\nd");
 	});
 
@@ -47,8 +47,14 @@ describe("hashline format v4", () => {
 		expect(() => parsePatch("INS.HEAD:")).toThrow(/needs at least one/);
 	});
 
-	it("rejects body rows under delete", () => {
-		expect(() => parsePatch("DEL 2\n+replacement")).toThrow(/does not take body rows/);
+	it("rejects body rows under cut", () => {
+		expect(() => parsePatch("CUT 2\n+replacement")).toThrow(/takes no body rows/);
+	});
+
+	it("does not recognize removed DEL or COPY headers", () => {
+		for (const header of ["DEL 2", "DEL.BLK 2", "COPY 2", "COPY.BLK 2"]) {
+			expect(() => parsePatch(header)).toThrow(/payload line has no preceding hunk header/);
+		}
 	});
 
 	it("auto-pipes bare body rows as literal text", () => {
@@ -85,14 +91,14 @@ describe("hashline format v4", () => {
 		);
 	});
 
-	it("ignores deleting the trailing blank sentinel of a newline-terminated file", () => {
+	it("ignores cutting the trailing blank sentinel of a newline-terminated file", () => {
 		// "a\nb\n" splits into ["a", "b", ""]; line 3 is the phantom sentinel.
-		const edits = parsePatch("DEL 3").edits;
+		const edits = parsePatch("CUT 3").edits;
 		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n");
 	});
 
-	it("treats a delete range ending at the trailing sentinel as ending at the last real line", () => {
-		const edits = parsePatch("DEL 2.=3").edits;
+	it("treats a cut range ending at the trailing sentinel as ending at the last real line", () => {
+		const edits = parsePatch("CUT 2.=3").edits;
 		expect(applyEdits("a\nb\n", edits).text).toBe("a\n");
 	});
 
@@ -106,9 +112,9 @@ describe("hashline format v4", () => {
 		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n\ntail");
 	});
 
-	it("still deletes a genuine empty last line of a non-newline-terminated file", () => {
+	it("still cuts a genuine last line of a non-newline-terminated file", () => {
 		// "a\nb" has no sentinel; line 2 is real content.
-		const edits = parsePatch("DEL 2").edits;
+		const edits = parsePatch("CUT 2").edits;
 		expect(applyEdits("a\nb", edits).text).toBe("a");
 	});
 

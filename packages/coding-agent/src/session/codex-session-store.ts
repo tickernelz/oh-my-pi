@@ -14,7 +14,7 @@ import type {
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { readForeignJsonRecords } from "./foreign-session-jsonl";
 import type { ForeignSessionInfo, ForeignSessionStore } from "./foreign-session-store";
-import type { ModelChangeEntry, SessionEntry, SessionMessageEntry } from "./session-entries";
+import type { CompactionEntry, ModelChangeEntry, SessionEntry, SessionMessageEntry } from "./session-entries";
 import { SessionManager } from "./session-manager";
 
 interface CodexThreadRow {
@@ -33,6 +33,12 @@ interface CodexIndexRow {
 	updated_at: string;
 }
 
+interface CodexCompaction {
+	summary: string;
+	replacementHistory?: Array<Record<string, unknown>>;
+	compactionItem?: Record<string, unknown>;
+}
+
 interface ConvertedRecord {
 	message?: UserMessage | AssistantMessage | ToolResultMessage;
 	followingMessage?: ToolResultMessage;
@@ -40,6 +46,7 @@ interface ConvertedRecord {
 	rollbackTurns?: number;
 	title?: string;
 	timestamp?: number;
+	compaction?: CodexCompaction;
 }
 
 const EMPTY_USAGE: AssistantMessage["usage"] = {
@@ -577,6 +584,28 @@ export class CodexSessionStore implements ForeignSessionStore {
 					canonical.toolCalls,
 					toolNames,
 				);
+			} else if (record.type === "compacted") {
+				const sourceSummary = stringField(record.payload, "message")?.trim();
+				const rawReplacementHistory = record.payload.replacement_history;
+				const replacementHistory =
+					Array.isArray(rawReplacementHistory) && rawReplacementHistory.every(isRecord)
+						? rawReplacementHistory
+						: undefined;
+				if (sourceSummary || replacementHistory) {
+					const compactionItem = replacementHistory?.findLast(
+						candidate =>
+							(candidate.type === "compaction" && typeof candidate.encrypted_content === "string") ||
+							candidate.type === "compaction_summary",
+					);
+					item = {
+						compaction: {
+							summary: sourceSummary || "Context compacted by Codex.",
+							replacementHistory,
+							compactionItem,
+						},
+						timestamp,
+					};
+				}
 			}
 			if (!item) continue;
 			if (item.rollbackTurns) rollback(converted, item.rollbackTurns);
@@ -609,6 +638,30 @@ export class CodexSessionStore implements ForeignSessionStore {
 					model: `openai-codex/${item.model}`,
 				};
 				entry = modelEntry;
+			} else if (item.compaction) {
+				let preserveData: Record<string, unknown> | undefined;
+				if (item.compaction.replacementHistory) {
+					const remoteCompaction: Record<string, unknown> = {
+						provider: "openai-codex",
+						replacementHistory: item.compaction.replacementHistory,
+					};
+					if (item.compaction.compactionItem) {
+						remoteCompaction.compactionItem = item.compaction.compactionItem;
+					}
+					preserveData = { openaiRemoteCompaction: remoteCompaction };
+				}
+				const compactionEntry: CompactionEntry = {
+					type: "compaction",
+					id,
+					parentId,
+					timestamp,
+					summary: item.compaction.summary,
+					shortSummary: "Imported Codex compaction",
+					firstKeptEntryId: id,
+					tokensBefore: 0,
+					preserveData,
+				};
+				entry = compactionEntry;
 			}
 			if (!entry) continue;
 			manager.ingestReplicatedEntry(entry);

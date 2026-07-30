@@ -385,6 +385,7 @@ thinkingBudgets:
 | `thinkingBudgets.high` | number | `16384` | Token budget for `high`. |
 | `thinkingBudgets.xhigh` | number | `32768` | Token budget for `xhigh`. |
 | `thinkingBudgets.max` | number | `32768` | Token budget for `max`. |
+| `providers.autoThinkingMaxEffort` | enum | `xhigh` | Highest effort `defaultThinkingLevel: auto` may resolve. `xhigh` keeps the classifier one tier below the top, so only `ultrathink` reaches `max`; `max` lets the classifier bill the top tier on models that expose it. The local on-device classifier stays capped at `xhigh` either way. This governs what `auto` *resolves*: a model whose ladder offers nothing under the ceiling gets no auto level at all, and one that also sets `thinking.requiresEffort` still receives its lowest supported effort from the transport — on a `["max"]` ladder that is `max`, because the model accepts nothing else. |
 
 ### Sampling
 

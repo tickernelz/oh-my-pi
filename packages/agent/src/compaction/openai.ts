@@ -38,6 +38,7 @@ import {
 	getOpenAIResponsesHistoryPayload,
 	normalizeResponsesToolCallId,
 } from "@oh-my-pi/pi-ai/utils";
+import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -840,18 +841,19 @@ export async function requestOpenAiRemoteCompaction(
 	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
+		const cause = await captureOpenAIHttpError(response);
 		logger.warn("OpenAI remote compaction failed", {
 			endpoint,
 			status: response.status,
 			statusText: response.statusText,
-			errorText,
+			errorText: cause.captured.bodyText ?? "",
 		});
 		throw new ProviderHttpError(
 			`Remote compaction failed (${response.status} ${response.statusText})`,
 			response.status,
 			{
 				headers: response.headers,
+				cause,
 			},
 		);
 	}

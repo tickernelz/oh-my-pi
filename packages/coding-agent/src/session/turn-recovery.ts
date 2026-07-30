@@ -117,6 +117,7 @@ export interface TurnRecoveryHost {
 	scheduleAgentContinue(options: { delayMs?: number; generation?: number; onError?: (error: unknown) => void }): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
+	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
 	setModelWithProviderSessionReset(model: Model): Promise<void>;
 	resetCurrentResponsesProviderSession(reason: string): void;
@@ -770,16 +771,24 @@ export class TurnRecovery {
 	discardAssistantTurn(assistantMessage: AssistantMessage): void {
 		this.removeAssistantMessageFromActiveContext(assistantMessage);
 
-		const branchEntry = this.#host.sessionManager
-			.getBranch()
-			.slice()
-			.reverse()
-			.find(
-				entry =>
-					entry.type === "message" &&
-					entry.message.role === "assistant" &&
-					this.#isSameAssistantMessage(entry.message as AssistantMessage, assistantMessage),
-			);
+		const branch = this.#host.sessionManager.getBranch();
+		const persistedEntryId = this.#host.persistedAssistantEntryId(assistantMessage);
+		const branchEntry =
+			(persistedEntryId === undefined
+				? undefined
+				: branch.find(
+						entry =>
+							entry.id === persistedEntryId && entry.type === "message" && entry.message.role === "assistant",
+					)) ??
+			branch
+				.slice()
+				.reverse()
+				.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						this.#isSameAssistantMessage(entry.message as AssistantMessage, assistantMessage),
+				);
 		if (!branchEntry) {
 			return;
 		}
@@ -798,7 +807,9 @@ export class TurnRecovery {
 			(left.timestamp === right.timestamp &&
 				left.provider === right.provider &&
 				left.model === right.model &&
-				left.stopReason === right.stopReason)
+				left.stopReason === right.stopReason &&
+				left.errorMessage === right.errorMessage &&
+				Bun.hash(JSON.stringify(left.content)) === Bun.hash(JSON.stringify(right.content)))
 		);
 	}
 

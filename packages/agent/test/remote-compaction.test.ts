@@ -4,6 +4,7 @@ import {
 	compact,
 	createFileOps,
 	DEFAULT_COMPACTION_SETTINGS,
+	NativeCompactionError,
 	prepareCompaction,
 	type SessionEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -20,6 +21,7 @@ import {
 	trimRemoteCompactionInputToContextWindow,
 } from "@oh-my-pi/pi-agent-core/compaction/openai";
 import * as ai from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getOpenAICodexTransportDetails } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	AssistantMessage,
@@ -732,6 +734,36 @@ describe("requestCompactionV2Streaming", () => {
 		});
 
 		expect(attempts).toBe(2);
+	});
+
+	test("does not retry and preserves auth_unavailable from V2 HTTP failures", async () => {
+		const model = makeOpenAiModel({
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const request = buildCompactionV2Request(
+			model,
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+			"instructions",
+		);
+		const fetchMock = vi.fn(async () =>
+			Response.json(
+				{ error: { type: "auth_unavailable", message: "no auth available for codex" } },
+				{ status: 503, statusText: "Service Unavailable" },
+			),
+		);
+
+		const error = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+			fetch: fetchMock,
+			retryWait: async () => {},
+		}).catch(cause => cause);
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(error).toBeInstanceOf(AIError.ProviderHttpError);
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(true);
 	});
 });
 
@@ -1687,6 +1719,78 @@ describe("compact() remote compaction failure handling", () => {
 		expect(JSON.stringify(sameProviderActive?.messagesToSummarize ?? [])).not.toContain("ORIGINAL ALPHA port 4242");
 	});
 
+	test("retains the V2 non-auth failure when the V1 fallback fails authentication", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			return url.endsWith("/responses/compact")
+				? new Response("authentication failed", { status: 401, statusText: "Unauthorized" })
+				: new Response("V2 transport failed", { status: 400, statusText: "Bad Request" });
+		};
+
+		const error = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock }).catch(
+			cause => cause,
+		);
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual(["/v1/responses", "/v1/responses/compact"]);
+		expect(error).toBeInstanceOf(NativeCompactionError);
+		expect(error).toMatchObject({ cause: { status: 400 } });
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(false);
+	});
+
+	test("keeps native compaction auth-classified when every attempted protocol fails authentication", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			requestedUrls.push(String(input));
+			return new Response("authentication failed", { status: 401, statusText: "Unauthorized" });
+		};
+
+		const error = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock }).catch(
+			cause => cause,
+		);
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual(["/v1/responses", "/v1/responses/compact"]);
+		expect(error).toBeInstanceOf(NativeCompactionError);
+		expect(error).toMatchObject({ cause: { status: 401 } });
+		expect(AIError.is(AIError.classify(error), AIError.Flag.AuthFailed)).toBe(true);
+	});
+
+	test("V2 native failure falls back to V1 without generic summarization", async () => {
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local summary"));
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url.endsWith("/responses/compact")) {
+				return Response.json({ output: [{ type: "compaction", encrypted_content: "enc-v1" }] });
+			}
+			return new Response("V2 unavailable", { status: 502, statusText: "Bad Gateway" });
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestedUrls.some(url => url.endsWith("/responses"))).toBe(true);
+		expect(requestedUrls.some(url => url.endsWith("/responses/compact"))).toBe(true);
+		expect(result.shortSummary).toBe("Remote compaction");
+		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
 	test("user abort during the remote compact request rejects without falling back to local summarization", async () => {
 		// Contract: Esc is a cancellation, not a remote failure. Before the fix
 		// the AbortError was swallowed by the fallback catch and compaction kept
@@ -1760,16 +1864,54 @@ describe("compact() remote compaction failure handling", () => {
 		});
 	});
 
-	test("remote compact server failure without abort still falls back to local summarization", async () => {
+	test("uses an explicit remote endpoint after provider-native compaction fails", async () => {
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local fallback"));
+		const preparation = makePreparation();
+		preparation.settings = {
+			...preparation.settings,
+			remoteEndpoint: "http://summary.test/v1/chat/completions",
+			remoteStreamingV2Enabled: true,
+		};
+		const model = makeOpenAiModel({
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url === preparation.settings.remoteEndpoint) {
+				const summary =
+					requestedUrls.filter(requested => requested === url).length === 1
+						? "configured remote history summary"
+						: "configured remote short summary";
+				return Response.json({ choices: [{ message: { content: summary } }] });
+			}
+			return new Response("native compaction unavailable", { status: 400, statusText: "Bad Request" });
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestedUrls.map(url => new URL(url).pathname)).toEqual([
+			"/v1/responses",
+			"/v1/responses/compact",
+			"/v1/chat/completions",
+			"/v1/chat/completions",
+		]);
+		expect(result.summary).toContain("configured remote history summary");
+		expect(result.shortSummary).toBe("configured remote short summary");
+		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
+	test("native compaction server failure rejects without generic summarization", async () => {
 		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(localSummaryMessage("local summary"));
 		const fetchMock: FetchImpl = async () =>
 			new Response("nope", { status: 500, statusText: "Internal Server Error" });
 
-		const result = await compact(makePreparation(), makeOpenAiModel(), "test-key", undefined, undefined, {
-			fetch: fetchMock,
-		});
-
-		expect(result.summary).toContain("local summary");
-		expect(completeSpy).toHaveBeenCalled();
+		await expect(
+			compact(makePreparation(), makeOpenAiModel(), "test-key", undefined, undefined, {
+				fetch: fetchMock,
+			}),
+		).rejects.toThrow("Remote compaction failed");
+		expect(completeSpy).not.toHaveBeenCalled();
 	});
 });

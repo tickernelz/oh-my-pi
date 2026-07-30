@@ -15,6 +15,11 @@ import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/sessio
 import { calculateTokensPerSecond } from "../../../utils/token-rate";
 import { sanitizeStatusText } from "../../shared";
 import { theme } from "../../theme/theme";
+import {
+	type CodexResetFireworksEvent,
+	type CodexResetUsageSnapshot,
+	detectCodexResetFireworks,
+} from "../codex-reset-fireworks";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { getPreset } from "./presets";
 import { renderSegment, type SegmentContext } from "./segments";
@@ -29,6 +34,36 @@ import type {
 
 const JJ_REFRESH_TTL_MS = 5000;
 const WATCHER_FAILURE_POLL_TTL_MS = 5000;
+
+function normalizeCodexIdentityValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : undefined;
+}
+
+/**
+ * Fireworks are stateful, so their report match must be stricter than the
+ * status display's fallback matching: every known credential identifier must
+ * be present and equal or a workspace sibling can mutate this account's
+ * baseline.
+ */
+function codexReportMatchesExactIdentity(report: UsageReport, identity: OAuthAccountIdentity | undefined): boolean {
+	if (!identity) return false;
+	const accountId = normalizeCodexIdentityValue(identity.accountId);
+	const email = normalizeCodexIdentityValue(identity.email);
+	const projectId = normalizeCodexIdentityValue(identity.projectId);
+	const orgId = normalizeCodexIdentityValue(identity.orgId);
+	if (!accountId && !email && !projectId && !orgId) return false;
+
+	const metadata = report.metadata ?? {};
+	const reportAccountId =
+		normalizeCodexIdentityValue(metadata.accountId) ?? normalizeCodexIdentityValue(metadata.account_id);
+	const reportProjectId =
+		normalizeCodexIdentityValue(metadata.projectId) ?? normalizeCodexIdentityValue(metadata.project_id);
+	if (accountId && reportAccountId !== accountId) return false;
+	if (email && normalizeCodexIdentityValue(metadata.email) !== email) return false;
+	if (projectId && reportProjectId !== projectId) return false;
+	if (orgId && normalizeCodexIdentityValue(metadata.orgId) !== orgId) return false;
+	return true;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Context-usage memo
@@ -367,6 +402,12 @@ export class StatusLineComponent implements Component {
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
 	#usageStartTimer: Timer | null = null;
+	// A timed-out request may still resolve. Its result remains eligible only
+	// until a newer request has applied.
+	#usageRefreshSequence = 0;
+	#latestAppliedUsageRefreshSequence = 0;
+	#codexResetSnapshots = new Map<string, CodexResetUsageSnapshot>();
+	#onCodexResetFireworks: ((event: CodexResetFireworksEvent) => void) | undefined;
 	// Context-usage memo. The status line redraws on every agent event, so the
 	// hot path must not recompute context tokens unless an input changed.
 	// `getContextUsage()` anchors on the last assistant's real prompt-token
@@ -585,6 +626,11 @@ export class StatusLineComponent implements Component {
 		this.#collabStatus = status;
 	}
 
+	/** Set the callback that presents detected Codex reset celebrations, or clear it with `undefined`. */
+	setCodexResetFireworksHandler(handler: ((event: CodexResetFireworksEvent) => void) | undefined): void {
+		this.#onCodexResetFireworks = handler;
+	}
+
 	setHookStatus(key: string, text: string | undefined): void {
 		if (text === undefined) {
 			this.#hookStatuses.delete(key);
@@ -660,6 +706,8 @@ export class StatusLineComponent implements Component {
 		this.#resetJjRequests();
 		this.#onBranchChange = null;
 		this.#clearUsageStartTimer();
+		this.#onCodexResetFireworks = undefined;
+		this.#codexResetSnapshots.clear();
 		this.#retireGitWatcher();
 	}
 
@@ -1125,10 +1173,8 @@ export class StatusLineComponent implements Component {
 		return this.#vibeWorkerTokenRate?.() ?? null;
 	}
 
-	#getUsageContextKey(session: AgentSession): string {
-		const activeProvider = session.state.model?.provider ?? session.model?.provider ?? "";
+	#formatUsageContextKey(activeProvider: string | undefined, identity: OAuthAccountIdentity | undefined): string {
 		if (!activeProvider) return "";
-		const identity = session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId);
 		// orgId is part of the key: rotating between two same-email Anthropic
 		// subscriptions must invalidate the cached usage immediately instead of
 		// showing the previous org's quota for the rest of the cache TTL.
@@ -1139,6 +1185,14 @@ export class StatusLineComponent implements Component {
 			identity?.projectId ?? "",
 			identity?.orgId ?? "",
 		].join("\0");
+	}
+
+	#getUsageContextKey(session: AgentSession): string {
+		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const identity = activeProvider
+			? session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId)
+			: undefined;
+		return this.#formatUsageContextKey(activeProvider, identity);
 	}
 
 	/**
@@ -1170,40 +1224,60 @@ export class StatusLineComponent implements Component {
 			this.#usageInFlight = false;
 			return;
 		}
+		const sequence = ++this.#usageRefreshSequence;
 		const signal = AbortSignal.timeout(STATUS_USAGE_REFRESH_TIMEOUT_MS);
 		let reportsPromise: Promise<unknown> | undefined;
 		try {
 			reportsPromise = fetcher.call(session, signal);
-			this.#applyUsageRefreshReports(session, await this.#raceUsageRefreshWithSignal(reportsPromise, signal));
+			this.#applyUsageRefreshReports(
+				session,
+				await this.#raceUsageRefreshWithSignal(reportsPromise, signal),
+				sequence,
+			);
 		} catch {
 			if (this.session !== session) return;
 			this.#usageFetchedAt = Date.now();
 			if (signal.aborted && reportsPromise) {
-				this.#observeLateUsageRefresh(session, reportsPromise);
+				this.#observeLateUsageRefresh(session, reportsPromise, sequence);
 			}
 		} finally {
 			if (this.session === session) this.#usageInFlight = false;
 		}
 	}
 
-	#applyUsageRefreshReports(session: AgentSession, reports: unknown): void {
-		if (this.#disposed || this.session !== session) return;
+	#applyUsageRefreshReports(session: AgentSession, reports: unknown, sequence: number): void {
+		if (this.#disposed || this.session !== session || sequence < this.#latestAppliedUsageRefreshSequence) {
+			return;
+		}
+		this.#latestAppliedUsageRefreshSequence = sequence;
 		const activeProvider = session.state.model?.provider ?? session.model?.provider;
 		const activeIdentity =
 			activeProvider && session.modelRegistry?.authStorage
 				? session.modelRegistry.authStorage.getOAuthAccountIdentity(activeProvider, session.sessionId)
 				: undefined;
-		this.#cachedUsage = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		const normalized = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		const resetSnapshot =
+			activeProvider === "openai-codex" ? this.#normalizeCodexResetSnapshot(reports, activeIdentity) : null;
+		this.#cachedUsage = normalized;
 		this.#usageFetchedAt = Date.now();
+		if (!resetSnapshot) return;
+		const contextKey = this.#formatUsageContextKey(activeProvider, activeIdentity);
+		const previous = this.#codexResetSnapshots.get(contextKey);
+		this.#codexResetSnapshots.set(contextKey, resetSnapshot);
+		if (!previous || !settings.get("tui.codexResetFireworks")) return;
+		const event = detectCodexResetFireworks(previous, resetSnapshot);
+		if (event) this.#onCodexResetFireworks?.(event);
 	}
 
-	#observeLateUsageRefresh(session: AgentSession, reportsPromise: Promise<unknown>): void {
+	#observeLateUsageRefresh(session: AgentSession, reportsPromise: Promise<unknown>, sequence: number): void {
 		void reportsPromise
 			.then(reports => {
-				this.#applyUsageRefreshReports(session, reports);
+				this.#applyUsageRefreshReports(session, reports, sequence);
 			})
 			.catch(() => {
-				if (this.#disposed || this.session !== session) return;
+				if (this.#disposed || this.session !== session || sequence < this.#latestAppliedUsageRefreshSequence) {
+					return;
+				}
 				this.#usageFetchedAt = Date.now();
 			});
 	}
@@ -1218,6 +1292,72 @@ export class StatusLineComponent implements Component {
 		} finally {
 			signal.removeEventListener("abort", onAbort);
 		}
+	}
+
+	#normalizeCodexResetSnapshot(
+		reports: unknown,
+		activeIdentity: OAuthAccountIdentity | undefined,
+	): CodexResetUsageSnapshot | null {
+		if (!Array.isArray(reports)) return null;
+		let matchingReport: UsageReport | undefined;
+		for (const report of reports) {
+			if (!report || typeof report !== "object") continue;
+			if (
+				!("provider" in report) ||
+				report.provider !== "openai-codex" ||
+				!("limits" in report) ||
+				!Array.isArray(report.limits)
+			) {
+				continue;
+			}
+			// The report boundary above validates the fields this extractor iterates;
+			// optional metadata and credit fields are narrowed again before use.
+			const usageReport = report as UsageReport;
+			if (!codexReportMatchesExactIdentity(usageReport, activeIdentity)) continue;
+			matchingReport = usageReport;
+			break;
+		}
+		if (!matchingReport) return null;
+
+		const plan =
+			typeof matchingReport.metadata?.planType === "string" && matchingReport.metadata.planType
+				? matchingReport.metadata.planType
+				: undefined;
+		let sevenDay: CodexResetUsageSnapshot["sevenDay"];
+		let sevenDayTier: string | undefined;
+		for (const limit of matchingReport.limits) {
+			if (!limit || typeof limit !== "object") continue;
+			const candidate = limit as {
+				scope?: { windowId?: string; tier?: string };
+				window?: { resetsAt?: number };
+				amount?: { usedFraction?: number };
+			};
+			const fraction = candidate.amount?.usedFraction;
+			if (candidate.scope?.windowId !== "7d" || typeof fraction !== "number" || !Number.isFinite(fraction)) {
+				continue;
+			}
+			const tier =
+				typeof candidate.scope?.tier === "string" && candidate.scope.tier ? candidate.scope.tier : undefined;
+			if (sevenDay && (sevenDayTier === undefined || tier)) continue;
+			const resetsAt = candidate.window?.resetsAt;
+			sevenDay = {
+				percent: fraction * 100,
+				resetsAt: typeof resetsAt === "number" && Number.isFinite(resetsAt) ? resetsAt : undefined,
+				tier,
+				plan,
+			};
+			sevenDayTier = tier;
+		}
+
+		const fetchedAt = matchingReport.fetchedAt;
+		const availableCount = matchingReport.resetCredits?.availableCount;
+		const observedAt = typeof fetchedAt === "number" && Number.isFinite(fetchedAt) ? fetchedAt : undefined;
+		const savedResets =
+			typeof availableCount === "number" && Number.isFinite(availableCount)
+				? Math.max(0, Math.trunc(availableCount))
+				: undefined;
+		if (!sevenDay && savedResets === undefined) return null;
+		return { observedAt, sevenDay, savedResets };
 	}
 
 	#normalizeUsageReports(
@@ -1241,12 +1381,10 @@ export class StatusLineComponent implements Component {
 			if (activeProvider && provider !== activeProvider) continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
+			const usageReport = report as UsageReport;
 			for (const limit of limits) {
 				if (!limit || typeof limit !== "object") continue;
-				if (
-					activeIdentity &&
-					!limitMatchesActiveAccount(report as UsageReport, limit as UsageLimit, activeIdentity)
-				) {
+				if (activeIdentity && !limitMatchesActiveAccount(usageReport, limit as UsageLimit, activeIdentity)) {
 					continue;
 				}
 				const l = limit as {

@@ -48,7 +48,7 @@ describe("hashline section headers", () => {
 
 	it("reports bracket syntax with a 4-hex example when the header is missing", () => {
 		try {
-			Patch.parse("DEL 38.=40");
+			Patch.parse("CUT 38.=40");
 			throw new Error("expected missing-header error");
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -68,18 +68,18 @@ describe("hashline core — verb header forms", () => {
 		expect(() => parsePatch("2 3\n+X")).toThrow(/Hunk headers need a verb/);
 	});
 
-	it("accepts canonical replace/delete/insert forms", () => {
+	it("accepts canonical replace/cut/insert forms", () => {
 		expect(applyPatch(FILE, "SWAP 2.=3:\n+X")).toBe("a\nX\nd\ne");
-		expect(applyPatch(FILE, "DEL 2.=3")).toBe("a\nd\ne");
+		expect(applyPatch(FILE, "CUT 2.=3")).toBe("a\nd\ne");
 		expect(applyPatch(FILE, "INS.PRE 2:\n+X")).toBe("a\nX\nb\nc\nd\ne");
 		expect(applyPatch(FILE, "INS.POST 2:\n+X")).toBe("a\nb\nX\nc\nd\ne");
 		expect(applyPatch(FILE, "INS.HEAD:\n+X")).toBe("X\na\nb\nc\nd\ne");
 		expect(applyPatch(FILE, "INS.TAIL:\n+X")).toBe("a\nb\nc\nd\ne\nX");
 	});
 
-	it("accepts single-number replace and delete shorthand", () => {
+	it("accepts single-number replace and cut shorthand", () => {
 		expect(applyPatch(FILE, "SWAP 2:\n+X")).toBe("a\nX\nc\nd\ne");
-		expect(applyPatch(FILE, "DEL 2")).toBe("a\nc\nd\ne");
+		expect(applyPatch(FILE, "CUT 2")).toBe("a\nc\nd\ne");
 	});
 
 	it("accepts alternate replace range separators and missing colon", () => {
@@ -103,8 +103,8 @@ describe("hashline core — verb header forms", () => {
 		// `INS.POST 2.:` instead of `INS.POST 2:`
 		expect(applyPatch(FILE, "INS.POST 2.:\n+X")).toBe("a\nb\nX\nc\nd\ne");
 		expect(applyPatch(FILE, "INS.PRE 2.:\n+X")).toBe("a\nX\nb\nc\nd\ne");
-		// `DEL 2.=3.` instead of `DEL 2.=3` (stray dot, no colon)
-		expect(applyPatch(FILE, "DEL 2.=3.")).toBe("a\nd\ne");
+		// `CUT 2.=3.` instead of `CUT 2.=3`
+		expect(applyPatch(FILE, "CUT 2.=3.")).toBe("a\nd\ne");
 		// `INS.HEAD.:` and `INS.TAIL.:` with stray dot
 		expect(applyPatch(FILE, "INS.HEAD.:\n+X")).toBe("X\na\nb\nc\nd\ne");
 		expect(applyPatch(FILE, "INS.TAIL.:\n+X")).toBe("a\nb\nc\nd\ne\nX");
@@ -202,12 +202,8 @@ describe("hashline body contracts", () => {
 		expect(() => parsePatch("INS.TAIL:")).toThrow(/`INS` needs/);
 	});
 
-	it("rejects delete with a body", () => {
-		expect(() => parsePatch("DEL 2\n+X")).toThrow(/does not take body rows/);
-	});
-
-	it("rejects delete with a colon", () => {
-		expect(() => parsePatch("DEL 2:\n+X")).toThrow(/has no colon/);
+	it("rejects cut with a body", () => {
+		expect(() => parsePatch("CUT 2\n+X")).toThrow(/takes no body rows/);
 	});
 });
 

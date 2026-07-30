@@ -2829,6 +2829,169 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("mcp_notification", () => {
+		it("delivers mcp_notification events to subscribed extensions with the typed payload", async () => {
+			const eventsPath = path.join(tempDir.path(), "mcp-notification-events.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("mcp_notification", async (event) => {
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({
+								type: event.type,
+								server: event.server,
+								method: event.method,
+								params: event.params,
+							}) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "mcp-notification.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => sessionManager.getSessionName(),
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.emitMcpNotification({
+				server: "peers",
+				method: "notifications/peer_message",
+				params: { from: "alice", text: "hi" },
+			});
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([
+				{
+					type: "mcp_notification",
+					server: "peers",
+					method: "notifications/peer_message",
+					params: { from: "alice", text: "hi" },
+				},
+			]);
+		});
+
+		it("buffers pre-initialize events and drains them on initialize (caps at 100, drops oldest)", async () => {
+			// Guard against regression of the two-layer startup race that Codex flagged
+			// on PR #6535 (commit ffa058aa8): the sdk.ts bridge wires
+			// mcpManager.addNotificationListener inside createAgentSession BEFORE the
+			// mode controller calls ExtensionRunner.initialize(). Frames the manager
+			// drains from its own buffer arrive here pre-init. Prior behavior silently
+			// dropped them; the fix buffers and drains on initialize (same shape as
+			// emitCredentialDisabled).
+			const eventsPath = path.join(tempDir.path(), "mcp-notification-cap.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("mcp_notification", async (event) => {
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({ server: event.server, method: event.method }) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "mcp-notification-cap.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			// Push 101 events while uninitialized — the 1st should be dropped, next 100 buffered.
+			for (let i = 0; i < 101; i++) {
+				await runner.emitMcpNotification({
+					server: "peers",
+					method: `notifications/test/${i}`,
+					params: null,
+				});
+			}
+
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => sessionManager.getSessionName(),
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
+			for (let i = 0; i < 5; i++) await Promise.resolve();
+
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toHaveLength(100);
+			// Drop-oldest policy: test/0 was evicted, test/1 survives as the head.
+			expect(events[0]?.method).toBe("notifications/test/1");
+			expect(events[99]?.method).toBe("notifications/test/100");
+		});
+	});
+
 	describe("managed timers (ctx.setInterval / ctx.setTimeout)", () => {
 		it("contains a throwing interval callback instead of letting it escape as uncaughtException", () => {
 			vi.useFakeTimers();

@@ -183,6 +183,13 @@ def _require_str(payload: JsonObject, field: str) -> str:
     return value
 
 
+def _require_bool(payload: JsonObject, field: str) -> bool:
+    value = payload.get(field)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
 def _optional_str(payload: JsonObject, field: str) -> str | None:
     value = payload.get(field)
     if value is None:
@@ -231,6 +238,15 @@ def _optional_int(payload: JsonObject, field: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer")
     return value
+
+
+def _optional_float(payload: JsonObject, field: str) -> float | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    return float(value)
 
 
 def _tuple_of_strings(values: object, *, field: str) -> tuple[str, ...] | None:
@@ -776,6 +792,9 @@ class SessionState:
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
+    fast_mode_enabled: bool = False
+    fast_mode_active: bool = False
+    tokens_per_second: float | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -789,6 +808,12 @@ class BashResult:
     output_lines: int
     output_bytes: int
     artifact_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class FastModeResult:
+    enabled: bool
+    active: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -1344,6 +1369,9 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         ),
         system_prompt=_optional_str_list(payload, "systemPrompt"),
         dump_tools=dump_tools,
+        fast_mode_enabled=bool(payload.get("fastModeEnabled", False)),
+        fast_mode_active=bool(payload.get("fastModeActive", False)),
+        tokens_per_second=_optional_float(payload, "tokensPerSecond"),
     )
 
 
@@ -1358,6 +1386,13 @@ def parse_bash_result(payload: JsonObject) -> BashResult:
         output_lines=int(payload.get("outputLines", 0)),
         output_bytes=int(payload.get("outputBytes", 0)),
         artifact_id=_optional_str(payload, "artifactId"),
+    )
+
+
+def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
+    return FastModeResult(
+        enabled=_require_bool(payload, "enabled"),
+        active=_require_bool(payload, "active"),
     )
 
 

@@ -36,6 +36,7 @@ import {
 	assertJournalableEntry,
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
@@ -180,6 +181,7 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 		case "thinking_level_change":
 		case "service_tier_change":
 		case "mode_change":
+		case "credential_pin":
 			return true;
 		default:
 			return false;
@@ -2113,6 +2115,41 @@ export class SessionManager {
 			for (const name of entry.injectedRules) names.add(name);
 		}
 		return [...names];
+	}
+
+	/** Append a credential pin recording which OAuth account served `provider`. */
+	appendCredentialPin(provider: string, hash: string): string {
+		const entry: CredentialPinEntry = {
+			type: "credential_pin",
+			...this.#freshEntryFields(),
+			provider,
+			hash,
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Latest credential pin per provider on the current branch (root → leaf),
+	 * with the effective last-use time of the pinned account.
+	 *
+	 * Pins are appended only when the serving account *changes*, so a long
+	 * session on one account carries a single old pin entry. Any assistant turn
+	 * for the same provider after that pin was necessarily served by the pinned
+	 * account, so its timestamp advances `lastUsedAt` — a resume seconds after
+	 * the last turn seeds a warm sticky instead of a stale one.
+	 */
+	getCredentialPins(): Map<string, { hash: string; lastUsedAt: number }> {
+		const pins = new Map<string, { hash: string; lastUsedAt: number }>();
+		for (const entry of this.getBranch()) {
+			if (entry.type === "credential_pin") {
+				pins.set(entry.provider, { hash: entry.hash, lastUsedAt: new Date(entry.timestamp).getTime() });
+			} else if (entry.type === "message" && entry.message.role === "assistant") {
+				const pin = pins.get(entry.message.provider);
+				if (pin) pin.lastUsedAt = Math.max(pin.lastUsedAt, entry.message.timestamp);
+			}
+		}
+		return pins;
 	}
 
 	getLeafId(): string | null {

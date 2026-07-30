@@ -129,6 +129,7 @@ import {
 } from "../tools/todo";
 import { vocalizer } from "../tts/vocalizer";
 import { renderTreeList } from "../tui/tree-list";
+import { formatStartupChangelogSummary, type StartupChangelogSelection } from "../utils/changelog";
 import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
@@ -150,6 +151,7 @@ import {
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
+import { CodexResetFireworksController } from "./components/codex-reset-fireworks";
 import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import { ErrorBannerComponent } from "./components/error-banner";
@@ -557,7 +559,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#cleanupUnsubscribe?: () => void;
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
-	readonly #changelogMarkdown: string | undefined;
+	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	#planModePreviousTools: string[] | undefined;
 	#goalModePreviousTools: string[] | undefined;
 	#vibeModePreviousTools: string[] | undefined;
@@ -583,6 +585,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	mcpManager?: MCPManager;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 
+	readonly #codexResetFireworksController: CodexResetFireworksController;
 	readonly #btwController: BtwController;
 	readonly #tanCommandController: TanCommandController;
 	readonly #omfgController: OmfgController;
@@ -665,7 +668,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	constructor(
 		session: AgentSession,
 		version: string,
-		changelogMarkdown: string | undefined = undefined,
+		startupChangelog: StartupChangelogSelection | undefined = undefined,
 		setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void = () => {},
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
@@ -677,7 +680,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.keybindings = KeybindingsManager.inMemory();
 		this.agent = session.agent;
 		this.#version = version;
-		this.#changelogMarkdown = changelogMarkdown;
+		this.#startupChangelog = startupChangelog;
 		this.#toolUiContextSetter = setToolUIContext;
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
@@ -753,6 +756,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editorContainer.addChild(this.editor);
 		this.statusLine = new StatusLineComponent(session);
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.#codexResetFireworksController = new CodexResetFireworksController(this);
+		this.statusLine.setCodexResetFireworksHandler(event => {
+			this.#codexResetFireworksController.show(event);
+		});
 		// Vibe worker tok/s aggregator — keeps the status-line render layer off
 		// the heavy vibe/task dependency graph. The director is often idle while
 		// workers stream, so without this the tok/s badge would show a stale
@@ -944,19 +951,20 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 
 			// Add changelog if provided
-			if (this.#changelogMarkdown) {
+			if (this.#startupChangelog && settings.get("startup.changelogMode") !== "hidden") {
 				this.ui.addChild(new DynamicBorder());
-				if (settings.get("collapseChangelog")) {
-					const versionMatch = this.#changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
-					const latestVersion = versionMatch ? versionMatch[1] : this.#version;
-					const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
-					this.ui.addChild(new Text(condensedText, 1, 0));
+				this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+				this.ui.addChild(new Spacer(1));
+				if (settings.get("startup.changelogMode") === "summary") {
+					const summary = formatStartupChangelogSummary(this.#startupChangelog).replace(
+						/\/changelog(?: full)?/g,
+						command => theme.bold(command),
+					);
+					this.ui.addChild(new Text(summary, 1, 0));
 				} else {
-					this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-					this.ui.addChild(new Spacer(1));
-					this.ui.addChild(new Markdown(this.#changelogMarkdown.trim(), 1, 0, getMarkdownTheme()));
-					this.ui.addChild(new Spacer(1));
+					this.ui.addChild(new Markdown(this.#startupChangelog.markdown?.trim() ?? "", 1, 0, getMarkdownTheme()));
 				}
+				this.ui.addChild(new Spacer(1));
 				this.ui.addChild(new DynamicBorder());
 			}
 		}
@@ -3953,6 +3961,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#agentRegistryUnsubscribe = undefined;
 		this.#agentRegistrySubscriptionTarget = undefined;
 		this.#eventController.dispose();
+		this.#codexResetFireworksController.dispose();
 		this.statusLine.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);

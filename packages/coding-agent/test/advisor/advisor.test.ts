@@ -3475,6 +3475,193 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
+		it("strips echoed thinking after a classifier refusal and succeeds without a notice", async () => {
+			const promptInputs: string[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					promptCalls++;
+					if (promptCalls === 1) {
+						state.error = "Refusal (reasoning_extraction): reasoning may not be echoed";
+						state.messages.push({
+							role: "assistant",
+							content: [],
+							stopReason: "error",
+							stopDetails: { type: "refusal", category: "reasoning_extraction" },
+							errorMessage: state.error,
+							timestamp: 2,
+						} as unknown as AgentMessage);
+						return;
+					}
+					state.error = undefined;
+					state.messages.push({
+						role: "assistant",
+						content: [],
+						stopReason: "stop",
+						timestamp: 3,
+					} as unknown as AgentMessage);
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages = [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "private reasoning" },
+						{ type: "text", text: "answer" },
+					],
+					timestamp: 1,
+				} as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+				},
+				0,
+			);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("private reasoning");
+			expect(promptInputs[1]).not.toContain("private reasoning");
+			expect(promptInputs[1]).toContain("answer");
+			expect(failures).toEqual([]);
+		});
+
+		it("surfaces a persistent classifier refusal after one stripped resend", async () => {
+			const promptInputs: string[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.error = "Refusal (reasoning_extraction): reasoning may not be echoed";
+					state.messages.push({
+						role: "assistant",
+						content: [],
+						stopReason: "error",
+						stopDetails: { type: "refusal", category: "reasoning_extraction" },
+						errorMessage: state.error,
+						timestamp: promptInputs.length + 1,
+					} as unknown as AgentMessage);
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages = [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "private reasoning" },
+						{ type: "text", text: "answer" },
+					],
+					timestamp: 1,
+				} as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+				},
+				0,
+			);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("private reasoning");
+			expect(promptInputs[1]).not.toContain("private reasoning");
+			expect(failures).toHaveLength(1);
+		});
+
+		it("degrades on a category-less refusal", async () => {
+			const promptInputs: string[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					promptCalls++;
+					if (promptCalls === 1) {
+						state.error = "Refusal: reasoning may not be echoed";
+						state.messages.push({
+							role: "assistant",
+							content: [],
+							stopReason: "error",
+							stopDetails: { type: "refusal" },
+							errorMessage: state.error,
+							timestamp: 2,
+						} as unknown as AgentMessage);
+						return;
+					}
+					state.error = undefined;
+					state.messages.push({
+						role: "assistant",
+						content: [],
+						stopReason: "stop",
+						timestamp: 3,
+					} as unknown as AgentMessage);
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages = [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "private reasoning" },
+						{ type: "text", text: "answer" },
+					],
+					timestamp: 1,
+				} as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(
+				agent,
+				{
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+				},
+				0,
+			);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => runtime.backlog === 0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("private reasoning");
+			expect(promptInputs[1]).not.toContain("private reasoning");
+			expect(failures).toEqual([]);
+		});
+
 		it("calls onTurnError with state.error before retrying the batch", async () => {
 			const promptInputs: string[] = [];
 			const turnErrors: unknown[] = [];

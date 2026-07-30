@@ -1065,9 +1065,9 @@ dependencies = [
 
 [[package]]
 name = "clang-sys"
-version = "1.8.1"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
 dependencies = [
  "glob",
  "libc",
@@ -1439,9 +1439,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "1.0.11"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9bb72bb94fdc1bd619f4c18cc91ecf6302aeb333d31b3c6ec0bb841cd920209"
+checksum = "2d83cb7e7a873830708d6b02a78cd36a592c6fa14bf267b68725103b85c0d77f"
 
 [[package]]
 name = "ctr"
@@ -1692,13 +1692,13 @@ dependencies = [
 
 [[package]]
 name = "displaydoc"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
+checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2202,9 +2202,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fontdue"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e57e16b3fe8ff4364c0661fdaac543fb38b29ea9bc9c2f45612d90adf931d2b"
+checksum = "7894823fa221401399e2598f8b63f81ac77ff5c63248b7656779bff1632d7d3d"
 dependencies = [
  "ttf-parser",
 ]
@@ -4732,7 +4732,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "17.1.8"
+version = "17.2.0"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "17.1.8"
+version = "17.2.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -4813,14 +4813,12 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "17.1.8"
+version = "17.2.0"
 dependencies = [
  "anyhow",
  "arboard",
  "ast-grep-core",
- "audiopus_sys",
  "base64",
- "bytes",
  "clap",
  "clipboard-win",
  "core-graphics",
@@ -4838,17 +4836,16 @@ dependencies = [
  "image",
  "inferno",
  "libc",
- "maudio",
  "napi",
  "napi-build",
  "napi-derive",
- "opus",
  "parking_lot",
  "phf 0.13.1",
  "pi-ast",
  "pi-iso",
  "pi-shell",
  "pi-uutils-ctx",
+ "pi-voice",
  "pi-walker",
  "png",
  "portable-pty",
@@ -4865,7 +4862,6 @@ dependencies = [
  "toml",
  "unicode-segmentation",
  "unicode-width 0.2.2",
- "webrtc",
  "windows-sys 0.61.2",
  "winreg 0.56.0",
  "x11rb",
@@ -4876,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "17.1.8"
+version = "17.2.0"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -4962,8 +4958,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-voice"
+version = "17.2.0"
+dependencies = [
+ "audiopus_sys",
+ "bytes",
+ "flume",
+ "maudio",
+ "opus",
+ "parking_lot",
+ "tokio",
+ "webrtc",
+]
+
+[[package]]
 name = "pi-walker"
-version = "17.1.8"
+version = "17.2.0"
 dependencies = [
  "dashmap",
  "globset",
@@ -5758,9 +5768,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "once_cell",
  "ring",
@@ -6513,13 +6523,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.1"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -6542,9 +6552,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.3+spec-1.1.0"
+version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -6749,9 +6759,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-elisp"
-version = "1.6.1"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e2e9a6ab3cebf24ca41cdc1f985549b9b33f7ef25c19ac7d18e53a4ee24da09"
+checksum = "5d68ec866ff7af14f1514f11b0eba7aa837adf2ad1837fa9b30c360461bff481"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -7223,9 +7233,12 @@ checksum = "b40688ea6389c8171614b25491f71d4a27946e0c7ce2da1c6de27e25abf1a0ae"
 
 [[package]]
 name = "ttf-parser"
-version = "0.21.1"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+dependencies = [
+ "core_maths",
+]
 
 [[package]]
 name = "turn"

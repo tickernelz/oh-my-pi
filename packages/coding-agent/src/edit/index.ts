@@ -399,14 +399,24 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #editMode?: EditMode;
 	readonly #deferredDiagnostics: DeferredDiagnostics;
 
-	constructor(private readonly session: ToolSession) {
+	/**
+	 * `mode` pins the edit variant for this instance, for callers whose protocol
+	 * fixes the shape of an edit. The Cursor `pi_edit` frame carries
+	 * `old_text`/`new_text` pairs, which only `replace` accepts — under the
+	 * default `hashline` mode those args do not match the schema at all. Left
+	 * unset, the env/settings resolution applies as before.
+	 */
+	constructor(
+		private readonly session: ToolSession,
+		mode?: EditMode,
+	) {
 		const {
 			PI_EDIT_FUZZY: editFuzzy = "auto",
 			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
 			PI_EDIT_VARIANT: envEditVariant = "auto",
 		} = Bun.env;
 
-		this.#editMode = resolveConfiguredEditMode(envEditVariant);
+		this.#editMode = mode ?? resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
 		const deduplicateDiagnostics =

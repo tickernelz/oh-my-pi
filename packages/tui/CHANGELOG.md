@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.2.0] - 2026-07-30
+
 ### Added
 
 - Added response-level OSC 11 appearance subscriptions to help terminal consumers distinguish confirmed unchanged background classifications from missing replies.
