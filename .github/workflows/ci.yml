@@ -177,7 +177,7 @@ jobs:
            with:
               scope: linux
          - name: Build native addons once
-           if: steps.decide.outputs.needed == 'true'
+           if: github.event_name != 'pull_request'
            run: |
               set -eo pipefail
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
