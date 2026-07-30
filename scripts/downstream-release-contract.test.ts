@@ -113,7 +113,7 @@ describe("downstream release governance", () => {
 		expect(serialized).not.toMatch(/pi-natives-(?:linux-(?:arm64|musl)|darwin|win32)/);
 
 		const nativeAddons = record(jobs.native_addons, "native_addons");
-		const smoke = namedStep(nativeAddons, "Smoke addons before caching");
+		const smoke = namedStep(nativeAddons, "Smoke built addons");
 		expect(String(smoke.run)).toContain('node "$RUNNER_TEMP/smoke-addons.js"');
 		const workspaceTests = namedStep(
 			record(jobs.test_workspace, "test_workspace"),
