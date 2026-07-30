@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [17.2.0] - 2026-07-30
+
+### Breaking Changes
+
+- Removed `DEL`, `DEL.BLK`, `COPY`, and `COPY.BLK` from the patch language. Use `CUT` / `CUT.BLK` for deletion; a cut does not require a following `PASTE` and leaves the removed content available to later pastes.
+
+### Added
+
+- Added clipboard ops: `CUT N.=M` captures lines into a register (and deletes them), `CUT.BLK N` captures tree-sitter blocks, and `PASTE.PRE|POST N` / `PASTE.HEAD|TAIL` / `PASTE.BLK.POST N` insert the captured lines without retyping. The register flows top-to-bottom across sections, so content moves between files in one patch; `PASTE` does not consume it and the last capture wins.
+- Added `PatcherOptions.clipboard` for a host-owned register that persists across `Patcher.apply` batches. Batches work on a fork (`forkClipboard`) published per landed section (`commitClipboard`), so failed batches never poison the register and a mid-batch write failure still preserves content already cut from disk.
+- Added clipboard safety guards: a `PASTE` with an empty register, a capture overwriting un-pasted `CUT` content, and clipboard ops in same-path sections interleaved across another file's section are all rejected with targeted diagnostics. `CUT` ranges participate in overlap validation, the seen-lines guard, and drift recovery (every captured line must remap).
+
+### Changed
+
+- Simplified `grammar.lark` around shared target and position shapes, collapsing the concrete and block `CUT` forms plus the `INS` / `PASTE` position variants into their common grammar rules.
+
 ### Fixed
 
 - Prevented CPU and memory exhaustion in streaming previews by rejecting line anchors above Number.MAX_SAFE_INTEGER and ranges spanning more than 100,000 lines.

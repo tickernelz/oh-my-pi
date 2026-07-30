@@ -171,6 +171,7 @@ export interface TitleChangeEntry extends SessionEntryBase {
 declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 	interface CustomCompactionSessionEntries {
 		titleChange: TitleChangeEntry;
+		credentialPin: CredentialPinEntry;
 	}
 }
 
@@ -179,6 +180,24 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	type: "ttsr_injection";
 	/** Names of rules that were injected */
 	injectedRules: string[];
+}
+
+/**
+ * Records which OAuth account served this session's requests for a provider.
+ *
+ * Provider prompt caches (Anthropic in particular) are account-scoped, and the
+ * auth store's session-sticky routing is process-local under a remote auth
+ * broker, so resume must re-pin the same account to reuse the warm cache
+ * prefix. Stores a sha-256 of the account + billing-scope tuple instead of
+ * the raw email/uuid/org; note an unsalted digest of a guessable email is
+ * still linkable, so exported sessions are pseudonymous, not anonymous.
+ */
+export interface CredentialPinEntry extends SessionEntryBase {
+	type: "credential_pin";
+	/** Provider id the pin applies to (e.g. "anthropic"). */
+	provider: string;
+	/** `credentialPinHash()` of the serving account's identity + scope tuple. */
+	hash: string;
 }
 
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
@@ -247,7 +266,8 @@ export type SessionEntry =
 	| TitleChangeEntry
 	| TtsrInjectionEntry
 	| SessionInitEntry
-	| ModeChangeEntry;
+	| ModeChangeEntry
+	| CredentialPinEntry;
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;

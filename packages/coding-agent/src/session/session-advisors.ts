@@ -2,6 +2,7 @@ import {
 	Agent,
 	type AgentMessage,
 	type AgentTool,
+	type AgentToolContext,
 	AppendOnlyContextManager,
 	type CompactionSummaryMessage,
 	countTokens,
@@ -16,9 +17,11 @@ import {
 	compactionContextTokens,
 	createCompactionSummaryMessage,
 	estimateTokens,
+	NativeCompactionError,
 	prepareCompaction,
 	type SessionMessageEntry,
 	shouldCompact,
+	shouldUseProviderNativeCompaction,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AssistantMessage,
@@ -67,7 +70,8 @@ import {
 import { MODEL_ROLES } from "../config/model-roles";
 import { serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/service-tier";
 import type { Settings } from "../config/settings";
-import { CursorExecHandlers } from "../cursor";
+import { CursorExecHandlers, type CursorMcpResourceAdapter } from "../cursor";
+import { bridgeToolMap } from "../cursor-bridge-tools";
 import { estimateToolSchemaTokens } from "../modes/utils/context-usage";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -177,6 +181,36 @@ interface AdvisorRuntimeDescriptor {
 export interface SessionAdvisorsOptions {
 	enabled: boolean;
 	tools?: AgentTool[];
+	/**
+	 * Build a `grep` honoring a Cursor `pi_grep` frame's own context width and
+	 * match cap. The advisor's tools are fixed instances carrying session
+	 * defaults, so without this an advisor running against Cursor silently
+	 * drops both fields — the same gap the primary bridge closes.
+	 */
+	createGrepTool?(options: { context?: number; totalMatchLimit?: number }): AgentTool | undefined;
+	/**
+	 * Build the `replace`-mode `edit` a Cursor `pi_edit` frame needs. The
+	 * advisor's own instance follows the configured `edit.mode` (`hashline` by
+	 * default), whose schema the frame's `old_text`/`new_text` pairs do not
+	 * match, so without this every native advisor edit fails validation.
+	 */
+	createEditTool?(): AgentTool | undefined;
+	/**
+	 * The execute-time context the bridge's tools resolve approval from.
+	 *
+	 * `ExtensionToolWrapper` reads the approval mode, per-tool policies and
+	 * `autoApprove` only from here; with none it falls back to `yolo` and empty
+	 * policies, so a native frame would run past a configured `ask` or `deny`.
+	 */
+	getToolContext?: () => AgentToolContext | undefined;
+	/**
+	 * The live MCP connections Cursor's resource frames answer from.
+	 *
+	 * Advisors share the session's connections and may hold tools from those
+	 * same servers, so without this their frames report that every server
+	 * advertises nothing.
+	 */
+	mcpResources?: CursorMcpResourceAdapter;
 	watchdogPrompt?: string;
 	sharedInstructions?: string;
 	contextPrompt?: string;
@@ -250,6 +284,10 @@ export class SessionAdvisors {
 	readonly #host: SessionAdvisorsHost;
 	#advisorEnabled: boolean;
 	#advisorTools: AgentTool[] | undefined;
+	#advisorCreateGrepTool: SessionAdvisorsOptions["createGrepTool"];
+	#advisorCreateEditTool: SessionAdvisorsOptions["createEditTool"];
+	#advisorGetToolContext: SessionAdvisorsOptions["getToolContext"];
+	#advisorMcpResources: SessionAdvisorsOptions["mcpResources"];
 	#advisorWatchdogPrompt: string | undefined;
 	#advisorSharedInstructions: string | undefined;
 	#advisorContextPrompt: string | undefined;
@@ -272,6 +310,10 @@ export class SessionAdvisors {
 		this.#host = host;
 		this.#advisorEnabled = options.enabled;
 		this.#advisorTools = options.tools;
+		this.#advisorCreateGrepTool = options.createGrepTool;
+		this.#advisorCreateEditTool = options.createEditTool;
+		this.#advisorGetToolContext = options.getToolContext;
+		this.#advisorMcpResources = options.mcpResources;
 		this.#advisorWatchdogPrompt = options.watchdogPrompt;
 		this.#advisorSharedInstructions = options.sharedInstructions;
 		this.#advisorContextPrompt = options.contextPrompt;
@@ -718,11 +760,29 @@ export class SessionAdvisors {
 			// to delete workspace files it was never granted (issue #5680 review).
 			const advisorCanMutateFiles = advisorToolMap.has("write") || advisorToolMap.has("edit");
 			if (advisorCanMutateFiles) availableAdvisorToolNames.add("delete");
+			// `pi_edit` speaks `replace`'s `old_text`/`new_text` schema, which the
+			// advisor's ordinary `EditTool` (built at the session's configured
+			// `edit.mode`, `hashline` by default) does not accept. The bridge map
+			// swaps in a `replace` instance for the exec channel only — the
+			// advisor's own loop keeps the tool it was given — and only when
+			// `edit` was actually granted.
 			const advisorCursorExecHandlers = new CursorExecHandlers({
 				cwd: this.#host.sessionManager.getCwd(),
 				getCwd: () => this.#host.sessionManager.getCwd(),
-				tools: advisorToolMap,
-				allowNativeDelete: advisorCanMutateFiles,
+				tools: bridgeToolMap(advisorToolMap, this.#advisorCreateEditTool),
+				// Approval mode, per-tool policies and `autoApprove` live only on
+				// this context; without it every bridge tool resolves as `yolo`.
+				getToolContext: this.#advisorGetToolContext,
+				allowDirectFileMutation: advisorCanMutateFiles,
+				// Gated on the advisor's own grant: the factory builds a fresh
+				// tool, so handing it over unconditionally would give a roster
+				// without `grep` a search tool it was denied.
+				createGrepTool: advisorToolMap.has("grep") ? this.#advisorCreateGrepTool : undefined,
+				// Advisors share the session's live MCP connections, so their
+				// resource frames answer from the same catalog the primary sees.
+				// Not gated on a tool grant: reading what a server advertises is
+				// not the same permission as calling one of its tools.
+				mcpResources: this.#advisorMcpResources,
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, options) =>
@@ -816,6 +876,7 @@ export class SessionAdvisors {
 				maintainContext: (incomingTokens, signal) =>
 					this.#maintainAdvisorContext(advisorRef, incomingTokens, signal),
 				obfuscator: this.#host.obfuscator,
+				getModelIdentity: () => formatModelString(advisorRef.agent.state.model),
 				beginAdvisorUpdate: () => advisorRef.emissionGuard.beginUpdate(),
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
@@ -1341,6 +1402,7 @@ export class SessionAdvisors {
 
 		let compactResult: CompactionResult | undefined;
 		let lastError: unknown;
+		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 		// Instrument the advisor's overflow-compaction one-shot like the primary
 		// compaction path so the advisor model's maintenance call also emits spans.
 		const telemetry = resolveTelemetry(agent.telemetry, advisorProviderSessionId);
@@ -1354,6 +1416,14 @@ export class SessionAdvisors {
 		for (const candidate of candidates) {
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
 			if (!apiKey) continue;
+			if (
+				nativeCompactionFailure &&
+				(candidate.provider !== nativeCompactionFailure.provider ||
+					!shouldUseProviderNativeCompaction(candidate, compactionSettings))
+			) {
+				throw nativeCompactionFailure.error;
+			}
+
 			// The advisor overflow-compaction one-shot bypasses the advisor `Agent`,
 			// so its installed metadata resolver never runs. Emit the same
 			// `metadata.user_id` identity here (resolved per candidate provider,
@@ -1385,9 +1455,17 @@ export class SessionAdvisors {
 				break;
 			} catch (error) {
 				if (signal.aborted) throw error;
+				const id = AIError.classify(error, candidate.api);
+				if (error instanceof NativeCompactionError && !AIError.is(id, AIError.Flag.AuthFailed)) {
+					nativeCompactionFailure ??= { error, provider: candidate.provider };
+					lastError = nativeCompactionFailure.error;
+					continue;
+				}
 				lastError = error;
 			}
 		}
+
+		if (!compactResult && nativeCompactionFailure) throw nativeCompactionFailure.error;
 
 		if (!compactResult) {
 			logger.warn("Advisor compaction failed, falling back to re-prime", { error: String(lastError) });

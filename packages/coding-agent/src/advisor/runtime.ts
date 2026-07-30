@@ -78,6 +78,8 @@ export interface AdvisorRuntimeHost {
 	 *  recovery (credential switch, fallback chain) declined. Cleared only by
 	 *  an explicit reset (`/new`, config rebuild, session restart). */
 	notifyQuotaExhausted?(): void;
+	/** Stable identity for the live advisor model. Used to restore full transcript rendering after a model switch. */
+	getModelIdentity?(): string;
 }
 
 /**
@@ -230,7 +232,6 @@ const MAX_COALESCE_ROUNDS = 3;
 const MAX_QUARANTINE_RETRIES = 2;
 
 const ADVISOR_RENDER_OPTIONS = {
-	includeThinking: true,
 	includeToolIntent: true,
 	watchedRoles: true,
 	expandPrimaryContext: true,
@@ -295,6 +296,9 @@ export class AdvisorRuntime {
 	#failureNotified = false;
 	/** Consecutive quarantined turns since the last success/reset (issue #6661). */
 	#consecutiveQuarantines = 0;
+	/** Whether primary reasoning is included in advisor deltas for the current model. */
+	#includeThinking = true;
+	#modelIdentity: string | undefined;
 	/** Completed 3-failure backlog-drop cycles since the last success/reset. */
 	#droppedBacklogs = 0;
 	/**
@@ -563,13 +567,23 @@ export class AdvisorRuntime {
 		this.#wakeAllWaiters();
 	}
 
+	#syncModelIdentity(): void {
+		const identity = this.host.getModelIdentity?.();
+		if (identity === undefined || identity === this.#modelIdentity) return;
+		this.#modelIdentity = identity;
+		this.#includeThinking = true;
+	}
+
 	#formatRawDelta(rawMessages: AgentMessage[], wip = false): string | null {
 		const delta = rawMessages
 			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
 			.map(message => this.#dedupContextMessage(message));
 		if (delta.length === 0) return null;
 		const obfuscator = this.host.obfuscator;
-		let md = formatSessionHistoryMarkdown(delta, ADVISOR_RENDER_OPTIONS);
+		let md = formatSessionHistoryMarkdown(delta, {
+			...ADVISOR_RENDER_OPTIONS,
+			includeThinking: this.#includeThinking,
+		});
 		if (!md.trim()) return null;
 		if (obfuscator?.hasSecrets()) {
 			let discoveredNewRegexSecretValue = false;
@@ -603,7 +617,7 @@ export class AdvisorRuntime {
 						? obfuscateAdvisorMessage(obfuscator, message, this.#advisorRegexSecretValues)
 						: message,
 				),
-				ADVISOR_RENDER_OPTIONS,
+				{ ...ADVISOR_RENDER_OPTIONS, includeThinking: this.#includeThinking },
 			);
 			md = obfuscator.obfuscate(md, this.#advisorRegexSecretValues);
 		}
@@ -842,7 +856,9 @@ export class AdvisorRuntime {
 		if (this.#busy || this.#sessionTransitionPaused) return;
 		this.#busy = true;
 		try {
+			this.#syncModelIdentity();
 			while (!this.disposed && !this.#sessionTransitionPaused && this.#pending.length) {
+				this.#syncModelIdentity();
 				let popped: PendingDelta[];
 				if (this.#pending[0]?.overflowRecovery) {
 					const recovery = this.#pending.shift();
@@ -944,6 +960,9 @@ export class AdvisorRuntime {
 					this.#wakeAllWaiters();
 					const failedMessages = this.agent.state.messages.slice(messageSnapshot);
 					const terminalFailure = this.#terminalAssistantFailure(messageSnapshot);
+					const classifierRefusal =
+						(terminalFailure !== undefined && isClassifierRefusal(terminalFailure)) ||
+						AIError.is(AIError.classify(err), AIError.Flag.ContentBlocked);
 					const terminalFailureId =
 						terminalFailure === undefined ? undefined : AIError.classifyMessage(terminalFailure);
 					const contextOverflow =
@@ -959,6 +978,29 @@ export class AdvisorRuntime {
 						AIError.is(terminalFailureId, AIError.Flag.ContextOverflow);
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
+					if (classifierRefusal) {
+						if (this.#includeThinking) {
+							this.#includeThinking = false;
+							const strippedBatch = this.#formatRawDelta(rawMessages, wip);
+							if (strippedBatch) {
+								this.#pending.unshift({
+									text: strippedBatch,
+									rawMessages,
+									renderRevision: this.#renderRevision,
+									turns: finalTurns,
+									wip,
+									overflowRecovery: recoveringOverflow || undefined,
+								});
+								logger.debug("advisor refusal recovered by stripping primary reasoning");
+								continue;
+							}
+						}
+						this.#notifyFailureOnce(err);
+						this.#clearSeenContext();
+						this.#backlog = Math.max(0, this.#backlog - finalTurns);
+						this.#notifyWaiters();
+						continue;
+					}
 					let recovered = false;
 					try {
 						recovered =
@@ -1110,6 +1152,14 @@ export class AdvisorRuntime {
 			this.#busy = false;
 		}
 	}
+}
+
+/** Mirrors turn recovery's refusal classification and retains AIError's provider-neutral content-block fallback. */
+function isClassifierRefusal(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error") return false;
+	const stopType = message.stopDetails?.type;
+	if (stopType === "refusal" || stopType === "sensitive") return true;
+	return AIError.is(AIError.classifyMessage(message), AIError.Flag.ContentBlocked);
 }
 
 /**

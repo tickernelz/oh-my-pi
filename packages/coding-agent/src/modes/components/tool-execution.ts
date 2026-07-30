@@ -1,4 +1,4 @@
-import type { SnapshotStore } from "@oh-my-pi/hashline";
+import type { Clipboard, SnapshotStore } from "@oh-my-pi/hashline";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import {
 	Box,
@@ -203,6 +203,13 @@ class SafeToolRendererComponent implements Component {
  */
 export interface TranscriptLiveRegionProbe {
 	isBlockInLiveRegion(component: Component): boolean;
+	/**
+	 * Whether none of the block's rows have entered native scrollback (see
+	 * `TranscriptContainer.isBlockUncommitted`). Optional: standalone hosts
+	 * without commit tracking omit it, and blocks treat their rows as
+	 * uncommitted.
+	 */
+	isBlockUncommitted?(component: Component): boolean;
 }
 
 /** Minimal TUI surface ToolExecutionComponent uses to schedule repaints and share image budget. */
@@ -215,6 +222,8 @@ export interface ToolExecutionUi {
 
 export interface ToolExecutionOptions {
 	snapshots?: SnapshotStore;
+	/** Session-persistent edit clipboard register, forked per preview frame. */
+	clipboard?: Clipboard;
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	editFuzzyThreshold?: number;
 	editAllowFuzzy?: boolean;
@@ -278,6 +287,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
 	#snapshots?: SnapshotStore;
+	#clipboard?: Clipboard;
 	#isPartial = true;
 	#resultVersion = 0;
 	#lastDisplayKey: string | undefined;
@@ -337,10 +347,21 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	// transcript, e.g. in tests): whether this block is still repaintable.
 	#liveRegion?: TranscriptLiveRegionProbe;
 	// One-way latch for a detached (`async.state === "running"`) task block
-	// that left the transcript live region: its rows are commit-eligible
-	// history, so progress renders static gray and further partial snapshots are
-	// dropped (see #maybeFreezeBackgroundTask).
+	// whose rows became native-scrollback history — it left the transcript
+	// live region, or its head rows were committed while it was still the
+	// live tail. Further partial snapshots are dropped so committed rows are
+	// never mutated (see #maybeFreezeBackgroundTask).
 	#backgroundTaskFrozen = false;
+	// Whether the freeze may restyle the progress rows static gray. Set only
+	// when the latch fired while no row was committed: a recolor of rows
+	// already on the tape would itself diverge immutable history and force an
+	// erase-replay (or, with scrollback rebuild off, a duplicate slab).
+	#backgroundTaskFrozenStyled = false;
+	// Wall clock captured at each repaintable rebuild of a task card and
+	// reused verbatim once the card freezes or any of its rows commit, so
+	// time-derived rows (current-tool elapsed, retry countdown) cannot drift
+	// a committed byte on later rebuilds (theme epoch, image toggles).
+	#taskRenderNowMs = Date.now();
 	// Set on each `render()` when the last painted pending shape must be
 	// replayed wholesale when the first result arrives. Reset gates key off
 	// these so a topology-changing update that lands before the shape reaches
@@ -375,6 +396,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#editFuzzyThreshold = options.editFuzzyThreshold;
 		this.#editAllowFuzzy = options.editAllowFuzzy;
 		this.#snapshots = options.snapshots;
+		this.#clipboard = options.clipboard;
 		this.#liveRegion = options.liveRegion;
 		this.#tool = tool;
 		this.#ui = ui;
@@ -532,6 +554,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 				cwd: this.#cwd,
 				signal: controller.signal,
 				snapshots: this.#snapshots!,
+				clipboard: this.#clipboard,
 				fuzzyThreshold: this.#editFuzzyThreshold,
 				allowFuzzy: this.#editAllowFuzzy,
 				isStreaming,
@@ -559,13 +582,17 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		_toolCallId?: string,
 	): void {
 		// A detached task spawn keeps streaming progress snapshots after the
-		// block froze (left the transcript live region). Drop them: the rows are
-		// static gray history now, and repainting would rewrite rows the engine
-		// may already have committed to native scrollback. The terminal snapshot
-		// (async completed/failed → isPartial=false) still applies so a block
-		// that is still on screen settles on real results.
-		if (isPartial && this.#toolName === "task" && this.#maybeFreezeBackgroundTask()) {
-			return;
+		// block froze (left the transcript live region, or its rows entered
+		// native scrollback). Drop them: repainting would rewrite rows the
+		// engine may already have committed. The terminal snapshot (async
+		// completed/failed → isPartial=false) still settles a card that is
+		// wholly uncommitted (still on screen); once any row is on the tape
+		// the card is immutable history — replacing it would re-commit the
+		// whole slab below the stale copy — so the settlement is dropped and
+		// the job's result surfaces through its own delivery message.
+		if (this.#toolName === "task" && this.#maybeFreezeBackgroundTask()) {
+			if (isPartial) return;
+			if (!(this.#liveRegion?.isBlockUncommitted?.(this) ?? true)) return;
 		}
 		const hadNoResult = this.#result === undefined;
 		const wasPartialResult = this.#result !== undefined && this.#isPartial;
@@ -713,22 +740,30 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	}
 
 	/**
-	 * Freeze a detached (`async.state === "running"`) task block once it leaves
-	 * the transcript's live region. Past that seam its rows are commit-eligible
-	 * native-scrollback history: repaint the progress rows static gray and drop
-	 * further partial snapshots. One-way — blocks never re-enter the live
-	 * region. Returns whether the block is frozen.
+	 * Freeze a detached (`async.state === "running"`) task block once its rows
+	 * become native-scrollback history: the block left the transcript's live
+	 * region (a later block streams below it), or — while it is still the
+	 * live tail — its head rows were committed because the frame outgrew the
+	 * viewport. Committed rows are immutable, so from that point every further
+	 * partial snapshot is dropped. Rows restyle static gray only when nothing
+	 * is committed yet; otherwise the bytes stay exactly as painted. One-way —
+	 * blocks never re-enter the live region. Returns whether the block is
+	 * frozen.
 	 */
 	#maybeFreezeBackgroundTask(): boolean {
 		if (this.#backgroundTaskFrozen) return true;
 		if (this.#toolName !== "task" || this.#liveRegion === undefined) return false;
 		const asyncState = (this.#result?.details as { async?: { state?: string } } | undefined)?.async?.state;
 		if (asyncState !== "running") return false;
-		if (this.#liveRegion.isBlockInLiveRegion(this)) return false;
+		const uncommitted = this.#liveRegion.isBlockUncommitted?.(this) ?? true;
+		if (uncommitted && this.#liveRegion.isBlockInLiveRegion(this)) return false;
 		this.#backgroundTaskFrozen = true;
 		this.#updateSpinnerAnimation();
-		this.#updateDisplay();
-		this.#ui.requestRender();
+		if (uncommitted) {
+			this.#backgroundTaskFrozenStyled = true;
+			this.#updateDisplay();
+			this.#ui.requestRender();
+		}
 		return true;
 	}
 
@@ -784,16 +819,16 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 
 	/**
 	 * Keeps in-flight TV-wall frames out of immutable native scrollback: the
-	 * `vibe_wait` wall and displaceable snapshots (`hub` waiting polls, `todo`
-	 * lists). Their frames replace each other rather than append, and their
-	 * rows mutate every spinner tick — an unpinned commit records a per-tick
-	 * frozen snapshot AND force-seals the block (see TranscriptContainer's
-	 * committed-snapshot seal), so the next poll stacks a new frame instead of
-	 * displacing this one.
+	 * `vibe_wait` wall, displaceable snapshots (`hub` waiting polls, `todo`
+	 * lists), and live `task` calls. Their frames replace each other rather
+	 * than append — task progress rows rewrite in place on every snapshot —
+	 * so an unpinned commit records a per-tick frozen snapshot (and for
+	 * displaceable blocks force-seals them, stacking the next poll below).
+	 * The finalized frame commits exactly once when the pin lifts.
 	 */
 	isNativeScrollbackLiveRegionPinned(): boolean {
 		if (this.isTranscriptBlockFinalized()) return false;
-		return this.#toolName === "vibe_wait" || this.#displaceableByToolName !== undefined;
+		return this.#toolName === "vibe_wait" || this.#toolName === "task" || this.#displaceableByToolName !== undefined;
 	}
 
 	/**
@@ -827,8 +862,12 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#sealed = true;
 		this.#displaceableByToolName = undefined;
 		// A sealed detached task is abandoned history: settle its progress rows
-		// on static gray.
+		// on static gray — but only while none of them are committed; a recolor
+		// on the tape would diverge immutable history.
 		this.#backgroundTaskFrozen = true;
+		if (this.#liveRegion?.isBlockUncommitted?.(this) ?? true) {
+			this.#backgroundTaskFrozenStyled = true;
+		}
 		this.stopAnimation();
 		this.#updateDisplay();
 		this.#ui.requestRender();
@@ -888,7 +927,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		// TUI startup, so a result rendered before it lands must re-shape once it
 		// does (it gates Image children vs text fallback in #rebuildDisplay); keyed
 		// here for the same reason markdown.ts keys its render cache on it.
-		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${this.#backgroundTaskFrozen}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
+		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${this.#backgroundTaskFrozenStyled}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
 		if (key === this.#lastDisplayKey && this.#displayBuilt) return;
 		this.#lastDisplayKey = key;
 
@@ -1292,9 +1331,17 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 			// draws every dispatched agent as a progress/result line, so tell
 			// `renderCall` to drop its duplicate streaming preview list.
 			context.hasResult = Boolean(this.#result);
-			// Out of the transcript live region: progress rows render static gray
-			// (see task/render.ts).
-			context.frozen = this.#backgroundTaskFrozen;
+			// Settled as history (out of the live region, before any row entered
+			// the tape): progress rows render static gray (see task/render.ts).
+			context.frozen = this.#backgroundTaskFrozenStyled;
+			// Freeze the render clock alongside the latch — and independently the
+			// moment any row commits, closing the window between a commit paint
+			// and the next snapshot where a settings-triggered rebuild could
+			// re-derive elapsed/countdown bytes under committed rows.
+			if (!this.#backgroundTaskFrozen && (this.#liveRegion?.isBlockUncommitted?.(this) ?? true)) {
+				this.#taskRenderNowMs = Date.now();
+			}
+			context.nowMs = this.#taskRenderNowMs;
 		} else if (isEditLikeToolName(this.#toolName)) {
 			context.editMode = this.#editMode;
 			const previews = this.#editDiffPreview;

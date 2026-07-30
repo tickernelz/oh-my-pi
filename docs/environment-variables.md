@@ -244,7 +244,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 
 | Variable                                            | Used by                                                       |
 | --------------------------------------------------- | ------------------------------------------------------------- |
-| `EXA_API_KEY`                                       | Exa search provider and Exa MCP tools                         |
+| `EXA_API_KEY`                                       | Exa search/MCP; alternatively use `/login exa`                |
 | `BRAVE_API_KEY`                                     | Brave search provider                                         |
 | `PERPLEXITY_API_KEY`                                | Perplexity search provider API-key mode                       |
 | `PERPLEXITY_COOKIES`                                | Perplexity cookie-auth search mode                            |

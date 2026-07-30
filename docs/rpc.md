@@ -124,6 +124,7 @@ Important edge behavior from runtime:
 ### State
 
 - `{ id?, type: "get_state" }`
+- `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "set_todos", phases: TodoPhase[] }`
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
@@ -231,6 +232,19 @@ Local-only slash commands may emit `command_output` frames before completing via
 
 ### `get_state` payload
 
+`tokensPerSecond` is a number when output throughput is available and `null`
+otherwise. `fastModeEnabled` reports the session setting, while
+`fastModeActive` reports the actual computed active state. For Fireworks,
+`providers.fireworksTier: priority` is a provider-level setting independent of
+the `/fast` family setting, so `fastModeActive` may remain `true` for an
+unsupported Fireworks model.
+
+For direct Anthropic, a provider rejection of `speed: "fast"` uses a sticky
+fallback scoped by the resolved endpoint and exact model: `fastModeEnabled` may
+remain `true` while `fastModeActive` is `false`. An explicit `set_fast_mode`
+enable expresses retry intent and clears that fallback so the provider attempt
+is re-armed.
+
 ```json
 {
   "model": { "provider": "...", "id": "..." },
@@ -243,6 +257,9 @@ Local-only slash commands may emit `command_output` frames before completing via
   "sessionFile": "...",
   "sessionId": "...",
   "sessionName": "...",
+  "fastModeEnabled": false,
+  "tokensPerSecond": null,
+  "fastModeActive": false,
   "autoCompactionEnabled": true,
   "messageCount": 0,
   "queuedMessageCount": 0,
@@ -272,6 +289,73 @@ Local-only slash commands may emit `command_output` frames before completing via
     "contextWindow": 200000,
     "percent": 0.55
   }
+}
+```
+
+### `set_fast_mode` payload
+
+`set_fast_mode` changes whether fast mode is enabled for the session. The
+request is:
+
+```json
+{ "id": "req_fast_on", "type": "set_fast_mode", "enabled": true }
+```
+
+On success, `data` always contains both `enabled` and `active`. These are the
+actual computed values: `enabled` reports the session setting, and `active`
+reports the resulting active state, including any provider-level Fireworks
+priority setting:
+
+For direct Anthropic, an explicit enable also re-arms a provider attempt after
+the sticky rejection fallback, even when fast mode was already enabled.
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": true, "active": true }
+}
+```
+
+Enabling fast mode on a model without a service-tier family fails with the
+exact error below:
+
+```json
+{
+  "id": "req_fast_on",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": false,
+  "error": "Fast mode is unavailable for the current model."
+}
+```
+
+Disabling fast mode is idempotent, including on an unsupported model. It
+succeeds as an off/no-op result, but disabling `/fast` does not override
+provider-level settings, so a successful disable does not guarantee
+`active: false`. For example, with an unsupported
+`fireworks/deepseek-v4-flash` model and `providers.fireworksTier: priority`,
+the response reports the session setting as disabled while the provider
+priority keeps the computed active state true:
+
+```json
+{
+  "id": "req_fast_off",
+  "type": "response",
+  "command": "set_fast_mode",
+  "success": true,
+  "data": { "enabled": false, "active": true }
+}
+```
+
+The corresponding `get_state` result reports the same computed state:
+
+```json
+{
+  "fastModeEnabled": false,
+  "fastModeActive": true
 }
 ```
 

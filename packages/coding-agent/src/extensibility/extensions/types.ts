@@ -49,6 +49,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
+import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -415,6 +416,8 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Get a read-only snapshot of async jobs owned by this session. */
+	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -714,6 +717,31 @@ export interface CredentialDisabledEvent {
 }
 
 // ============================================================================
+// MCP Events
+// ============================================================================
+
+/**
+ * Fired for every JSON-RPC notification received from a connected MCP server,
+ * AFTER the runtime's own handling of known list/update methods. Unknown or
+ * server-custom methods are delivered too — extensions can bridge them into
+ * session behavior by inspecting `method`/`params` and injecting a follow-up
+ * via `pi.sendMessage(..., { deliverAs })` or `pi.sendUserMessage(...)`.
+ */
+export interface McpNotificationEvent {
+	type: "mcp_notification";
+	/**
+	 * Server name as declared in the MCP config (raw, unsanitized). Note this
+	 * differs from the sanitized prefix used in `mcp__<sanitized_server>_<tool>`
+	 * tool names — filter by this raw name, not by tool-name prefix matching.
+	 */
+	server: string;
+	/** JSON-RPC method (e.g. `notifications/tools/list_changed`, or server-custom). */
+	method: string;
+	/** JSON-RPC params, opaque to the runtime. */
+	params: unknown;
+}
+
+// ============================================================================
 // User Bash Events
 // ============================================================================
 
@@ -941,6 +969,7 @@ export type ExtensionEvent =
 	| TodoReminderEvent
 	| GoalUpdatedEvent
 	| CredentialDisabledEvent
+	| McpNotificationEvent
 	| UserBashEvent
 	| UserPythonEvent
 	| InputEvent
@@ -1133,6 +1162,7 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
+	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
 
 	// =========================================================================
 	// Tool Registration

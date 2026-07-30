@@ -158,6 +158,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `modelRegistry`, `model`
 - `models` (read-only model query — see below)
 - `getContextUsage()`
+- `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
 - `compact(...)`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
@@ -267,6 +268,23 @@ Cancelable pre-events:
 - `todo_reminder`
 - `goal_updated`
 - `credential_disabled`
+
+### MCP notifications
+
+- `mcp_notification` — fired for every JSON-RPC notification received from a connected MCP server, AFTER the manager's own handling of known list/update methods (`notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/resources/updated`, `notifications/prompts/list_changed`). Unknown or server-custom methods are also delivered. Payload: `{ server: string; method: string; params: unknown }`. Multiple extensions may subscribe; a handler that throws does not prevent other handlers from firing. Notifications received before any listener attaches are buffered (bounded FIFO, cap 100, drop-oldest) and drained into the first subscriber — so startup-time frames aren't lost even if the extension binds after MCP discovery.
+
+Bridging a push-capable MCP into a session steer:
+
+```ts
+pi.on("mcp_notification", event => {
+  if (event.server !== "peer-bus") return;
+  if (event.method !== "notifications/peer_message") return;
+  const params = event.params as { from: string; text: string };
+  pi.sendUserMessage(`[from ${params.from}] ${params.text}`, { deliverAs: "steer" });
+});
+```
+
+The runtime handles the JSON-RPC transport and its own list/update refresh first; the handler runs afterwards and can inject a mid-turn steer via `pi.sendMessage` / `pi.sendUserMessage`.
 
 ### User command interception
 

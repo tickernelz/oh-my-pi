@@ -65,6 +65,7 @@ import {
 } from "./usage/openai-codex-reset";
 import { opencodeGoUsageProvider } from "./usage/opencode-go";
 import { syntheticUsageProvider } from "./usage/synthetic";
+import { umansUsageProvider } from "./usage/umans";
 import { xaiOauthUsageProvider } from "./usage/xai-oauth";
 import { zaiRankingStrategy, zaiUsageProvider } from "./usage/zai";
 
@@ -664,6 +665,7 @@ const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
 	ollamaCloudUsageProvider,
 	claudeUsageProvider,
 	zaiUsageProvider,
+	umansUsageProvider,
 	opencodeGoUsageProvider,
 	githubCopilotUsageProvider,
 	cursorUsageProvider,
@@ -1813,15 +1815,20 @@ export class AuthStorage {
 		}
 	}
 
-	/** Records which credential was used for a session (for rate-limit switching). */
+	/**
+	 * Records which credential was used for a session (for rate-limit switching).
+	 * `lastUsedAtMs` backdates the sticky (session-file pin restores on resume);
+	 * it defaults to now for live selections.
+	 */
 	#recordSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
 		type: AuthCredential["type"],
 		index: number,
+		lastUsedAtMs?: number,
 	): void {
 		if (!sessionId) return;
-		const nowMs = Date.now();
+		const nowMs = lastUsedAtMs ?? Date.now();
 		const sessionMap = this.#sessionLastCredential.get(provider) ?? new Map();
 		sessionMap.set(sessionId, { type, index, lastUsedAtMs: nowMs });
 		this.#sessionLastCredential.set(provider, sessionMap);
@@ -5405,8 +5412,18 @@ export class AuthStorage {
 	 * The durable credential id keeps the pin stable across credential refreshes,
 	 * storage reordering, and process restarts. Normal auth retry and usage-limit
 	 * handling may still route around an unavailable account.
+	 *
+	 * `options.lastUsedAtMs` backdates the sticky's last-use timestamp so a pin
+	 * restored from a persisted session keeps the provider's warm-window
+	 * semantics: a resume inside the prompt-cache TTL reuses the account, a
+	 * stale resume still re-ranks.
 	 */
-	pinSessionOAuthAccount(provider: string, sessionId: string, credentialId: number): boolean {
+	pinSessionOAuthAccount(
+		provider: string,
+		sessionId: string,
+		credentialId: number,
+		options?: { lastUsedAtMs?: number },
+	): boolean {
 		if (!sessionId || this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
 			return false;
 		}
@@ -5414,7 +5431,7 @@ export class AuthStorage {
 		const index = stored.findIndex(entry => entry.id === credentialId);
 		const target = stored[index];
 		if (target?.credential.type !== "oauth") return false;
-		this.#recordSessionCredential(provider, sessionId, "oauth", index);
+		this.#recordSessionCredential(provider, sessionId, "oauth", index, options?.lastUsedAtMs);
 		return true;
 	}
 

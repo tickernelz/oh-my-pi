@@ -7,6 +7,7 @@ import { ClaudeSessionStore } from "../src/session/claude-session-store";
 import { CodexSessionStore } from "../src/session/codex-session-store";
 import { persistForeignSession } from "../src/session/foreign-session-import";
 import type { ForeignSessionInfo } from "../src/session/foreign-session-store";
+import { buildSessionContext } from "../src/session/session-context";
 import { SessionManager } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
 
@@ -170,8 +171,12 @@ describe("CodexSessionStore", () => {
 		const id = "44444444-4444-4444-8444-444444444444";
 		const sessionPath = path.join(root, ".sessions", "2025", "01", "01", `rollout-${id}.jsonl`);
 		await writeJsonl(path.join(root, "session_index.jsonl"), [
-			{ id, thread_name: "Legacy Codex", updated_at: "2025-01-01T00:00:09.000Z" },
+			{ id, thread_name: "Legacy Codex", updated_at: "2025-01-01T00:00:12.000Z" },
 		]);
+		const replacementHistory = [
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "Retained context" }] },
+			{ type: "compaction", encrypted_content: "encrypted-compaction" },
+		];
 		await writeJsonl(sessionPath, [
 			{ type: "session_meta", timestamp: "2025-01-01T00:00:00.000Z", payload: { id, cwd } },
 			{ type: "turn_context", timestamp: "2025-01-01T00:00:01.000Z", payload: { model: "gpt-5.3-codex" } },
@@ -196,18 +201,29 @@ describe("CodexSessionStore", () => {
 				payload: { type: "function_call_output", call_id: "call-codex", output: "file contents" },
 			},
 			{
-				type: "event_msg",
+				type: "compacted",
 				timestamp: "2025-01-01T00:00:06.000Z",
+				payload: { message: "", replacement_history: replacementHistory },
+			},
+			{ type: "turn_context", timestamp: "2025-01-01T00:00:07.000Z", payload: { model: "gpt-5.3-codex" } },
+			{
+				type: "response_item",
+				timestamp: "2025-01-01T00:00:08.000Z",
+				payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] },
+			},
+			{
+				type: "event_msg",
+				timestamp: "2025-01-01T00:00:09.000Z",
 				payload: { type: "web_search_end", call_id: "call-web", query: "docs", action: { query: "docs" } },
 			},
 			{
 				type: "response_item",
-				timestamp: "2025-01-01T00:00:07.000Z",
+				timestamp: "2025-01-01T00:00:10.000Z",
 				payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done" }] },
 			},
 			{
 				type: "event_msg",
-				timestamp: "2025-01-01T00:00:08.000Z",
+				timestamp: "2025-01-01T00:00:11.000Z",
 				payload: { type: "thread_name_updated", thread_name: "Imported Codex" },
 			},
 		]);
@@ -224,6 +240,51 @@ describe("CodexSessionStore", () => {
 		expect(entries.some(entry => entry.type === "model_change" && entry.model === "openai-codex/gpt-5.3-codex")).toBe(
 			true,
 		);
+		const compaction = entries.find(entry => entry.type === "compaction");
+		if (compaction?.type !== "compaction") throw new Error("Missing imported Codex compaction");
+		expect(compaction.firstKeptEntryId).toBe(compaction.id);
+		expect(compaction.preserveData).toEqual({
+			openaiRemoteCompaction: {
+				provider: "openai-codex",
+				replacementHistory,
+				compactionItem: replacementHistory[1],
+			},
+		});
+		const activeContext = buildSessionContext(entries);
+		expect(activeContext.messages.map(message => message.role)).toEqual([
+			"compactionSummary",
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(activeContext.messages[1]).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "Continue" }],
+		});
+		const activeSummary = activeContext.messages[0];
+		if (activeSummary?.role !== "compactionSummary") throw new Error("Missing active Codex compaction context");
+		expect(activeSummary.providerPayload).toEqual({
+			type: "openaiResponsesHistory",
+			provider: "openai-codex",
+			items: replacementHistory,
+		});
+		const transcript = buildSessionContext(entries, undefined, undefined, { transcript: true });
+		expect(transcript.messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"assistant",
+			"toolResult",
+			"compactionSummary",
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(transcript.messages[0]).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "Inspect" }],
+		});
 		const calls = new Set<string>();
 		for (const entry of entries) {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;

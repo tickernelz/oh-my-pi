@@ -90,11 +90,11 @@ describe("SWAP.BLK — native tree-sitter resolution end-to-end", () => {
 		});
 	});
 
-	it("deletes the resolved `if` block (line 2) end-to-end via `DEL.BLK`", async () => {
+	it("deletes the resolved `if` block (line 2) end-to-end via `CUT.BLK`", async () => {
 		await withTempDir(async tempDir => {
 			const session = makeSession(tempDir);
 			const { filePath, header } = await seedFile(tempDir, session, "x.ts", TS_SOURCE);
-			const input = `${header}\nDEL.BLK 2`;
+			const input = `${header}\nCUT.BLK 2`;
 
 			await executeHashlineSingle(executeOptions(tempDir, input, session));
 
@@ -166,17 +166,17 @@ describe("SWAP.BLK — native tree-sitter resolution end-to-end", () => {
 		});
 	});
 
-	it("echoes the resolved span in the result text for DEL.BLK", async () => {
+	it("echoes the resolved span in the result text for CUT.BLK", async () => {
 		await withTempDir(async tempDir => {
 			const session = makeSession(tempDir);
 			const { header } = await seedFile(tempDir, session, "x.ts", TS_SOURCE);
-			const input = `${header}\nDEL.BLK 2`;
+			const input = `${header}\nCUT.BLK 2`;
 
 			const result = await executeHashlineSingle(executeOptions(tempDir, input, session));
 			const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
 
 			// `if (y) {` opens on line 2; resolves lines 2-3.
-			expect(text).toContain("DEL.BLK 2 → resolved lines 2-3 (2 lines)");
+			expect(text).toContain("CUT.BLK 2 → resolved lines 2-3 (2 lines)");
 		});
 	});
 
@@ -256,13 +256,13 @@ const MD_PLAN = [
 ].join("\n");
 
 describe("block ops on markdown headings — whole-section resolution end-to-end", () => {
-	it("DEL.BLK at a `## H2` deletes the entire section, including nested subsections", async () => {
+	it("CUT.BLK at a `## H2` deletes the entire section, including nested subsections", async () => {
 		await withTempDir(async tempDir => {
 			const session = makeSession(tempDir);
 			// Line 4 is `## Context`; its section runs through `### Detail` and
 			// the trailing blank, up to `## Approach`.
 			const { filePath, header } = await seedFile(tempDir, session, "plan.md", MD_PLAN);
-			const input = `${header}\nDEL.BLK 4`;
+			const input = `${header}\nCUT.BLK 4`;
 
 			const result = await executeHashlineSingle(executeOptions(tempDir, input, session));
 			const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
@@ -270,7 +270,7 @@ describe("block ops on markdown headings — whole-section resolution end-to-end
 			expect(await Bun.file(filePath).text()).toBe(
 				["# Plan", "intro", "", "## Approach", "step one", ""].join("\n"),
 			);
-			expect(text).toContain("DEL.BLK 4 → resolved lines 4-10 (7 lines)");
+			expect(text).toContain("CUT.BLK 4 → resolved lines 4-10 (7 lines)");
 		});
 	});
 

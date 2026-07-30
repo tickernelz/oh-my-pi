@@ -51,6 +51,9 @@ class ProtocolParsingTests(unittest.TestCase):
                 "sessionFile": "/tmp/test.jsonl",
                 "sessionId": "session-123",
                 "sessionName": "Scratchpad",
+                "fastModeEnabled": False,
+                "fastModeActive": True,
+                "tokensPerSecond": 12.5,
                 "autoCompactionEnabled": True,
                 "messageCount": 4,
                 "queuedMessageCount": 1,
@@ -95,6 +98,38 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.model.thinking.default_level, "medium")
         self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
         self.assertTrue(state.model.thinking.supports_display)
+        self.assertFalse(state.fast_mode_enabled)
+        self.assertTrue(state.fast_mode_active)
+        self.assertEqual(state.tokens_per_second, 12.5)
+
+    def test_parse_session_state_defaults_missing_fast_mode_and_throughput(
+        self,
+    ) -> None:
+        missing = object()
+        for tokens_per_second, expected in (
+            (None, None),
+            (missing, None),
+        ):
+            with self.subTest(tokens_per_second=tokens_per_second):
+                payload = {
+                    "sessionId": "session-123",
+                    "steeringMode": "one-at-a-time",
+                    "followUpMode": "all",
+                    "interruptMode": "immediate",
+                }
+                if tokens_per_second is not missing:
+                    payload["tokensPerSecond"] = tokens_per_second
+
+                state = parse_session_state(payload)
+
+                self.assertEqual(
+                    (
+                        state.fast_mode_enabled,
+                        state.fast_mode_active,
+                        state.tokens_per_second,
+                    ),
+                    (False, False, expected),
+                )
 
     def test_parse_agent_end_notification(self) -> None:
         notification = parse_notification(

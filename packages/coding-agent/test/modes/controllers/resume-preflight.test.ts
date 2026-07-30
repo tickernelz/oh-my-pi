@@ -220,8 +220,9 @@ describe("SelectorController.handleResumeSession preflight flush", () => {
 
 		selector!.handleInput("\n");
 		expect(selectionPromise).toBeDefined();
-		await selectionPromise!;
+		await selectionPromise;
 
+		expect(ctx.showError).toHaveBeenCalledWith("switch failed");
 		expect(ctx.settings.flush).toHaveBeenCalledTimes(1);
 		expect(switchSession).toHaveBeenCalledWith(session.path);
 		expect(ctx.showError).toHaveBeenCalledWith(switchError.message);

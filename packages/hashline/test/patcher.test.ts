@@ -337,7 +337,7 @@ describe("Patcher seen-line provenance", () => {
 		const patcher = new Patcher({ fs, snapshots });
 
 		// Anchor 60 unseen lines — over the 40-line inline reveal cap.
-		const dels = Array.from({ length: 60 }, (_, i) => `DEL ${100 + i}`).join("\n");
+		const dels = Array.from({ length: 60 }, (_, i) => `CUT ${100 + i}`).join("\n");
 		let message: string | undefined;
 		try {
 			await patcher.apply(Patch.parse(`[${PATH}#${tag}]\n${dels}`));

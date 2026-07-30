@@ -18,6 +18,13 @@ on:
          - "Cargo.lock"
          - "rust-toolchain.toml"
          - "rustfmt.toml"
+         # A root dependency change (lockfile/catalog/patches) affects every
+         # job; without these a lockfile-only push shipped untested — and a
+         # release retagged onto such a commit never triggered its run.
+         - "bun.lock"
+         - "bunfig.toml"
+         - "package.json"
+         - "patches/**"
          - ".github/**"
    pull_request:
       branches: [main]
@@ -36,6 +43,10 @@ on:
          - "Cargo.lock"
          - "rust-toolchain.toml"
          - "rustfmt.toml"
+         - "bun.lock"
+         - "bunfig.toml"
+         - "package.json"
+         - "patches/**"
          - ".github/**"
    workflow_dispatch:
 
@@ -52,6 +63,7 @@ permissions:
    contents: read
 
 jobs:
+
    check:
       name: Lint, type check & web build
       runs-on: ubuntu-22.04
@@ -63,26 +75,22 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Rust validation (tests, clippy, rustfmt) and native addon production are
-   # separate jobs: TS test shards wait only on the addons, and on
-   # native-changing PRs validation no longer delays artifact production.
+   # Rust validation (tests, clippy, rustfmt) runs on non-PR events only.
+   # Native-changing PRs are rare enough that they do not warrant PR-side
+   # Rust validation or a PR-side addon build (see native_addons): Rust is
+   # validated post-merge on main (kata remote cache, warm) and again at
+   # release. A skipped required check still satisfies branch protection.
    rust_validate:
       name: Validate Rust workspace (bazel)
       runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
-         - id: inputs
-           uses: ./.github/actions/native-inputs
-         # TS-only PRs skip Rust validation entirely.
-         - if: steps.inputs.outputs.rust == 'true'
-           uses: ./.github/actions/bun-install
+         - uses: ./.github/actions/bun-install
          - id: cache
-           if: steps.inputs.outputs.rust == 'true'
            uses: ./.github/actions/bazel-cache
            with:
               scope: linux
          - name: Rust tests
-           if: steps.inputs.outputs.rust == 'true'
            # The ulimit guard runs in the step that launches the bazel server
            # (limits are per-process and the server persists across steps).
            run: |
@@ -93,23 +101,15 @@ jobs:
          # `[lints] workspace = true` get the workspace policy, the vendored
          # brush fork is exempt (same as run-rs-task.ts's cargo excludes).
          - name: Clippy (workspace lint policy on opted-in crates)
-           if: steps.inputs.outputs.rust == 'true'
            run: |
-              bazelisk query "kind('rust_library|rust_shared_library', //crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...)" \
+              bazelisk query "kind('rust_library|rust_shared_library', //crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-voice/... + //crates/pi-walker/...)" \
                 | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy-strict --
          - name: Clippy (default lints elsewhere)
-           if: steps.inputs.outputs.rust == 'true'
            run: |
-              bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (//crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-walker/...) - //crates/vendor/brush-core/... - //crates/vendor/brush-builtins/...)" \
+              bazelisk query "kind('rust_library|rust_shared_library', //crates/... - (//crates/pi-ast/... + //crates/pi-iso/... + //crates/pi-natives/... + //crates/pi-shell/... + //crates/pi-voice/... + //crates/pi-walker/...) - //crates/vendor/brush-core/... - //crates/vendor/brush-builtins/...)" \
                 | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy --
          - name: Rustfmt
-           if: steps.inputs.outputs.rust == 'true'
            run: bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=rustfmt //crates/...
-         # No disk-cache save here: native_addons saves this same key
-         # concurrently, and an immutable archive can have only one producer
-         # per key — a validation-only archive winning the race would
-         # suppress the addon half on every later exact hit. Validation
-         # actions are seeded by the main cache warmer's combined archive.
 
    # Builds the Linux x64 addons every downstream test job installs. TS-only
    # pull requests may restore the trusted main cache; all other runs build the
@@ -119,39 +119,26 @@ jobs:
       runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
-         - id: inputs
-           uses: ./.github/actions/native-inputs
-         # Trusted fast path. Exact-key restores only — a prefix fallback
-         # could resolve valid-but-wrong .node files under a changed
-         # target/profile (the key embeds schema + os/arch + target pair +
-         # build profile + input hash; see native-inputs action).
-         - name: Restore prebuilt native addons
-           id: prebuilt
+
+         # ---- PR path: latest release addons from npm ----
+         - name: Fetch release native addons (npm)
            if: github.event_name == 'pull_request'
-           uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-           with:
-              path: ~/.cache/omp-native-addons
-              key: ${{ steps.inputs.outputs.cache-key }}
-         - name: Stage cached addons
-           if: steps.prebuilt.outputs.cache-hit == 'true'
            shell: bash
-           # Canonical filenames come from the target map in
-           # scripts/bazel-natives.ts; staging reproduces the bazel-bin
-           # layout the artifact upload below globs.
            run: |
               set -euo pipefail
+              tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
+              echo "Fetching $tarball"
+              curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
               mkdir -p bazel-bin/natives-linux-x64-baseline bazel-bin/natives-linux-x64-modern
-              cp ~/.cache/omp-native-addons/pi_natives.linux-x64-baseline.node bazel-bin/natives-linux-x64-baseline/
-              cp ~/.cache/omp-native-addons/pi_natives.linux-x64-modern.node bazel-bin/natives-linux-x64-modern/
-         # A poisoned cache entry must not ship: load both addons before
-         # trusting them. Failure falls back to a full build (loudly) rather
-         # than failing the PR.
-         - name: Smoke cached addons
-           id: smoke
-           if: steps.prebuilt.outputs.cache-hit == 'true'
+              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" bazel-bin/natives-linux-x64-baseline/
+              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" bazel-bin/natives-linux-x64-modern/
+         # A corrupt download must fail here, not as a confusing dlopen error
+         # in every downstream test shard.
+         - name: Smoke release addons
+           if: github.event_name == 'pull_request'
            shell: bash
            run: |
-              set -uo pipefail
+              set -euo pipefail
               # NOTE: `bun -e 'require("./x.node")'` swallows dlopen failures
               # (exit 0 on a bogus addon); a script file enforces them in
               # both bun and node. Verified against a corrupt .node fixture.
@@ -166,30 +153,26 @@ jobs:
               EOF
               loader=node
               if command -v bun >/dev/null 2>&1; then loader=bun; fi
-              if "$loader" "$RUNNER_TEMP/smoke-addons.js" \
-                 "$PWD/bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
-                 "$PWD/bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"; then
-                echo "ok=true" >> "$GITHUB_OUTPUT"
-              else
-                echo "::warning::cached native addons failed to load; falling back to a full bazel build"
-                rm -rf bazel-bin
-                echo "ok=false" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Decide build path
-           id: decide
+              "$loader" "$RUNNER_TEMP/smoke-addons.js" \
+                "$PWD/bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
+                "$PWD/bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"
+         # Make the policy visible on the rare native-touching PR instead of
+         # leaving a reviewer to wonder which addons the tests exercised.
+         # Best-effort: a diff-API failure must not fail the job over a notice.
+         - name: Note native changes tested against release addons
+           if: github.event_name == 'pull_request'
            shell: bash
            env:
-              HIT: ${{ steps.prebuilt.outputs.cache-hit }}
-              SMOKE: ${{ steps.smoke.outputs.ok }}
+              GH_TOKEN: ${{ github.token }}
            run: |
-              if [ "$HIT" = "true" ] && [ "$SMOKE" = "true" ]; then
-                echo "Prebuilt addons restored and verified; skipping bazel."
-                echo "needed=false" >> "$GITHUB_OUTPUT"
-              else
-                echo "needed=true" >> "$GITHUB_OUTPUT"
+              if gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null \
+                 | grep -qE '^(crates/|bazel/|Cargo\.(toml|lock)|MODULE\.bazel(\.lock)?|BUILD\.bazel|\.bazelrc|\.bazelignore|\.bazelversion|rust-toolchain\.toml|rustfmt\.toml)'; then
+                echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
               fi
+
+         # ---- main path: bazel build of all Linux-hosted targets ----
          - id: cache
-           if: steps.decide.outputs.needed == 'true'
+           if: github.event_name != 'pull_request'
            uses: ./.github/actions/bazel-cache
            with:
               scope: linux
@@ -204,7 +187,7 @@ jobs:
          # thousands of actions is the failure mode that made CI slow — make
          # it visible in the run summary instead of discovering it weeks in.
          - name: Report bazel cache stats
-           if: steps.decide.outputs.needed == 'true'
+           if: github.event_name != 'pull_request'
            shell: bash
            run: |
               # Bazel runs with --color=yes (config=ci); strip ANSI before
@@ -413,4 +396,5 @@ jobs:
            env:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
+
 

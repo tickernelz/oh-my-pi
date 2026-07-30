@@ -1727,6 +1727,12 @@ export const revList = {
 	async range(cwd: string, base: string, head: string, signal?: AbortSignal): Promise<string[]> {
 		return splitLines(await runText(cwd, ["rev-list", "--reverse", `${base}..${head}`], { readOnly: true, signal }));
 	},
+	/** Commits reachable from `ref` that touched `file`, newest first, capped at `limit`. */
+	async touching(cwd: string, ref: string, file: string, limit: number, signal?: AbortSignal): Promise<string[]> {
+		return splitLines(
+			await runText(cwd, ["rev-list", `--max-count=${limit}`, ref, "--", file], { readOnly: true, signal }),
+		);
+	},
 };
 
 // ════════════════════════════════════════════════════════════════════════════

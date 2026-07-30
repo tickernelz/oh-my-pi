@@ -46,6 +46,7 @@ function createHost(
 	return {
 		agent: undefined as never,
 		sessionManager: undefined as never,
+		persistedAssistantEntryId: () => undefined,
 		settings,
 		modelRegistry,
 		configWarnings: [],

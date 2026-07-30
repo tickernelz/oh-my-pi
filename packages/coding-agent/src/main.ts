@@ -42,7 +42,7 @@ import {
 	type ScopedModel,
 } from "./config/model-resolver";
 import { ModelsConfigFile } from "./config/models-config";
-import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
+import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
 import { initializeWithSettings } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
@@ -91,14 +91,7 @@ import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
-import {
-	getChangelogPath,
-	parseChangelog,
-	parseChangelogVersion,
-	readLastChangelogVersion,
-	selectStartupChangelog,
-	writeLastChangelogVersion,
-} from "./utils/changelog";
+import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
@@ -402,7 +395,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
-	changelogMarkdown: string | undefined,
+	startupChangelog: StartupChangelogSelection | undefined,
 	notifs: (InteractiveModeNotify | null)[],
 	versionCheckPromise: Promise<string | undefined>,
 	initialMessages: string[],
@@ -420,7 +413,7 @@ async function runInteractiveMode(
 	const mode = new InteractiveMode(
 		session,
 		version,
-		changelogMarkdown,
+		startupChangelog,
 		setExtensionUIContext,
 		lspServers,
 		mcpManager,
@@ -666,33 +659,19 @@ async function resolveScopedModels(
 	);
 }
 
-async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
+async function getChangelogForDisplay(
+	parsed: Args,
+	mode: SettingValue<"startup.changelogMode">,
+): Promise<StartupChangelogSelection | undefined> {
 	if (parsed.continue || parsed.resume || isForeignSessionImport(parsed)) {
 		return undefined;
 	}
 
-	const lastVersion = await readLastChangelogVersion();
-	const parsedLastVersion = parseChangelogVersion(lastVersion);
-	if (!parsedLastVersion) {
-		await writeLastChangelogVersion(VERSION);
-		return undefined;
-	}
-	if (lastVersion === VERSION) {
-		// Steady state: user already saw the current version's changelog. Skip the file read + parse.
-		return undefined;
-	}
-
-	const changelogPath = getChangelogPath();
-	const entries = await parseChangelog(changelogPath);
-	const startupChangelog = selectStartupChangelog(entries, lastVersion, VERSION);
-	if (startupChangelog.persistCurrentVersion) {
-		await writeLastChangelogVersion(VERSION);
-	}
-	if (startupChangelog.markdown) {
-		return startupChangelog.markdown;
-	}
-
-	return undefined;
+	return resolveStartupChangelogForDisplay({
+		mode,
+		currentVersion: VERSION,
+		changelogPath: getChangelogPath(),
+	});
 }
 
 const SESSION_ID_ARG_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1654,7 +1633,12 @@ export async function runRootCommand(
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
-			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
+			const startupChangelog = await logger.time(
+				"main:getChangelogForDisplay",
+				getChangelogForDisplay,
+				parsedArgs,
+				settingsInstance.get("startup.changelogMode"),
+			);
 
 			const modelScopeNotification = buildModelScopeNotification(
 				scopedModels,
@@ -1679,7 +1663,7 @@ export async function runRootCommand(
 			await runInteractiveMode(
 				session,
 				VERSION,
-				changelogMarkdown,
+				startupChangelog,
 				notifs,
 				versionCheckPromise,
 				initialArgs.messages,

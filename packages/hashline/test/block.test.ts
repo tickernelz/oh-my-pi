@@ -140,19 +140,19 @@ describe("resolveBlockEdits", () => {
 		expect(error?.message).not.toContain("\n\n");
 	});
 
-	it("fires onResolved with the resolved span for replace and delete blocks", () => {
+	it("fires onResolved with the resolved span for replace and cut blocks", () => {
 		const seen: BlockResolution[] = [];
 		// stubResolver maps line N → span [N, N+1].
 		resolveBlockEdits(parsePatch("SWAP.BLK 2:\n+A\n+B").edits, "ignored", PATH, stubResolver, {
 			onResolved: resolution => seen.push(resolution),
 		});
-		resolveBlockEdits(parsePatch("DEL.BLK 5").edits, "ignored", PATH, stubResolver, {
+		resolveBlockEdits(parsePatch("CUT.BLK 5").edits, "ignored", PATH, stubResolver, {
 			onResolved: resolution => seen.push(resolution),
 		});
 
 		expect(seen).toEqual([
 			{ anchorLine: 2, start: 2, end: 3, op: "replace" },
-			{ anchorLine: 5, start: 5, end: 6, op: "delete" },
+			{ anchorLine: 5, start: 5, end: 6, op: "cut" },
 		]);
 	});
 
@@ -305,11 +305,11 @@ describe("Patcher with a block resolver", () => {
 	});
 });
 
-describe("DEL.BLK", () => {
+describe("CUT.BLK", () => {
 	const text = "function x() {\n  if (y) {\n  }\n}\n";
 
-	it("parses `DEL.BLK N` into a block edit with no payloads", () => {
-		const { edits } = parsePatch("DEL.BLK 2");
+	it("parses `CUT.BLK N` into a cut block edit", () => {
+		const { edits } = parsePatch("CUT.BLK 2");
 
 		expect(edits).toHaveLength(1);
 		const edit = edits[0];
@@ -317,38 +317,38 @@ describe("DEL.BLK", () => {
 		if (edit?.kind !== "block") throw new Error("expected a block edit");
 		expect(edit.anchor.line).toBe(2);
 		expect(edit.payloads).toEqual([]);
+		expect(edit.mode).toBe("cut");
 	});
 
-	it("rejects body rows under `DEL.BLK N`", () => {
-		expect(() => parsePatch("DEL.BLK 2\n+X")).toThrow("`DEL.BLK N` does not take body rows");
+	it("rejects body rows under `CUT.BLK N`", () => {
+		expect(() => parsePatch("CUT.BLK 2\n+X")).toThrow("`CUT N.=M` captures + deletes lines");
 	});
 
-	it("resolveBlockEdits expands a delete-block edit into pure deletes", () => {
-		const edits = parsePatch("DEL.BLK 2").edits;
-		const resolved = resolveBlockEdits(edits, "ignored", PATH, stubResolver);
+	it("resolveBlockEdits expands a cut block into capture and deletes", () => {
+		const resolved = resolveBlockEdits(parsePatch("CUT.BLK 2").edits, "ignored", PATH, stubResolver);
 
-		expect(resolved.every(edit => edit.kind === "delete")).toBe(true);
-		expect(resolved.map(edit => (edit.kind === "delete" ? edit.anchor.line : -1))).toEqual([2, 3]);
+		expect(resolved.map(edit => edit.kind)).toEqual(["cut", "delete", "delete"]);
+		expect(resolved.flatMap(edit => (edit.kind === "delete" ? [edit.anchor.line] : []))).toEqual([2, 3]);
 	});
 
 	it("applyTo deletes the resolved block span", () => {
-		const section = Patch.parseSingle(`[${PATH}#1A2B]\nDEL.BLK 2`);
+		const section = Patch.parseSingle(`[${PATH}#1A2B]\nCUT.BLK 2`);
 		// stub span [2,3] → drop "  if (y) {" and "  }".
 		expect(section.applyTo(text, stubResolver).text).toBe("function x() {\n}\n");
 	});
 
-	it("applyPartialTo drops an unresolvable delete-block edit instead of throwing", () => {
-		const section = Patch.parseSingle(`[${PATH}#1A2B]\nDEL.BLK 2`);
+	it("applyPartialTo drops an unresolvable cut-block edit", () => {
+		const section = Patch.parseSingle(`[${PATH}#1A2B]\nCUT.BLK 2`);
 		expect(section.applyPartialTo(text).text).toBe(text);
 	});
 
-	it("Patcher applies a delete-block edit on the hash-match path", async () => {
+	it("Patcher applies a cut-block edit on the hash-match path", async () => {
 		const fs = new InMemoryFilesystem([[PATH, text]]);
 		const snapshots = new InMemorySnapshotStore();
 		const tag = snapshots.record(PATH, text);
 		const patcher = new Patcher({ fs, snapshots, blockResolver: stubResolver });
 
-		const result = await patcher.apply(Patch.parse(`[${PATH}#${tag}]\nDEL.BLK 2`));
+		const result = await patcher.apply(Patch.parse(`[${PATH}#${tag}]\nCUT.BLK 2`));
 
 		expect(result.sections[0]?.op).toBe("update");
 		expect(fs.get(PATH)).toBe("function x() {\n}\n");

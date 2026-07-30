@@ -22,7 +22,7 @@ import {
 	type Usage,
 	withAuth,
 } from "@oh-my-pi/pi-ai";
-import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { convertTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildResponsesInput, resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
@@ -43,6 +43,7 @@ import {
 	V2_RETAINED_MESSAGE_TOKEN_BUDGET,
 } from "./compaction-v2-streaming";
 import type { CompactionEntry, SessionEntry } from "./entries";
+import { NativeCompactionError } from "./errors";
 import { isEstimateCacheable, readEstimateCache, writeEstimateCache } from "./message-cache";
 import { type ConvertToLlm, createBranchSummaryMessage, createCustomMessage, defaultConvertToLlm } from "./messages";
 import {
@@ -201,6 +202,18 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	remoteStreamingV2Enabled: true,
 	v2RetainedMessageBudget: V2_RETAINED_MESSAGE_TOKEN_BUDGET,
 };
+
+/** Whether a compaction candidate preserves provider-native transport under the effective settings. */
+export function shouldUseProviderNativeCompaction(
+	model: Model,
+	settings: Pick<CompactionSettings, "remoteEnabled" | "remoteStreamingV2Enabled">,
+): boolean {
+	if (settings.remoteEnabled === false) return false;
+	return (
+		shouldUseOpenAiRemoteCompaction(model) ||
+		(settings.remoteStreamingV2Enabled !== false && shouldUseCompactionV2Streaming(model))
+	);
+}
 
 // ============================================================================
 // Token calculation
@@ -725,7 +738,9 @@ function resolveCompactionEffort(model: Model, level: ThinkingLevel | undefined)
  */
 function createSummarizationError(prefix: string, response: AssistantMessage): Error {
 	const text = `${prefix}: ${response.errorMessage || "Unknown error"}`;
-	return response.errorStatus === undefined ? new Error(text) : new ProviderHttpError(text, response.errorStatus);
+	return response.errorStatus === undefined
+		? new Error(text)
+		: new AIError.ProviderHttpError(text, response.errorStatus);
 }
 
 function shouldRetryHandoffWithAutoToolChoice(response: AssistantMessage): boolean {
@@ -1333,6 +1348,17 @@ function buildCompactionV2Reasoning(
 }
 
 /**
+ * Keep any non-auth native protocol failure ahead of authentication failures.
+ * Downstream may retry compaction with another provider only when every native
+ * protocol failed authentication, so a later auth error must not hide an
+ * earlier transport or protocol failure.
+ */
+function selectNativeCompactionError(previousError: unknown, nextError: unknown): unknown {
+	if (previousError === undefined) return nextError;
+	return AIError.is(AIError.classify(previousError), AIError.Flag.AuthFailed) ? nextError : previousError;
+}
+
+/**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds id/parentId when saving.
  *
@@ -1406,6 +1432,7 @@ export async function compact(
 		...recentMessages,
 	];
 	let usedRemoteCompaction = false;
+	let nativeCompactionError: unknown;
 	if (
 		settings.remoteEnabled !== false &&
 		settings.remoteStreamingV2Enabled !== false &&
@@ -1467,7 +1494,8 @@ export async function compact(
 				// swallowing it here would downgrade Esc into "fall back to local
 				// summarization" and keep compaction running on an aborted signal.
 				if (signal?.aborted) throw err;
-				logger.warn("OpenAI V2 remote compaction failed, falling back to V1/local summarization", {
+				nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
+				logger.warn("OpenAI V2 remote compaction failed, falling back to V1 remote compaction", {
 					error: err instanceof Error ? err.message : String(err),
 					model: model.id,
 					provider: model.provider,
@@ -1517,13 +1545,18 @@ export async function compact(
 				// swallowing it here would downgrade Esc into "fall back to local
 				// summarization" and keep compaction running on an aborted signal.
 				if (signal?.aborted) throw err;
-				logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
+				nativeCompactionError = selectNativeCompactionError(nativeCompactionError, err);
+				logger.warn("OpenAI remote compaction failed", {
 					error: err instanceof Error ? err.message : String(err),
 					model: model.id,
 					provider: model.provider,
 				});
 			}
 		}
+	}
+
+	if (!usedRemoteCompaction && nativeCompactionError !== undefined && !summaryOptions.remoteEndpoint) {
+		throw new NativeCompactionError(nativeCompactionError);
 	}
 
 	// Generate summaries (can be parallel if both needed) and merge into one

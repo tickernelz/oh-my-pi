@@ -22,7 +22,8 @@ build --@rules_rust//rust/toolchain/channel=nightly
 
 # --- Rust validation (replaces cargo clippy/nextest in CI) --------------------
 # Mirrors cargo semantics: crates with `[lints] workspace = true` (pi-ast,
-# pi-iso, pi-natives, pi-shell, pi-walker) get the strict workspace policy
+# pi-iso, pi-natives, pi-shell, pi-voice, pi-walker) get the strict workspace
+# policy
 # (clippy-strict; bazel/clippy.bazelrc is generated from Cargo.toml); everything
 # else gets default clippy + -Dwarnings (clippy).
 build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect

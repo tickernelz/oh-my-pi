@@ -393,6 +393,8 @@ Twenty-five backends. Pin one, or let `auto` walk the chain in order.
 | `mojeek`     | no key (browser)       |
 | `public`     | no key (all of the above, consolidated) |
 
+Exa also accepts a stored API key through `/login exa`; explicit keyless selection uses the public MCP fallback.
+
 ### Specialised handlers
 
 The agent gets structured content, not stripped HTML.

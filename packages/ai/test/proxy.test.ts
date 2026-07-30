@@ -61,7 +61,6 @@ async function waitForSocketClose(socket: net.Socket): Promise<void> {
 	socket.once("close", () => closed.resolve());
 	await closed.promise;
 }
-
 const isProxyEnvKey = (k: string): boolean =>
 	k.startsWith("PI_PROXY") ||
 	k === "HTTP_PROXY" ||
