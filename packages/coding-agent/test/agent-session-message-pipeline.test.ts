@@ -28,7 +28,7 @@ import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/typ
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
-import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent, lcmCueTerms } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	convertToLlm,
@@ -1701,6 +1701,61 @@ describe("AgentSession message pipeline", () => {
 			controller.abort(queuedAbort);
 			await Promise.allSettled([first, second]);
 		}
+	});
+
+	it("adds no cue when no lossless projection owns the request", async () => {
+		const session = createLcmCompletionSession(() => {
+			throw new Error("primary stream must not run");
+		});
+		const input: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "deployment rollback checklist question" }], timestamp: 1 },
+		];
+		// Cues are gated on ownership: compaction is disabled here, so LCM returns the native array
+		// untouched and no `developer` block may appear even though the setting defaults to on.
+		expect(session.settings.get("context.lossless.retrievalCues")).toBe(true);
+		const projected = await session.projectLcmContext(input);
+		expect(projected).toBe(input);
+		expect(projected.some(message => message.role === "developer")).toBe(false);
+	});
+
+	it("builds cue terms from user text only, across scripts, ignoring image parts", () => {
+		// Image parts must never reach the query; stringifying one would send base64 to FTS.
+		expect(
+			lcmCueTerms([
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "which deployment rollback checklist did we approve" },
+						{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+					],
+					timestamp: 1,
+				},
+			]),
+		).toEqual(["deployment", "checklist", "rollback"]);
+
+		// A Unicode-aware split is required: an ASCII-only one returns nothing for non-Latin text.
+		expect(
+			lcmCueTerms([
+				{ role: "user", content: [{ type: "text", text: "kenapa proyeksi belum dievaluasi" }], timestamp: 1 },
+			]),
+		).toEqual(["dievaluasi", "proyeksi", "kenapa"]);
+		expect(
+			lcmCueTerms([{ role: "user", content: [{ type: "text", text: "配置文件 已经 更新" }], timestamp: 1 }]),
+		).toEqual(["配置文件"]);
+
+		// Only the newest user message matters; stopwords and short tokens are dropped.
+		expect(
+			lcmCueTerms([
+				{ role: "user", content: [{ type: "text", text: "stale earlier question" }], timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "that with them" }], timestamp: 2 },
+			]),
+		).toEqual([]);
+		expect(lcmCueTerms([{ ...createAssistantMessage("no user here"), timestamp: 1 }])).toEqual([]);
+		expect(lcmCueTerms([{ role: "user", content: "plain string content works", timestamp: 1 }])).toEqual([
+			"content",
+			"string",
+			"plain",
+		]);
 	});
 
 	it("runs LCM before extensions only on the primary provider path", async () => {

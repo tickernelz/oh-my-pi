@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `context.lossless.retrievalCues` (default on). Each turn where a lossless projection owns the request, up to three short breadcrumbs from compacted history matching the newest request are injected as one ephemeral `developer` block immediately before the latest user message. Cues carry an executable `lcm-handle:v1:` token plus a 240-character excerpt — never expanded content — and anything already present in the projection is filtered out, so nothing is added when history holds no unseen match. The block never enters the journal, and a failed lookup logs at debug and yields no cue rather than failing the turn.
+- Added `context.lossless.leafChunkTokens` (Fine 4,000 / Balanced 8,000, default 4,000), which sets how much history one leaf node covers; sources per leaf scale with it, holding the measured 24-sources-per-4,000-tokens ratio. The value is read when a store is opened, so it applies to leaves formed after a restart while existing coverage keeps the size it was built with until a project rebuild. It was previously a fixed constant that only the benchmark could override.
+- Added `context.lossless.freshTailSources` (Standard 32 / Extended 64, default 32), the number of newest journal entries kept verbatim instead of being replaced by a projected node. A tool call and its result are separate entries, so 32 entries is roughly 16 exchanges; the existing token allowance still caps the tail, and a longer tail adds those raw tokens to every request.
+
+### Changed
+
+- `/lcm status` now explains why a projection has not run instead of reporting a bare `unevaluated`. A new `Engagement:` line shows both gates the control loop actually uses — background arming compares `max(live request, branch total)` against the prewarm threshold, while takeover compares the live request alone against the hard threshold — and the projection line distinguishes standing down below prewarm, building summaries in the background, and waiting on the current revision. Previously a healthy session that had just been compacted reported `WARMING` plus `unevaluated` with no number to explain it, because a native compaction shrinks the live request below the takeover point while the branch total keeps growing; the displayed `source tokens` was the branch total, never the value the decision reads. The project-wide job counts are now labelled `All branches in this project:` so they are not read as a backlog for the current session.
+
 ## [17.2.0] - 2026-07-30
 
 ### Breaking Changes

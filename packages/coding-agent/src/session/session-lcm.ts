@@ -60,6 +60,8 @@ const SUMMARY_RETRY_DELAY_MS = 2_000;
 const SUMMARY_RETRY_AFTER_MAX_MS = 24 * 60 * 60_000;
 const SUMMARY_MAX_OUTPUT_TOKENS = 2_048;
 const HARD_PROJECTION_WAIT_MS = 60_000;
+/** Mirrors `lcm-context`'s unexported `DEFAULT_LEAF_MAX_TOKENS`; the adapter must name its own default. */
+const DEFAULT_LEAF_CHUNK_TOKENS = 4_000;
 /** The project store is shared across processes and peer completions raise no local signal. */
 const PEER_PROGRESS_POLL_MS = 1_000;
 const SQLITE_CONTENTION_DELAYS_MS = [100, 200, 400] as const;
@@ -133,6 +135,11 @@ export function normalizeLcmHardProjectionWaitMs(value: unknown): number {
 		: HARD_PROJECTION_WAIT_MS;
 }
 
+/** Leaf chunk sizes are clamped to measured presets: an arbitrary value has no benchmark behind it. */
+export function normalizeLcmLeafChunkTokens(value: unknown): number {
+	return value === 8_000 ? 8_000 : DEFAULT_LEAF_CHUNK_TOKENS;
+}
+
 export interface LcmProjectionAggregate {
 	revision: number;
 	sourceTokens: number;
@@ -156,9 +163,21 @@ export interface LcmCurrentBranchStatus {
 	projection?: LcmProjectionAggregate;
 }
 
+/** One arming-decision sample: the two token measures and the two thresholds they are judged against. */
+export interface LcmProjectionPressure {
+	/** Live request estimate. Shrinks on native compaction; decides takeover. */
+	requestTokens: number;
+	/** `max(requestTokens, branch total)`. Only grows; decides whether LCM engages at all. */
+	armTokens: number;
+	prewarmThresholdTokens: number;
+	hardThresholdTokens: number;
+}
+
 export interface LcmRuntimeStatus {
 	phase: LcmRuntimePhase;
 	summaryWorkers: { active: number; limit: number };
+	/** Live request pressure sampled at the most recent projection attempt. Absent before the first one. */
+	pressure?: LcmProjectionPressure;
 	summaryBackoff?: { preferred?: number; fallback?: number };
 	summaryModelSelector?: string;
 	resolvedSummaryModel?: string;
@@ -251,6 +270,7 @@ export interface SessionLcmOptions {
 	summaryModel?: string;
 	maxConcurrentSummaries?: number;
 	hardProjectionWaitMs?: number;
+	leafChunkTokens?: number;
 	registerProject?: (project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>;
 	dependencies?: SessionLcmDependencies;
 }
@@ -309,6 +329,8 @@ type SummaryWorkerOutcome =
 
 interface ProjectionRequest {
 	limits: LcmProjectionLimits;
+	/** `max(live request, branch total)` as evaluated when LCM armed; see `#attemptProjection`. */
+	armTokens: number;
 }
 
 function collectArtifactRefs(value: unknown, refs: Set<string>, depth = 0): void {
@@ -803,6 +825,7 @@ export class SessionLcm {
 	readonly #agentDir: string | undefined;
 	#summaryModel: string | undefined;
 	#maxConcurrentSummaries: number;
+	#leafChunkTokens: number;
 	readonly #openContext: typeof openLcmContext;
 	readonly #resolveProject: typeof resolveLcmProject;
 	readonly #registerProject:
@@ -837,6 +860,12 @@ export class SessionLcm {
 	#summaryProgressVersion = 0;
 	#summaryProgressSignal = Promise.withResolvers<void>();
 	#lastProjectionRequest: ProjectionRequest | undefined;
+	/**
+	 * Observation-only sample of the last arming decision. Separate from
+	 * `#lastProjectionRequest` because that field also gates scheduling and phase selection,
+	 * while this one must record a below-prewarm stand-down too.
+	 */
+	#lastPressure: LcmProjectionPressure | undefined;
 	#projectionAttempt = 0;
 	#summaryWakeTimer: NodeJS.Timeout | undefined;
 	#summaryWakeAt: number | undefined;
@@ -861,6 +890,7 @@ export class SessionLcm {
 		this.#summaryModel =
 			typeof options.summaryModel === "string" ? options.summaryModel.trim() || undefined : undefined;
 		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
+		this.#leafChunkTokens = normalizeLcmLeafChunkTokens(options.leafChunkTokens);
 		this.#openContext = options.dependencies?.openContext ?? openLcmContext;
 		this.#resolveProject = options.dependencies?.resolveProject ?? resolveLcmProject;
 		this.#registerProject = options.registerProject;
@@ -888,6 +918,8 @@ export class SessionLcm {
 		if (nextModel !== this.#summaryModel) this.#resolvedSummaryModel = undefined;
 		this.#summaryModel = nextModel;
 		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
+		// `leafChunkTokens` is deliberately absent: the store bakes `leafChunk` in at open time and
+		// existing spans were built under the old chunking, so a live change would mix policies.
 		if (!this.#hardWaitFixed) this.#hardWaitMs = normalizeLcmHardProjectionWaitMs(options.hardProjectionWaitMs);
 		this.#signalSummaryCapacity();
 		if (this.#context) this.#startSummaryJobs();
@@ -910,6 +942,7 @@ export class SessionLcm {
 		return {
 			phase: this.#runtimePhase,
 			summaryWorkers: { active: this.#activeSummaryJobs.size, limit: this.#maxConcurrentSummaries },
+			...(this.#lastPressure ? { pressure: this.#lastPressure } : {}),
 			...(preferred === undefined && fallback === undefined
 				? {}
 				: {
@@ -1227,6 +1260,12 @@ export class SessionLcm {
 				dbPath: project.storePath,
 				recoverCorrupt: true,
 				regexEngine: NATIVE_REGEX_ENGINE,
+				// 24 sources per 4,000 tokens is the ratio the tuning matrix measured; holding it
+				// keeps a coarser chunk from also changing how many sources each leaf spans.
+				leafChunk: {
+					maxTokens: this.#leafChunkTokens,
+					maxSources: (this.#leafChunkTokens / DEFAULT_LEAF_CHUNK_TOKENS) * 24,
+				},
 			});
 		} catch (error) {
 			logger.warn("LCM store open failed; using native context", { error: errorLabel(error) });
@@ -2012,6 +2051,7 @@ export class SessionLcm {
 		const attempt = ++this.#projectionAttempt;
 		const isCurrent = (): boolean => attempt === this.#projectionAttempt && !this.#disposed;
 		this.#lastProjectionRequest = undefined;
+		this.#lastPressure = undefined;
 		this.#invalidateProjectionForRequest();
 		const limits = this.#host.projectionLimits(messages);
 		if (!limits) return native;
@@ -2019,6 +2059,14 @@ export class SessionLcm {
 		// cover only grows, so arming reads whichever is larger. Ownership below still
 		// reads the live request, which is what actually overflows.
 		const armTokens = Math.max(limits.sourceTokens, this.#currentBranch?.sourceTokens ?? 0);
+		// Recorded before the arming gate so `/lcm status` can distinguish a deliberate
+		// stand-down from never having measured anything.
+		this.#lastPressure = {
+			requestTokens: limits.sourceTokens,
+			armTokens,
+			prewarmThresholdTokens: limits.prewarmThresholdTokens,
+			hardThresholdTokens: limits.hardThresholdTokens,
+		};
 		if (armTokens < limits.prewarmThresholdTokens) return native;
 		// Strictly greater, matching native `shouldCompact`: at exact equality native
 		// leaves the request alone, so blocking the turn for a projection would be waste.
@@ -2029,7 +2077,7 @@ export class SessionLcm {
 		}
 
 		this.#summaryRetryDeferred = false;
-		this.#lastProjectionRequest = { limits };
+		this.#lastProjectionRequest = { limits, armTokens };
 		if (this.#runtimePhase !== "active") {
 			this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
 		}
@@ -2113,6 +2161,7 @@ export class SessionLcm {
 		this.#pendingFallbackCategory = undefined;
 		this.#preferredUnfit = false;
 		this.#lastProjectionRequest = undefined;
+		this.#lastPressure = undefined;
 		this.#runtimePhase = "idle";
 		this.#clearActiveBranch();
 		const drain = this.#summaryTask;
@@ -2259,6 +2308,22 @@ export class SessionLcm {
 		});
 	}
 
+	/**
+	 * Cue-path search. Deliberately skips the reconcile `search` performs: the caller runs inside a
+	 * turn that just projected, so reconciling again would repeat that work on every provider call.
+	 * Scope still comes only from the active branch, never from an argument.
+	 */
+	async searchProjected(query: string, limit: number, expectedRevision: number): Promise<SearchHit[]> {
+		return this.#enqueue(() => {
+			const context = this.#context;
+			const scope = this.#activeBranch?.snapshot.scope;
+			// A reconcile between the projection and this call would leave the cue describing a
+			// revision the request no longer contains.
+			if (!context || !scope || this.#currentBranch?.revision !== expectedRevision) return [];
+			return context.search({ ...scope, query, limit, mode: "text" });
+		});
+	}
+
 	async describe(handle: LcmHandle): Promise<LcmDescription | null> {
 		if (!(await this.#requestReconcile(true))) return null;
 		const resolved = await this.#enqueue(() => {
@@ -2390,6 +2455,8 @@ export class SessionLcm {
 			this.#context = undefined;
 			this.#project = undefined;
 			this.#clearActiveBranch();
+			this.#lastProjectionRequest = undefined;
+			this.#lastPressure = undefined;
 			if (summaryRejected) throw summaryError;
 		})();
 		return this.#closeTask;

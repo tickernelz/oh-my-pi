@@ -2204,6 +2204,69 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"context.lossless.leafChunkTokens": {
+		type: "number",
+		default: 4_000,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Leaf Chunk Tokens",
+			description:
+				"How much history one leaf node covers before a new one starts. Coarser chunks mean fewer background jobs for new history, at the cost of coarser retrieval granularity. Applies to leaves formed after a restart; existing coverage keeps the size it was built with until a project rebuild.",
+			options: [
+				{
+					value: "4000",
+					label: "Fine",
+					description: "24 sources per leaf; preserves previous behavior.",
+				},
+				{
+					value: "8000",
+					label: "Balanced",
+					description: "48 sources per leaf; roughly halves the number of leaf jobs.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.freshTailSources": {
+		type: "number",
+		default: 32,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Fresh Tail Sources",
+			description:
+				"How many of the most recent journal entries stay verbatim instead of being replaced by a projected node. A tool call and its result are separate entries, so 32 entries is roughly 16 exchanges. The token allowance still caps the tail, and a longer tail adds those raw tokens to every request.",
+			options: [
+				{
+					value: "32",
+					label: "Standard",
+					description: "Roughly 16 recent exchanges; preserves previous behavior.",
+				},
+				{
+					value: "64",
+					label: "Extended",
+					description: "Roughly twice the verbatim tail, paid for on every request.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.retrievalCues": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Retrieval Cues",
+			description:
+				"Each turn, surface up to three short breadcrumbs from compacted history that match the latest request, so the model can tell what it no longer sees. Cues are excerpts with handles, never expanded content, and nothing is added when history holds no match.",
+			condition: "losslessContextActive",
+		},
+	},
+
 	"context.lossless.trackFileAboveTokens": {
 		type: "number",
 		default: 25_000,

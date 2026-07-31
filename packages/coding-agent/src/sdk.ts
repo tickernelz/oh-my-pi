@@ -3325,6 +3325,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
 				maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
 				hardProjectionWaitMs: settings.get("context.lossless.hardProjectionWaitMs"),
+				leafChunkTokens: settings.get("context.lossless.leafChunkTokens"),
 				registerProject: async (project, journal) => {
 					await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
 				},

@@ -169,7 +169,12 @@ export interface AgentSessionConfig {
 	/** LCM capability and construction options; the effective context engine controls its live lifecycle. */
 	lcm?: Pick<
 		SessionLcmOptions,
-		"agentDir" | "summaryModel" | "maxConcurrentSummaries" | "hardProjectionWaitMs" | "registerProject"
+		| "agentDir"
+		| "summaryModel"
+		| "maxConcurrentSummaries"
+		| "hardProjectionWaitMs"
+		| "leafChunkTokens"
+		| "registerProject"
 	>;
 	/** Provider request transform applied after message conversion. */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;

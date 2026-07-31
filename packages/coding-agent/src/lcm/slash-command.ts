@@ -97,14 +97,14 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 			`Store: ${store.branches} branches, ${store.activeSources} active sources, ${store.tombstones} retained tombstones, ${store.leafSummaries + store.condensedSummaries} summary nodes`,
 		);
 		lines.push(
-			`Project jobs: ${store.jobs.pending} pending, ${store.jobs.leased} running, ${store.jobs.failed} failed, ${store.jobs.completed} completed, ${store.jobs.obsolete} obsolete`,
+			`All branches in this project: ${store.jobs.pending} pending, ${store.jobs.leased} running, ${store.jobs.failed} failed, ${store.jobs.completed} completed, ${store.jobs.obsolete} obsolete`,
 		);
 		lines.push(
 			`Storage: ${formatBytes(store.storage.databaseBytes)} database, ${formatBytes(store.storage.walBytes)} WAL, ${formatBytes(store.storage.quarantineBytes)} quarantine`,
 		);
 	} else {
 		lines.push("SQLite WAL: not initialized");
-		lines.push("Project jobs: not initialized");
+		lines.push("All branches in this project: not initialized");
 	}
 	lines.push(
 		`Backoff: preferred until ${formatBackoff(runtime.summaryBackoff?.preferred)}; fallback until ${formatBackoff(runtime.summaryBackoff?.fallback)}`,
@@ -118,8 +118,24 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 		lines.push(
 			`Current branch: session ${safeOpaqueIdentifier(branch.sessionId)}; branch ${safeOpaqueIdentifier(branch.branchId)}; revision ${branch.revision}; ${branch.activeSources} active sources; ${branch.sourceTokens} source tokens`,
 		);
+		const pressure = runtime.pressure;
+		if (pressure) {
+			lines.push(
+				`Engagement: armed at ${pressure.armTokens} vs ${pressure.prewarmThresholdTokens} prewarm; takeover at ${pressure.requestTokens} vs ${pressure.hardThresholdTokens} hard`,
+			);
+		}
 		if (branch.projectionState === "unevaluated") {
-			lines.push("Projection: unevaluated for the current branch");
+			if (!pressure) {
+				lines.push("Projection: not evaluated yet; no projection attempt has run for this session");
+			} else if (pressure.requestTokens > pressure.hardThresholdTokens) {
+				lines.push("Projection: evaluation pending for the current revision");
+			} else if (pressure.armTokens < pressure.prewarmThresholdTokens) {
+				lines.push("Projection: not needed; below the prewarm threshold, so LCM is standing down");
+			} else {
+				lines.push(
+					"Projection: not needed yet; summaries are building in the background and LCM takes over once the live request passes the hard threshold",
+				);
+			}
 		} else if (branch.projectionState === "unfitted") {
 			lines.push(
 				`Projection: unfitted for the current request${branch.projection ? `; ${branch.projection.pendingJobs} relevant jobs pending` : ""}`,
@@ -146,6 +162,17 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 		lines.push("Derived store is quarantined; native compaction remains active.");
 	} else if (runtime.phase === "degraded") {
 		lines.push("Lossless projection is degraded; native compaction remains active.");
+	} else if (runtime.phase === "warming" && branch?.projectionState === "unevaluated") {
+		const pressure = runtime.pressure;
+		if (pressure && pressure.requestTokens > pressure.hardThresholdTokens) {
+			lines.push("Lossless projection is evaluating the current revision; native compaction stays ready meanwhile.");
+		} else if (pressure && pressure.armTokens >= pressure.prewarmThresholdTokens) {
+			lines.push(
+				"Lossless projection is building summaries in the background; it takes over at the hard threshold, not before.",
+			);
+		} else if (pressure) {
+			lines.push("Lossless projection is standing down: nothing is close to the prewarm threshold yet.");
+		}
 	}
 	if (store?.latestRecovery) {
 		lines.push(

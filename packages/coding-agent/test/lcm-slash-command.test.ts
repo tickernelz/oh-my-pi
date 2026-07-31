@@ -281,10 +281,48 @@ describe("/lcm slash command", () => {
 		expect(idle.output[0]).toContain(
 			"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",
 		);
-		expect(idle.output[0]).toContain("Projection: unevaluated for the current branch");
+		expect(idle.output[0]).toContain("Projection: not evaluated yet; no projection attempt has run for this session");
 		expect(idle.output[0]).not.toContain("no fitted projection yet");
 		expect(degraded.output[0]).toContain("Projection: unfitted for the current request");
 		expect(active.output[0]).toContain("Projection: fitted to the current request");
+	});
+
+	it("explains an unevaluated projection differently for each engagement gate", async () => {
+		const thresholds = { prewarmThresholdTokens: 340_000, hardThresholdTokens: 850_000 };
+		const cases = [
+			{
+				name: "stood down",
+				pressure: { requestTokens: 100_000, armTokens: 100_000, ...thresholds },
+				expected: "Projection: not needed; below the prewarm threshold, so LCM is standing down",
+				closing: "Lossless projection is standing down: nothing is close to the prewarm threshold yet.",
+			},
+			{
+				// Arming reads max(request, branch total), so a compacted request stays armed.
+				name: "armed below takeover",
+				pressure: { requestTokens: 100_000, armTokens: 947_669, ...thresholds },
+				expected: "Projection: not needed yet; summaries are building in the background",
+				closing: "Lossless projection is building summaries in the background;",
+			},
+			{
+				name: "past takeover",
+				pressure: { requestTokens: 900_000, armTokens: 947_669, ...thresholds },
+				expected: "Projection: evaluation pending for the current revision",
+				closing: "Lossless projection is evaluating the current revision;",
+			},
+		];
+
+		for (const item of cases) {
+			const status = statusFor("warming");
+			status.runtime.pressure = item.pressure;
+			const harness = createRuntime(agentDir, { status });
+			await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+			const output = harness.output[0] as string;
+			expect(output, item.name).toContain(item.expected);
+			expect(output, item.name).toContain(
+				`Engagement: armed at ${item.pressure.armTokens} vs 340000 prewarm; takeover at ${item.pressure.requestTokens} vs 850000 hard`,
+			);
+			if (item.closing) expect(output, item.name).toContain(item.closing);
+		}
 	});
 
 	it("renders disabled workers and an unopened project exactly", async () => {
@@ -297,7 +335,7 @@ describe("/lcm slash command", () => {
 				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
 				"Workers: 0/0 active",
 				"SQLite WAL: not initialized",
-				"Project jobs: not initialized",
+				"All branches in this project: not initialized",
 				"Backoff: preferred until none; fallback until none",
 				"Current branch: not initialized",
 				"Projection: unevaluated; no active branch",
@@ -311,7 +349,9 @@ describe("/lcm slash command", () => {
 
 		expect(harness.output[0]).toContain("LCM status: DEGRADED");
 		expect(harness.output[0]).toContain("Workers: 0/4 active");
-		expect(harness.output[0]).toContain("Project jobs: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete");
+		expect(harness.output[0]).toContain(
+			"All branches in this project: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
+		);
 		expect(harness.output[0]).toContain("Backoff: preferred until 2030-03-17T17:46:40.000Z; fallback until none");
 		expect(harness.output[0]).toContain("Lossless projection is degraded; native compaction remains active.");
 	});
@@ -328,7 +368,7 @@ describe("/lcm slash command", () => {
 				"Workers: 2/4 active",
 				"SQLite WAL: enabled; schema: 6",
 				"Store: 2 branches, 9 active sources, 1 retained tombstones, 3 summary nodes",
-				"Project jobs: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
+				"All branches in this project: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
 				"Storage: 10.0KB database, 2.0KB WAL, 512B quarantine",
 				"Backoff: preferred until none; fallback until 2030-03-17T17:46:40.000Z",
 				"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",

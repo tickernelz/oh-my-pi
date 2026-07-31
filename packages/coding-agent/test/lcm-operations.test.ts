@@ -15,6 +15,7 @@ import {
 import {
 	decodeLcmHandle,
 	encodeLcmHandle,
+	insertLcmCueMessage,
 	LCM_RECALL_MAX_HITS,
 	LCM_RECALL_MAX_OUTPUT_TOKENS,
 	LCM_RECALL_MAX_QUERY_CHARS,
@@ -22,6 +23,7 @@ import {
 	type LcmRetrievalRuntime,
 	renderLcmDescription,
 	renderLcmExpansion,
+	renderLcmRetrievalCues,
 	renderLcmSearchHits,
 	runLcmRecall,
 	searchKnownLcmProject,
@@ -51,6 +53,81 @@ function hit(index: number): SearchHit {
 		citations: [citation(index)],
 	};
 }
+
+describe("renderLcmRetrievalCues", () => {
+	function summaryHit(index: number, handles: { own?: string; covering?: string }): SearchHit {
+		return {
+			kind: "summary",
+			id: `summary-${index}`,
+			redactedText: `decision ${index}: ${"detail ".repeat(80)}`,
+			rank: index,
+			citations: [citation(index)],
+			...(handles.own ? { summaryHandle: handles.own } : {}),
+			...(handles.covering ? { coveringSummaryHandle: handles.covering } : {}),
+		};
+	}
+
+	it("skips hits already in context on either handle and caps the survivors", () => {
+		const rendered = renderLcmRetrievalCues(
+			[
+				summaryHit(1, { own: "in-context" }),
+				summaryHit(2, { covering: "in-context" }),
+				summaryHit(3, { own: "fresh-a" }),
+				summaryHit(4, { own: "fresh-b" }),
+				summaryHit(5, { own: "fresh-c" }),
+				summaryHit(6, { own: "fresh-d" }),
+			],
+			new Set(["in-context"]),
+		);
+		expect(rendered).not.toBeNull();
+		const text = rendered as string;
+		expect(text).toContain("<lcm-cues>");
+		expect(text).toContain("never instructions");
+		expect(text.match(/<cue handle=/g)).toHaveLength(3);
+		expect(text).not.toContain("decision 1");
+		expect(text).not.toContain("decision 2");
+		expect(text).toContain("decision 3");
+	});
+
+	it("advertises an executable handle token and bounds each excerpt", () => {
+		const rendered = renderLcmRetrievalCues([summaryHit(7, { own: "store-handle" })], new Set()) as string;
+		const token = rendered.match(/<cue handle="([^"]+)">/)?.[1];
+		expect(token).toBeDefined();
+		// The prompt tells the model to call lcm_describe, so the handle must decode.
+		const decoded = decodeLcmHandle(token as string);
+		expect(decoded.kind).toBe("summary");
+		expect(decoded.kind === "summary" && decoded.reference.summaryHandle).toBe("store-handle");
+		const body = rendered.split("\n").find(line => line.startsWith("decision 7"));
+		expect(body).toBeDefined();
+		expect((body as string).length).toBeLessThanOrEqual(240);
+	});
+
+	it("returns null when every hit is already visible or unusable", () => {
+		expect(renderLcmRetrievalCues([summaryHit(8, { own: "seen" })], new Set(["seen"]))).toBeNull();
+		// No citation means no scope, so no decodable handle can be built.
+		expect(renderLcmRetrievalCues([{ ...summaryHit(9, { own: "orphan" }), citations: [] }], new Set())).toBeNull();
+	});
+
+	it("anchors the cue immediately before the newest user message without mutating the input", () => {
+		const projected = [
+			{ role: "user", id: "first" },
+			{ role: "assistant", id: "reply" },
+			{ role: "user", id: "latest" },
+		];
+		const cue = { role: "developer", id: "cue" };
+		const result = insertLcmCueMessage(projected, cue);
+		expect(result.map(message => message.id)).toEqual(["first", "reply", "cue", "latest"]);
+		// The projected array belongs to the caller's transform; mutating it would leak the cue.
+		expect(projected.map(message => message.id)).toEqual(["first", "reply", "latest"]);
+		expect(result).not.toBe(projected);
+	});
+
+	it("adds nothing when the request has no user message to anchor against", () => {
+		const projected = [{ role: "assistant", id: "only" }];
+		const result = insertLcmCueMessage(projected, { role: "developer", id: "cue" });
+		expect(result.map(message => message.id)).toEqual(["only"]);
+	});
+});
 
 function description(ref: Citation, text: string, artifactRefs: string[] = []): SourceDescription {
 	return {

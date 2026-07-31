@@ -602,6 +602,47 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
+	it("samples request pressure even when it stands down below prewarm", async () => {
+		const manager = SessionManager.inMemory("/pressure-sample");
+		appendUser(manager, "small", 1);
+		const { lcm } = createHarness(manager, undefined, undefined, undefined, () => ({
+			sourceTokens: 39,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		expect((await lcm.status()).runtime.pressure).toBeUndefined();
+		await lcm.project(manager.buildSessionContext().messages);
+		// Recorded despite the stand-down, and taken from the projection limits rather than
+		// the branch's own source-token total.
+		expect((await lcm.status()).runtime.pressure).toEqual({
+			requestTokens: 39,
+			armTokens: 39,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+		});
+		await lcm.close();
+		expect((await lcm.status()).runtime.pressure).toBeUndefined();
+	});
+
+	it("refuses a cue search whose expected revision no longer matches the branch", async () => {
+		const manager = SessionManager.inMemory("/cue-staleness");
+		appendUser(manager, "history", 1);
+		const context = new FakeLcmContext();
+		vi.spyOn(context, "search").mockReturnValue([
+			{ kind: "summary", id: "s1", summaryHandle: "h1", redactedText: "text", rank: 1, citations: [] },
+		]);
+		const { lcm } = createHarness(manager, context);
+		await lcm.project(manager.buildSessionContext().messages);
+		const revision = (await lcm.status()).runtime.currentBranch?.revision;
+		expect(revision).toBeDefined();
+		expect(await lcm.searchProjected("text", 8, revision as number)).toHaveLength(1);
+		// A reconcile between projection and cue lookup would describe a request that moved on.
+		expect(await lcm.searchProjected("text", 8, (revision as number) + 1)).toEqual([]);
+		await lcm.close();
+	});
+
 	it("returns soft-threshold foreground work before a held summary completes", async () => {
 		const manager = SessionManager.inMemory("/soft-background");
 		appendUser(manager, "growing history", 1);

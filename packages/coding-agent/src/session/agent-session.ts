@@ -21,6 +21,7 @@ import { isPromise } from "node:util/types";
 
 import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import type {
+	ContextProjection,
 	DoctorReport,
 	PurgeResult,
 	RebuildResult,
@@ -168,6 +169,7 @@ import type {
 	LcmResolvedExpansion,
 	LcmSearchOptions,
 } from "../lcm/operations";
+import { insertLcmCueMessage, LCM_SEARCH_DEFAULT_LIMIT, renderLcmRetrievalCues } from "../lcm/operations";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
@@ -451,6 +453,82 @@ type SetSessionNameWithTrigger = (
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
+
+/**
+ * Additive filter only: `lcm_search` text mode ANDs the tokens, so a whole sentence matches nothing.
+ * These are the English function words most likely to survive the length filter and over-constrain.
+ */
+const LCM_CUE_STOPWORDS = new Set([
+	"about",
+	"after",
+	"again",
+	"also",
+	"been",
+	"could",
+	"does",
+	"from",
+	"have",
+	"into",
+	"just",
+	"like",
+	"make",
+	"more",
+	"must",
+	"only",
+	"over",
+	"said",
+	"same",
+	"should",
+	"some",
+	"than",
+	"that",
+	"them",
+	"then",
+	"there",
+	"these",
+	"they",
+	"those",
+	"very",
+	"were",
+	"what",
+	"when",
+	"which",
+	"while",
+	"will",
+	"with",
+	"would",
+	"your",
+]);
+const LCM_CUE_MIN_TOKEN_CHARS = 4;
+const LCM_CUE_QUERY_TOKENS = 3;
+
+/**
+ * Reduces the newest user message to a few distinctive terms. Splits on Unicode non-alphanumerics so
+ * non-Latin scripts survive; an ASCII-only split would silently return nothing for them.
+ */
+export function lcmCueTerms(messages: readonly AgentMessage[]): string[] {
+	const latest = messages.findLast(message => message.role === "user");
+	if (!latest) return [];
+	const content = latest.content;
+	const text =
+		typeof content === "string"
+			? content
+			: content
+					.filter(part => part.type === "text")
+					.map(part => part.text)
+					.join(" ");
+	if (text.trim().length === 0) return [];
+	const seen = new Set<string>();
+	const tokens: string[] = [];
+	for (const raw of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+		if (raw.length < LCM_CUE_MIN_TOKEN_CHARS || LCM_CUE_STOPWORDS.has(raw) || seen.has(raw)) continue;
+		seen.add(raw);
+		tokens.push(raw);
+	}
+	// Longest-first is a cheap proxy for distinctiveness; ties keep first-occurrence order.
+	tokens.sort((left, right) => right.length - left.length);
+	return tokens.slice(0, LCM_CUE_QUERY_TOKENS);
+}
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -4289,7 +4367,7 @@ export class AgentSession {
 			hardThresholdTokens,
 			tokenBudget,
 			freshTail: {
-				maxSources: 32,
+				maxSources: this.settings.get("context.lossless.freshTailSources"),
 				maxTokens: Math.max(1, Math.min(16_000, Math.floor(tokenBudget / 2))),
 			},
 		};
@@ -4348,7 +4426,48 @@ export class AgentSession {
 		const result = await lcm.project(messages, signal);
 		this.#pendingPrimaryRequestUsedLcm = result.owned && !signal?.aborted;
 		if (result.projection && !signal?.aborted) this.#emit({ type: "lcm_projection", projection: result.projection });
-		return result.messages;
+		if (!result.owned || signal?.aborted || !result.projection) return result.messages;
+		if (!this.settings.get("context.lossless.retrievalCues")) return result.messages;
+		return await this.#withLcmRetrievalCues(lcm, messages, result.messages, result.projection);
+	}
+
+	/**
+	 * Appends one ephemeral cue block pointing at compacted history the request no longer contains.
+	 * The query comes from the ORIGINAL messages — the projected array holds summaries, not the ask —
+	 * and insertion targets the projected array, which the transform never journals.
+	 */
+	async #withLcmRetrievalCues(
+		lcm: SessionLcm,
+		original: readonly AgentMessage[],
+		projected: AgentMessage[],
+		projection: ContextProjection,
+	): Promise<AgentMessage[]> {
+		try {
+			const terms = lcmCueTerms(original);
+			if (terms.length === 0) return projected;
+			// Text mode ANDs the terms, so a three-term query often matches nothing even when the
+			// topic is present. Retry once with the most distinctive term alone before giving up.
+			let hits = await lcm.searchProjected(terms.join(" "), LCM_SEARCH_DEFAULT_LIMIT, projection.revision);
+			if (hits.length === 0 && terms.length > 1) {
+				hits = await lcm.searchProjected(terms[0]!, LCM_SEARCH_DEFAULT_LIMIT, projection.revision);
+			}
+			if (hits.length === 0) return projected;
+			const inContext = new Set(projection.historical.map(item => item.summaryHandle));
+			const rendered = renderLcmRetrievalCues(hits, inContext);
+			if (!rendered) return projected;
+			return insertLcmCueMessage(projected, {
+				role: "developer",
+				content: [{ type: "text", text: rendered }],
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+		} catch (error) {
+			logger.debug("LCM retrieval cues skipped", {
+				operation: "searchProjected",
+				error: error instanceof Error ? error.name : typeof error,
+			});
+			return projected;
+		}
 	}
 
 	/** Pin the completed primary transform to the provider request about to start. */

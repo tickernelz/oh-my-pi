@@ -17,6 +17,7 @@ import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { escapeXmlText, getLcmDir, normalizePathForComparison, prompt } from "@oh-my-pi/pi-utils";
 import recallPrompt from "../prompts/lcm/recall.md" with { type: "text" };
 import recallSystemPrompt from "../prompts/lcm/recall-system.md" with { type: "text" };
+import retrievalCuesPrompt from "../prompts/lcm/retrieval-cues.md" with { type: "text" };
 import type { LcmCompletionRequest } from "../session/session-lcm";
 import { shortenPath, TRUNCATE_LENGTHS } from "../tools/render-utils";
 import { resolveLcmProjectSelector } from "./project-catalog";
@@ -46,6 +47,9 @@ const LCM_EXPAND_ITEM_MAX_CHARS = 4_000;
 const LCM_MAX_HANDLES_PER_HIT = 8;
 const LCM_MAX_ARTIFACT_REFS = 16;
 const LCM_MAX_FILES = 16;
+/** Breadcrumbs, not content: three cues of this size keep the per-turn block small. */
+export const LCM_CUE_MAX_COUNT = 3;
+export const LCM_CUE_EXCERPT_MAX_CHARS = 240;
 
 export type LcmHandle =
 	| { kind: "source"; citation: Citation }
@@ -256,6 +260,57 @@ function boundedDisplayText(value: string, maxChars: number): string {
 	}
 	const text = output.join("\n").trim();
 	return truncated ? `${text}\n[truncated]`.trim() : text;
+}
+
+/**
+ * Places a rendered cue block immediately before the newest user message, returning a NEW array so the
+ * caller's projected messages are never mutated. Returns the input unchanged when there is no user
+ * message to anchor against.
+ */
+export function insertLcmCueMessage<T extends { role: string }>(projected: readonly T[], cue: T): T[] {
+	const anchor = projected.findLastIndex(message => message.role === "user");
+	if (anchor < 0) return [...projected];
+	const withCue = [...projected];
+	withCue.splice(anchor, 0, cue);
+	return withCue;
+}
+
+/**
+ * Renders the per-turn retrieval cue block, or `null` when nothing survives filtering.
+ * Owns all selection: the caller only supplies authorized hits and the handles already in context.
+ */
+export function renderLcmRetrievalCues(
+	hits: readonly SearchHit[],
+	inContextHandles: ReadonlySet<string>,
+): string | null {
+	const cues: Array<{ handle: string; excerpt: string }> = [];
+	for (const hit of hits) {
+		if (cues.length >= LCM_CUE_MAX_COUNT) break;
+		// Either handle being in context means the model can already see this region.
+		if (hit.summaryHandle && inContextHandles.has(hit.summaryHandle)) continue;
+		if (hit.coveringSummaryHandle && inContextHandles.has(hit.coveringSummaryHandle)) continue;
+		// Dedupe on the raw store handle, but advertise the encoded token: `lcm_describe` only
+		// accepts `lcm-handle:v1:`, and scope comes from the hit's own citation.
+		const rawHandle = hit.summaryHandle ?? hit.coveringSummaryHandle;
+		const citation = hit.citations[0];
+		if (!rawHandle || !citation) continue;
+		const excerpt = boundedDisplayText(hit.redactedText, LCM_CUE_EXCERPT_MAX_CHARS);
+		if (excerpt.length === 0) continue;
+		cues.push({
+			handle: renderLcmHandle({
+				kind: "summary",
+				reference: {
+					projectId: citation.projectId,
+					sessionId: citation.sessionId,
+					branchId: citation.branchId,
+					summaryHandle: rawHandle,
+				},
+			}),
+			excerpt,
+		});
+	}
+	if (cues.length === 0) return null;
+	return prompt.render(retrievalCuesPrompt, { cues });
 }
 
 function hardBound(value: string, maxChars: number): string {
