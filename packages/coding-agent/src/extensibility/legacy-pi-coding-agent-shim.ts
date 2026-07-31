@@ -140,6 +140,25 @@ export interface LsToolOptions {
 	operations?: LsOperations;
 }
 
+export interface EditOperations {
+	readFile: (absolutePath: string) => Promise<Buffer>;
+	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	access: (absolutePath: string) => Promise<void>;
+}
+
+export interface EditToolOptions {
+	operations?: EditOperations;
+}
+
+export interface WriteOperations {
+	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	mkdir: (dir: string) => Promise<void>;
+}
+
+export interface WriteToolOptions {
+	operations?: WriteOperations;
+}
+
 const legacyBashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds" })),
@@ -634,6 +653,40 @@ export function createLsToolDefinition(cwd: string, options?: LsToolOptions): To
 /** Create the legacy ls tool. */
 export function createLsTool(cwd: string, options?: LsToolOptions): ToolDefinition {
 	return createLsToolDefinition(cwd, options);
+}
+
+/** Create the legacy edit tool definition. */
+export function createEditToolDefinition(cwd: string, options?: EditToolOptions): ToolDefinition {
+	if (options?.operations) {
+		throw new Error(
+			"Legacy EditToolOptions.operations is not supported: OMP's built-in edit tool writes the local " +
+				"filesystem natively and exposes no pluggable operations seam. Register a custom edit tool via " +
+				"defineTool() instead of passing operations to createEditTool()/createEditToolDefinition().",
+		);
+	}
+	return legacyBuiltinTool(cwd, "edit");
+}
+
+/** Create the legacy edit tool. */
+export function createEditTool(cwd: string, options?: EditToolOptions): ToolDefinition {
+	return createEditToolDefinition(cwd, options);
+}
+
+/** Create the legacy write tool definition. */
+export function createWriteToolDefinition(cwd: string, options?: WriteToolOptions): ToolDefinition {
+	if (options?.operations) {
+		throw new Error(
+			"Legacy WriteToolOptions.operations is not supported: OMP's built-in write tool writes the local " +
+				"filesystem natively and exposes no pluggable operations seam. Register a custom write tool via " +
+				"defineTool() instead of passing operations to createWriteTool()/createWriteToolDefinition().",
+		);
+	}
+	return legacyBuiltinTool(cwd, "write");
+}
+
+/** Create the legacy write tool. */
+export function createWriteTool(cwd: string, options?: WriteToolOptions): ToolDefinition {
+	return createWriteToolDefinition(cwd, options);
 }
 
 /** Create legacy read, bash, edit, and write tools. */

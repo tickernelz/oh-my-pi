@@ -59,6 +59,9 @@ Special URLs for internal resources; with most FS/bash tools they auto-resolve t
 - `agent://<id>`: agent output artifact; `/<child>` reads a nested subagent's output, else `/<path>` extracts a JSON field
 - `history://<id>`: read-only markdown transcript of an agent (live, parked, or released); bare `history://` lists all agents. Serves registered agents process-wide plus persisted subagents discoverable from their artifact trees; does not discover unregistered top-level sessions solely from their persisted session files.
 - `artifact://<id>`: artifact content
+{{#if securityEnabled}}
+- `security://scans[/<id>/…]`: read-only OMP security scans, findings, coverage, reports, SARIF, and provenance
+{{/if}}
 - `local://<name>.md`: plan artifacts or shared content for subagents
 {{#if hasObsidian}}
 - `vault://<vault>/<path>`: Obsidian vault (read/edit). `vault://` lists vaults; `vault://_/…` targets the active vault. File ops `?op=outline|backlinks|links|tags|properties|tasks|base|…`; vault ops `?op=search&q=…|daily|tasks|orphans|unresolved|bases|…`.

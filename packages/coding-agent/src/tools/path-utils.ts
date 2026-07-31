@@ -42,6 +42,7 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	omp: true,
 	pr: true,
 	rule: true,
+	security: true,
 	skill: true,
 	ssh: true,
 	vault: true,
@@ -60,6 +61,7 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
 	"artifact://",
 	"skill://",
 	"rule://",
+	"security://",
 	"local://",
 	"mcp://",
 	"ssh://",
@@ -117,6 +119,7 @@ function normalizeAtPrefix(filePath: string): string {
 		withoutAt.startsWith("artifact://") ||
 		withoutAt.startsWith("skill://") ||
 		withoutAt.startsWith("rule://") ||
+		withoutAt.startsWith("security://") ||
 		withoutAt.startsWith("local:") ||
 		withoutAt.startsWith("mcp://")
 	) {

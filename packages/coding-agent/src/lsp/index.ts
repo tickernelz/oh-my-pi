@@ -1599,6 +1599,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
+		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
+			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
+		}
 		const timeoutSec = clampTimeout("lsp", timeout, this.session.settings.get("tools.maxTimeout"));
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const callerSignal = signal;

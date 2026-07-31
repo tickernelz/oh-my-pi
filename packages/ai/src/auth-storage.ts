@@ -5481,6 +5481,33 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Resolve one stored OAuth credential by its durable storage row id.
+	 *
+	 * Unlike the normal session resolver, this method never ranks, rotates, or
+	 * falls back to sibling credentials. A forced refresh re-mints only the
+	 * requested row, preserving exact-account affinity for operations whose
+	 * provenance and policy boundary are tied to one workspace.
+	 *
+	 * Returns `undefined` when the row does not exist for `provider` or an
+	 * explicit runtime/config API-key override suppresses OAuth.
+	 */
+	async getOAuthAccessByCredentialId(
+		provider: string,
+		credentialId: number,
+		options?: AuthApiKeyOptions,
+	): Promise<OAuthAccessResolution | undefined> {
+		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+			return undefined;
+		}
+		const selection = this.#getStoredOAuthSelections(provider).find(
+			candidate => candidate.credentialId === credentialId,
+		);
+		if (!selection) return undefined;
+		const providerKey = this.#getProviderTypeKey(provider, "oauth");
+		return this.#resolveStoredOAuthAccess(provider, selection, providerKey, options);
+	}
+
+	/**
 	 * List saved rate-limit resets for every stored OAuth account of `provider`
 	 * (Codex), fetched LIVE from the dedicated `rate-limit-reset-credits` route.
 	 *

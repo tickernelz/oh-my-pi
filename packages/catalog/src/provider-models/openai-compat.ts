@@ -2300,6 +2300,7 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 	const resolveMetadata = createOllamaMetadataResolver(nativeBaseUrl, config?.fetch);
 	return {
 		providerId: "ollama",
+		cacheProviderId: resolveModelCacheProviderId("ollama", { baseUrl }),
 		fetchDynamicModels: async () => {
 			const openAiCompatible = await fetchOpenAICompatibleModels({
 				api: "openai-responses",

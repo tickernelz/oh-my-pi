@@ -4,9 +4,13 @@
 //! the core addon acquires no C GUI `DT_NEEDED` entries (libxcb, libpipewire,
 //! libxkbcommon, libwayland) and keeps `dlopen` working on headless servers.
 //! Capture uses core `GetImage` over the root window, monitor enumeration uses
-//! RandR 1.5 monitors, and input is synthesized with XTest — which also works
-//! under XWayland, where XTest coordinates land in the same X11 global space
-//! `GetImage` composites from.
+//! RandR 1.5 monitors, and input is synthesized with XTest. XTest input works
+//! under XWayland — its coordinates land in the same X11 global space a rooted
+//! server composites from — but root `GetImage` only succeeds when the X server
+//! owns a root pixmap (a real X11 server, Xvfb, or a rootful XWayland). The
+//! default rootless XWayland (GNOME/KDE/sway) keeps no root pixmap, so the
+//! capture probe in `Monitor::all` fails fast there instead of emitting a raw
+//! protocol error on the first screenshot.
 //!
 //! The types mirror the names, variants, and call shapes of the enigo/xcap
 //! surface `crate::desktop` compiles against on macOS and Windows, so the
@@ -418,7 +422,9 @@ mod x11 {
 	use image::RgbaImage;
 	use x11rb::{
 		connection::Connection,
+		errors::ReplyError,
 		protocol::{
+			ErrorKind,
 			randr::ConnectionExt as _,
 			xproto::{
 				BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, ImageFormat, ImageOrder,
@@ -468,6 +474,31 @@ mod x11 {
 
 	fn capture_error(error: impl std::fmt::Display) -> X11Error {
 		X11Error(format!("X11 request failed: {error}"))
+	}
+
+	/// Actionable message for a root capture that failed because the X11 root is
+	/// not a readable drawable — the signature of a rootless `XWayland` session
+	/// (the GNOME/KDE/sway default), whose compositor keeps no X11 root pixmap.
+	/// Pure Wayland capture (portal/PipeWire) is not implemented, so such a
+	/// session has no usable capture path at all.
+	const ROOTLESS_XWAYLAND_CAPTURE: &str =
+		"X11 root window is not a readable drawable; this is a rootless XWayland session (the \
+		 GNOME/KDE/sway default) whose compositor keeps no X11 root pixmap, so screen capture \
+		 through XWayland is impossible, and pure Wayland capture (portal/PipeWire) is not \
+		 implemented";
+
+	/// Translate a failed root `GetImage` reply into a capture error. A
+	/// `Match`/`Drawable` protocol error means the root has no backing pixmap
+	/// (rootless `XWayland`) and gets [`ROOTLESS_XWAYLAND_CAPTURE`]; every other
+	/// failure is surfaced verbatim so genuine capture faults stay visible.
+	fn root_capture_error(error: &ReplyError) -> X11Error {
+		if let ReplyError::X11Error(x11) = error
+			&& matches!(x11.error_kind, ErrorKind::Match | ErrorKind::Drawable)
+		{
+			X11Error(ROOTLESS_XWAYLAND_CAPTURE.to_string())
+		} else {
+			X11Error(format!("X11 GetImage failed: {error}"))
+		}
 	}
 
 	fn input_request_error(error: impl std::fmt::Display) -> X11InputError {
@@ -533,6 +564,18 @@ mod x11 {
 				blue:  root_visual.blue_mask,
 			};
 			color_components(color_masks, 32).map_err(X11Error)?;
+			// A rootless XWayland root window has no backing pixmap, so root
+			// `GetImage` fails with a Match error even though `DISPLAY` is set and
+			// RandR enumerates monitors. Probe a 1x1 read up front and fail fast
+			// with an actionable message instead of emitting a raw protocol dump
+			// on the first screenshot.
+			if let Err(error) = conn
+				.get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 1, 1, !0)
+				.map_err(capture_error)?
+				.reply()
+			{
+				return Err(root_capture_error(&error));
+			}
 			let reply = conn
 				.randr_get_monitors(root, true)
 				.map_err(capture_error)?
@@ -636,7 +679,7 @@ mod x11 {
 				.get_image(ImageFormat::Z_PIXMAP, self.root, x, y, width, height, !0)
 				.map_err(capture_error)?
 				.reply()
-				.map_err(|error| X11Error(format!("X11 GetImage failed: {error}")))?;
+				.map_err(|error| root_capture_error(&error))?;
 			let setup = self.conn.setup();
 			let format = setup
 				.pixmap_formats
@@ -907,6 +950,45 @@ mod x11 {
 						X11CleanupOperation::Restore(keycode, row) => self.write_row(keycode, row),
 					}
 				});
+		}
+	}
+
+	#[cfg(test)]
+	mod capture_probe_tests {
+		use x11rb::{errors::ReplyError, protocol::ErrorKind, x11_utils::X11Error as WireError};
+
+		use super::{ROOTLESS_XWAYLAND_CAPTURE, root_capture_error};
+
+		fn wire(kind: ErrorKind) -> ReplyError {
+			ReplyError::X11Error(WireError {
+				error_kind:     kind,
+				error_code:     8,
+				sequence:       6,
+				bad_value:      850,
+				minor_opcode:   0,
+				major_opcode:   73,
+				extension_name: None,
+				request_name:   Some("GetImage"),
+			})
+		}
+
+		#[test]
+		fn match_and_drawable_map_to_actionable_rootless_message() {
+			for kind in [ErrorKind::Match, ErrorKind::Drawable] {
+				let message = root_capture_error(&wire(kind)).to_string();
+				assert_eq!(message, ROOTLESS_XWAYLAND_CAPTURE);
+				assert!(message.contains("rootless XWayland"));
+				assert!(message.contains("not a readable drawable"));
+				// The raw protocol dump must not leak into the actionable guidance.
+				assert!(!message.contains("X11Error {"));
+			}
+		}
+
+		#[test]
+		fn unrelated_protocol_errors_stay_verbatim() {
+			let message = root_capture_error(&wire(ErrorKind::Value)).to_string();
+			assert!(message.starts_with("X11 GetImage failed:"));
+			assert!(message.contains("Value"));
 		}
 	}
 }
