@@ -175,6 +175,7 @@ export interface AgentSessionConfig {
 		| "hardProjectionWaitMs"
 		| "leafChunkTokens"
 		| "registerProject"
+		| "dependencies"
 	>;
 	/** Provider request transform applied after message conversion. */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;

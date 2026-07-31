@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { openLcmContext, type SourceSnapshot } from "@oh-my-pi/lcm-context";
 import {
 	Agent,
 	type AgentMessage,
@@ -1702,6 +1703,162 @@ describe("AgentSession message pipeline", () => {
 			await Promise.allSettled([first, second]);
 		}
 	});
+
+	it("injects a cue into an owned projection and suppresses it when the setting is off", async () => {
+		using tempDir = TempDir.createSync("@pi-lcm-cue-owned-");
+		const model = buildModel({
+			id: "lcm-cue-model",
+			name: "LCM Cue Model",
+			api: "anthropic",
+			provider: "test-lcm-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const manager = SessionManager.inMemory(tempDir.path());
+		// The first user entry is always kept raw, so the token mass must live in a middle entry
+		// that the summary covers — otherwise the projection cannot fit under the threshold.
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "opening question" }],
+			timestamp: 1,
+		});
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `bulk ${"detail ".repeat(2000)}` }],
+			timestamp: 2,
+		});
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "which deployment rollback checklist did we approve" }],
+			timestamp: 3,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": true,
+			// Must clear nonMessageTokens + 512, or tokenBudget < 1 short-circuits to native.
+			"compaction.thresholdTokens": 2_000,
+			"context.engine": "lossless",
+			modelRoles: { smol: "lcm-cue-model" },
+		});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: manager,
+			settings,
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn: () => {
+				throw new Error("primary stream must not run");
+			},
+			lcm: {
+				agentDir: tempDir.path(),
+				dependencies: {
+					openContext: async options => {
+						const context = await openLcmContext(options);
+						let captured: SourceSnapshot | undefined;
+						const reconcile = context.reconcile.bind(context);
+						vi.spyOn(context, "reconcile").mockImplementation((snapshot, reconcileOptions) => {
+							captured = snapshot;
+							return reconcile(snapshot, reconcileOptions);
+						});
+						vi.spyOn(context, "project").mockImplementation(() => {
+							const entries = captured?.entries ?? [];
+							// The bulk middle entry is what the summary replaces; entry 0 stays raw.
+							const covered = entries[1];
+							const fresh = entries.at(-1);
+							return {
+								revision: 1,
+								ready: true,
+								historical:
+									covered && captured
+										? [
+												{
+													kind: "summary" as const,
+													summaryId: "seen-summary",
+													summaryHandle: "seen-handle",
+													level: 0,
+													redactedText: "older facts",
+													tokenCount: 3,
+													sourceIds: [covered.entryId],
+													citations: [
+														{
+															...captured.scope,
+															sourceId: covered.entryId,
+															sourceKey: "covered-key",
+															contentHash: covered.contentHash,
+															position: 0,
+														},
+													],
+													files: [],
+												},
+											]
+										: [],
+								freshTailSourceIds: fresh ? [fresh.entryId] : [],
+								uncoveredSourceIds: [],
+								sourceTokens: 5_000,
+								selectedLevelCounts: { 0: 1 },
+								coveredSourceCount: 1,
+								freshSourceCount: 1,
+								estimatedTokens: 20,
+								pendingJobs: 0,
+							};
+						});
+						vi.spyOn(context, "search").mockReturnValue([
+							{
+								kind: "summary",
+								id: "unseen-summary",
+								summaryHandle: "unseen-handle",
+								redactedText: "earlier decision: roll back with the staged checklist",
+								rank: 1,
+								citations: [
+									{
+										projectId: "p",
+										sessionId: "s",
+										branchId: "b",
+										sourceId: "src",
+										sourceKey: "key",
+										contentHash: "hash",
+										position: 0,
+									},
+								],
+							},
+						]);
+						return context;
+					},
+				},
+			},
+		});
+		sessions.push(session);
+		// Direct assignment to agent.state.model does not stick; this is the supported setter.
+		session.agent.setModel(model);
+		expect(session.model?.contextWindow).toBe(200_000);
+		expect(session.settings.getGroup("compaction").enabled).toBe(true);
+		expect(session.settings.getGroup("compaction").strategy).not.toBe("off");
+		const input = manager.buildSessionContext().messages;
+		const projected = await session.projectLcmContext(input);
+		expect(projected).not.toBe(input);
+
+		const cueIndex = projected.findIndex(
+			message =>
+				message.role === "developer" &&
+				Array.isArray(message.content) &&
+				message.content.some(part => part.type === "text" && part.text.includes("<lcm-cues>")),
+		);
+		expect(cueIndex).toBeGreaterThanOrEqual(0);
+		expect(cueIndex).toBe(projected.findLastIndex(message => message.role === "user") - 1);
+		const cueText = JSON.stringify(projected[cueIndex]);
+		expect(cueText).toContain("lcm-handle:v1:");
+		expect(cueText).not.toContain("older facts");
+
+		settings.set("context.lossless.retrievalCues", false);
+		const withoutCues = await session.projectLcmContext(input);
+		expect(withoutCues.some(message => message.role === "developer")).toBe(false);
+	}, 30_000);
 
 	it("adds no cue when no lossless projection owns the request", async () => {
 		const session = createLcmCompletionSession(() => {
