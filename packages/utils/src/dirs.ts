@@ -720,6 +720,16 @@ export function getAutoresearchRunDir(encodedProject: string, runId: number): st
 	return path.join(getAutoresearchProjectDir(encodedProject), "runs", String(runId).padStart(4, "0"));
 }
 
+/** Get the security-analysis state directory (~/.omp/security). */
+export function getSecurityDir(): string {
+	return dirs.rootSubdir("security", "state");
+}
+
+/** Get one project's security-analysis state directory (~/.omp/security/<project-key>). */
+export function getSecurityProjectDir(projectKey: string): string {
+	return path.join(getSecurityDir(), projectKey);
+}
+
 // =============================================================================
 // Agent subdirectories (~/.omp/agent/*)
 // =============================================================================

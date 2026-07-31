@@ -144,7 +144,7 @@ Use one display when:
 - a layout gap makes targets ambiguous; or
 - you want to isolate sensitive content on another monitor.
 
-On Linux, Wayland sessions are captured and driven through XWayland: `DISPLAY` must point at the XWayland server, capture reads the X11 composite, and input is emitted as XTest events in the same X11 global coordinate space, so multi-display coordinate mapping is exact. Whether that input reaches native Wayland windows depends on the compositor's XWayland input bridging (modern GNOME and KDE support it).
+On Linux, capture reads the X11 root window with core `GetImage` and input is emitted as XTest events in the same X11 global coordinate space, so multi-display coordinate mapping is exact. This requires an X server that owns a readable root pixmap — a real X11 session, Xvfb, or a rootful XWayland (`Xwayland -rootful`). The default **rootless** XWayland used by GNOME, KDE, and sway keeps no X11 root pixmap, so root `GetImage` fails; the tool detects this at initialization and reports `DESKTOP_BACKEND_UNAVAILABLE` instead of failing on the first screenshot. Pure Wayland capture (portal/PipeWire) is not implemented.
 
 ## Approval and safety precedence
 
@@ -194,7 +194,7 @@ See [Tool approval mode](./approval-mode.md) for general policy resolution.
 |---|---|---|
 | macOS x64/arm64 | Bounded macOS `screencapture` service capture; Quartz/CGEvent and native input | Supported. Grant Screen Recording and Accessibility. Real remote desktop execution was verified on Apple hardware; see [Verification boundary](#verification-boundary). |
 | Linux x64/arm64, glibc/musl, X11 | Pure-Rust X11 capture and XTest input (`x11rb`), bundled in the core addon | Supported when a graphical session and `DISPLAY` are available. No GUI system libraries are required; the backend speaks the X protocol directly over the display socket. Requires the RandR and XTEST server extensions. |
-| Linux x64/arm64, glibc/musl, Wayland | XWayland capture; XTest input bridged by the compositor | Supported with an active XWayland `DISPLAY`. Pure Wayland capture (portal/PipeWire) is not implemented. Input delivery to native Wayland windows depends on the compositor's XWayland input bridge. |
+| Linux x64/arm64, glibc/musl, Wayland | XWayland capture; XTest input bridged by the compositor | **Unsupported on the default rootless XWayland** (GNOME/KDE/sway): its root window has no readable pixmap, so root `GetImage` fails and the tool reports `DESKTOP_BACKEND_UNAVAILABLE` at initialization. Capture needs a rooted X server (a real X11 session, Xvfb, or a rootful `Xwayland -rootful`), which exposes only X11 clients — native Wayland windows are invisible to X11. Pure Wayland capture (portal/PipeWire) is not implemented. |
 | Windows x64 | xcap capture; Win32 virtual-desktop pointer movement and native input | Implemented, including negative origins and secondary monitors. Not remotely exercised in this feature's verification. |
 | Other OS/architectures | none | Unsupported by the published native package matrix. |
 
@@ -214,8 +214,8 @@ For X11, run OMP inside the target graphical session and ensure `DISPLAY` identi
 
 For Wayland:
 
-- keep XWayland enabled and ensure `DISPLAY` is set; capture and input both go through it; and
-- use a compositor that bridges XWayland XTest input to native windows (modern GNOME and KDE do).
+- capture goes through XWayland, which can only read a **rooted** X server's root pixmap; the default rootless XWayland (GNOME/KDE/sway) has none, so capture fails at initialization with `DESKTOP_BACKEND_UNAVAILABLE`; and
+- even a rooted/rootful XWayland exposes only X11 clients — native Wayland windows are structurally invisible to X11 — and pure Wayland capture (portal/PipeWire) is not implemented, so Wayland desktops have no usable capture path today.
 
 The desktop backend is always bundled in the core `pi-natives` addon on every published Linux target (x64/arm64, glibc/musl). It opens no display connection until the tool runs, so headless hosts are unaffected; without a reachable X server the tool reports `DESKTOP_BACKEND_UNAVAILABLE`.
 
@@ -269,6 +269,7 @@ Computer backend errors begin with a stable code:
 Common exact failures:
 
 - `Wayland sessions require an active XWayland DISPLAY for native capture and input; pure Wayland capture is unavailable` → enable XWayland or use X11.
+- `X11 root window is not a readable drawable; this is a rootless XWayland session …` → the compositor keeps no X11 root pixmap (the GNOME/KDE/sway default), so no capture path exists on this session; use a native X11 session. Portal/PipeWire capture is not implemented.
 - `X11/x11rb XTest absolute input cannot represent negative global desktop coordinates` → select a display whose origin is non-negative.
 - `X11/x11rb XTest absolute input is limited to global coordinates in 0..=32767` → select one display or a smaller layout.
 - `native action deadline exceeded; remaining batch actions were not executed` → split the batch into smaller calls and take a fresh screenshot.
@@ -288,7 +289,7 @@ The native composite safety ceiling is 268,435,456 pixels. Normal defaults are f
 - Coordinate targets are valid only for the preceding frame and current display layout.
 - Screenshot composites may downscale small text to fit configured limits.
 - Gaps are visible but not valid input targets; overlapping non-mirrored layouts fail closed.
-- Pure Wayland capture currently requires XWayland; the portal/PipeWire capture path is not implemented.
+- Wayland capture works only under a rooted/rootful XWayland that owns a readable root pixmap and exposes X11 clients; the default rootless XWayland (GNOME/KDE/sway) has no capturable root and the portal/PipeWire path is not implemented, so native Wayland desktops are unsupported for capture.
 - On Wayland, XTest input reaching native windows depends on the compositor's XWayland input bridge.
 - Linux coordinate input fails closed for negative global display origins; select a display whose origin is non-negative.
 - X11/XTest coordinate input is limited to global positions through 32767 on each axis.

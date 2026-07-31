@@ -499,8 +499,8 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		});
 
 		try {
-			expect(restricted.getAllToolNames()).toEqual(["read", "yield"]);
-			expect(restricted.getActiveToolNames()).toEqual(["read", "yield"]);
+			expect(restricted.getAllToolNames()).toEqual(["read", "lsp", "yield"]);
+			expect(restricted.getActiveToolNames()).toEqual(["read", "lsp", "yield"]);
 			for (const name of [
 				"generate_image",
 				"tts",
@@ -512,7 +512,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 				"default_active_tool",
 				"default_inactive_tool",
 				"sdk_custom_tool",
-				"lsp",
 				"hub",
 			]) {
 				expect(restricted.getToolByName(name)).toBeUndefined();
@@ -560,6 +559,25 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			);
 		} finally {
 			await normal.dispose();
+		}
+	});
+
+	it("permits only explicitly named SDK custom tools when a restricted caller opts in", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			customTools: [sdkCustomTool],
+			toolNames: ["read", "sdk_custom_tool"],
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+		});
+
+		try {
+			expect(session.getAllToolNames()).toEqual(["read", "sdk_custom_tool"]);
+			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
+			expect(session.getToolByName("sdk_custom_tool")).toBeDefined();
+		} finally {
+			await session.dispose();
 		}
 	});
 

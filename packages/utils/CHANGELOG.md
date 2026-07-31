@@ -10,6 +10,12 @@
 
 - Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
 - Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
+## [17.2.1] - 2026-07-30
+
+### Added
+
+- Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
+- Added project-keyed OMP security-state directory helpers under the user state root.
 
 ## [17.1.8] - 2026-07-28
 

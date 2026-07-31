@@ -135,6 +135,17 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
 	});
 
+	it("forwards an exact credential resolver without replacing it", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const getApiKey = async () => "exact-account-key";
+
+		const result = await runSubprocess({ ...baseOptions, getApiKey });
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.getApiKey).toBe(getApiKey);
+	});
+
 	it("forwards undefined when the parent has not pre-discovered state", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));

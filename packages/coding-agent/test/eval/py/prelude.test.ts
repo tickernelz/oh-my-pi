@@ -101,4 +101,60 @@ describe("python prelude", () => {
 		expect(PYTHON_PRELUDE).toContain('("changesApplied", "changes_applied")');
 		expect(PYTHON_PRELUDE).toContain('("isolationSummary", "isolation_summary")');
 	});
+
+	it("bypasses discovered proxies for parallel loopback bridge calls", async () => {
+		let proxyRequests = 0;
+		const bridge = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				const body = (await request.json()) as { name?: string; args?: { path?: string } };
+				return Response.json({
+					ok: true,
+					value: body.name === "__concurrency__" ? { limit: 3 } : body.args?.path,
+				});
+			},
+		});
+		const proxy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => {
+				proxyRequests++;
+				return new Response("proxy intercepted", { status: 502 });
+			},
+		});
+
+		try {
+			const proxyUrl = proxy.url.toString();
+			// urllib also reads macOS SystemConfiguration; environment injection
+			// is the hermetic equivalent for this subprocess test.
+			const result = await runPrelude(
+				[
+					'paths = ["one.ts", "two.ts", "three.ts"]',
+					'print(parallel([lambda path=path: tool.read({"path": path}) for path in paths]))',
+				].join("\n"),
+				{
+					PI_TOOL_BRIDGE_URL: bridge.url.toString(),
+					PI_TOOL_BRIDGE_TOKEN: "test-token",
+					PI_TOOL_BRIDGE_SESSION: "test-session",
+					HTTP_PROXY: proxyUrl,
+					http_proxy: proxyUrl,
+					ALL_PROXY: proxyUrl,
+					all_proxy: proxyUrl,
+					NO_PROXY: "",
+					no_proxy: "",
+				},
+			);
+
+			expect(result).toEqual({
+				stdout: "['one.ts', 'two.ts', 'three.ts']\n",
+				stderr: "",
+				exitCode: 0,
+			});
+			expect(proxyRequests).toBe(0);
+		} finally {
+			bridge.stop(true);
+			proxy.stop(true);
+		}
+	});
 });
