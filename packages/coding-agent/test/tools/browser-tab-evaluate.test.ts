@@ -3,7 +3,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { BrowserTool } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { getTabsMapForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
-import { CHROMIUM_AVAILABLE } from "./chromium-probe";
+import { chromiumCanLaunch } from "./chromium-probe";
+
+const CHROMIUM_AVAILABLE = await chromiumCanLaunch();
 
 function makeSession(): ToolSession {
 	return {
