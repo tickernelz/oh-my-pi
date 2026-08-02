@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
@@ -39,6 +39,7 @@ function assistantMessage(timestamp: number, stopReason: AssistantMessage["stopR
 function projection(overrides: Partial<ContextProjection> = {}): ContextProjection {
 	return {
 		revision: 1,
+		activeSourceFingerprint: activeSourceFingerprint(["source-a", "source-b", "fresh"]),
 		ready: true,
 		historical: [
 			{

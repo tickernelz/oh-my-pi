@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added request-local `beforeProviderDispatch` and `afterProviderResponse` hooks carrying the post-transform message array, allowing hosts to fence and attribute a provider call across context conversion.
+
 ### Changed
 
 - Compaction summary messages can carry a sanitized `lcmFallback` category so hosts can explain when native compaction replaced unavailable Lossless context work.

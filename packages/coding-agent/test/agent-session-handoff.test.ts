@@ -608,7 +608,7 @@ describe("AgentSession handoff", () => {
 			details: {},
 		});
 
-		await session.runIdleCompaction();
+		await session.runIdleCompaction(0);
 
 		const endEvent = events.find(
 			(event): event is Extract<AgentSessionEvent, { type: "auto_compaction_end" }> =>
@@ -760,7 +760,7 @@ describe("AgentSession handoff", () => {
 		});
 
 		try {
-			await localSession.runIdleCompaction();
+			await localSession.runIdleCompaction(0);
 			expect(compactSpy).toHaveBeenCalledTimes(1);
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");
 			if (compactionEntry?.type !== "compaction") throw new Error("Expected persisted compaction entry");

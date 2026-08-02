@@ -2189,6 +2189,31 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
+	it("disables Codex SSE transport retries for a single-attempt caller", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let requestCount = 0;
+		const fetchMock: FetchImpl = async () => {
+			requestCount += 1;
+			throw new TypeError("The socket connection was closed unexpectedly");
+		};
+		const options = {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			disableProviderRetries: true,
+		};
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			options,
+		).result();
+
+		expect(requestCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("does not retry a caller abort before response headers", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -2224,6 +2249,51 @@ describe("openai-codex streaming", () => {
 		expect(requestCount).toBe(1);
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
+	});
+
+	it("does not disable a shared websocket when a single-attempt caller aborts its handshake", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const controller = new AbortController();
+		const { promise: socketCreated, resolve: markSocketCreated } = Promise.withResolvers<void>();
+		let socketCount = 0;
+
+		class PendingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				socketCount += 1;
+				markSocketCreated();
+			}
+		}
+
+		global.WebSocket = PendingWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("caller abort must not fall back to SSE");
+		});
+		const resultPromise = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			disableProviderRetries: true,
+			fetch: fetchMock as FetchImpl,
+			providerSessionState,
+			sessionId: "ws-disabled-retry-caller-abort",
+			signal: controller.signal,
+		}).result();
+
+		await socketCreated;
+		controller.abort();
+		const result = await resultPromise;
+		const details = getOpenAICodexTransportDetails(model, {
+			providerSessionState,
+			sessionId: "ws-disabled-retry-caller-abort",
+		});
+
+		expect(socketCount).toBe(1);
+		expect(result.stopReason).toBe("aborted");
+		expect(details.websocketDisabled).toBe(false);
+		expect(details.fallbackCount).toBe(0);
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("sets conversation_id/session_id headers and prompt_cache_key when sessionId is provided", async () => {
@@ -2674,6 +2744,75 @@ describe("openai-codex streaming", () => {
 		expect(fallbackDetails.lastTransport).toBe("sse");
 		expect(fallbackDetails.websocketDisabled).toBe(true);
 		expect(fallbackDetails.fallbackCount).toBe(1);
+	});
+
+	it("advances the shared transport cursor between disabled-retry outer attempts", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let websocketRequestCount = 0;
+		let sseRequestCount = 0;
+
+		class FailingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				websocketRequestCount += 1;
+				queueMicrotask(() => {
+					this.emit("error", new Event("error"));
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", new Event("close"));
+				});
+			}
+		}
+
+		global.WebSocket = FailingWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const context = createCodexTestContext();
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock: FetchImpl = async () => {
+			sseRequestCount += 1;
+			return new Response(createCompletedCodexSse("Hello SSE"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+		const streamOnce = () =>
+			streamOpenAICodexResponses(model, context, {
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				sessionId: "disabled-retry-transport-session",
+				providerSessionState,
+				disableProviderRetries: true,
+				codexCompaction: {
+					operationId: "durable-summary-attempt",
+					trigger: "auto",
+					reason: "context_limit",
+					implementation: "responses",
+					phase: "pre_turn",
+					strategy: "memento",
+				},
+			}).result();
+
+		const first = await streamOnce();
+		const afterFailure = getOpenAICodexTransportDetails(model, {
+			sessionId: "disabled-retry-transport-session",
+			providerSessionState,
+		});
+		const firstWireCounts = { websocket: websocketRequestCount, sse: sseRequestCount };
+		const second = await streamOnce();
+		const afterRecovery = getOpenAICodexTransportDetails(model, {
+			sessionId: "disabled-retry-transport-session",
+			providerSessionState,
+		});
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCounts).toEqual({ websocket: 1, sse: 0 });
+		expect(afterFailure.websocketDisabled).toBe(true);
+		expect(afterFailure.fallbackCount).toBe(1);
+		expect(afterFailure.lastFallbackAt).toBeDefined();
+		expect(second.stopReason).toBe("stop");
+		expect({ websocket: websocketRequestCount, sse: sseRequestCount }).toEqual({ websocket: 1, sse: 1 });
+		expect(afterRecovery.websocketDisabled).toBe(true);
+		expect(afterRecovery.fallbackCount).toBe(1);
 	});
 
 	it("carries fatal websocket fallback into isolated compaction transport", async () => {
@@ -4028,6 +4167,64 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	it("cleans a trailing whitespace-only tool call without a second wire attempt", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let sendCount = 0;
+
+		class SingleAttemptWhitespaceWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(): void {
+				sendCount += 1;
+				this.sendJson({
+					type: "response.output_item.added",
+					item: {
+						type: "function_call",
+						id: "fc_ws_single_attempt_whitespace",
+						call_id: "call_ws_single_attempt_whitespace",
+						name: "todo",
+						arguments: "",
+					},
+				});
+				for (let sequence = 1; sequence <= 300; sequence += 1) {
+					this.sendJson({
+						type: "response.function_call_arguments.delta",
+						delta: " ".repeat(64),
+						item_id: "fc_ws_single_attempt_whitespace",
+						output_index: 1,
+						sequence_number: sequence,
+					});
+				}
+			}
+		}
+
+		global.WebSocket = SingleAttemptWhitespaceWebSocket as unknown as typeof WebSocket;
+		const fetchMock = vi.fn(async () => {
+			throw new Error("single-attempt whitespace cleanup must not fall back to SSE");
+		});
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				disableProviderRetries: true,
+				fetch: fetchMock as FetchImpl,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				sessionId: "ws-single-attempt-whitespace",
+			},
+		).result();
+
+		expect(sendCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("whitespace-only tool-call argument delta");
+		expect(result.content).toEqual([]);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("drops the degenerate tool call and recovers when a retried websocket stream completes", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -4634,6 +4831,62 @@ describe("openai-codex streaming", () => {
 
 		expect(result.stopReason).toBe("stop");
 		expect(result.content.find(c => c.type === "text")?.text).toBe("Replay succeeded");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("records a mid-stream websocket failure without replaying a single-attempt request", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Recovered on the next durable attempt");
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		let websocketCount = 0;
+		class SingleAttemptBufferedCloseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				websocketCount += 1;
+				this.scheduleOpen();
+			}
+
+			send(): void {
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_ws_partial", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "Partial output" });
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1006 } as unknown as Event);
+			}
+		}
+
+		global.WebSocket = SingleAttemptBufferedCloseWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const request = () =>
+			streamOpenAICodexResponses(model, createCodexTestContext(), {
+				apiKey: createCodexTestToken(),
+				disableProviderRetries: true,
+				fetch: fetchMock as FetchImpl,
+				providerSessionState,
+				sessionId: "ws-single-attempt-midstream-failure",
+			}).result();
+
+		const first = await request();
+		const firstFetchCalls = fetchMock.mock.calls.length;
+		const afterFailure = getOpenAICodexTransportDetails(model, {
+			providerSessionState,
+			sessionId: "ws-single-attempt-midstream-failure",
+		});
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstFetchCalls).toBe(0);
+		expect(afterFailure.websocketDisabled).toBe(true);
+		expect(afterFailure.fallbackCount).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(websocketCount).toBe(1);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 

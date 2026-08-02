@@ -85,14 +85,14 @@ export interface ReconcileOptions {
 }
 
 export interface FreshTailLimits {
-	/** Target source count; an indivisible `atomicGroupId` closure may expand it. */
+	/** Target source count; the mandatory newest indivisible unit may exceed it. */
 	maxSources: number;
-	/** Hard fresh-tail token ceiling, including any atomic closure expansion. */
+	/** Target fresh-tail token ceiling; the mandatory newest indivisible unit may exceed it. */
 	maxTokens: number;
 }
 
 export interface ProjectionRequest extends ContextScope {
-	/** Total estimated-token ceiling across summaries and the fresh tail. */
+	/** Target total used to select and schedule the protected fresh-tail boundary. */
 	tokenBudget: number;
 	freshTail: FreshTailLimits;
 }
@@ -174,7 +174,9 @@ export type SummaryLocalAttemptOutcome = "aborted" | "stale" | "lease_lost";
 
 export interface ContextProjection {
 	revision: number;
-	/** False means the caller must fail open to its native history path. */
+	/** Ordered active entry IDs hashed in the same read snapshot as this frontier. */
+	activeSourceFingerprint: string;
+	/** True only when every active source is represented by the frontier or fresh tail. */
 	ready: boolean;
 	historical: readonly ProjectedHistoricalItem[];
 	freshTailSourceIds: readonly string[];
@@ -185,7 +187,7 @@ export interface ContextProjection {
 	selectedLevelCounts: Readonly<Record<number, number>>;
 	coveredSourceCount: number;
 	freshSourceCount: number;
-	/** Estimated tokens after projection, including the protected fresh tail. */
+	/** Unrendered complete-candidate estimate; it is not proof that a provider payload fits. */
 	estimatedTokens: number;
 	pendingJobs: number;
 }
@@ -197,9 +199,41 @@ export interface SummaryJobInput {
 	tokenCount: number;
 }
 
-export interface SummaryJob {
+export interface SummaryRetryPolicy {
+	retryKey: string;
+	retryEpoch: number;
+}
+
+export type ConfigureSummaryRetryPolicyResult =
+	| ({ kind: "ready" } & SummaryRetryPolicy)
+	| ({ kind: "conflict" } & SummaryRetryPolicy);
+
+export interface ConfigureSummaryRetryPolicyOptions {
+	expected?: SummaryRetryPolicy;
+	force?: boolean;
+}
+
+export interface SummaryJobLease extends SummaryRetryPolicy {
 	jobId: string;
 	leaseToken: string;
+	leasePolicyToken: string;
+	leaseMutationNonce: string;
+}
+
+export interface SummaryJobAvailability {
+	runnable: number;
+	leased: number;
+	backoff: number;
+	exhausted: number;
+	missing: number;
+	policyMismatch: number;
+	nextAvailableAt?: number;
+	nextLeaseExpiryAt?: number;
+}
+
+export type SummaryRetryMode = "due" | "all";
+
+export interface SummaryJob extends SummaryJobLease {
 	leaseExpiresAt: number;
 	queueClass: "preferred" | "fallback";
 	kind: "leaf" | "condensed";
@@ -213,12 +247,13 @@ export interface SummaryJob {
 	transportRetryCount: number;
 }
 
-export interface ClaimSummaryJobsOptions {
+export interface ClaimSummaryJobsOptions extends SummaryRetryPolicy {
 	workerId: string;
 	leaseMs: number;
 	limit: number;
 	/** Hard output ceiling requested from the completion provider. */
 	maxOutputTokens: number;
+	maxTransportRetries: number;
 	preferredScope?: ContextScope;
 	/** Defaults to true to preserve project-wide draining when no scope is supplied. */
 	allowFallback?: boolean;
@@ -347,6 +382,8 @@ export interface LcmPerformanceCounters {
 	projectionWallMs: number;
 	projectionCpuMs: number;
 	projectionLineageRowsRead: number;
+	/** Committed logical rows changed by reconcile operations. */
+	reconcileRowsChanged: number;
 	schedulerBranchPasses: number;
 }
 
@@ -400,43 +437,69 @@ export interface RebuildResult {
 export interface LcmContext extends Disposable {
 	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult;
 	project(request: ProjectionRequest): ContextProjection;
+	configureSummaryRetryPolicy(
+		projectId: string,
+		retryKey: string,
+		options?: ConfigureSummaryRetryPolicyOptions,
+	): ConfigureSummaryRetryPolicyResult;
+	summaryJobAvailability(
+		request: ProjectionRequest,
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+	): SummaryJobAvailability;
+	retrySummaryJobs(
+		request: ProjectionRequest,
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		mode?: SummaryRetryMode,
+	): SummaryJobAvailability;
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[];
-	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback?: boolean): number | null;
+	nextSummaryJobDelayMs(
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		preferredScope?: ContextScope,
+		allowFallback?: boolean,
+	): number | null;
 	/** Summary spend already recorded for this session strictly before `before`, in USD. */
 	priorSummarySpendUsd(sessionId: string, before: number): number;
-	summaryJobFailures(preferredScope?: ContextScope): readonly {
+	summaryJobFailures(
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		preferredScope?: ContextScope,
+	): readonly {
 		jobId: string;
 		availableAt: number;
 		queueClass: "preferred" | "fallback";
 	}[];
-	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean;
-	releaseSummaryJob(jobId: string, leaseToken: string): boolean;
-	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult;
+	extendSummaryJob(lease: SummaryJobLease, leaseMs: number): string | null;
+	releaseSummaryJob(lease: SummaryJobLease): boolean;
+	completeSummaryJob(lease: SummaryJobLease, completion: SummaryCompletion): CompleteSummaryJobResult;
 	/**
 	 * Record a dispatched provider attempt before it starts. Returns false when the
 	 * lease is stale, the job is no longer placed on a current branch, or the
 	 * attempt id already exists — the caller must then dispatch nothing.
 	 */
 	beginSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
+		lease: SummaryJobLease,
 		attempt: SummaryProviderAttemptStart,
 		provenance: SummaryAttemptProvenance,
 	): boolean;
 	/** Finish an in-flight attempt without mutating job retry state. */
 	settleSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
-		attempt: SummaryProviderAttempt,
+		lease: SummaryJobLease,
+		attempt: SummaryProviderAttempt | SummaryProviderAttemptStart,
 		requestedOutcome: SummaryLocalAttemptOutcome,
 	): SummaryAttemptOutcome | null;
 	failSummaryJob(
-		jobId: string,
-		leaseToken: string,
+		lease: SummaryJobLease,
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
-		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
+		failedAttempt?: {
+			attempt: SummaryProviderAttempt | SummaryProviderAttemptStart;
+			outcome: SummaryFailureAttemptOutcome;
+		},
+		countTransportRetry?: boolean,
 	): boolean;
 	search(request: SearchRequest): SearchHit[];
 	searchProject(request: ProjectSearchRequest): SearchHit[];

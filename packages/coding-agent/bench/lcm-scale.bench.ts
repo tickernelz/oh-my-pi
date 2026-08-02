@@ -52,6 +52,8 @@ import { convertToLlm, createHistoricalContextMessage } from "../src/session/mes
 import { buildSessionContext } from "../src/session/session-context";
 import type { CompactionEntry, SessionEntry } from "../src/session/session-entries";
 import {
+	estimateLcmProjectionMessageTokenUpperBound,
+	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
@@ -66,6 +68,15 @@ const IMAGE_MARKER = "[image:opaque]";
 const COST_PER_MILLION = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } as const;
 const MAINTENANCE_OUTPUT_TOKENS = 1;
 
+function projectionTokenMeasurements(messages: readonly AgentMessage[]): { tokens: number; upperBound: number } {
+	let tokens = 0;
+	let upperBound = 0;
+	for (const message of messages) {
+		tokens += estimateLcmProjectionMessageTokens(message);
+		upperBound += estimateLcmProjectionMessageTokenUpperBound(message);
+	}
+	return { tokens, upperBound };
+}
 const SOURCES = envInteger("LCM_SCALE_SOURCES", 2_000, 64);
 const BRANCHES = envInteger("LCM_SCALE_BRANCHES", 4, 2);
 const SAMPLES = envInteger("LCM_SCALE_SAMPLES", 3, 1);
@@ -335,6 +346,8 @@ async function measureTiming(storePath: string, branchCount: number): Promise<Ti
 			);
 			context.reconcile({ scope, entries }, { summarize: projectionRequest(scope) });
 		}
+		const retryPolicy = context.configureSummaryRetryPolicy("lcm-scale", "lcm-scale/lcm-scale-summary");
+		if (retryPolicy.kind !== "ready") throw new Error("LCM scale retry policy initialization conflicted");
 
 		const completionHashes = new Set<string>();
 		let duplicateCompletionHashes = 0;
@@ -343,6 +356,8 @@ async function measureTiming(storePath: string, branchCount: number): Promise<Ti
 		for (;;) {
 			const claimStarted = Bun.nanoseconds();
 			const [job] = context.claimSummaryJobs({
+				...retryPolicy,
+				maxTransportRetries: 5,
 				workerId: "scale",
 				leaseMs: 600_000,
 				limit: 1,
@@ -355,7 +370,7 @@ async function measureTiming(storePath: string, branchCount: number): Promise<Ti
 				.digest("hex");
 			if (completionHashes.has(inputHash)) duplicateCompletionHashes++;
 			completionHashes.add(inputHash);
-			context.completeSummaryJob(job.jobId, job.leaseToken, { redactedText: ".", tokenCount: 1 });
+			context.completeSummaryJob(job, { redactedText: ".", tokenCount: 1 });
 			lastCompletionAt = Bun.nanoseconds();
 		}
 
@@ -460,8 +475,9 @@ async function measureLcmCost(
 				tokenBudget: 120_000,
 				freshTail: { maxSources: 8, maxTokens: 4_000 },
 			}),
-			projectionFits: () => true,
+			projectionTokenMeasurements,
 			complete,
+			resolveSummaryModel: () => `openai/${MODEL.id}`,
 		},
 		{
 			summaryModel: "@smol",
@@ -475,7 +491,6 @@ async function measureLcmCost(
 						condenseFanIn: FAN_IN,
 					}),
 				resolveProject: async () => ({ projectId: "lcm-scale-cost", rootPath: projectRoot, storePath }),
-				hardWaitMs: 900_000,
 			},
 		},
 	);
@@ -765,13 +780,12 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 
 	let call = 0;
 	let billedFailureUsageTokens = 0;
-	// The projection signal is independent of the summary worker's own controller, so
-	// aborting pass 1 the moment the billed failure lands ends the foreground wait
-	// without cancelling the store work that records it.
+	// Abort the foreground request only after schema-10 has durably settled the provider failure.
 	const firstPass = new AbortController();
 	const complete = async (request: LcmCompletionRequest): Promise<LcmCompletionResult> => {
+		const attemptOrdinal = call + 1;
 		const start: SummaryProviderAttemptStart = {
-			attemptId: `retry-attempt-${++call}`,
+			attemptId: `retry-attempt-${attemptOrdinal}`,
 			startedAt: clock.now,
 			provider: "openai",
 			model: MODEL.id,
@@ -783,6 +797,7 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 				category: "aborted",
 			});
 		}
+		call = attemptOrdinal;
 		const inputTokens = canonicalTokens(request.systemPrompt) + canonicalTokens(request.prompt);
 		const attempt: SummaryProviderAttempt = {
 			...start,
@@ -791,7 +806,6 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 		};
 		if (call === 1) {
 			billedFailureUsageTokens = inputTokens + MAINTENANCE_OUTPUT_TOKENS;
-			firstPass.abort("retry probe observed the billed failure");
 			throw new LcmCompletionError("retry probe provider error", {
 				provider: "openai",
 				category: "provider_error",
@@ -811,8 +825,9 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 				tokenBudget: 60_000,
 				freshTail: { maxSources: 1, maxTokens: 2_000 },
 			}),
-			projectionFits: () => true,
+			projectionTokenMeasurements,
 			complete,
+			resolveSummaryModel: () => `openai/${MODEL.id}`,
 		},
 		{
 			summaryModel: "@smol",
@@ -820,7 +835,6 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 			dependencies: {
 				openContext: async options => openLcmContext({ ...options, now: () => clock.now }),
 				resolveProject: async () => ({ projectId: "lcm-scale-retry", rootPath: projectRoot, storePath }),
-				hardWaitMs: 30_000,
 				now: () => clock.now,
 			},
 		},
@@ -830,21 +844,28 @@ async function measureRetryProbe(projectRoot: string, storePath: string): Promis
 	let retryPassMs = 0;
 	let succeededAfterRetry = false;
 	try {
+		await lcm.status();
 		const firstStarted = Bun.nanoseconds();
-		await lcm.project(manager.buildSessionContext().messages, firstPass.signal);
-		firstPassMs = (Bun.nanoseconds() - firstStarted) / 1e6;
+		const firstProjection = lcm.project(manager.buildSessionContext().messages, firstPass.signal);
 
 		const failures = new Database(storePath, { readonly: true });
 		let availableAt: number | undefined;
 		try {
-			availableAt = failures
-				.query<{ available_at: number }, []>(
-					"SELECT available_at FROM summary_jobs WHERE status = 'failed' ORDER BY available_at DESC LIMIT 1",
-				)
-				.get()?.available_at;
+			for (let poll = 0; poll < 1_000; poll++) {
+				availableAt = failures
+					.query<{ available_at: number }, []>(
+						"SELECT available_at FROM summary_jobs WHERE status = 'failed' ORDER BY available_at DESC LIMIT 1",
+					)
+					.get()?.available_at;
+				if (availableAt !== undefined) break;
+				await Promise.resolve();
+			}
 		} finally {
 			failures.close();
 		}
+		firstPass.abort("retry probe observed the durable failure");
+		await firstProjection;
+		firstPassMs = (Bun.nanoseconds() - firstStarted) / 1e6;
 		if (availableAt === undefined) {
 			throw new Error("retry probe recorded no failed summary job, so no backoff could be advanced");
 		}

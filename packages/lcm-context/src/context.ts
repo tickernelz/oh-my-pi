@@ -7,6 +7,8 @@ import type {
 	Citation,
 	ClaimSummaryJobsOptions,
 	CompleteSummaryJobResult,
+	ConfigureSummaryRetryPolicyOptions,
+	ConfigureSummaryRetryPolicyResult,
 	ContextProjection,
 	ContextScope,
 	DoctorCheck,
@@ -41,12 +43,16 @@ import type {
 	SummaryExpansionRequest,
 	SummaryFailureAttemptOutcome,
 	SummaryJob,
+	SummaryJobAvailability,
 	SummaryJobInput,
+	SummaryJobLease,
 	SummaryLocalAttemptOutcome,
 	SummaryProviderAttempt,
 	SummaryProviderAttemptStart,
 	SummaryProviderUsage,
 	SummaryReference,
+	SummaryRetryMode,
+	SummaryRetryPolicy,
 	SummaryStage,
 	SummaryStrategy,
 } from "./types";
@@ -161,6 +167,13 @@ interface BranchRow {
 	revision: number;
 }
 
+interface ReconcileBranchRow extends BranchRow {
+	reconciled_at: number;
+	summary_token_budget: number | null;
+	fresh_tail_max_sources: number | null;
+	fresh_tail_max_tokens: number | null;
+}
+
 interface CurrentSourceRow {
 	id: number;
 	entry_id: string;
@@ -168,6 +181,7 @@ interface CurrentSourceRow {
 	position: number;
 	source_key: string;
 	atomic_group_id: string | null;
+	token_count: number;
 }
 
 interface ActiveSourceRow extends CurrentSourceRow {
@@ -244,12 +258,24 @@ interface JobRow {
 	input_hash: string;
 	level: number;
 	status: string;
+	worker_id: string | null;
 	lease_token: string | null;
 	lease_expires_at: number | null;
 	lease_input_tokens: number | null;
 	lease_output_budget: number | null;
 	stage: SummaryStage;
 	transport_retry_count: number;
+	attempt_count: number;
+	available_at: number;
+	retry_epoch: number;
+	lease_policy_token: string | null;
+	lease_mutation_nonce: string | null;
+}
+
+interface RetryPolicyRow {
+	retry_key: string | null;
+	epoch: number;
+	claim_token: string | null;
 }
 
 interface JobInputRow {
@@ -305,6 +331,25 @@ function assertIdentifier(value: string, name: string): string {
 	return value;
 }
 
+function normalizedRetryPolicy(policy: SummaryRetryPolicy): SummaryRetryPolicy {
+	if (!policy || typeof policy !== "object") throw new TypeError("retryPolicy must be an object");
+	return {
+		retryKey: assertIdentifier(policy.retryKey, "retryPolicy.retryKey"),
+		retryEpoch: assertInteger(policy.retryEpoch, "retryPolicy.retryEpoch", 1),
+	};
+}
+
+function normalizedLease(lease: SummaryJobLease): SummaryJobLease {
+	const policy = normalizedRetryPolicy(lease);
+	return {
+		...policy,
+		jobId: assertIdentifier(lease.jobId, "lease.jobId"),
+		leaseToken: assertIdentifier(lease.leaseToken, "lease.leaseToken"),
+		leasePolicyToken: assertIdentifier(lease.leasePolicyToken, "lease.leasePolicyToken"),
+		leaseMutationNonce: assertIdentifier(lease.leaseMutationNonce, "lease.leaseMutationNonce"),
+	};
+}
+
 function estimateTokens(text: string): number {
 	if (text.length === 0) return 0;
 	return Math.ceil(Buffer.byteLength(text, "utf8") / 4);
@@ -316,6 +361,23 @@ function contentAddress(parts: readonly string[]): string {
 		hasher.update(`${Buffer.byteLength(part, "utf8")}:`);
 		hasher.update(part);
 	}
+	return hasher.digest("hex");
+}
+
+export function activeSourceFingerprint(sourceIds: Iterable<string>): string {
+	const hasher = new Bun.CryptoHasher("sha256");
+	const length = new Uint8Array(4);
+	const update = (value: string): void => {
+		const byteLength = Buffer.byteLength(value, "utf8");
+		length[0] = byteLength >>> 24;
+		length[1] = byteLength >>> 16;
+		length[2] = byteLength >>> 8;
+		length[3] = byteLength;
+		hasher.update(length);
+		hasher.update(value);
+	};
+	update("lcm-active-source-fingerprint-v1");
+	for (const sourceId of sourceIds) update(sourceId);
 	return hasher.digest("hex");
 }
 
@@ -571,11 +633,10 @@ function selectFreshTail<T extends { atomic_group_id: string | null; token_count
 	const tokenLimit = Math.min(maxTokens, tokenBudget);
 	for (let unitIndex = units.length - 1; unitIndex >= 0; unitIndex--) {
 		const unit = units[unitIndex];
-		if (!unit || count >= maxSources) break;
+		if (!unit) break;
+		const newest = unitIndex === units.length - 1;
 		const unitTokens = unit.reduce((total, row) => total + row.token_count, 0);
-		const expandsSourceLimit = count + unit.length > maxSources;
-		const isAtomicClosure = unit.some(row => row.atomic_group_id !== null);
-		if ((expandsSourceLimit && !isAtomicClosure) || tokens + unitTokens > tokenLimit) break;
+		if (!newest && (count + unit.length > maxSources || tokens + unitTokens > tokenLimit)) break;
 		start -= unit.length;
 		tokens += unitTokens;
 		count += unit.length;
@@ -1264,6 +1325,7 @@ class SqliteLcmContext implements LcmContext {
 		projectionWallMs: 0,
 		projectionCpuMs: 0,
 		projectionLineageRowsRead: 0,
+		reconcileRowsChanged: 0,
 		schedulerBranchPasses: 0,
 	};
 
@@ -1325,10 +1387,14 @@ class SqliteLcmContext implements LcmContext {
 	reconcile(snapshot: SourceSnapshot, options?: ReconcileOptions): ReconcileResult {
 		this.#assertAvailable();
 		const normalized = normalizeSnapshot(snapshot);
+		const before = this.#db.query<{ count: number }, []>("SELECT total_changes() AS count").get()!.count;
 		const transaction = this.#db.transaction(() =>
 			this.#reconcileNormalized(normalized, this.#options.now(), options?.summarize),
 		);
-		return transaction.immediate();
+		const result = transaction.immediate();
+		const after = this.#db.query<{ count: number }, []>("SELECT total_changes() AS count").get()!.count;
+		this.#performance.reconcileRowsChanged += after - before;
+		return result;
 	}
 
 	#reconcileNormalized(
@@ -1367,6 +1433,14 @@ class SqliteLcmContext implements LcmContext {
 			}
 			unchangedPrefix++;
 		}
+		const policy =
+			summarize && typeof summarize === "object"
+				? {
+						tokenBudget: assertInteger(summarize.tokenBudget, "summarize.tokenBudget", 0),
+						maxSources: assertInteger(summarize.freshTail.maxSources, "summarize.freshTail.maxSources", 0),
+						maxTokens: assertInteger(summarize.freshTail.maxTokens, "summarize.freshTail.maxTokens", 0),
+					}
+				: undefined;
 
 		if (unchanged) {
 			// Placement is identical, but derived file metadata (exploration summary) may have
@@ -1425,20 +1499,28 @@ class SqliteLcmContext implements LcmContext {
 				tombstonedSources++;
 			}
 			revision++;
-			this.#db.run("UPDATE branches SET revision = ?, reconciled_at = ? WHERE id = ?", [revision, now, branch.id]);
-			this.#carryForwardSpans(branch.id, branch.revision, revision, unchangedPrefix);
 		}
 
-		if (summarize && typeof summarize === "object") {
-			const tokenBudget = assertInteger(summarize.tokenBudget, "summarize.tokenBudget", 0);
-			const maxSources = assertInteger(summarize.freshTail.maxSources, "summarize.freshTail.maxSources", 0);
-			const maxTokens = assertInteger(summarize.freshTail.maxTokens, "summarize.freshTail.maxTokens", 0);
+		const policyChanged =
+			policy !== undefined &&
+			(policy.tokenBudget !== branch.summary_token_budget ||
+				policy.maxSources !== branch.fresh_tail_max_sources ||
+				policy.maxTokens !== branch.fresh_tail_max_tokens);
+		if (!unchanged || policyChanged) {
 			this.#db.run(
-				`UPDATE branches SET summary_token_budget = ?, fresh_tail_max_sources = ?, fresh_tail_max_tokens = ?
-				 WHERE id = ?`,
-				[tokenBudget, maxSources, maxTokens, branch.id],
+				`UPDATE branches SET revision = ?, reconciled_at = ?, summary_token_budget = ?,
+					fresh_tail_max_sources = ?, fresh_tail_max_tokens = ? WHERE id = ?`,
+				[
+					revision,
+					unchanged ? branch.reconciled_at : now,
+					policy?.tokenBudget ?? branch.summary_token_budget,
+					policy?.maxSources ?? branch.fresh_tail_max_sources,
+					policy?.maxTokens ?? branch.fresh_tail_max_tokens,
+					branch.id,
+				],
 			);
 		}
+		if (!unchanged) this.#carryForwardSpans(branch.id, branch.revision, revision, unchangedPrefix);
 		const schedule =
 			summarize === false
 				? { queued: 0, reused: 0 }
@@ -1487,10 +1569,15 @@ class SqliteLcmContext implements LcmContext {
 		this.#rebuildFrontier(branchRowId, newRevision);
 	}
 
-	#ensureBranch(scope: ContextScope, now: number): BranchRow {
+	#ensureBranch(scope: ContextScope, now: number): ReconcileBranchRow {
+		this.#db.run(
+			"INSERT OR IGNORE INTO summary_retry_policies(project_id, retry_key, epoch, claim_token, updated_at) VALUES (?, NULL, 0, NULL, 0)",
+			[scope.projectId],
+		);
 		const existing = this.#db
-			.query<BranchRow, [string, string, string]>(
-				"SELECT id, revision FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?",
+			.query<ReconcileBranchRow, [string, string, string]>(
+				`SELECT id, revision, reconciled_at, summary_token_budget, fresh_tail_max_sources, fresh_tail_max_tokens
+				 FROM branches WHERE project_id = ? AND session_id = ? AND branch_id = ?`,
 			)
 			.get(scope.projectId, scope.sessionId, scope.branchId);
 		if (existing) return existing;
@@ -1498,7 +1585,14 @@ class SqliteLcmContext implements LcmContext {
 			"INSERT INTO branches (project_id, session_id, branch_id, reconciled_at) VALUES (?, ?, ?, ?)",
 			[scope.projectId, scope.sessionId, scope.branchId, now],
 		);
-		return { id: Number(inserted.lastInsertRowid), revision: 0 };
+		return {
+			id: Number(inserted.lastInsertRowid),
+			revision: 0,
+			reconciled_at: now,
+			summary_token_budget: null,
+			fresh_tail_max_sources: null,
+			fresh_tail_max_tokens: null,
+		};
 	}
 
 	#insertSourceContent(projectId: string, entry: NormalizedEntry, now: number): void {
@@ -1583,8 +1677,10 @@ class SqliteLcmContext implements LcmContext {
 	#activeRows(branchRowId: number): CurrentSourceRow[] {
 		return this.#db
 			.query<CurrentSourceRow, [number]>(
-				`SELECT id, entry_id, parent_entry_id, position, source_key, atomic_group_id
-				 FROM branch_sources WHERE branch_row_id = ? AND active = 1 ORDER BY position`,
+				`SELECT bs.id, bs.entry_id, bs.parent_entry_id, bs.position, bs.source_key, bs.atomic_group_id,
+					sc.token_count
+				 FROM branch_sources bs JOIN source_contents sc ON sc.source_key = bs.source_key
+				 WHERE bs.branch_row_id = ? AND bs.active = 1 ORDER BY bs.position`,
 			)
 			.all(branchRowId);
 	}
@@ -1854,6 +1950,24 @@ class SqliteLcmContext implements LcmContext {
 		}
 	}
 
+	#completedChildInputs(span: SpanRow, children: readonly SpanRow[]): JobInputSpec[] | null {
+		let cursor = span.start_position;
+		const inputs: JobInputSpec[] = [];
+		for (const child of children) {
+			if (
+				child.level !== span.level - 1 ||
+				child.start_position < span.start_position ||
+				child.end_position > span.end_position
+			) {
+				continue;
+			}
+			if (child.start_position !== cursor || child.summary_id === null) return null;
+			inputs.push({ kind: "summary", id: child.summary_id });
+			cursor = child.end_position;
+		}
+		return cursor === span.end_position && inputs.length > 1 ? inputs : null;
+	}
+
 	/** Ordered completed child summary ids exactly covering a parent span, or null. */
 	#childSpanInputs(branchRowId: number, revision: number, span: SpanRow): JobInputSpec[] | null {
 		const children = this.#db
@@ -1865,14 +1979,7 @@ class SqliteLcmContext implements LcmContext {
 				 ORDER BY start_position`,
 			)
 			.all(branchRowId, revision, span.level - 1, span.start_position, span.end_position);
-		let cursor = span.start_position;
-		const inputs: JobInputSpec[] = [];
-		for (const child of children) {
-			if (child.start_position !== cursor || child.summary_id === null) return null;
-			inputs.push({ kind: "summary", id: child.summary_id });
-			cursor = child.end_position;
-		}
-		return cursor === span.end_position && inputs.length > 1 ? inputs : null;
+		return this.#completedChildInputs(span, children);
 	}
 
 	/**
@@ -2022,15 +2129,21 @@ class SqliteLcmContext implements LcmContext {
 			};
 		}
 
+		const retryEpoch =
+			this.#db
+				.query<{ epoch: number }, [string]>("SELECT epoch FROM summary_retry_policies WHERE project_id = ?")
+				.get(params.projectId)?.epoch ?? 0;
 		const existing = this.#db
-			.query<{ status: string }, [string]>("SELECT status FROM summary_jobs WHERE job_id = ?")
+			.query<Pick<JobRow, "status" | "retry_epoch">, [string]>(
+				"SELECT status, retry_epoch FROM summary_jobs WHERE job_id = ?",
+			)
 			.get(jobId);
 		if (!existing) {
 			this.#db.run(
 				`INSERT INTO summary_jobs
 					(job_id, project_id, input_hash, level, origin_branch_row_id, origin_revision,
-					 status, available_at, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+					 status, available_at, created_at, updated_at, retry_epoch)
+				 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
 				[
 					jobId,
 					params.projectId,
@@ -2041,17 +2154,35 @@ class SqliteLcmContext implements LcmContext {
 					params.now,
 					params.now,
 					params.now,
+					retryEpoch,
 				],
 			);
 			this.#writeJobPayload(jobId, params.inputs, params.lineage);
 			params.stats.queued++;
 		} else if (existing.status === "obsolete" || existing.status === "completed") {
+			const preserveRetryState = existing.status === "obsolete" && existing.retry_epoch === retryEpoch;
 			this.#compactTerminalJob(jobId);
 			this.#writeJobPayload(jobId, params.inputs, params.lineage);
 			this.#db.run(
 				`UPDATE summary_jobs SET status = 'pending', origin_branch_row_id = ?, origin_revision = ?,
-					available_at = ?, result_summary_id = NULL, updated_at = ? WHERE job_id = ?`,
-				[params.branchRowId, params.revision, params.now, params.now, jobId],
+					worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, lease_input_tokens = NULL,
+					lease_output_budget = NULL, lease_policy_token = NULL, lease_mutation_nonce = NULL,
+					retry_epoch = ?,
+					transport_retry_count = CASE WHEN ? = 1 THEN transport_retry_count ELSE 0 END,
+					available_at = CASE WHEN ? = 1 THEN available_at ELSE ? END, result_summary_id = NULL,
+					last_error = CASE WHEN ? = 1 THEN last_error ELSE NULL END,
+					updated_at = ? WHERE job_id = ?`,
+				[
+					params.branchRowId,
+					params.revision,
+					retryEpoch,
+					preserveRetryState ? 1 : 0,
+					preserveRetryState ? 1 : 0,
+					params.now,
+					preserveRetryState ? 1 : 0,
+					params.now,
+					jobId,
+				],
 			);
 			params.stats.queued++;
 		}
@@ -2062,7 +2193,8 @@ class SqliteLcmContext implements LcmContext {
 		const startedWall = Bun.nanoseconds();
 		const startedCpu = process.cpuUsage();
 		try {
-			return this.#projectInternal(request);
+			const transaction = this.#db.transaction(() => this.#projectInternal(request));
+			return transaction.deferred();
 		} finally {
 			const cpu = process.cpuUsage(startedCpu);
 			this.#performance.projectionCalls++;
@@ -2081,6 +2213,7 @@ class SqliteLcmContext implements LcmContext {
 		if (!branch) {
 			return {
 				revision: 0,
+				activeSourceFingerprint: activeSourceFingerprint([]),
 				ready: true,
 				historical: [],
 				freshTailSourceIds: [],
@@ -2094,6 +2227,11 @@ class SqliteLcmContext implements LcmContext {
 			};
 		}
 		const rows = this.#activeSourceRows(scope);
+		const fingerprint = activeSourceFingerprint(
+			(function* () {
+				for (const row of rows) yield row.entry_id;
+			})(),
+		);
 		const units = atomicUnits(rows);
 		const atomicBoundaries = new Set<number>([0]);
 		let boundary = 0;
@@ -2160,10 +2298,7 @@ class SqliteLcmContext implements LcmContext {
 		let usedTokens = tailTokens;
 		while (cursor < tailStart) {
 			const selected = (byStart.get(cursor) ?? []).find(
-				span =>
-					span.end_position <= tailStart &&
-					atomicBoundaries.has(span.end_position) &&
-					usedTokens + span.token_count <= tokenBudget,
+				span => span.end_position <= tailStart && atomicBoundaries.has(span.end_position),
 			);
 			if (!selected) break;
 			const coveredRows = rows.slice(selected.start_position, selected.end_position);
@@ -2185,6 +2320,7 @@ class SqliteLcmContext implements LcmContext {
 
 		return {
 			revision: branch.revision,
+			activeSourceFingerprint: fingerprint,
 			ready: cursor === tailStart,
 			historical,
 			freshTailSourceIds: rows.slice(tailStart).map(row => row.entry_id),
@@ -2194,7 +2330,7 @@ class SqliteLcmContext implements LcmContext {
 			coveredSourceCount: cursor,
 			freshSourceCount: rows.length - tailStart,
 			estimatedTokens: usedTokens,
-			pendingJobs: this.#pendingSpanCount(branch.id, branch.revision, tailStart),
+			pendingJobs: this.#pendingSpans(branch.id, branch.revision, tailStart).length,
 		};
 	}
 
@@ -2203,8 +2339,8 @@ class SqliteLcmContext implements LcmContext {
 	 * whose completed children already cover its range is excluded: projection can use
 	 * those children while condensation continues in the background.
 	 */
-	#pendingSpanCount(branchRowId: number, revision: number, tailStart: number): number {
-		const unresolved = this.#db
+	#pendingSpans(branchRowId: number, revision: number, tailStart: number): SpanRow[] {
+		const spans = this.#db
 			.query<SpanRow, [number, number, number]>(
 				`SELECT level, start_position, end_position, input_hash, summary_id, frontier
 				 FROM branch_summary_spans
@@ -2213,12 +2349,282 @@ class SqliteLcmContext implements LcmContext {
 				 ORDER BY start_position`,
 			)
 			.all(branchRowId, revision, tailStart);
-		let count = 0;
-		for (const span of unresolved) {
-			if (span.level > 0 && this.#childSpanInputs(branchRowId, revision, span) !== null) continue;
-			count++;
+		if (!spans.some(span => span.level > 0)) return spans;
+		const children = this.#db
+			.query<SpanRow, [number, number, number]>(
+				`SELECT DISTINCT child.level, child.start_position, child.end_position,
+					child.input_hash, child.summary_id, child.frontier
+				 FROM branch_summary_spans child
+				 JOIN branch_summary_spans parent
+				   ON parent.branch_row_id = child.branch_row_id AND parent.revision = child.revision
+				  AND parent.level = child.level + 1
+				  AND child.start_position >= parent.start_position AND child.end_position <= parent.end_position
+				 WHERE child.branch_row_id = ? AND child.revision = ?
+				   AND parent.summary_id IS NULL AND parent.frontier = 1 AND parent.start_position < ?
+				 ORDER BY child.level, child.start_position`,
+			)
+			.all(branchRowId, revision, tailStart);
+		return spans.filter(span => span.level === 0 || this.#completedChildInputs(span, children) === null);
+	}
+
+	#retryPolicy(projectId: string): RetryPolicyRow | null {
+		return this.#db
+			.query<RetryPolicyRow, [string]>(
+				"SELECT retry_key, epoch, claim_token FROM summary_retry_policies WHERE project_id = ?",
+			)
+			.get(projectId);
+	}
+
+	configureSummaryRetryPolicy(
+		projectId: string,
+		retryKey: string,
+		options: ConfigureSummaryRetryPolicyOptions = {},
+	): ConfigureSummaryRetryPolicyResult {
+		this.#assertAvailable();
+		assertIdentifier(projectId, "projectId");
+		assertIdentifier(retryKey, "retryKey");
+		const expected = options.expected === undefined ? undefined : normalizedRetryPolicy(options.expected);
+		const observed = this.#retryPolicy(projectId);
+		if (observed?.retry_key === retryKey && !options.force) {
+			return { kind: "ready", retryKey, retryEpoch: observed.epoch };
 		}
-		return count;
+		if (
+			observed !== null &&
+			observed.retry_key !== null &&
+			!options.force &&
+			(expected === undefined || expected.retryKey !== observed.retry_key || expected.retryEpoch !== observed.epoch)
+		) {
+			return { kind: "conflict", retryKey: observed.retry_key, retryEpoch: observed.epoch };
+		}
+
+		const now = this.#options.now();
+		const transaction = this.#db.transaction((): ConfigureSummaryRetryPolicyResult => {
+			this.#db.run(
+				"INSERT OR IGNORE INTO summary_retry_policies(project_id, retry_key, epoch, claim_token, updated_at) VALUES (?, NULL, 0, NULL, 0)",
+				[projectId],
+			);
+			const current = this.#retryPolicy(projectId);
+			if (!current) throw new Error("summary retry policy disappeared");
+			if (current.retry_key === retryKey && !options.force) {
+				return { kind: "ready", retryKey, retryEpoch: current.epoch };
+			}
+			if (
+				current.retry_key !== null &&
+				!options.force &&
+				(expected === undefined || expected.retryKey !== current.retry_key || expected.retryEpoch !== current.epoch)
+			) {
+				return { kind: "conflict", retryKey: current.retry_key, retryEpoch: current.epoch };
+			}
+			const nextEpoch = current.epoch + 1;
+			const claimToken = crypto.randomUUID();
+			const changed = this.#db.run(
+				`UPDATE summary_retry_policies SET retry_key = ?, epoch = ?, claim_token = ?, updated_at = ?
+				 WHERE project_id = ? AND retry_key IS ? AND epoch = ? AND claim_token IS ?`,
+				[retryKey, nextEpoch, claimToken, now, projectId, current.retry_key, current.epoch, current.claim_token],
+			);
+			if (Number(changed.changes) === 0) {
+				const conflict = this.#retryPolicy(projectId);
+				if (!conflict?.retry_key) throw new Error("summary retry policy CAS lost without an active owner");
+				return { kind: "conflict", retryKey: conflict.retry_key, retryEpoch: conflict.epoch };
+			}
+			const preserveMatching = current.epoch === 0;
+			this.#db.run(
+				`UPDATE summary_jobs SET
+					retry_epoch = ?,
+					status = CASE
+						WHEN status = 'leased' THEN 'pending'
+						WHEN status = 'failed' AND (? = 0 OR last_resolved_model IS NOT ?) THEN 'pending'
+						ELSE status
+					END,
+					worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+					lease_input_tokens = NULL, lease_output_budget = NULL,
+					lease_policy_token = NULL, lease_mutation_nonce = NULL,
+					transport_retry_count = CASE
+						WHEN ? = 1 AND last_resolved_model IS ? THEN transport_retry_count ELSE 0
+					END,
+					available_at = CASE WHEN ? = 1 AND last_resolved_model IS ? THEN available_at ELSE ? END,
+					last_error = CASE WHEN ? = 1 AND last_resolved_model IS ? THEN last_error ELSE NULL END,
+					updated_at = ?
+				 WHERE project_id = ?`,
+				[
+					nextEpoch,
+					preserveMatching ? 1 : 0,
+					retryKey,
+					preserveMatching ? 1 : 0,
+					retryKey,
+					preserveMatching ? 1 : 0,
+					retryKey,
+					now,
+					preserveMatching ? 1 : 0,
+					retryKey,
+					now,
+					projectId,
+				],
+			);
+			return { kind: "ready", retryKey, retryEpoch: nextEpoch };
+		});
+		return transaction.immediate();
+	}
+
+	#relevantPendingSpans(request: ProjectionRequest): { projectId: string; spans: SpanRow[] } {
+		const scope = normalizeScope(request);
+		const tokenBudget = assertInteger(request.tokenBudget, "tokenBudget", 0);
+		const maxSources = assertInteger(request.freshTail.maxSources, "freshTail.maxSources", 0);
+		const maxTokens = assertInteger(request.freshTail.maxTokens, "freshTail.maxTokens", 0);
+		const branch = this.#branchRow(scope);
+		if (!branch) return { projectId: scope.projectId, spans: [] };
+		const rows = this.#activeRows(branch.id);
+		const tailStart = selectFreshTail(rows, tokenBudget, maxSources, maxTokens).start;
+		return { projectId: scope.projectId, spans: this.#pendingSpans(branch.id, branch.revision, tailStart) };
+	}
+
+	#summaryJobAvailability(
+		request: ProjectionRequest,
+		policy: SummaryRetryPolicy,
+		retryLimit: number,
+	): SummaryJobAvailability {
+		const { projectId, spans } = this.#relevantPendingSpans(request);
+		const availability: SummaryJobAvailability = {
+			runnable: 0,
+			leased: 0,
+			backoff: 0,
+			exhausted: 0,
+			missing: 0,
+			policyMismatch: 0,
+		};
+		const storedPolicy = this.#retryPolicy(projectId);
+		if (
+			storedPolicy?.retry_key !== policy.retryKey ||
+			storedPolicy.epoch !== policy.retryEpoch ||
+			storedPolicy.claim_token === null
+		) {
+			availability.policyMismatch = spans.length;
+			return availability;
+		}
+		const now = this.#options.now();
+		if (spans.length === 0) return availability;
+		const scope = normalizeScope(request);
+		const jobsByInputHash = new Map<string, JobRow>();
+		for (const job of this.#db
+			.query<JobRow, [string, string, string]>(
+				`SELECT DISTINCT job.job_id, job.project_id, job.input_hash, job.level, job.status,
+					job.worker_id, job.lease_token, job.lease_expires_at, job.lease_input_tokens,
+					job.lease_output_budget, job.stage, job.transport_retry_count, job.available_at,
+					job.retry_epoch, job.lease_policy_token, job.lease_mutation_nonce
+				 FROM branches branch
+				 JOIN branch_summary_spans span
+				   ON span.branch_row_id = branch.id AND span.revision = branch.revision
+				 JOIN summary_jobs job
+				   ON job.project_id = branch.project_id AND job.input_hash = span.input_hash
+				 WHERE branch.project_id = ? AND branch.session_id = ? AND branch.branch_id = ?
+				   AND span.summary_id IS NULL AND span.frontier = 1`,
+			)
+			.all(scope.projectId, scope.sessionId, scope.branchId)) {
+			jobsByInputHash.set(job.input_hash, job);
+		}
+		for (const span of spans) {
+			const job = jobsByInputHash.get(span.input_hash);
+			if (!job) {
+				availability.missing++;
+				continue;
+			}
+			if (job.retry_epoch !== policy.retryEpoch) {
+				availability.policyMismatch++;
+				continue;
+			}
+			if (job.transport_retry_count >= retryLimit) {
+				availability.exhausted++;
+				continue;
+			}
+			if (job.status === "leased" && job.lease_expires_at !== null && job.lease_expires_at > now) {
+				if (
+					job.lease_policy_token !== storedPolicy.claim_token ||
+					job.lease_mutation_nonce === null ||
+					job.lease_token === null
+				) {
+					availability.policyMismatch++;
+					continue;
+				}
+				availability.leased++;
+				availability.nextLeaseExpiryAt = Math.min(
+					availability.nextLeaseExpiryAt ?? job.lease_expires_at,
+					job.lease_expires_at,
+				);
+				continue;
+			}
+			if (job.status !== "pending" && job.status !== "failed" && job.status !== "leased") {
+				availability.missing++;
+				continue;
+			}
+			if (job.available_at <= now) availability.runnable++;
+			else {
+				availability.backoff++;
+				availability.nextAvailableAt = Math.min(availability.nextAvailableAt ?? job.available_at, job.available_at);
+			}
+		}
+		return availability;
+	}
+
+	summaryJobAvailability(
+		request: ProjectionRequest,
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+	): SummaryJobAvailability {
+		this.#assertAvailable();
+		const policy = normalizedRetryPolicy(retryPolicy);
+		const retryLimit = assertInteger(maxTransportRetries, "maxTransportRetries", 1);
+		const transaction = this.#db.transaction(() => this.#summaryJobAvailability(request, policy, retryLimit));
+		return transaction.deferred();
+	}
+
+	retrySummaryJobs(
+		request: ProjectionRequest,
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		mode: SummaryRetryMode = "due",
+	): SummaryJobAvailability {
+		this.#assertAvailable();
+		if (mode !== "due" && mode !== "all") throw new TypeError('mode must be "due" or "all"');
+		const policy = normalizedRetryPolicy(retryPolicy);
+		const retryLimit = assertInteger(maxTransportRetries, "maxTransportRetries", 1);
+		if (mode === "due") return this.summaryJobAvailability(request, policy, retryLimit);
+
+		const transaction = this.#db.transaction(() => {
+			const { projectId, spans } = this.#relevantPendingSpans(request);
+			const storedPolicy = this.#retryPolicy(projectId);
+			if (
+				storedPolicy?.retry_key !== policy.retryKey ||
+				storedPolicy.epoch !== policy.retryEpoch ||
+				storedPolicy.claim_token === null
+			) {
+				return;
+			}
+			const inputHashes = [...new Set(spans.map(span => span.input_hash))];
+			if (inputHashes.length === 0) return;
+			const now = this.#options.now();
+			this.#db.run(
+				`UPDATE summary_jobs SET available_at = ?, updated_at = ?
+				 WHERE project_id = ? AND input_hash IN (${inputHashes.map(() => "?").join(", ")})
+				   AND status IN ('pending', 'failed') AND retry_epoch = ? AND transport_retry_count < ?
+				   AND EXISTS (
+					SELECT 1 FROM summary_retry_policies policy
+					WHERE policy.project_id = summary_jobs.project_id AND policy.retry_key = ?
+					  AND policy.epoch = summary_jobs.retry_epoch AND policy.claim_token = ?
+				   )`,
+				[
+					now,
+					now,
+					projectId,
+					...inputHashes,
+					policy.retryEpoch,
+					retryLimit,
+					policy.retryKey,
+					storedPolicy.claim_token,
+				],
+			);
+		});
+		transaction.immediate();
+		return this.summaryJobAvailability(request, policy, retryLimit);
 	}
 
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[] {
@@ -2227,21 +2633,30 @@ class SqliteLcmContext implements LcmContext {
 		const leaseMs = assertInteger(options.leaseMs, "leaseMs", 1);
 		const limit = assertInteger(options.limit, "limit", 1);
 		const maxOutputTokens = assertInteger(options.maxOutputTokens, "maxOutputTokens", 1);
+		const retryPolicy = normalizedRetryPolicy(options);
+		const maxTransportRetries = assertInteger(options.maxTransportRetries, "maxTransportRetries", 1);
 		const preferredScope = options.preferredScope === undefined ? undefined : normalizeScope(options.preferredScope);
 		const allowFallback = options.allowFallback ?? true;
 		const now = this.#options.now();
 		const transaction = this.#db.transaction(() => {
 			const preferredBranchRowId = this.#preferredBranchRowId(preferredScope);
 			const candidates = this.#db
-				.query<Pick<JobRow, "job_id" | "project_id" | "input_hash" | "stage">, [number, number]>(
-					`SELECT job_id, project_id, input_hash, stage FROM summary_jobs
-					 WHERE available_at <= ? AND (
-						status IN ('pending', 'failed') OR
-						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-					 )
-					 ORDER BY level, created_at, job_id`,
+				.query<
+					Pick<JobRow, "job_id" | "project_id" | "input_hash" | "stage"> & { claim_token: string },
+					[string, number, number, number, number]
+				>(
+					`SELECT job.job_id, job.project_id, job.input_hash, job.stage, policy.claim_token
+					 FROM summary_jobs job
+					 JOIN summary_retry_policies policy ON policy.project_id = job.project_id
+					 WHERE policy.retry_key = ? AND policy.epoch = ? AND policy.claim_token IS NOT NULL
+					   AND job.retry_epoch = policy.epoch AND job.transport_retry_count < ?
+					   AND job.available_at <= ? AND (
+						job.status IN ('pending', 'failed') OR
+						(job.status = 'leased' AND job.lease_expires_at IS NOT NULL AND job.lease_expires_at <= ?)
+					   )
+					 ORDER BY job.level, job.created_at, job.job_id`,
 				)
-				.all(now, now);
+				.all(retryPolicy.retryKey, retryPolicy.retryEpoch, maxTransportRetries, now, now);
 			const preferred: Array<{ candidate: (typeof candidates)[number]; queueClass: "preferred" }> = [];
 			const fallback: Array<{ candidate: (typeof candidates)[number]; queueClass: "fallback" }> = [];
 			const obsolete: string[] = [];
@@ -2254,7 +2669,8 @@ class SqliteLcmContext implements LcmContext {
 			for (const jobId of obsolete) {
 				this.#db.run(
 					`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-						lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
+						lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+						lease_policy_token = NULL, lease_mutation_nonce = NULL, updated_at = ? WHERE job_id = ?`,
 					[now, jobId],
 				);
 				this.#compactTerminalJob(jobId);
@@ -2265,10 +2681,12 @@ class SqliteLcmContext implements LcmContext {
 				if (claimed.length >= limit) break;
 				const inputs = this.#loadJobInputs(candidate.job_id);
 				if (!inputs) {
-					this.#db.run("UPDATE summary_jobs SET status = 'obsolete', updated_at = ? WHERE job_id = ?", [
-						now,
-						candidate.job_id,
-					]);
+					this.#db.run(
+						`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
+							lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+							lease_policy_token = NULL, lease_mutation_nonce = NULL, updated_at = ? WHERE job_id = ?`,
+						[now, candidate.job_id],
+					);
 					this.#compactTerminalJob(candidate.job_id);
 					continue;
 				}
@@ -2276,7 +2694,10 @@ class SqliteLcmContext implements LcmContext {
 				const outputTokenBudget = outputBudgetForStage(candidate.stage, maxOutputTokens, inputTokenCount);
 				if (outputTokenBudget < 1) {
 					this.#db.run(
-						"UPDATE summary_jobs SET status = 'obsolete', last_error = 'input too small to compress', updated_at = ? WHERE job_id = ?",
+						`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
+							lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+							lease_policy_token = NULL, lease_mutation_nonce = NULL,
+							last_error = 'input too small to compress', updated_at = ? WHERE job_id = ?`,
 						[now, candidate.job_id],
 					);
 					this.#compactTerminalJob(candidate.job_id);
@@ -2284,11 +2705,13 @@ class SqliteLcmContext implements LcmContext {
 				}
 				const leaseToken = crypto.randomUUID();
 				const leaseExpiresAt = now + leaseMs;
+				const leaseMutationNonce = crypto.randomUUID();
 				const changed = this.#db.run(
 					`UPDATE summary_jobs SET status = 'leased', worker_id = ?, lease_token = ?, lease_expires_at = ?,
 						lease_input_tokens = ?, lease_output_budget = ?, attempt_count = attempt_count + 1,
-						last_strategy = ?, last_input_tokens = ?, updated_at = ?
-					 WHERE job_id = ? AND available_at <= ? AND (
+						last_strategy = ?, last_input_tokens = ?, retry_epoch = ?, lease_policy_token = ?,
+						lease_mutation_nonce = ?, updated_at = ?
+					 WHERE job_id = ? AND retry_epoch = ? AND transport_retry_count < ? AND available_at <= ? AND (
 						status IN ('pending', 'failed') OR
 						(status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
 					 )`,
@@ -2300,8 +2723,13 @@ class SqliteLcmContext implements LcmContext {
 						outputTokenBudget,
 						strategyForStage(candidate.stage),
 						inputTokenCount,
+						retryPolicy.retryEpoch,
+						candidate.claim_token,
+						leaseMutationNonce,
 						now,
 						candidate.job_id,
+						retryPolicy.retryEpoch,
+						maxTransportRetries,
 						now,
 						now,
 					],
@@ -2311,6 +2739,10 @@ class SqliteLcmContext implements LcmContext {
 					candidate.job_id,
 					leaseToken,
 					leaseExpiresAt,
+					retryPolicy.retryKey,
+					retryPolicy.retryEpoch,
+					candidate.claim_token,
+					leaseMutationNonce,
 					inputs,
 					this.#count("SELECT COUNT(*) AS count FROM job_lineage WHERE job_id = ?", candidate.job_id),
 					inputTokenCount,
@@ -2321,8 +2753,10 @@ class SqliteLcmContext implements LcmContext {
 				else {
 					this.#db.run(
 						`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-							lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
-						[now, candidate.job_id, leaseToken],
+							lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+							lease_policy_token = NULL, lease_mutation_nonce = NULL, updated_at = ?
+						 WHERE job_id = ? AND lease_token = ? AND lease_mutation_nonce = ?`,
+						[now, candidate.job_id, leaseToken, leaseMutationNonce],
 					);
 					this.#compactTerminalJob(candidate.job_id);
 				}
@@ -2332,8 +2766,15 @@ class SqliteLcmContext implements LcmContext {
 		return transaction.immediate();
 	}
 
-	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback = true): number | null {
+	nextSummaryJobDelayMs(
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		preferredScope?: ContextScope,
+		allowFallback = true,
+	): number | null {
 		this.#assertAvailable();
+		const policy = normalizedRetryPolicy(retryPolicy);
+		const retryLimit = assertInteger(maxTransportRetries, "maxTransportRetries", 1);
 		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
 		const preferredBranchRowId = this.#preferredBranchRowId(scope);
 		const now = this.#options.now();
@@ -2347,17 +2788,19 @@ class SqliteLcmContext implements LcmContext {
 					available_at: number;
 					lease_expires_at: number | null;
 				},
-				[]
+				[string, number, number]
 			>(
-				`SELECT job_id, project_id, input_hash, status, available_at, lease_expires_at FROM summary_jobs
-				 WHERE status IN ('pending', 'failed', 'leased')`,
+				`SELECT job.job_id, job.project_id, job.input_hash, job.status, job.available_at, job.lease_expires_at
+				 FROM summary_jobs job JOIN summary_retry_policies policy ON policy.project_id = job.project_id
+				 WHERE policy.retry_key = ? AND policy.epoch = ? AND policy.claim_token IS NOT NULL
+				   AND job.retry_epoch = policy.epoch AND job.transport_retry_count < ?
+				   AND job.status IN ('pending', 'failed', 'leased')`,
 			)
-			.all();
+			.all(policy.retryKey, policy.retryEpoch, retryLimit);
 		let availableAt: number | null = null;
 		for (const row of rows) {
 			const placement = this.#jobSpanClass(row.project_id, row.input_hash, preferredBranchRowId);
-			if (placement === null) continue;
-			if (placement === "fallback" && !allowFallback) continue;
+			if (placement === null || (placement === "fallback" && !allowFallback)) continue;
 			const candidateAt = row.status === "leased" ? row.lease_expires_at : row.available_at;
 			if (candidateAt !== null && (availableAt === null || candidateAt < availableAt)) availableAt = candidateAt;
 		}
@@ -2381,6 +2824,10 @@ class SqliteLcmContext implements LcmContext {
 		jobId: string,
 		leaseToken: string,
 		leaseExpiresAt: number,
+		retryKey: string,
+		retryEpoch: number,
+		leasePolicyToken: string,
+		leaseMutationNonce: string,
 		inputs: readonly SummaryJobInput[],
 		sourceCount: number,
 		inputTokenCount: number,
@@ -2388,14 +2835,23 @@ class SqliteLcmContext implements LcmContext {
 		queueClass: SummaryJob["queueClass"],
 	): SummaryJob | null {
 		const job = this.#db
-			.query<Pick<JobRow, "job_id" | "level" | "stage" | "transport_retry_count">, [string]>(
-				"SELECT job_id, level, stage, transport_retry_count FROM summary_jobs WHERE job_id = ?",
+			.query<
+				Pick<JobRow, "job_id" | "level" | "stage" | "transport_retry_count">,
+				[string, string, number, string, string]
+			>(
+				`SELECT job_id, level, stage, transport_retry_count FROM summary_jobs
+				 WHERE job_id = ? AND lease_token = ? AND retry_epoch = ?
+				   AND lease_policy_token = ? AND lease_mutation_nonce = ?`,
 			)
-			.get(jobId);
+			.get(jobId, leaseToken, retryEpoch, leasePolicyToken, leaseMutationNonce);
 		if (!job) return null;
 		return {
 			jobId,
 			leaseToken,
+			retryKey,
+			retryEpoch,
+			leasePolicyToken,
+			leaseMutationNonce,
 			leaseExpiresAt,
 			queueClass,
 			kind: job.level === 0 ? "leaf" : "condensed",
@@ -2501,20 +2957,32 @@ class SqliteLcmContext implements LcmContext {
 			.map(row => row.source_key);
 	}
 
-	summaryJobFailures(preferredScope?: ContextScope): readonly {
+	summaryJobFailures(
+		retryPolicy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		preferredScope?: ContextScope,
+	): readonly {
 		jobId: string;
 		availableAt: number;
 		queueClass: "preferred" | "fallback";
 	}[] {
 		this.#assertAvailable();
+		const policy = normalizedRetryPolicy(retryPolicy);
+		const retryLimit = assertInteger(maxTransportRetries, "maxTransportRetries", 1);
 		const scope = preferredScope === undefined ? undefined : normalizeScope(preferredScope);
 		const preferredBranchRowId = this.#preferredBranchRowId(scope);
 		const rows = this.#db
-			.query<{ job_id: string; project_id: string; input_hash: string; available_at: number }, []>(
-				`SELECT job_id, project_id, input_hash, available_at FROM summary_jobs
-				 WHERE status = 'failed' ORDER BY available_at, job_id`,
+			.query<
+				{ job_id: string; project_id: string; input_hash: string; available_at: number },
+				[number, number, string]
+			>(
+				`SELECT job.job_id, job.project_id, job.input_hash, job.available_at
+				 FROM summary_jobs job JOIN summary_retry_policies policy ON policy.project_id = job.project_id
+				 WHERE job.status = 'failed' AND job.transport_retry_count < ?
+				   AND job.retry_epoch = ? AND policy.retry_key = ? AND policy.epoch = job.retry_epoch
+				 ORDER BY job.available_at, job.job_id`,
 			)
-			.all();
+			.all(retryLimit, policy.retryEpoch, policy.retryKey);
 		const failures: Array<{
 			jobId: string;
 			availableAt: number;
@@ -2528,39 +2996,56 @@ class SqliteLcmContext implements LcmContext {
 		return failures;
 	}
 
-	extendSummaryJob(jobId: string, leaseToken: string, leaseMs: number): boolean {
+	extendSummaryJob(leaseInput: SummaryJobLease, leaseMs: number): string | null {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
+		const lease = normalizedLease(leaseInput);
 		assertInteger(leaseMs, "leaseMs", 1);
 		const now = this.#options.now();
+		const nextNonce = crypto.randomUUID();
 		const result = this.#db.run(
-			`UPDATE summary_jobs SET lease_expires_at = ?, updated_at = ?
-			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
-			[now + leaseMs, now, jobId, leaseToken, now],
+			`UPDATE summary_jobs SET lease_expires_at = ?, lease_mutation_nonce = ?, updated_at = ?
+			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND retry_epoch = ?
+			   AND lease_policy_token = ? AND lease_mutation_nonce = ? AND lease_expires_at > ?
+			   AND EXISTS (
+				SELECT 1 FROM summary_retry_policies policy WHERE policy.project_id = summary_jobs.project_id
+				  AND policy.retry_key = ? AND policy.epoch = summary_jobs.retry_epoch
+				  AND policy.claim_token = summary_jobs.lease_policy_token
+			   )`,
+			[
+				now + leaseMs,
+				nextNonce,
+				now,
+				lease.jobId,
+				lease.leaseToken,
+				lease.retryEpoch,
+				lease.leasePolicyToken,
+				lease.leaseMutationNonce,
+				now,
+				lease.retryKey,
+			],
 		);
-		return Number(result.changes) > 0;
+		return Number(result.changes) > 0 ? nextNonce : null;
 	}
 
-	releaseSummaryJob(jobId: string, leaseToken: string): boolean {
+	releaseSummaryJob(leaseInput: SummaryJobLease): boolean {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
+		const lease = normalizedLease(leaseInput);
 		const now = this.#options.now();
 		const result = this.#db.run(
 			`UPDATE summary_jobs SET status = 'pending', worker_id = NULL, lease_token = NULL,
 				lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
-				available_at = ?, updated_at = ?
-			 WHERE job_id = ? AND status = 'leased' AND lease_token = ?`,
-			[now, now, jobId, leaseToken],
+				lease_policy_token = NULL, lease_mutation_nonce = NULL, available_at = ?, updated_at = ?
+			 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND retry_epoch = ?
+			   AND lease_policy_token = ? AND lease_mutation_nonce = ?`,
+			[now, now, lease.jobId, lease.leaseToken, lease.retryEpoch, lease.leasePolicyToken, lease.leaseMutationNonce],
 		);
 		return Number(result.changes) > 0;
 	}
 
-	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult {
+	completeSummaryJob(leaseInput: SummaryJobLease, completion: SummaryCompletion): CompleteSummaryJobResult {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
+		const lease = normalizedLease(leaseInput);
+		const { jobId, leaseToken } = lease;
 		if (typeof completion.redactedText !== "string" || completion.redactedText.trim().length === 0) {
 			throw new TypeError("completion.redactedText must be a non-empty string");
 		}
@@ -2581,11 +3066,15 @@ class SqliteLcmContext implements LcmContext {
 		const now = this.#options.now();
 		const attempt = completion.attempt;
 		if (attempt) assertProviderAttempt(attempt, "completion.attempt");
+		const dispatchedAttemptCount = attempt === undefined ? 0 : 1;
 		const markObsolete = (): void => {
 			this.#db.run(
 				`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-					lease_expires_at = NULL, updated_at = ? WHERE job_id = ? AND lease_token = ?`,
-				[now, jobId, leaseToken],
+					lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+					lease_policy_token = NULL, lease_mutation_nonce = NULL, updated_at = ?
+				 WHERE job_id = ? AND lease_token = ? AND retry_epoch = ?
+				   AND lease_policy_token = ? AND lease_mutation_nonce = ?`,
+				[now, jobId, leaseToken, lease.retryEpoch, lease.leasePolicyToken, lease.leaseMutationNonce],
 			);
 			this.#compactTerminalJob(jobId);
 		};
@@ -2593,7 +3082,7 @@ class SqliteLcmContext implements LcmContext {
 		// `in_flight`. A non-null result means the settler overrode the branch intent.
 		const settle = (requested: SummaryAttemptOutcome): CompleteSummaryJobResult | null => {
 			if (!attempt) return null;
-			const settled = this.#settleAttempt(jobId, leaseToken, attempt, requested, now);
+			const settled = this.#settleAttempt(lease, attempt, requested, now);
 			if (settled === requested) return null;
 			if (settled === "stale") {
 				markObsolete();
@@ -2601,23 +3090,33 @@ class SqliteLcmContext implements LcmContext {
 			}
 			return { accepted: false, reason: "lease_lost" };
 		};
+		let detachedSettlement = false;
 		const transaction = this.#db.transaction((): CompleteSummaryJobResult => {
 			const job = this.#db
 				.query<JobRow, [string]>(
-					`SELECT job_id, project_id, input_hash, level, status, lease_token, lease_expires_at,
-						lease_input_tokens, lease_output_budget, stage, transport_retry_count
+					`SELECT job_id, project_id, input_hash, level, status, worker_id, lease_token, lease_expires_at,
+						lease_input_tokens, lease_output_budget, stage, transport_retry_count, available_at,
+						retry_epoch, lease_policy_token, lease_mutation_nonce
 					 FROM summary_jobs WHERE job_id = ?`,
 				)
 				.get(jobId);
+			const policy = job ? this.#retryPolicy(job.project_id) : null;
 			if (
 				job?.status !== "leased" ||
 				job.lease_token !== leaseToken ||
+				job.retry_epoch !== lease.retryEpoch ||
+				job.lease_policy_token !== lease.leasePolicyToken ||
+				job.lease_mutation_nonce !== lease.leaseMutationNonce ||
+				policy?.retry_key !== lease.retryKey ||
+				policy.epoch !== lease.retryEpoch ||
+				policy.claim_token !== lease.leasePolicyToken ||
 				job.lease_expires_at === null ||
 				job.lease_input_tokens === null ||
 				job.lease_output_budget === null ||
 				job.lease_expires_at <= now
 			) {
-				return settle("lease_lost") ?? { accepted: false, reason: "lease_lost" };
+				detachedSettlement = true;
+				return { accepted: false, reason: "lease_lost" };
 			}
 			const strategy = strategyForStage(job.stage);
 			if (provenance && provenance.strategy !== strategy) {
@@ -2645,13 +3144,16 @@ class SqliteLcmContext implements LcmContext {
 				if (advanced) {
 					this.#db.run(
 						`UPDATE summary_jobs SET status = 'pending', stage = ?, worker_id = NULL, lease_token = NULL,
-							lease_expires_at = NULL, available_at = ?, last_error = 'summary did not compress input',
-							non_compression_count = non_compression_count + 1, last_strategy = ?, last_prompt_hash = ?,
+							lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+							lease_policy_token = NULL, lease_mutation_nonce = NULL,
+							last_error = 'summary did not compress input',
+							non_compression_count = non_compression_count + 1,
+							transport_retry_count = transport_retry_count + ?, last_strategy = ?, last_prompt_hash = ?,
 							last_model_selector = ?, last_resolved_model = ?, last_input_tokens = ?, last_output_tokens = ?,
-							updated_at = ? WHERE job_id = ? AND lease_token = ?`,
+							updated_at = ? WHERE job_id = ? AND lease_token = ? AND lease_mutation_nonce = ?`,
 						[
 							advanced,
-							now,
+							dispatchedAttemptCount,
 							strategy,
 							promptHash,
 							modelSelector,
@@ -2661,17 +3163,22 @@ class SqliteLcmContext implements LcmContext {
 							now,
 							jobId,
 							leaseToken,
+							lease.leaseMutationNonce,
 						],
 					);
 					return { accepted: false, reason: "escalated", stage: advanced };
 				}
 				this.#db.run(
 					`UPDATE summary_jobs SET status = 'obsolete', worker_id = NULL, lease_token = NULL,
-						lease_expires_at = NULL, last_error = 'deterministic summary did not compress input',
-						non_compression_count = non_compression_count + 1, last_strategy = ?, last_prompt_hash = ?,
+						lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+						lease_policy_token = NULL, lease_mutation_nonce = NULL,
+						last_error = 'deterministic summary did not compress input',
+						non_compression_count = non_compression_count + 1,
+						transport_retry_count = transport_retry_count + ?, last_strategy = ?, last_prompt_hash = ?,
 						last_model_selector = ?, last_resolved_model = ?, last_input_tokens = ?, last_output_tokens = ?,
-						updated_at = ? WHERE job_id = ? AND lease_token = ?`,
+						updated_at = ? WHERE job_id = ? AND lease_token = ? AND lease_mutation_nonce = ?`,
 					[
+						dispatchedAttemptCount,
 						strategy,
 						promptHash,
 						modelSelector,
@@ -2681,6 +3188,7 @@ class SqliteLcmContext implements LcmContext {
 						now,
 						jobId,
 						leaseToken,
+						lease.leaseMutationNonce,
 					],
 				);
 				this.#compactTerminalJob(jobId);
@@ -2754,10 +3262,11 @@ class SqliteLcmContext implements LcmContext {
 			}
 			this.#db.run(
 				`UPDATE summary_jobs SET status = 'completed', result_summary_id = ?, worker_id = NULL,
-					lease_token = NULL, lease_expires_at = NULL, last_error = NULL, last_strategy = ?,
-					last_prompt_hash = ?, last_model_selector = ?, last_resolved_model = ?,
-					last_input_tokens = ?, last_output_tokens = ?, updated_at = ?
-				 WHERE job_id = ? AND lease_token = ?`,
+					lease_token = NULL, lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+					lease_policy_token = NULL, lease_mutation_nonce = NULL, transport_retry_count = 0,
+					last_error = NULL, last_strategy = ?, last_prompt_hash = ?, last_model_selector = ?,
+					last_resolved_model = ?, last_input_tokens = ?, last_output_tokens = ?, updated_at = ?
+				 WHERE job_id = ? AND lease_token = ? AND lease_mutation_nonce = ?`,
 				[
 					summary.summary_id,
 					strategy,
@@ -2769,13 +3278,18 @@ class SqliteLcmContext implements LcmContext {
 					now,
 					jobId,
 					leaseToken,
+					lease.leaseMutationNonce,
 				],
 			);
 			this.#compactTerminalJob(jobId);
 			this.#fillCompletedSpans(job.project_id, job.input_hash, summary.summary_id, jobInputs, now);
 			return { accepted: true, summaryId: summary.summary_id };
 		});
-		return transaction.immediate();
+		const result = transaction.immediate();
+		if (detachedSettlement && attempt) {
+			this.#db.transaction(() => this.#settleAttempt(lease, attempt, "lease_lost", now)).immediate();
+		}
+		return result;
 	}
 
 	/**
@@ -2851,19 +3365,50 @@ class SqliteLcmContext implements LcmContext {
 		}
 	}
 
+	#authorizedLease(lease: SummaryJobLease, now: number): JobRow | null {
+		const job = this.#db
+			.query<JobRow, [string]>(
+				`SELECT job_id, project_id, input_hash, level, status, worker_id, lease_token, lease_expires_at,
+					lease_input_tokens, lease_output_budget, stage, transport_retry_count, attempt_count, available_at,
+					retry_epoch, lease_policy_token, lease_mutation_nonce
+				 FROM summary_jobs WHERE job_id = ?`,
+			)
+			.get(lease.jobId);
+		if (
+			job?.status !== "leased" ||
+			job.lease_token !== lease.leaseToken ||
+			job.retry_epoch !== lease.retryEpoch ||
+			job.lease_policy_token !== lease.leasePolicyToken ||
+			job.lease_mutation_nonce !== lease.leaseMutationNonce ||
+			job.lease_expires_at === null ||
+			job.lease_expires_at <= now
+		) {
+			return null;
+		}
+		const policy = this.#retryPolicy(job.project_id);
+		return policy?.retry_key === lease.retryKey &&
+			policy.epoch === lease.retryEpoch &&
+			policy.claim_token === lease.leasePolicyToken
+			? job
+			: null;
+	}
+
 	failSummaryJob(
-		jobId: string,
-		leaseToken: string,
+		leaseInput: SummaryJobLease,
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
-		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
+		failedAttempt?: {
+			attempt: SummaryProviderAttempt | SummaryProviderAttemptStart;
+			outcome: SummaryFailureAttemptOutcome;
+		},
+		countTransportRetry = true,
 	): boolean {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
+		const lease = normalizedLease(leaseInput);
 		if (typeof redactedError !== "string") throw new TypeError("redactedError must be a string");
-		assertInteger(retryDelayMs, "retryDelayMs", 0);
+		const normalizedDelay = Math.max(1, assertInteger(retryDelayMs, "retryDelayMs", 0));
+		if (typeof countTransportRetry !== "boolean") throw new TypeError("countTransportRetry must be a boolean");
 		if (provenance) {
 			assertIdentifier(provenance.promptHash, "provenance.promptHash");
 			if (provenance.modelSelector !== undefined)
@@ -2871,38 +3416,47 @@ class SqliteLcmContext implements LcmContext {
 			if (provenance.resolvedModel !== undefined)
 				assertIdentifier(provenance.resolvedModel, "provenance.resolvedModel");
 		}
-		if (failedAttempt) assertProviderAttempt(failedAttempt.attempt, "failedAttempt.attempt");
+		if (failedAttempt) {
+			if ("completedAt" in failedAttempt.attempt)
+				assertProviderAttempt(failedAttempt.attempt, "failedAttempt.attempt");
+			else assertProviderAttemptStart(failedAttempt.attempt, "failedAttempt.attempt");
+		}
 		const now = this.#options.now();
+		const availableAt = Math.min(Number.MAX_SAFE_INTEGER, now + normalizedDelay);
 		const applyFailure = (): boolean => {
 			const result = this.#db.run(
 				`UPDATE summary_jobs SET status = 'failed', worker_id = NULL, lease_token = NULL,
-					lease_expires_at = NULL, available_at = ?, last_error = ?,
-					transport_retry_count = transport_retry_count + 1,
+					lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+					lease_policy_token = NULL, lease_mutation_nonce = NULL,
+					available_at = ?, last_error = ?, transport_retry_count = transport_retry_count + ?,
 					last_strategy = COALESCE(?, last_strategy), last_prompt_hash = COALESCE(?, last_prompt_hash),
 					last_model_selector = COALESCE(?, last_model_selector),
 					last_resolved_model = COALESCE(?, last_resolved_model),
 					last_input_tokens = lease_input_tokens, updated_at = ?
-				 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?`,
+				 WHERE job_id = ? AND status = 'leased' AND lease_token = ? AND retry_epoch = ?
+				   AND lease_policy_token = ? AND lease_mutation_nonce = ? AND lease_expires_at > ?`,
 				[
-					now + retryDelayMs,
+					availableAt,
 					boundedDiagnostic(redactedError),
+					countTransportRetry ? 1 : 0,
 					provenance?.strategy ?? null,
 					provenance?.promptHash ?? null,
 					provenance?.modelSelector ? boundedDiagnostic(provenance.modelSelector) : null,
 					provenance?.resolvedModel ? boundedDiagnostic(provenance.resolvedModel) : null,
 					now,
-					jobId,
-					leaseToken,
+					lease.jobId,
+					lease.leaseToken,
+					lease.retryEpoch,
+					lease.leasePolicyToken,
+					lease.leaseMutationNonce,
 					now,
 				],
 			);
 			return Number(result.changes) > 0;
 		};
 		if (!failedAttempt) return applyFailure();
-		// Only the requested provider failure retries: a superseded or re-leased job
-		// records its billed attempt without resurrecting obsolete work.
 		const transaction = this.#db.transaction((): boolean => {
-			const settled = this.#settleAttempt(jobId, leaseToken, failedAttempt.attempt, failedAttempt.outcome, now);
+			const settled = this.#settleAttempt(lease, failedAttempt.attempt, failedAttempt.outcome, now);
 			return settled === failedAttempt.outcome && applyFailure();
 		});
 		return transaction.immediate();
@@ -2920,14 +3474,12 @@ class SqliteLcmContext implements LcmContext {
 	}
 
 	beginSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
+		leaseInput: SummaryJobLease,
 		attempt: SummaryProviderAttemptStart,
 		provenance: SummaryAttemptProvenance,
 	): boolean {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
+		const lease = normalizedLease(leaseInput);
 		assertProviderAttemptStart(attempt, "attempt");
 		assertIdentifier(provenance.promptHash, "provenance.promptHash");
 		if (provenance.modelSelector !== undefined)
@@ -2937,26 +3489,8 @@ class SqliteLcmContext implements LcmContext {
 		if (provenance.sessionId !== undefined) assertIdentifier(provenance.sessionId, "provenance.sessionId");
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): boolean => {
-			const job = this.#db
-				.query<
-					Pick<JobRow, "project_id" | "input_hash" | "status" | "lease_token" | "lease_expires_at" | "stage"> & {
-						attempt_count: number;
-					},
-					[string]
-				>(
-					`SELECT project_id, input_hash, status, lease_token, lease_expires_at, stage, attempt_count
-					 FROM summary_jobs WHERE job_id = ?`,
-				)
-				.get(jobId);
-			if (
-				job?.status !== "leased" ||
-				job.lease_token !== leaseToken ||
-				job.lease_expires_at === null ||
-				job.lease_expires_at <= now
-			) {
-				return false;
-			}
-			if (!this.#jobPlacementActive(jobId, job.project_id)) return false;
+			const job = this.#authorizedLease(lease, now);
+			if (!job || !this.#jobPlacementActive(lease.jobId, job.project_id)) return false;
 			const inserted = this.#db.run(
 				`INSERT INTO summary_attempts
 					(attempt_id, job_id, project_id, input_hash, attempt_count, started_at, outcome,
@@ -2965,7 +3499,7 @@ class SqliteLcmContext implements LcmContext {
 				 ON CONFLICT(attempt_id) DO NOTHING`,
 				[
 					attempt.attemptId,
-					jobId,
+					lease.jobId,
 					job.project_id,
 					job.input_hash,
 					Math.max(1, job.attempt_count),
@@ -2985,18 +3519,17 @@ class SqliteLcmContext implements LcmContext {
 	}
 
 	settleSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
-		attempt: SummaryProviderAttempt,
+		leaseInput: SummaryJobLease,
+		attempt: SummaryProviderAttempt | SummaryProviderAttemptStart,
 		requestedOutcome: SummaryLocalAttemptOutcome,
 	): SummaryAttemptOutcome | null {
 		this.#assertAvailable();
-		assertIdentifier(jobId, "jobId");
-		assertIdentifier(leaseToken, "leaseToken");
-		assertProviderAttempt(attempt, "attempt");
+		const lease = normalizedLease(leaseInput);
+		if ("completedAt" in attempt) assertProviderAttempt(attempt, "attempt");
+		else assertProviderAttemptStart(attempt, "attempt");
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): SummaryAttemptOutcome | null =>
-			this.#settleAttempt(jobId, leaseToken, attempt, requestedOutcome, now),
+			this.#settleAttempt(lease, attempt, requestedOutcome, now),
 		);
 		return transaction.immediate();
 	}
@@ -3008,9 +3541,8 @@ class SqliteLcmContext implements LcmContext {
 	 * rows return null and mutate nothing.
 	 */
 	#settleAttempt(
-		jobId: string,
-		leaseToken: string,
-		attempt: SummaryProviderAttempt,
+		lease: SummaryJobLease,
+		attempt: SummaryProviderAttempt | SummaryProviderAttemptStart,
 		requestedOutcome: SummaryAttemptOutcome,
 		now: number,
 	): SummaryAttemptOutcome | null {
@@ -3019,41 +3551,56 @@ class SqliteLcmContext implements LcmContext {
 				"SELECT job_id, project_id, outcome, started_at FROM summary_attempts WHERE attempt_id = ?",
 			)
 			.get(attempt.attemptId);
-		if (!row || row.job_id !== jobId || row.outcome !== "in_flight") return null;
-		const job = this.#db
-			.query<Pick<JobRow, "project_id" | "status" | "lease_token" | "lease_expires_at">, [string]>(
-				"SELECT project_id, status, lease_token, lease_expires_at FROM summary_jobs WHERE job_id = ?",
-			)
-			.get(jobId);
-		let outcome: SummaryAttemptOutcome;
-		if (
-			job?.status !== "leased" ||
-			job.lease_token !== leaseToken ||
-			job.lease_expires_at === null ||
-			job.lease_expires_at <= now
-		) {
-			outcome = "lease_lost";
-		} else if (!this.#jobPlacementActive(jobId, job.project_id)) {
-			outcome = "stale";
-		} else {
-			outcome = requestedOutcome;
+		if (!row || row.job_id !== lease.jobId) return null;
+		if (row.outcome !== "in_flight") {
+			if (!("completedAt" in attempt)) return null;
+			const enriched = this.#db.run(
+				`UPDATE summary_attempts SET completed_at = MAX(COALESCE(completed_at, ?), ?),
+					input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, total_tokens = ?,
+					orchestration_input_tokens = ?, orchestration_cache_read_tokens = ?, orchestration_output_tokens = ?,
+					reasoning_tokens = ?, premium_requests = ?, cache_write_5m_tokens = ?, cache_write_1h_tokens = ?,
+					server_web_search_requests = ?, server_web_fetch_requests = ?,
+					cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?
+				 WHERE attempt_id = ? AND job_id = ? AND outcome != 'in_flight' AND total_tokens IS NULL`,
+				[
+					row.started_at,
+					attempt.completedAt,
+					...attemptUsageBindings(attempt.usage),
+					attempt.attemptId,
+					lease.jobId,
+				],
+			);
+			return Number(enriched.changes) > 0 ? (row.outcome as SummaryAttemptOutcome) : null;
 		}
-		const changed = this.#db.run(
-			`UPDATE summary_attempts SET completed_at = ?, outcome = ?,
-				input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, total_tokens = ?,
-				orchestration_input_tokens = ?, orchestration_cache_read_tokens = ?, orchestration_output_tokens = ?,
-				reasoning_tokens = ?, premium_requests = ?, cache_write_5m_tokens = ?, cache_write_1h_tokens = ?,
-				server_web_search_requests = ?, server_web_fetch_requests = ?,
-				cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?
-			 WHERE attempt_id = ? AND job_id = ? AND outcome = 'in_flight'`,
-			[
-				Math.max(row.started_at, attempt.completedAt),
-				outcome,
-				...attemptUsageBindings(attempt.usage),
-				attempt.attemptId,
-				jobId,
-			],
-		);
+		const job = this.#authorizedLease(lease, now);
+		const outcome: SummaryAttemptOutcome = !job
+			? "lease_lost"
+			: !this.#jobPlacementActive(lease.jobId, job.project_id)
+				? "stale"
+				: requestedOutcome;
+		const changed =
+			"completedAt" in attempt
+				? this.#db.run(
+						`UPDATE summary_attempts SET completed_at = ?, outcome = ?,
+							input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, total_tokens = ?,
+							orchestration_input_tokens = ?, orchestration_cache_read_tokens = ?, orchestration_output_tokens = ?,
+							reasoning_tokens = ?, premium_requests = ?, cache_write_5m_tokens = ?, cache_write_1h_tokens = ?,
+							server_web_search_requests = ?, server_web_fetch_requests = ?,
+							cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?
+						 WHERE attempt_id = ? AND job_id = ? AND outcome = 'in_flight'`,
+						[
+							Math.max(row.started_at, attempt.completedAt),
+							outcome,
+							...attemptUsageBindings(attempt.usage),
+							attempt.attemptId,
+							lease.jobId,
+						],
+					)
+				: this.#db.run(
+						`UPDATE summary_attempts SET completed_at = ?, outcome = ?
+						 WHERE attempt_id = ? AND job_id = ? AND outcome = 'in_flight'`,
+						[Math.max(row.started_at, now), outcome, attempt.attemptId, lease.jobId],
+					);
 		return Number(changed.changes) > 0 ? outcome : null;
 	}
 
@@ -3665,13 +4212,24 @@ class SqliteLcmContext implements LcmContext {
 		if (!Array.isArray(snapshots)) throw new TypeError("snapshots must be an array");
 		const normalized = snapshots.map(normalizeSnapshot);
 		const scopes = new Set<string>();
+		const projects = new Set<string>();
 		for (const snapshot of normalized) {
 			const scopeKey = JSON.stringify([snapshot.scope.projectId, snapshot.scope.sessionId, snapshot.scope.branchId]);
 			if (scopes.has(scopeKey)) throw new TypeError("rebuild snapshots contain a duplicate branch scope");
 			scopes.add(scopeKey);
+			projects.add(snapshot.scope.projectId);
 		}
 		const now = this.#options.now();
 		const transaction = this.#db.transaction((): RebuildResult => {
+			for (const projectId of projects) {
+				const policy = this.#retryPolicy(projectId);
+				if (!policy?.retry_key) continue;
+				this.#db.run(
+					`UPDATE summary_retry_policies SET epoch = ?, claim_token = ?, updated_at = ?
+					 WHERE project_id = ? AND epoch = ? AND claim_token = ?`,
+					[policy.epoch + 1, crypto.randomUUID(), now, projectId, policy.epoch, policy.claim_token],
+				);
+			}
 			this.#db.run("DELETE FROM branch_summary_spans");
 			this.#db.run("DELETE FROM summary_jobs");
 			this.#db.run("DELETE FROM summary_children");

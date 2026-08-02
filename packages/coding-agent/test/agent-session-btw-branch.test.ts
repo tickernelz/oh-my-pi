@@ -136,6 +136,44 @@ describe("AgentSession.branchFromBtw", () => {
 		if (promoted?.role !== "assistant") throw new Error("Expected promoted assistant message");
 		expectSanitizedBtwAssistant(promoted);
 	});
+
+	it("drains a canceled automatic tail before committing the /btw branch", async () => {
+		const activeSession = await createSession();
+		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		await activeSession.sessionManager.flush();
+		const originalFile = activeSession.sessionFile;
+		const originalLeaf = activeSession.sessionManager.getLeafId();
+		const probeStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const releaseProbe = Promise.withResolvers<void>();
+		let tailSessionFile: string | undefined;
+		vi.spyOn(activeSession, "losslessOwnsRequest").mockImplementation(async (_messages, signal) => {
+			probeStarted.resolve(signal);
+			await releaseProbe.promise;
+			tailSessionFile = activeSession.sessionFile;
+			return { kind: "aborted" };
+		});
+
+		const automatic = activeSession.runIdleCompaction(250);
+		const signal = await probeStarted.promise;
+		let branchSettled = false;
+		const branch = activeSession.branchFromBtw("question", createBtwAssistant()).then(result => {
+			branchSettled = true;
+			return result;
+		});
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+
+		expect(signal?.aborted).toBe(true);
+		expect(branchSettled).toBe(false);
+		expect(activeSession.sessionFile).toBe(originalFile);
+		expect(activeSession.sessionManager.getLeafId()).toBe(originalLeaf);
+
+		releaseProbe.resolve();
+		const [, result] = await Promise.all([automatic, branch]);
+		expect(tailSessionFile).toBe(originalFile);
+		expect(result.cancelled).toBe(false);
+		expect(activeSession.sessionFile).not.toBe(originalFile);
+	});
+
 	it("does not record a late advisor turn into a /btw branch", async () => {
 		const activeSession = await createSession();
 		activeSession.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");

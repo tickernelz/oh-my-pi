@@ -6,7 +6,7 @@ import type { Citation, SearchHit, SourceDescription } from "@oh-my-pi/lcm-conte
 import { encodeLcmHandle, type LcmDescription, type LcmHandle } from "@oh-my-pi/pi-coding-agent/lcm/operations";
 import { registerLcmProject } from "@oh-my-pi/pi-coding-agent/lcm/project-catalog";
 import { resolveLcmProject } from "@oh-my-pi/pi-coding-agent/lcm/project-identity";
-import type { LcmPublicStatus, LcmRuntimePhase } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
+import type { LcmPublicStatus } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getSessionDirCandidatesReadOnly } from "@oh-my-pi/pi-coding-agent/session/session-paths";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -49,7 +49,7 @@ const SOURCE_DESCRIPTION: SourceDescription = {
 const DESCRIPTION: LcmDescription = { kind: "source", value: SOURCE_DESCRIPTION };
 
 const STORE: NonNullable<LcmPublicStatus["store"]> = {
-	schemaVersion: 6,
+	schemaVersion: 10,
 	journalMode: "wal",
 	quarantined: false,
 	branches: 2,
@@ -62,22 +62,32 @@ const STORE: NonNullable<LcmPublicStatus["store"]> = {
 	latestRecovery: null,
 };
 
-function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
-	const withoutStore = phase === "disabled" || phase === "uninitialized";
+type StatusFixture = "disabled" | "uninitialized" | "idle" | "warming" | "ready" | "degraded" | "quarantined";
+
+function statusFor(state: StatusFixture): LcmPublicStatus {
+	const withoutStore = state === "disabled" || state === "uninitialized";
+	const health =
+		state === "disabled" || state === "uninitialized" || state === "degraded" || state === "quarantined"
+			? state
+			: "healthy";
+	const coverageReadiness =
+		withoutStore || state === "quarantined" ? undefined : state === "idle" || state === "warming" ? state : "ready";
 	const projection = {
 		revision: 7,
 		sourceTokens: 12_000,
 		selectedLevelCounts: { 0: 2, 2: 1 },
 		coveredSourceCount: 6,
+		uncoveredSourceCount: 0,
 		freshSourceCount: 3,
 		estimatedTokens: 4_000,
 		pendingJobs: 2,
 	};
 	return {
 		runtime: {
-			phase,
+			health,
+			...(coverageReadiness ? { coverageReadiness } : {}),
 			summaryWorkers:
-				phase === "disabled" ? { active: 0, limit: 0 } : { active: phase === "active" ? 2 : 0, limit: 4 },
+				state === "disabled" ? { active: 0, limit: 0 } : { active: state === "ready" ? 2 : 0, limit: 4 },
 			...(withoutStore ? {} : { summaryModelSelector: "@smol", resolvedSummaryModel: "provider/model" }),
 			...(withoutStore
 				? {}
@@ -90,30 +100,32 @@ function statusFor(phase: LcmRuntimePhase): LcmPublicStatus {
 							activeSources: 3,
 							sourceTokens: 12_000,
 							projectionState:
-								phase === "active"
+								state === "ready"
 									? ("fitted" as const)
-									: phase === "degraded"
+									: state === "degraded"
 										? ("unfitted" as const)
 										: ("unevaluated" as const),
-							...(phase === "active" || phase === "degraded" ? { projection } : {}),
+							...(state === "ready" || state === "degraded" ? { projection } : {}),
 						},
 					}),
-			...(phase === "active"
+			...(state === "ready"
 				? {
-						summaryBackoff: { fallback: 1_900_000_000_000 },
-						lastFailureCategory: "provider" as const,
-						retryAt: 1_900_000_000_000,
+						lastRequestRoute: {
+							kind: "lossless" as const,
+							metrics: { observedAt: 1_900_000_000_000, revision: 7 },
+						},
+						lastTakeover: { observedAt: 1_900_000_000_000, revision: 7 },
+						lastFailure: { observedAt: 1_899_999_000_000, category: "provider" as const },
 					}
 				: {}),
-			...(phase === "degraded"
+			...(state === "degraded"
 				? {
 						summaryBackoff: { preferred: 1_900_000_000_000 },
-						lastFailureCategory: "provider" as const,
 						retryAt: 1_900_000_000_000,
 					}
 				: {}),
 		},
-		...(withoutStore ? {} : { store: { ...STORE, quarantined: phase === "quarantined" } }),
+		...(withoutStore ? {} : { store: { ...STORE, quarantined: state === "quarantined" } }),
 	};
 }
 
@@ -126,10 +138,10 @@ interface RuntimeOptions {
 
 function createRuntime(agentDir: string, options: RuntimeOptions = {}) {
 	const output: string[] = [];
-	const status = options.status ?? statusFor("active");
+	const status = options.status ?? statusFor("ready");
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory("/tmp");
 	const session = {
-		lcmEnabled: options.enabled ?? status.runtime.phase !== "disabled",
+		lcmEnabled: options.enabled ?? status.runtime.health !== "disabled",
 		lcmStatus: vi.fn(async () => status),
 		lcmDoctor: vi.fn(async () => ({
 			ok: false,
@@ -149,6 +161,14 @@ function createRuntime(agentDir: string, options: RuntimeOptions = {}) {
 			files: 5,
 			quarantineFiles: 6,
 			quarantineBytes: 7_168,
+		})),
+		lcmRetrySummaries: vi.fn(async (_mode: "due" | "all") => ({
+			runnable: 1,
+			leased: 2,
+			backoff: 3,
+			exhausted: 4,
+			missing: 5,
+			policyMismatch: 6,
 		})),
 		lcmSearch: vi.fn(async (_query: string) => options.hits ?? [HIT]),
 		lcmDescribe: vi.fn(async (_handle: LcmHandle) => DESCRIPTION),
@@ -241,25 +261,31 @@ describe("/lcm slash command", () => {
 
 		expect(harness.session.lcmGc).not.toHaveBeenCalled();
 		expect(harness.output).toEqual([
-			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|gc|search <query>|describe <handle>|projects>",
-			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|gc|search <query>|describe <handle>|projects>",
-			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|gc|search <query>|describe <handle>|projects>",
+			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|retry [all]|gc|search <query>|describe <handle>|projects>",
+			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|retry [all]|gc|search <query>|describe <handle>|projects>",
+			"Usage: /lcm <status|doctor|rebuild <current|project> --yes|retry [all]|gc|search <query>|describe <handle>|projects>",
 		]);
 	});
 
-	it("distinguishes every public runtime phase and preserves quarantine output", async () => {
-		for (const phase of [
+	it("distinguishes health and coverage readiness while preserving quarantine output", async () => {
+		for (const state of [
 			"disabled",
 			"uninitialized",
 			"idle",
 			"warming",
-			"active",
+			"ready",
 			"degraded",
 			"quarantined",
 		] as const) {
-			const harness = createRuntime(agentDir, { status: statusFor(phase), enabled: phase !== "disabled" });
+			const status = statusFor(state);
+			const harness = createRuntime(agentDir, { status, enabled: state !== "disabled" });
 			await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
-			expect(harness.output[0]).toContain(`LCM status: ${phase.toUpperCase()}`);
+			expect(harness.output[0]).toContain(`LCM health: ${status.runtime.health.toUpperCase()}`);
+			if (status.runtime.coverageReadiness) {
+				expect(harness.output[0]).toContain(
+					`Current coverage readiness: ${status.runtime.coverageReadiness.toUpperCase()}`,
+				);
+			}
 		}
 
 		const quarantined = createRuntime(agentDir, { status: statusFor("quarantined") });
@@ -269,14 +295,67 @@ describe("/lcm slash command", () => {
 		expect(quarantined.output[0]).not.toContain("top-secret");
 	});
 
+	it("renders health, readiness, route, takeover, and failure as separate status lines", async () => {
+		const status = statusFor("ready");
+		Object.assign(status.runtime, {
+			health: "healthy",
+			coverageReadiness: "ready",
+			lastRequestRoute: {
+				kind: "native_fallback",
+				category: "unfit",
+				reason: "coverage_gap",
+				metrics: { observedAt: 1_900_000_000_000, revision: 7 },
+			},
+			lastTakeover: { observedAt: 1_899_999_000_000, revision: 6 },
+			lastFailure: { observedAt: 1_900_000_000_000, category: "unfit", reason: "coverage_gap" },
+		});
+		const harness = createRuntime(agentDir, { status });
+
+		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+
+		const lines = harness.output[0]!.split("\n");
+		expect(lines).toContain("LCM health: HEALTHY");
+		expect(lines).toContain("Current coverage readiness: READY");
+		expect(lines).toContain("Last primary request route: native fallback (unfit/coverage_gap)");
+		expect(lines).toContain("Last LCM takeover: 2030-03-17T17:30:00.000Z; revision 6");
+		expect(lines).toContain("Last LCM failure: 2030-03-17T17:46:40.000Z; unfit/coverage_gap");
+	});
+
+	it("sanitizes malformed route and failure diagnostics", async () => {
+		const status = statusFor("ready");
+		Object.assign(status.runtime, {
+			health: "healthy",
+			coverageReadiness: "ready",
+			lastRequestRoute: {
+				kind: "native_fallback",
+				category: "token=top-secret",
+				reason: "../private/top-secret",
+				metrics: { observedAt: 1_900_000_000_000 },
+			},
+			lastFailure: {
+				observedAt: 1_900_000_000_000,
+				category: "token=top-secret",
+				reason: "../private/top-secret",
+			},
+		});
+		const harness = createRuntime(agentDir, { status });
+
+		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
+
+		expect(harness.output[0]).not.toContain("top-secret");
+		expect(harness.output[0]).not.toContain("../private");
+		expect(harness.output[0]).toContain("Last primary request route: native fallback ([redacted]/[redacted])");
+		expect(harness.output[0]).toContain("Last LCM failure: 2030-03-17T17:46:40.000Z; [redacted]/[redacted]");
+	});
+
 	it("renders unevaluated, unfitted, and fitted projection states distinctly", async () => {
 		const idle = createRuntime(agentDir, { status: statusFor("idle") });
 		const degraded = createRuntime(agentDir, { status: statusFor("degraded") });
-		const active = createRuntime(agentDir, { status: statusFor("active") });
+		const ready = createRuntime(agentDir, { status: statusFor("ready") });
 
 		await executeAcpBuiltinSlashCommand("/lcm status", idle.runtime);
 		await executeAcpBuiltinSlashCommand("/lcm status", degraded.runtime);
-		await executeAcpBuiltinSlashCommand("/lcm status", active.runtime);
+		await executeAcpBuiltinSlashCommand("/lcm status", ready.runtime);
 
 		expect(idle.output[0]).toContain(
 			"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",
@@ -284,7 +363,7 @@ describe("/lcm slash command", () => {
 		expect(idle.output[0]).toContain("Projection: not evaluated yet; no projection attempt has run for this session");
 		expect(idle.output[0]).not.toContain("no fitted projection yet");
 		expect(degraded.output[0]).toContain("Projection: unfitted for the current request");
-		expect(active.output[0]).toContain("Projection: fitted to the current request");
+		expect(ready.output[0]).toContain("Projection: fitted to the current request");
 	});
 
 	it("explains an unevaluated projection differently for each engagement gate", async () => {
@@ -331,7 +410,11 @@ describe("/lcm slash command", () => {
 
 		expect(harness.output).toEqual([
 			[
-				"LCM status: DISABLED",
+				"LCM health: DISABLED",
+				"Current coverage readiness: UNAVAILABLE",
+				"Last primary request route: none",
+				"Last LCM takeover: none",
+				"Last LCM failure: none",
 				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
 				"Workers: 0/0 active",
 				"SQLite WAL: not initialized",
@@ -343,39 +426,42 @@ describe("/lcm slash command", () => {
 		]);
 	});
 
-	it("renders preferred-model backoff while DEGRADED", async () => {
+	it("renders preferred-model backoff while degraded", async () => {
 		const harness = createRuntime(agentDir, { status: statusFor("degraded") });
 		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
 
-		expect(harness.output[0]).toContain("LCM status: DEGRADED");
+		expect(harness.output[0]).toContain("LCM health: DEGRADED");
 		expect(harness.output[0]).toContain("Workers: 0/4 active");
 		expect(harness.output[0]).toContain(
 			"All branches in this project: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
 		);
 		expect(harness.output[0]).toContain("Backoff: preferred until 2030-03-17T17:46:40.000Z; fallback until none");
-		expect(harness.output[0]).toContain("Lossless projection is degraded; native compaction remains active.");
+		expect(harness.output[0]).toContain("Lossless runtime is degraded; native compaction remains active.");
 	});
 
-	it("keeps a fitted fallback failure ACTIVE and renders exact status lines", async () => {
-		const harness = createRuntime(agentDir, { status: statusFor("active") });
+	it("keeps historical failure after a healthy fitted takeover and renders exact status lines", async () => {
+		const harness = createRuntime(agentDir, { status: statusFor("ready") });
 		await executeAcpBuiltinSlashCommand("/lcm status", harness.runtime);
 
 		expect(harness.output).toEqual([
 			[
-				"LCM status: ACTIVE",
+				"LCM health: HEALTHY",
+				"Current coverage readiness: READY",
+				"Last primary request route: LCM takeover",
+				"Last LCM takeover: 2030-03-17T17:46:40.000Z; revision 7",
+				"Last LCM failure: 2030-03-17T17:30:00.000Z; provider",
 				"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
 				"Summary model: @smol -> provider/model",
 				"Workers: 2/4 active",
-				"SQLite WAL: enabled; schema: 6",
+				"SQLite WAL: enabled; schema: 10",
 				"Store: 2 branches, 9 active sources, 1 retained tombstones, 3 summary nodes",
 				"All branches in this project: 2 pending, 1 running, 1 failed, 4 completed, 1 obsolete",
 				"Storage: 10.0KB database, 2.0KB WAL, 512B quarantine",
-				"Backoff: preferred until none; fallback until 2030-03-17T17:46:40.000Z",
+				"Backoff: preferred until none; fallback until none",
 				"Current branch: session opaque-session; branch opaque-branch; revision 7; 3 active sources; 12000 source tokens",
 				"Projection: fitted to the current request; 2 relevant jobs pending",
-				"DAG: depth 3, 3 selected nodes, 6 covered sources, 3 fresh sources",
+				"DAG: depth 3, 3 selected nodes, 6 covered sources, 0 uncovered sources, 3 fresh sources",
 				"Estimated tokens: 12000 -> 4000",
-				"Last fallback: provider",
 			].join("\n"),
 		]);
 	});
@@ -412,6 +498,17 @@ describe("/lcm slash command", () => {
 		expect(harness.output[0]).toContain("Derived store recovery: 2030-03-17T17:46:40.000Z; category corruption.");
 		expect(harness.output[1]).toContain("attention required");
 		expect(harness.output[2]).toContain("Native context remains available");
+	});
+
+	it("retries due work by default and requires an explicit all override", async () => {
+		const harness = createRuntime(agentDir);
+		await executeAcpBuiltinSlashCommand("/lcm retry", harness.runtime);
+		await executeAcpBuiltinSlashCommand("/lcm retry all", harness.runtime);
+
+		expect(harness.session.lcmRetrySummaries.mock.calls).toEqual([["due"], ["all"]]);
+		expect(harness.output[0]).toContain("retry (due)");
+		expect(harness.output[1]).toContain("retry (all)");
+		expect(harness.output[1]).toContain("4 exhausted");
 	});
 
 	it("requires confirmation and warns before dispatching a destructive current rebuild", async () => {
@@ -503,16 +600,16 @@ describe("/lcm slash command", () => {
 	});
 
 	it("keeps disabled, uninitialized, degraded, and genuine no-results search outcomes distinct", async () => {
-		const cases: Array<{ phase: LcmRuntimePhase; enabled: boolean; expected: string }> = [
-			{ phase: "disabled", enabled: false, expected: "Lossless context is disabled" },
-			{ phase: "uninitialized", enabled: true, expected: "derived state is uninitialized" },
-			{ phase: "degraded", enabled: true, expected: "runtime is degraded" },
-			{ phase: "active", enabled: true, expected: "No LCM matches found" },
+		const cases: Array<{ state: StatusFixture; enabled: boolean; expected: string }> = [
+			{ state: "disabled", enabled: false, expected: "Lossless context is disabled" },
+			{ state: "uninitialized", enabled: true, expected: "derived state is uninitialized" },
+			{ state: "degraded", enabled: true, expected: "runtime is degraded" },
+			{ state: "ready", enabled: true, expected: "No LCM matches found" },
 		];
 		const outcomes: string[] = [];
 		for (const item of cases) {
 			const harness = createRuntime(agentDir, {
-				status: statusFor(item.phase),
+				status: statusFor(item.state),
 				enabled: item.enabled,
 				hits: [],
 			});

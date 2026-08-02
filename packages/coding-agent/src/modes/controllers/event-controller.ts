@@ -125,6 +125,7 @@ export class EventController {
 	#pendingLcmProjection?: { fingerprint: string; projection: LcmProjection };
 	#lastRenderedLcmProjectionFingerprint?: string;
 	#idleCompactionTimer?: NodeJS.Timeout;
+	#idleCompactionAbort?: AbortController;
 	#idleRecapTimer?: NodeJS.Timeout;
 	// In-flight ephemeral recap turn; aborted by #cancelIdleRecap when any
 	// activity (new turn, compaction, editor draft) supersedes the idle recap.
@@ -1430,7 +1431,7 @@ export class EventController {
 	async #handleAutoCompactionStart(
 		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" }>,
 	): Promise<void> {
-		this.#cancelIdleCompaction();
+		this.#clearIdleCompactionTimer();
 		this.#cancelIdleRecap();
 		this.#setTerminalProgress(true);
 		this.#stopWorkingLoader();
@@ -1463,7 +1464,7 @@ export class EventController {
 	}
 
 	async #handleAutoCompactionEnd(event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>): Promise<void> {
-		this.#cancelIdleCompaction();
+		this.#clearIdleCompactionTimer();
 		this.#cancelIdleRecap();
 		this.#setTerminalProgress(false);
 		if (this.ctx.autoCompactionLoader) {
@@ -1638,11 +1639,17 @@ export class EventController {
 		await this.ctx.reloadTodos();
 	}
 
+	#clearIdleCompactionTimer(): void {
+		if (!this.#idleCompactionTimer) return;
+		clearTimeout(this.#idleCompactionTimer);
+		this.#idleCompactionTimer = undefined;
+	}
+
 	#cancelIdleCompaction(): void {
-		if (this.#idleCompactionTimer) {
-			clearTimeout(this.#idleCompactionTimer);
-			this.#idleCompactionTimer = undefined;
-		}
+		this.#clearIdleCompactionTimer();
+		const abortController = this.#idleCompactionAbort;
+		this.#idleCompactionAbort = undefined;
+		abortController?.abort();
 	}
 
 	#cancelIdleRecap(): void {
@@ -1680,8 +1687,15 @@ export class EventController {
 			if (this.ctx.viewSession.isStreaming) return;
 			if (this.ctx.viewSession.isCompacting) return;
 			if (this.ctx.editor.getText().trim()) return;
-			if (this.#currentContextTokens() < threshold) return;
-			void this.ctx.viewSession.runIdleCompaction();
+			const requestTokensFloor = this.#currentContextTokens();
+			if (requestTokensFloor < threshold) return;
+			const abortController = new AbortController();
+			this.#idleCompactionAbort = abortController;
+			void Promise.resolve(this.ctx.viewSession.runIdleCompaction(requestTokensFloor, abortController.signal))
+				.finally(() => {
+					if (this.#idleCompactionAbort === abortController) this.#idleCompactionAbort = undefined;
+				})
+				.catch(error => logger.warn("Idle compaction failed", { error: String(error) }));
 		}, timeoutMs);
 		this.#idleCompactionTimer.unref?.();
 	}

@@ -1217,6 +1217,46 @@ describe("anthropic stream envelope handling", () => {
 		expect(strictFlags).toEqual([[true], [false], [false]]);
 	});
 
+	it("learns rejected strict tools without retrying a single-attempt request", async () => {
+		const toolContext: Context = {
+			...context,
+			tools: [
+				{
+					name: "edit",
+					description: "Edit a value",
+					strict: true,
+					parameters: queryObjectSchema,
+				},
+			],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const strictFlags: boolean[][] = [];
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			strictFlags.push(getStrictFlags(params));
+			return attempt === 1
+				? (createRejectedMockRequest(createStrictGrammarTooLargeError()) as never)
+				: (createMockRequest(createTextSuccessEvents("recovered")) as never);
+		});
+		const request = () =>
+			streamAnthropic(model, toolContext, {
+				apiKey: "sk-ant-test",
+				disableProviderRetries: true,
+				providerSessionState,
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = attempt;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(strictFlags).toEqual([[true], [false]]);
+		expect(anthropicStrictToolsDisabled(providerSessionState)).toBe(true);
+	});
+
 	it.each([
 		[
 			"unsupported structured outputs",

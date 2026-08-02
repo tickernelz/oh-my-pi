@@ -2,8 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import { streamGoogleVertex } from "@oh-my-pi/pi-ai/providers/google-vertex";
-import type { AssistantMessageEvent, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessageEvent, Context, FetchImpl, Model, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { withEnv } from "./helpers";
 
 // A Gemini turn that finishes with `finishReason: STOP` but carries only an empty text part —
 // the well-known "empty response" failure. Delivered as-is, the agent receives a blank message
@@ -101,6 +102,52 @@ function endpointFromInput(input: Parameters<FetchImpl>[0]): string {
 }
 
 describe("Google empty-response retry (public + Vertex path)", () => {
+	it("routes a single-attempt ambient regional Vertex request directly to global", async () => {
+		await withEnv(
+			{
+				GOOGLE_VERTEX_LOCATION: undefined,
+				GOOGLE_CLOUD_LOCATION: "us-central1",
+				VERTEX_LOCATION: undefined,
+			},
+			async () => {
+				const urls: string[] = [];
+				const fetchMock: FetchImpl = async input => {
+					urls.push(input instanceof Request ? input.url : input.toString());
+					return sse(genaiChunk("Global response"));
+				};
+				const result = await streamGoogleVertex(vertexModel, context, {
+					apiKey: "k",
+					disableProviderRetries: true,
+					fetch: fetchMock,
+				}).result();
+
+				expect(result.stopReason).toBe("stop");
+				expect(urls).toHaveLength(1);
+				expect(new URL(urls[0]!).hostname).toBe("aiplatform.googleapis.com");
+			},
+		);
+	});
+
+	it("keeps explicit Vertex residency regional for a single-attempt request", async () => {
+		await withEnv({ GOOGLE_CLOUD_LOCATION: "us-central1" }, async () => {
+			const urls: string[] = [];
+			const fetchMock: FetchImpl = async input => {
+				urls.push(input instanceof Request ? input.url : input.toString());
+				return sse(genaiChunk("Regional response"));
+			};
+			const result = await streamGoogleVertex(vertexModel, context, {
+				apiKey: "k",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				location: "europe-west4",
+			}).result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(urls).toHaveLength(1);
+			expect(new URL(urls[0]!).hostname).toBe("europe-west4-aiplatform.googleapis.com");
+		});
+	});
+
 	it("retries a STOP-with-empty-text response and delivers the real follow-up content", async () => {
 		let calls = 0;
 		const fetchMock: FetchImpl = async () => {
@@ -323,6 +370,32 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 		expect(starts).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(textOf(result)).toBe("Recovered.");
+	});
+
+	it("advances Antigravity endpoints across durable single-attempt requests", async () => {
+		const requestedEndpoints: string[] = [];
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock: FetchImpl = async input => {
+			requestedEndpoints.push(endpointFromInput(input));
+			return new Response('{"error":{"message":"busy"}}', { status: 503 });
+		};
+		const request = () =>
+			streamGoogleGeminiCli(antigravityModel, context, {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				antigravityEndpointMode: "auto",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = requestedEndpoints.length;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(second.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(requestedEndpoints).toEqual([ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT]);
 	});
 
 	for (const { mode, endpoint } of [

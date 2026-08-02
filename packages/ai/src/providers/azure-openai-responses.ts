@@ -5,6 +5,7 @@ import type {
 	AssistantMessage,
 	Context,
 	Model,
+	ProviderSessionState,
 	RawSseEvent,
 	ServiceTier,
 	StreamFunction,
@@ -25,8 +26,13 @@ import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schem
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
 import {
 	applyOpenAIReasoningEffortFallback,
+	clearOpenAIReasoningEffortFallbackState,
 	createOpenAIReasoningEffortFallbackKey,
+	createOpenAIReasoningEffortFallbackState,
+	getOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
+	type OpenAIReasoningEffortFallbackState,
+	rememberOpenAIReasoningEffortFallback,
 	resolveOpenAIReasoningEffortFallback,
 } from "./openai-reasoning-fallback";
 import type { ResponseCreateParamsStreaming, ResponseStreamEvent } from "./openai-responses-wire";
@@ -74,6 +80,28 @@ type AzureOpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	presence_penalty?: number;
 	repetition_penalty?: number;
 };
+
+interface AzureOpenAIResponsesProviderSessionState extends ProviderSessionState, OpenAIReasoningEffortFallbackState {}
+
+const AZURE_OPENAI_RESPONSES_PROVIDER_SESSION_STATE_KEY = "azure-openai-responses";
+
+function getAzureOpenAIResponsesProviderSessionState(
+	providerSessionState: Map<string, ProviderSessionState> | undefined,
+): AzureOpenAIResponsesProviderSessionState | undefined {
+	if (!providerSessionState) return undefined;
+	const existing = providerSessionState.get(AZURE_OPENAI_RESPONSES_PROVIDER_SESSION_STATE_KEY) as
+		| AzureOpenAIResponsesProviderSessionState
+		| undefined;
+	if (existing) return existing;
+	const created: AzureOpenAIResponsesProviderSessionState = {
+		...createOpenAIReasoningEffortFallbackState(),
+		close() {
+			clearOpenAIReasoningEffortFallbackState(created);
+		},
+	};
+	providerSessionState.set(AZURE_OPENAI_RESPONSES_PROVIDER_SESSION_STATE_KEY, created);
+	return created;
+}
 
 /**
  * Generate function for Azure OpenAI Responses API
@@ -138,6 +166,19 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			if (replacementPayload !== undefined) {
 				params = replacementPayload as typeof params;
 			}
+			const providerSessionState = getAzureOpenAIResponsesProviderSessionState(options?.providerSessionState);
+			const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
+				"azure-responses",
+				url,
+				typeof params.model === "string" ? params.model : model.id,
+			);
+			const rememberedReasoningEffortFallback = getOpenAIReasoningEffortFallback(
+				providerSessionState,
+				reasoningEffortFallbackKey,
+			);
+			if (rememberedReasoningEffortFallback !== undefined) {
+				applyOpenAIReasoningEffortFallback(params, rememberedReasoningEffortFallback);
+			}
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
@@ -151,11 +192,6 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				url,
 				body: params,
 			};
-			const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
-				"azure-responses",
-				url,
-				typeof params.model === "string" ? params.model : model.id,
-			);
 			const attemptedReasoningEffortFallbacks = new Set<string>();
 			let openaiStream: AsyncIterable<ResponseStreamEvent>;
 			while (true) {
@@ -177,6 +213,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 						body: params,
 						signal: requestSignal,
 						fetch: options?.fetch,
+						disableProviderRetries: options?.disableProviderRetries,
 						// Transient 408/429/5xx get Retry-After-aware transport retries;
 						// the first-event watchdog aborts `requestSignal`, so retries
 						// cannot extend the caller's deadline.
@@ -190,6 +227,12 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
 						: undefined;
 					if (reasoningEffortFallback === undefined) throw error;
+					rememberOpenAIReasoningEffortFallback(
+						providerSessionState,
+						reasoningEffortFallbackKey,
+						reasoningEffortFallback,
+					);
+					if (options?.disableProviderRetries) throw error;
 					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
 					attemptedReasoningEffortFallbacks.add(retryMarker);

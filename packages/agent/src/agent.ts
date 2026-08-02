@@ -116,6 +116,11 @@ export interface AgentOptions {
 	 */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 
+	/** Request-local hook after API-key resolution and immediately before provider dispatch. */
+	beforeProviderDispatch?: AgentLoopConfig["beforeProviderDispatch"];
+	/** Final response hook paired with `beforeProviderDispatch` for one prepared call. */
+	afterProviderResponse?: AgentLoopConfig["afterProviderResponse"];
+
 	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
 	 */
@@ -370,6 +375,9 @@ export class Agent {
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#beforeProviderDispatch?: AgentLoopConfig["beforeProviderDispatch"];
+	#afterProviderResponse?: AgentLoopConfig["afterProviderResponse"];
+	#activeProviderRequestMessages?: AgentMessage[];
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#steeringWaiters = new Set<() => void>();
@@ -507,6 +515,8 @@ export class Agent {
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
 		this.#transformProviderContext = opts.transformProviderContext;
+		this.#beforeProviderDispatch = opts.beforeProviderDispatch;
+		this.#afterProviderResponse = opts.afterProviderResponse;
 	}
 
 	/**
@@ -1313,6 +1323,14 @@ export class Agent {
 			convertToLlm: this.#convertToLlm,
 			transformProviderContext: this.#transformProviderContext,
 			transformContext: this.#transformContext,
+			beforeProviderDispatch: (messages, signal) => {
+				this.#beforeProviderDispatch?.(messages, signal);
+				this.#activeProviderRequestMessages = messages;
+			},
+			afterProviderResponse: (messages, response) => {
+				if (this.#activeProviderRequestMessages === messages) this.#activeProviderRequestMessages = undefined;
+				this.#afterProviderResponse?.(messages, response);
+			},
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
@@ -1522,6 +1540,11 @@ export class Agent {
 							errorMessage,
 							timestamp: Date.now(),
 						};
+			const providerMessages = this.#activeProviderRequestMessages;
+			if (providerMessages) {
+				this.#activeProviderRequestMessages = undefined;
+				this.#afterProviderResponse?.(providerMessages, errorMsg);
+			}
 
 			if (shouldEmitVisibleError) {
 				if (!turnOpen) {

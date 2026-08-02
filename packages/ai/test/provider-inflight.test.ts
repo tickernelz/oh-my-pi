@@ -90,6 +90,7 @@ describe("provider in-flight request limits", () => {
 		const firstStarted = Promise.withResolvers<void>();
 		const releaseFirst = Promise.withResolvers<void>();
 		let callIndex = 0;
+		let fenceCalls = 0;
 		const mock = createMockModel({
 			provider: "tests",
 			handler: async () => {
@@ -110,14 +111,75 @@ describe("provider in-flight request limits", () => {
 		const second = streamSimple(mock.model, context(), {
 			maxInFlightRequests: { tests: 1 },
 			signal: controller.signal,
+			beforeTransportDispatch: () => {
+				fenceCalls++;
+			},
 		});
 		controller.abort(new Error("cancel queued request"));
 
 		await expect(second.result()).rejects.toThrow("cancel queued request");
 		expect(mock.calls).toHaveLength(1);
+		expect(fenceCalls).toBe(0);
 
 		releaseFirst.resolve();
 		await firstResult;
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	test("awaits the request fence after queue admission before dispatch", async () => {
+		registerMockApi();
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const fenceEntered = Promise.withResolvers<void>();
+		const releaseFence = Promise.withResolvers<void>();
+		let callIndex = 0;
+		const mock = createMockModel({
+			provider: "tests",
+			handler: async () => {
+				callIndex++;
+				if (callIndex === 1) {
+					firstStarted.resolve();
+					await releaseFirst.promise;
+				}
+				return { content: [`reply ${callIndex}`] };
+			},
+		});
+		const first = streamSimple(mock.model, context(), { maxInFlightRequests: { tests: 1 } });
+		const firstResult = first.result();
+		await firstStarted.promise;
+		const second = streamSimple(mock.model, context(), {
+			maxInFlightRequests: { tests: 1 },
+			beforeTransportDispatch: async () => {
+				fenceEntered.resolve();
+				await releaseFence.promise;
+			},
+		});
+		expect(mock.calls).toHaveLength(1);
+
+		releaseFirst.resolve();
+		await firstResult;
+		await fenceEntered.promise;
+		expect(mock.calls).toHaveLength(1);
+		releaseFence.resolve();
+		await second.result();
+		expect(mock.calls).toHaveLength(2);
+	});
+
+	test("awaits the request fence immediately before an unlimited dispatch", async () => {
+		registerMockApi();
+		const fenceEntered = Promise.withResolvers<void>();
+		const releaseFence = Promise.withResolvers<void>();
+		const mock = createMockModel({ provider: "tests", responses: [{ content: ["reply"] }] });
+		const stream = streamSimple(mock.model, context(), {
+			beforeTransportDispatch: async () => {
+				fenceEntered.resolve();
+				await releaseFence.promise;
+			},
+		});
+		await fenceEntered.promise;
+		expect(mock.calls).toHaveLength(0);
+		releaseFence.resolve();
+		await stream.result();
 		expect(mock.calls).toHaveLength(1);
 	});
 

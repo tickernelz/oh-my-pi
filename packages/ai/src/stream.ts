@@ -562,7 +562,9 @@ export const __providerInFlightForTesting = {
 	},
 };
 
-function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal" | "maxInFlightRequests">>(
+function withProviderInFlightLimit<
+	TOptions extends Pick<StreamOptions, "signal" | "maxInFlightRequests" | "beforeTransportDispatch">,
+>(
 	model: Model<Api>,
 	options: TOptions | undefined,
 	dispatch: () => AssistantMessageEventStream,
@@ -572,7 +574,7 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 	// provider exits are covered by one wrap. Official first-party providers are
 	// exempt (see `healLeakedThinking`); healing is otherwise idempotent.
 	const limit = resolveProviderInFlightLimit(model.provider, options);
-	if (limit === undefined) return healLeakedThinking(model, dispatch());
+	if (limit === undefined && !options?.beforeTransportDispatch) return healLeakedThinking(model, dispatch());
 
 	const outer = new AssistantMessageEventStream();
 	void (async () => {
@@ -586,12 +588,12 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 		try {
 			const startedWaitingAt = Date.now();
 			release = await acquireProviderInFlightSlot(model.provider, limit, options?.signal);
-			if (Date.now() - startedWaitingAt >= PROVIDER_INFLIGHT_SIGNAL_FALLBACK_MS) {
+			if (limit !== undefined && Date.now() - startedWaitingAt >= PROVIDER_INFLIGHT_SIGNAL_FALLBACK_MS) {
 				logger.debug("Provider in-flight limit wait completed", { provider: model.provider, limit });
 			}
-			if (options?.signal?.aborted) {
-				throw options.signal.reason ?? new AIError.AbortError("Provider request aborted before dispatch");
-			}
+			options?.signal?.throwIfAborted();
+			await options?.beforeTransportDispatch?.();
+			options?.signal?.throwIfAborted();
 			const inner = healLeakedThinking(model, dispatch());
 			try {
 				for await (const event of inner) {
@@ -769,6 +771,7 @@ export function stream<TApi extends Api>(
 		withProviderInFlightLimit(model, opts, () => streamDispatch(model, context, opts)),
 	);
 }
+stream.handlesBeforeTransportDispatch = true;
 
 function streamDispatch<TApi extends Api>(
 	model: Model<TApi>,
@@ -927,10 +930,12 @@ const THINKING_LOOP_RETRY_MAX_DELAY_MS = 8_000;
  */
 async function resolveWithThinkingLoopCook(
 	signal: AbortSignal | undefined,
+	disableProviderRetries: boolean,
 	dispatch: () => AssistantMessageEventStream,
 	cook: () => AssistantMessageEventStream,
 ): Promise<AssistantMessage> {
 	let message = await dispatch().result();
+	if (disableProviderRetries) return message;
 	let thinkingLoopRetry = AIError.is(message.errorId, AIError.Flag.ThinkingLoop);
 	for (let attempt = 0; thinkingLoopRetry && attempt < THINKING_LOOP_MAX_ABORTS - 1; attempt += 1) {
 		// A caller abort surfaces as a thrown abort (never the stall, which would
@@ -958,6 +963,7 @@ export async function complete<TApi extends Api>(
 ): Promise<AssistantMessage> {
 	return resolveWithThinkingLoopCook(
 		options?.signal,
+		options?.disableProviderRetries === true,
 		() => stream(model, context, options),
 		() => stream(model, context, { ...options, loopGuard: { ...options?.loopGuard, enabled: false } }),
 	);
@@ -1113,6 +1119,11 @@ export function streamSimple<TApi extends Api>(
 			const retryState = createAuthRetryKeyState(lastKey);
 			let failure = await runAttempt(lastKey);
 			if (!failure) return;
+			if (requestOptions.disableProviderRetries) {
+				await resolveNextAuthRetryKey(retryState, apiKeyResolver, failure.error, signal);
+				emitFailure(failure);
+				return;
+			}
 			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
 				// another doomed request — emit the captured failure instead.
@@ -1178,9 +1189,7 @@ export function streamSimple<TApi extends Api>(
 
 	// GitLab Duo Workflow - IDE workflow protocol + WebSocket action bridge
 	if (model.api === "gitlab-duo-agent") {
-		// Does not route through withProviderInFlightLimit, so heal explicitly.
-		return healLeakedThinking(
-			model,
+		return withProviderInFlightLimit(model, requestOptions, () =>
 			streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
 				...requestOptions,
 				apiKey,
@@ -1219,6 +1228,7 @@ export function streamSimple<TApi extends Api>(
 	const providerOptions = mapOptionsForApi(model, requestOptions, apiKey);
 	return stream(model, context, providerOptions);
 }
+Object.assign(streamSimple, { handlesBeforeTransportDispatch: true as const });
 
 export async function completeSimple<TApi extends Api>(
 	model: Model<TApi>,
@@ -1227,6 +1237,7 @@ export async function completeSimple<TApi extends Api>(
 ): Promise<AssistantMessage> {
 	return resolveWithThinkingLoopCook(
 		options?.signal,
+		options?.disableProviderRetries === true,
 		() => streamSimple(model, context, options),
 		() => streamSimple(model, context, { ...options, loopGuard: { ...options?.loopGuard, enabled: false } }),
 	);
@@ -1475,7 +1486,9 @@ function mapOptionsForApi<TApi extends Api>(
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		codexSseMaxAttempts: options?.codexSseMaxAttempts,
+		disableProviderRetries: options?.disableProviderRetries,
 		providerSessionState: options?.providerSessionState,
+		beforeTransportDispatch: options?.beforeTransportDispatch,
 		maxInFlightRequests: options?.maxInFlightRequests,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,

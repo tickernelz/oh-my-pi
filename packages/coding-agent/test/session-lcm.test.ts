@@ -6,6 +6,8 @@ import type {
 	Citation,
 	ClaimSummaryJobsOptions,
 	CompleteSummaryJobResult,
+	ConfigureSummaryRetryPolicyOptions,
+	ConfigureSummaryRetryPolicyResult,
 	ContextProjection,
 	ContextScope,
 	FileDescription,
@@ -28,24 +30,31 @@ import type {
 	SummaryExpansionRequest,
 	SummaryFailureAttemptOutcome,
 	SummaryJob,
+	SummaryJobAvailability,
+	SummaryJobLease,
 	SummaryLocalAttemptOutcome,
 	SummaryProviderAttempt,
 	SummaryProviderAttemptStart,
 	SummaryProviderUsage,
 	SummaryReference,
+	SummaryRetryMode,
+	SummaryRetryPolicy,
 } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { decodeLcmHandle, encodeLcmHandle } from "@oh-my-pi/pi-coding-agent/lcm/operations";
 import { convertToLlm, createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	estimateLcmProjectionMessageTokens,
+	estimateLcmProjectionMessageTokenUpperBound,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
+	MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS,
 	normalizeLcmBranch,
-	normalizeLcmHardProjectionWaitMs,
 	SessionLcm,
+	type SessionLcmDependencies,
 	type SessionLcmOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -61,6 +70,20 @@ class FakeLcmContext implements LcmContext {
 	reconcileErrors: unknown[] = [];
 	reconcileOptions: Array<ReconcileOptions | undefined> = [];
 	nextDelayMs: number | null = null;
+	retryPolicy: SummaryRetryPolicy | undefined;
+	retryPolicyToken = "policy-0";
+	readonly retryPolicyCalls: Array<{
+		projectId: string;
+		retryKey: string;
+		options: ConfigureSummaryRetryPolicyOptions | undefined;
+	}> = [];
+	readonly availabilityCalls: Array<{ request: ProjectionRequest; policy: SummaryRetryPolicy; limit: number }> = [];
+	readonly retryCalls: Array<{
+		request: ProjectionRequest;
+		policy: SummaryRetryPolicy;
+		limit: number;
+		mode: SummaryRetryMode;
+	}> = [];
 	deferredClaims = 0;
 	claimErrors: unknown[] = [];
 	releaseErrors: unknown[] = [];
@@ -72,7 +95,12 @@ class FakeLcmContext implements LcmContext {
 		{ jobId: string; availableAt: number; queueClass: SummaryJob["queueClass"] }
 	>();
 	readonly claimCalls: ClaimSummaryJobsOptions[] = [];
-	readonly delayCalls: Array<{ preferredScope: ContextScope | undefined; allowFallback: boolean }> = [];
+	readonly delayCalls: Array<{
+		policy: SummaryRetryPolicy;
+		maxTransportRetries: number;
+		preferredScope: ContextScope | undefined;
+		allowFallback: boolean;
+	}> = [];
 	readonly releaseCalls: Array<{ jobId: string; leaseToken: string; accepted: boolean }> = [];
 	readonly failureCalls: Array<{
 		jobId: string;
@@ -95,6 +123,9 @@ class FakeLcmContext implements LcmContext {
 	readonly summaryCompleted = Promise.withResolvers<void>();
 	readonly summaryFailed = Promise.withResolvers<void>();
 	readonly delayRequested = Promise.withResolvers<void>();
+	preResolvedModelOverride: string | undefined;
+	resolvedModelOverride: string | undefined;
+	beforeAttemptStart: ((request: LcmCompletionRequest) => void | Promise<void>) | undefined;
 	readonly failureRecordsRequested = Promise.withResolvers<void>();
 	lastCompletion: SummaryCompletion | undefined;
 	job: SummaryJob | undefined;
@@ -102,10 +133,12 @@ class FakeLcmContext implements LcmContext {
 	priorSpend = 0;
 	readonly priorSpendCalls: Array<{ sessionId: string; before: number }> = [];
 	maxLeased = 0;
+	projectionCalls = 0;
 	projectImpl: (request: ProjectionRequest, snapshot: SourceSnapshot) => ContextProjection = (_request, snapshot) => ({
 		revision: 1,
 		ready: false,
 		historical: [],
+		activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 		freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
 		uncoveredSourceIds: [],
 		sourceTokens: snapshot.entries.length,
@@ -149,13 +182,115 @@ class FakeLcmContext implements LcmContext {
 	}
 
 	project(request: ProjectionRequest): ContextProjection {
+		this.projectionCalls++;
 		return this.projectImpl(request, this.snapshots.at(-1)!);
+	}
+	configureSummaryRetryPolicy(
+		projectId: string,
+		retryKey: string,
+		options?: ConfigureSummaryRetryPolicyOptions,
+	): ConfigureSummaryRetryPolicyResult {
+		this.retryPolicyCalls.push({ projectId, retryKey, options });
+		const current = this.retryPolicy;
+		if (!current) {
+			const ready = { retryKey, retryEpoch: 1 };
+			this.retryPolicy = ready;
+			this.retryPolicyToken = "policy-1";
+			return { kind: "ready", ...ready };
+		}
+		if (current.retryKey === retryKey) return { kind: "ready", ...current };
+		const expected = options?.expected;
+		if (
+			options?.force !== true &&
+			(expected?.retryKey !== current.retryKey || expected.retryEpoch !== current.retryEpoch)
+		) {
+			return { kind: "conflict", ...current };
+		}
+		const ready = { retryKey, retryEpoch: current.retryEpoch + 1 };
+		this.retryPolicy = ready;
+		this.retryPolicyToken = `policy-${ready.retryEpoch}`;
+		for (const leased of this.leasedJobs.values()) this.jobs.unshift(leased);
+		this.leasedJobs.clear();
+		this.jobs = this.jobs.map(job => ({ ...job, retryKey, retryEpoch: ready.retryEpoch, transportRetryCount: 0 }));
+		this.failureRecords.clear();
+		return { kind: "ready", ...ready };
+	}
+
+	summaryJobAvailability(
+		request: ProjectionRequest,
+		policy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+	): SummaryJobAvailability {
+		this.availabilityCalls.push({ request, policy, limit: maxTransportRetries });
+		const result: SummaryJobAvailability = {
+			runnable: 0,
+			leased: 0,
+			backoff: 0,
+			exhausted: 0,
+			missing: 0,
+			policyMismatch: 0,
+		};
+		if (
+			!this.retryPolicy ||
+			this.retryPolicy.retryKey !== policy.retryKey ||
+			this.retryPolicy.retryEpoch !== policy.retryEpoch
+		) {
+			result.policyMismatch = Math.max(1, this.relevantPendingJobs ?? 0);
+			return result;
+		}
+		let observed = 0;
+		for (const job of [...this.jobs, ...this.leasedJobs.values()]) {
+			if (job.queueClass !== "preferred") continue;
+			observed++;
+			if (job.retryEpoch !== policy.retryEpoch) {
+				result.policyMismatch++;
+				continue;
+			}
+			if (job.transportRetryCount >= maxTransportRetries) {
+				result.exhausted++;
+				continue;
+			}
+			if (this.leasedJobs.has(job.jobId) && job.leaseExpiresAt > this.now) {
+				result.leased++;
+				result.nextLeaseExpiryAt = Math.min(result.nextLeaseExpiryAt ?? job.leaseExpiresAt, job.leaseExpiresAt);
+				continue;
+			}
+			const availableAt = this.failureRecords.get(job.jobId)?.availableAt ?? this.now;
+			if (availableAt <= this.now) result.runnable++;
+			else {
+				result.backoff++;
+				result.nextAvailableAt = Math.min(result.nextAvailableAt ?? availableAt, availableAt);
+			}
+		}
+		result.missing = Math.max(0, (this.relevantPendingJobs ?? observed) - observed);
+		return result;
+	}
+
+	retrySummaryJobs(
+		request: ProjectionRequest,
+		policy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		mode: SummaryRetryMode = "due",
+	): SummaryJobAvailability {
+		this.retryCalls.push({ request, policy, limit: maxTransportRetries, mode });
+		if (mode === "all") {
+			for (const [jobId, failure] of this.failureRecords) {
+				const job = this.jobs.find(candidate => candidate.jobId === jobId);
+				if (job && job.transportRetryCount < maxTransportRetries) {
+					this.failureRecords.set(jobId, { ...failure, availableAt: this.now });
+				}
+			}
+		}
+		return this.summaryJobAvailability(request, policy, maxTransportRetries);
 	}
 
 	claimSummaryJobs(options: ClaimSummaryJobsOptions): SummaryJob[] {
 		this.claimCalls.push(options);
 		const error = this.claimErrors.shift();
 		if (error !== undefined) throw error;
+		if (this.retryPolicy?.retryKey !== options.retryKey || this.retryPolicy.retryEpoch !== options.retryEpoch) {
+			return [];
+		}
 		if (this.deferredClaims > 0) {
 			this.deferredClaims--;
 			return [];
@@ -166,12 +301,17 @@ class FakeLcmContext implements LcmContext {
 		}
 		let index = this.jobs.findIndex(
 			job =>
-				job.queueClass === "preferred" && (this.failureRecords.get(job.jobId)?.availableAt ?? this.now) <= this.now,
+				job.queueClass === "preferred" &&
+				job.retryEpoch === options.retryEpoch &&
+				job.transportRetryCount < options.maxTransportRetries &&
+				(this.failureRecords.get(job.jobId)?.availableAt ?? this.now) <= this.now,
 		);
 		if (index < 0 && options.allowFallback !== false) {
 			index = this.jobs.findIndex(
 				job =>
 					job.queueClass === "fallback" &&
+					job.retryEpoch === options.retryEpoch &&
+					job.transportRetryCount < options.maxTransportRetries &&
 					(this.failureRecords.get(job.jobId)?.availableAt ?? this.now) <= this.now,
 			);
 		}
@@ -182,6 +322,10 @@ class FakeLcmContext implements LcmContext {
 			...queuedJob,
 			leaseToken: `lease-${queuedJob.jobId}-${++this.leaseSequence}`,
 			leaseExpiresAt: this.now + options.leaseMs,
+			retryKey: options.retryKey,
+			retryEpoch: options.retryEpoch,
+			leasePolicyToken: this.retryPolicyToken,
+			leaseMutationNonce: `nonce-${this.leaseSequence}`,
 		};
 		this.failureRecords.delete(job.jobId);
 		this.leasedJobs.set(job.jobId, job);
@@ -189,19 +333,23 @@ class FakeLcmContext implements LcmContext {
 		return [job];
 	}
 
-	nextSummaryJobDelayMs(preferredScope?: ContextScope, allowFallback = true): number | null {
-		this.delayCalls.push({ preferredScope, allowFallback });
+	nextSummaryJobDelayMs(
+		policy: SummaryRetryPolicy,
+		maxTransportRetries: number,
+		preferredScope?: ContextScope,
+		allowFallback = true,
+	): number | null {
+		this.delayCalls.push({ policy, maxTransportRetries, preferredScope, allowFallback });
 		this.delayRequested.resolve();
+		if (this.retryPolicy?.retryKey !== policy.retryKey || this.retryPolicy.retryEpoch !== policy.retryEpoch) {
+			return null;
+		}
 		if (this.nextDelayMs !== null) return this.nextDelayMs;
 		const delays: number[] = [];
 		for (const job of [...(this.job ? [this.job] : []), ...this.jobs]) {
 			if (job.queueClass === "fallback" && !allowFallback) continue;
+			if (job.retryEpoch !== policy.retryEpoch || job.transportRetryCount >= maxTransportRetries) continue;
 			delays.push(Math.max(0, (this.failureRecords.get(job.jobId)?.availableAt ?? this.now) - this.now));
-		}
-		for (const failure of this.failureRecords.values()) {
-			if (failure.queueClass === "preferred" || allowFallback) {
-				delays.push(Math.max(0, failure.availableAt - this.now));
-			}
 		}
 		return delays.length === 0 ? null : Math.min(...delays);
 	}
@@ -211,69 +359,97 @@ class FakeLcmContext implements LcmContext {
 		return this.priorSpend;
 	}
 
-	summaryJobFailures() {
+	summaryJobFailures(policy: SummaryRetryPolicy, maxTransportRetries: number) {
 		this.failureRecordsRequested.resolve();
-		return [...this.failureRecords.values()];
+		if (this.retryPolicy?.retryKey !== policy.retryKey || this.retryPolicy.retryEpoch !== policy.retryEpoch) {
+			return [];
+		}
+		return [...this.failureRecords.values()].filter(failure => {
+			const job = this.jobs.find(candidate => candidate.jobId === failure.jobId);
+			return !job || (job.retryEpoch === policy.retryEpoch && job.transportRetryCount < maxTransportRetries);
+		});
 	}
 
-	extendSummaryJob(jobId: string, leaseToken: string): boolean {
-		return this.leasedJobs.get(jobId)?.leaseToken === leaseToken;
+	#leaseMatches(leased: SummaryJob | undefined, lease: SummaryJobLease): leased is SummaryJob {
+		if (!leased) return false;
+		return (
+			leased?.leaseToken === lease.leaseToken &&
+			leased.retryKey === lease.retryKey &&
+			leased.retryEpoch === lease.retryEpoch &&
+			leased.leasePolicyToken === lease.leasePolicyToken &&
+			leased.leaseMutationNonce === lease.leaseMutationNonce
+		);
 	}
 
-	releaseSummaryJob(jobId: string, leaseToken: string): boolean {
+	extendSummaryJob(lease: SummaryJobLease): string | null {
+		const leased = this.leasedJobs.get(lease.jobId);
+		if (!this.#leaseMatches(leased, lease)) return null;
+		const nonce = `nonce-${++this.leaseSequence}`;
+		this.leasedJobs.set(lease.jobId, { ...leased, leaseMutationNonce: nonce });
+		return nonce;
+	}
+
+	releaseSummaryJob(lease: SummaryJobLease): boolean {
 		const error = this.releaseErrors.shift();
 		if (error !== undefined) throw error;
-		const leased = this.leasedJobs.get(jobId);
-		const accepted = leased?.leaseToken === leaseToken;
-		this.releaseCalls.push({ jobId, leaseToken, accepted });
+		const leased = this.leasedJobs.get(lease.jobId);
+		const accepted = this.#leaseMatches(leased, lease);
+		this.releaseCalls.push({ jobId: lease.jobId, leaseToken: lease.leaseToken, accepted });
 		if (!accepted || !leased) return false;
-		this.leasedJobs.delete(jobId);
+		this.leasedJobs.delete(lease.jobId);
 		this.jobs.unshift(leased);
 		return true;
 	}
 
 	beginSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
+		lease: SummaryJobLease,
 		attempt: SummaryProviderAttemptStart,
 		provenance: SummaryAttemptProvenance,
 	): boolean {
-		const leased = this.leasedJobs.get(jobId);
-		if (leased?.leaseToken !== leaseToken || this.rejectAttemptStart) return false;
+		const leased = this.leasedJobs.get(lease.jobId);
+		if (!this.#leaseMatches(leased, lease) || this.rejectAttemptStart) return false;
 		if (this.attemptRows.has(attempt.attemptId)) return false;
-		this.attemptRows.set(attempt.attemptId, { jobId, outcome: "in_flight", provenance, usage: undefined });
+		this.attemptRows.set(attempt.attemptId, {
+			jobId: lease.jobId,
+			outcome: "in_flight",
+			provenance,
+			usage: undefined,
+		});
 		return true;
 	}
 
 	settleSummaryAttempt(
-		jobId: string,
-		leaseToken: string,
-		attempt: SummaryProviderAttempt,
+		lease: SummaryJobLease,
+		attempt: SummaryProviderAttempt | SummaryProviderAttemptStart,
 		requestedOutcome: SummaryLocalAttemptOutcome,
 	): SummaryAttemptOutcome | null {
-		return this.#settleAttempt(jobId, leaseToken, attempt, requestedOutcome);
+		return this.#settleAttempt(lease, attempt, requestedOutcome);
 	}
 
 	#settleAttempt(
-		jobId: string,
-		leaseToken: string,
-		attempt: SummaryProviderAttempt,
+		lease: SummaryJobLease,
+		attempt: SummaryProviderAttempt | SummaryProviderAttemptStart,
 		requestedOutcome: SummaryAttemptOutcome,
 	): SummaryAttemptOutcome | null {
 		const row = this.attemptRows.get(attempt.attemptId);
-		if (!row || row.jobId !== jobId || row.outcome !== "in_flight") return null;
-		row.outcome = this.leasedJobs.get(jobId)?.leaseToken === leaseToken ? requestedOutcome : "lease_lost";
-		row.usage = attempt.usage;
+		if (!row || row.jobId !== lease.jobId) return null;
+		if (row.outcome !== "in_flight") {
+			if (!("usage" in attempt) || row.usage) return null;
+			row.usage = attempt.usage;
+			return row.outcome;
+		}
+		row.outcome = this.#leaseMatches(this.leasedJobs.get(lease.jobId), lease) ? requestedOutcome : "lease_lost";
+		row.usage = "usage" in attempt ? attempt.usage : undefined;
 		return row.outcome;
 	}
 
-	completeSummaryJob(jobId: string, leaseToken: string, completion: SummaryCompletion): CompleteSummaryJobResult {
-		const leased = this.leasedJobs.get(jobId);
-		if (leased?.leaseToken !== leaseToken) return { accepted: false, reason: "lease_lost" };
-		if (completion.attempt) this.#settleAttempt(jobId, leaseToken, completion.attempt, "completed");
-		this.leasedJobs.delete(jobId);
-		this.failureRecords.delete(jobId);
-		this.completedJobIds.add(jobId);
+	completeSummaryJob(lease: SummaryJobLease, completion: SummaryCompletion): CompleteSummaryJobResult {
+		const leased = this.leasedJobs.get(lease.jobId);
+		if (!this.#leaseMatches(leased, lease)) return { accepted: false, reason: "lease_lost" };
+		if (completion.attempt) this.#settleAttempt(lease, completion.attempt, "completed");
+		this.leasedJobs.delete(lease.jobId);
+		this.failureRecords.delete(lease.jobId);
+		this.completedJobIds.add(lease.jobId);
 		this.lastCompletion = completion;
 		this.queuedJobs = Math.max(0, this.queuedJobs - 1);
 		if (this.relevantPendingJobs !== undefined && leased.queueClass === "preferred") {
@@ -281,30 +457,42 @@ class FakeLcmContext implements LcmContext {
 		}
 		this.nextDelayMs = null;
 		this.summaryCompleted.resolve();
-		return { accepted: true, summaryId: `summary-${jobId}` };
+		return { accepted: true, summaryId: `summary-${lease.jobId}` };
 	}
 
 	failSummaryJob(
-		jobId: string,
-		leaseToken: string,
+		lease: SummaryJobLease,
 		redactedError: string,
 		retryDelayMs: number,
 		provenance?: SummaryAttemptProvenance,
-		failedAttempt?: { attempt: SummaryProviderAttempt; outcome: SummaryFailureAttemptOutcome },
+		failedAttempt?: {
+			attempt: SummaryProviderAttempt | SummaryProviderAttemptStart;
+			outcome: SummaryFailureAttemptOutcome;
+		},
+		countTransportRetry = true,
 	): boolean {
-		const leased = this.leasedJobs.get(jobId);
-		if (leased?.leaseToken !== leaseToken) return false;
+		const leased = this.leasedJobs.get(lease.jobId);
+		if (!this.#leaseMatches(leased, lease)) return false;
 		if (
 			failedAttempt &&
-			this.#settleAttempt(jobId, leaseToken, failedAttempt.attempt, failedAttempt.outcome) !== failedAttempt.outcome
+			this.#settleAttempt(lease, failedAttempt.attempt, failedAttempt.outcome) !== failedAttempt.outcome
 		) {
 			return false;
 		}
-		this.leasedJobs.delete(jobId);
-		this.jobs.push(leased);
+		this.leasedJobs.delete(lease.jobId);
+		this.jobs.push({
+			...leased,
+			transportRetryCount: leased.transportRetryCount + (countTransportRetry ? 1 : 0),
+		});
 		this.failedError = redactedError;
-		this.failureCalls.push({ jobId, leaseToken, redactedError, retryDelayMs, provenance });
-		this.seedFailure(jobId, this.now + retryDelayMs, leased.queueClass);
+		this.failureCalls.push({
+			jobId: lease.jobId,
+			leaseToken: lease.leaseToken,
+			redactedError,
+			retryDelayMs,
+			provenance,
+		});
+		this.seedFailure(lease.jobId, this.now + Math.max(1, retryDelayMs), leased.queueClass);
 		this.summaryFailed.resolve();
 		return true;
 	}
@@ -338,7 +526,7 @@ class FakeLcmContext implements LcmContext {
 			job => !this.failureRecords.has(job.jobId),
 		).length;
 		return {
-			schemaVersion: 6,
+			schemaVersion: 10,
 			journalMode: "wal",
 			quarantined: false,
 			branches: 1,
@@ -412,14 +600,31 @@ function createHarness(
 		tokenBudget: 100_000,
 		freshTail: { maxSources: 32, maxTokens: 20_000 },
 	}),
-	hardWaitMs = 20,
+	schedulerTickMs = 20,
 	projectRoot?: string,
 	maxConcurrentSummaries = 1,
-	projectionFits: (messages: AgentMessage[]) => boolean = () => true,
+	projectionTokenMeasurements: (messages: AgentMessage[]) => { tokens: number; upperBound: number } = messages => {
+		let tokens = 0;
+		let upperBound = 0;
+		for (const message of messages) {
+			tokens += estimateLcmProjectionMessageTokens(message);
+			upperBound += estimateLcmProjectionMessageTokenUpperBound(message);
+		}
+		return { tokens, upperBound };
+	},
 	peerPollMs?: number,
-	hardProjectionWaitMs?: number,
+	providerAttemptTimeoutMs?: number,
+	resolveProject?: SessionLcmDependencies["resolveProject"],
 ) {
 	const complete = vi.fn(async (_request: LcmCompletionRequest) => "redacted summary");
+	const resolveSummaryModel = vi.fn((selector?: string) => {
+		const configured = selector ?? "@smol";
+		return (
+			context.preResolvedModelOverride ??
+			context.resolvedModelOverride ??
+			(configured.startsWith("@") ? "test-provider/test-model" : configured)
+		);
+	});
 	let attemptOrdinal = 0;
 	const attemptStarts: SummaryProviderAttemptStart[] = [];
 	const completeWithAttempt = async (request: LcmCompletionRequest): Promise<LcmCompletionResult> => {
@@ -429,7 +634,9 @@ function createHarness(
 			provider: "test-provider",
 			model: "test-model",
 		};
-		request.onResolvedModel?.("test-provider/test-model");
+		const resolvedModel = context.resolvedModelOverride ?? resolveSummaryModel(request.modelSelector);
+		request.onResolvedModel?.(resolvedModel);
+		await context.beforeAttemptStart?.(request);
 		if (request.onAttemptStart && !(await request.onAttemptStart(start))) {
 			throw new LcmCompletionError("LCM completion was superseded before dispatch", {
 				provider: "test-provider",
@@ -459,31 +666,33 @@ function createHarness(
 				obfuscate: text => text.replaceAll("raw-secret", "#SECRET"),
 			},
 			projectionLimits,
-			projectionFits,
+			projectionTokenMeasurements,
 			complete: completeWithAttempt,
+			resolveSummaryModel,
 		},
 		{
 			summaryModel: "@smol",
 			maxConcurrentSummaries,
-			hardProjectionWaitMs,
 			registerProject,
 			dependencies: {
 				openContext,
-				resolveProject: async cwd => {
-					const rootPath = projectRoot ?? cwd;
-					return {
-						projectId: projectId ?? `project:${Bun.hash(cwd)}`,
-						rootPath,
-						storePath: `${rootPath}/context.sqlite`,
-					};
-				},
-				hardWaitMs,
-				peerPollMs,
+				resolveProject:
+					resolveProject ??
+					(async cwd => {
+						const rootPath = projectRoot ?? cwd;
+						return {
+							projectId: projectId ?? `project:${Bun.hash(cwd)}`,
+							rootPath,
+							storePath: `${rootPath}/context.sqlite`,
+						};
+					}),
+				peerPollMs: peerPollMs ?? schedulerTickMs,
+				providerAttemptTimeoutMs,
 				now: () => context.now,
 			},
 		},
 	);
-	return { lcm, context, complete, openContext };
+	return { lcm, context, complete, openContext, resolveSummaryModel };
 }
 
 function appendUser(manager: SessionManager, text: string, timestamp: number): AgentMessage {
@@ -493,7 +702,7 @@ function appendUser(manager: SessionManager, text: string, timestamp: number): A
 }
 
 function readyHistoricalProjection(snapshot: SourceSnapshot, summaryHandle: string): ContextProjection {
-	const old = snapshot.entries[1]!;
+	const historical = snapshot.entries.slice(0, -1);
 	const fresh = snapshot.entries.at(-1)!;
 	return {
 		revision: 1,
@@ -506,16 +715,17 @@ function readyHistoricalProjection(snapshot: SourceSnapshot, summaryHandle: stri
 				level: 0,
 				redactedText: "older facts",
 				tokenCount: 3,
-				sourceIds: [old.entryId],
+				sourceIds: historical.map(entry => entry.entryId),
 				citations: [],
 				files: [],
 			},
 		],
+		activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 		freshTailSourceIds: [fresh.entryId],
 		uncoveredSourceIds: [],
 		sourceTokens: snapshot.entries.length,
 		selectedLevelCounts: { 0: 1 },
-		coveredSourceCount: 1,
+		coveredSourceCount: historical.length,
 		freshSourceCount: 1,
 		estimatedTokens: 10,
 		pendingJobs: 0,
@@ -530,6 +740,10 @@ function summaryJob(
 		jobId,
 		leaseToken: `lease-${jobId}`,
 		leaseExpiresAt: Date.now() + 60_000,
+		retryKey: "@smol",
+		retryEpoch: 1,
+		leasePolicyToken: "policy-1",
+		leaseMutationNonce: `nonce-${jobId}`,
 		queueClass: overrides.queueClass ?? "preferred",
 		kind: "leaf",
 		level: 0,
@@ -565,6 +779,14 @@ async function flushScheduler(): Promise<void> {
 	for (let attempt = 0; attempt < 20; attempt++) await Promise.resolve();
 }
 
+async function waitForSummaryWorkerCount(lcm: SessionLcm, active: number): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if ((await lcm.status()).runtime.summaryWorkers.active === active) return;
+		await Promise.resolve();
+	}
+	throw new Error(`Summary workers did not settle at ${active}`);
+}
+
 describe("SessionLcm", () => {
 	it("charges serialized historical context against projection fit budgets", () => {
 		const historical = createHistoricalContextMessage({
@@ -574,32 +796,278 @@ describe("SessionLcm", () => {
 		expect(estimateLcmProjectionMessageTokens(historical)).toBeGreaterThan(1_000);
 	});
 
-	it("normalizes fractional provider retry hints and caps malformed long delays", () => {
-		expect(new LcmCompletionError("fractional", { retryAfterMs: 34_074.224 }).retryAfterMs).toBe(34_075);
-		expect(new LcmCompletionError("oversized", { retryAfterMs: Number.MAX_VALUE }).retryAfterMs).toBe(
-			24 * 60 * 60_000,
+	it("uses provider-visible UTF-8 bytes as a conservative historical upper bound", () => {
+		const historical = createHistoricalContextMessage({
+			redactedCitedContent: 'first line\nquoted "世界" \\ payload\nlast line',
+			timestamp: 1,
+		});
+		const providerBytes = convertToLlm([historical]).reduce((total, message) => {
+			if (typeof message.content === "string") return total + Buffer.byteLength(message.content, "utf8");
+			return (
+				total +
+				message.content.reduce(
+					(sum, block) => sum + (block.type === "text" ? Buffer.byteLength(block.text, "utf8") : 0),
+					0,
+				)
+			);
+		}, 0);
+
+		expect(estimateLcmProjectionMessageTokenUpperBound(historical)).toBe(providerBytes);
+		expect(estimateLcmProjectionMessageTokenUpperBound(historical)).toBeGreaterThanOrEqual(
+			estimateLcmProjectionMessageTokens(historical),
 		);
+	});
+
+	it("preserves finite provider retry hints up to the safe numeric bound", () => {
+		const fortyEightHours = 48 * 60 * 60_000;
+		expect(new LcmCompletionError("fractional", { retryAfterMs: 34_074.224 }).retryAfterMs).toBe(34_075);
+		expect(new LcmCompletionError("long quota reset", { retryAfterMs: fortyEightHours }).retryAfterMs).toBe(
+			fortyEightHours,
+		);
+		expect(new LcmCompletionError("oversized", { retryAfterMs: Number.MAX_VALUE }).retryAfterMs).toBe(
+			Number.MAX_SAFE_INTEGER,
+		);
+		expect(new LcmCompletionError("negative", { retryAfterMs: -1 }).retryAfterMs).toBeUndefined();
+		expect(
+			new LcmCompletionError("infinite", { retryAfterMs: Number.POSITIVE_INFINITY }).retryAfterMs,
+		).toBeUndefined();
 		expect(new LcmCompletionError("invalid", { retryAfterMs: Number.NaN }).retryAfterMs).toBeUndefined();
 	});
 
-	it("returns the exact native input below prewarm without opening the derived store", async () => {
+	it("rejects ready projections with a gap, duplicate, reorder, stale source set, or mismatched fingerprint", async () => {
+		const invalidProofs = [
+			["gap", (ids: string[]) => ({ ids: [ids[0]!, ids[2]!], fingerprint: activeSourceFingerprint(ids) })],
+			[
+				"duplicate",
+				(ids: string[]) => ({ ids: [ids[0]!, ids[1]!, ids[1]!], fingerprint: activeSourceFingerprint(ids) }),
+			],
+			[
+				"reorder",
+				(ids: string[]) => ({ ids: [ids[1]!, ids[0]!, ids[2]!], fingerprint: activeSourceFingerprint(ids) }),
+			],
+			[
+				"fingerprint",
+				(ids: string[]) => ({ ids, fingerprint: activeSourceFingerprint([ids[2]!, ids[1]!, ids[0]!]) }),
+			],
+			[
+				"stale-source-set",
+				(ids: string[]) => {
+					const staleIds = ids.map((_id, index) => `stale-${index}`);
+					return { ids: staleIds, fingerprint: activeSourceFingerprint(staleIds) };
+				},
+			],
+		] as const;
+
+		for (const [label, invalidProof] of invalidProofs) {
+			const manager = SessionManager.inMemory(`/invalid-coverage-proof-${label}`);
+			appendUser(manager, "first", 1);
+			appendUser(manager, "second", 2);
+			appendUser(manager, "third", 3);
+			const context = new FakeLcmContext();
+			context.projectImpl = (_request, snapshot) => {
+				const activeIds = snapshot.entries.map(entry => entry.entryId);
+				expect(activeIds).toHaveLength(3);
+				const proof = invalidProof(activeIds);
+				return {
+					revision: 1,
+					ready: true,
+					activeSourceFingerprint: proof.fingerprint,
+					historical: [],
+					freshTailSourceIds: proof.ids,
+					uncoveredSourceIds: [],
+					sourceTokens: activeIds.length,
+					selectedLevelCounts: {},
+					coveredSourceCount: 0,
+					freshSourceCount: proof.ids.length,
+					estimatedTokens: activeIds.length,
+					pendingJobs: 0,
+				};
+			};
+			const { lcm } = createHarness(manager, context);
+			try {
+				const input = manager.buildSessionContext().messages;
+				const result = await lcm.project(input);
+				expect(result.messages).toBe(input);
+				expect(result.owned).toBe(false);
+				expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+				expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+					kind: "native_fallback",
+					category: "unfit",
+					reason: "assembly_invalid",
+				});
+			} finally {
+				await lcm.close();
+			}
+		}
+	});
+
+	it("returns the exact native input below prewarm without resolving a project or opening the derived store", async () => {
 		const manager = SessionManager.inMemory("/below-prewarm");
 		appendUser(manager, "small", 1);
-		const { lcm, context, complete, openContext } = createHarness(manager, undefined, undefined, undefined, () => ({
-			sourceTokens: 39,
-			prewarmThresholdTokens: 40,
-			hardThresholdTokens: 100,
-			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
+		const resolveProject = vi.fn(async (cwd: string) => ({
+			projectId: "project:below-prewarm",
+			rootPath: cwd,
+			storePath: `${cwd}/context.sqlite`,
 		}));
+		const { lcm, context, complete, openContext } = createHarness(
+			manager,
+			undefined,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 39,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 80,
+				freshTail: { maxSources: 8, maxTokens: 40 },
+			}),
+			20,
+			undefined,
+			1,
+			undefined,
+			undefined,
+			undefined,
+			resolveProject,
+		);
 		const input = manager.buildSessionContext().messages;
 		const result = await lcm.project(input);
 		expect(result.messages).toBe(input);
 		expect(result.owned).toBe(false);
+		expect(typeof result.routeKey?.scope?.projectId).toBe("string");
+		expect(typeof result.routeKey?.scope?.branchId).toBe("string");
+		expect(typeof result.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(result.routeKey?.scope).not.toHaveProperty("revision");
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect(resolveProject).not.toHaveBeenCalled();
+		expect(openContext).not.toHaveBeenCalled();
+		expect(context.snapshots).toEqual([]);
+		const stale = await lcm.project(input);
+		appendUser(manager, "mutated before dispatch", 2);
+		expect(lcm.commitPrimaryRequestRoute(stale.routeKey)).toBe(false);
+		expect(resolveProject).not.toHaveBeenCalled();
 		expect(openContext).not.toHaveBeenCalled();
 		expect(context.snapshots).toEqual([]);
 		expect(complete).not.toHaveBeenCalled();
+		expect((await lcm.status()).runtime).toMatchObject({
+			health: "healthy",
+			coverageReadiness: "idle",
+			lastRequestRoute: { kind: "native_passthrough", reason: "below_prewarm" },
+		});
 		await lcm.close();
+	});
+
+	for (const [reason, passthroughTokens] of [
+		["below_prewarm", 39],
+		["below_hard", 90],
+	] as const) {
+		it(`fences a warmed ${reason} route by its matching derived revision`, async () => {
+			const manager = SessionManager.inMemory(`/warmed-${reason}-revision-fence`);
+			appendUser(manager, "covered request", 1);
+			const context = new FakeLcmContext();
+			let derivedRevision = 1;
+			context.projectImpl = (_request, snapshot) => ({
+				revision: derivedRevision,
+				ready: true,
+				historical: [],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+				freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: snapshot.entries.length,
+				estimatedTokens: snapshot.entries.length,
+				pendingJobs: 0,
+			});
+			const reconcile = context.reconcile.bind(context);
+			vi.spyOn(context, "reconcile").mockImplementation((snapshot, options) => ({
+				...reconcile(snapshot, options),
+				revision: derivedRevision,
+			}));
+			const rebuild = context.rebuild.bind(context);
+			vi.spyOn(context, "rebuild").mockImplementation(snapshots => {
+				const result = rebuild(snapshots);
+				derivedRevision++;
+				return result;
+			});
+			let sourceTokens = 101;
+			const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+				sourceTokens,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 80,
+				freshTail: { maxSources: 8, maxTokens: 40 },
+			}));
+			try {
+				const input = manager.buildSessionContext().messages;
+				expect((await lcm.project(input)).owned).toBe(true);
+				sourceTokens = passthroughTokens;
+				const staged = await lcm.project(input);
+				expect(staged.owned).toBe(false);
+				expect(await lcm.rebuild()).not.toBeNull();
+				expect((await lcm.status()).runtime.currentBranch?.revision).toBe(2);
+				expect(lcm.commitPrimaryRequestRoute(staged.routeKey)).toBe(false);
+				expect(staged.routeKey?.scope?.revision).toBe(1);
+			} finally {
+				await lcm.close();
+			}
+		});
+	}
+
+	it("rejects a warmed tokenBudget-zero below-hard route after rebuild", async () => {
+		const manager = SessionManager.inMemory("/warmed-invalid-limit-revision-fence");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		let derivedRevision = 1;
+		context.projectImpl = (_request, snapshot) => ({
+			revision: derivedRevision,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const reconcile = context.reconcile.bind(context);
+		vi.spyOn(context, "reconcile").mockImplementation((snapshot, options) => ({
+			...reconcile(snapshot, options),
+			revision: derivedRevision,
+		}));
+		const rebuild = context.rebuild.bind(context);
+		vi.spyOn(context, "rebuild").mockImplementation(snapshots => {
+			const result = rebuild(snapshots);
+			derivedRevision++;
+			return result;
+		});
+		let sourceTokens = 101;
+		let tokenBudget = 80;
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		try {
+			const input = manager.buildSessionContext().messages;
+			expect((await lcm.project(input)).owned).toBe(true);
+			sourceTokens = 90;
+			tokenBudget = 0;
+			const staged = await lcm.project(input);
+			expect(staged.owned).toBe(false);
+			expect(staged.routeKey).toBeDefined();
+			expect(await lcm.rebuild()).not.toBeNull();
+			expect((await lcm.status()).runtime.currentBranch?.revision).toBe(2);
+			expect(lcm.commitPrimaryRequestRoute(staged.routeKey)).toBe(false);
+			expect(staged.routeKey?.scope?.revision).toBe(1);
+		} finally {
+			await lcm.close();
+		}
 	});
 
 	it("samples request pressure even when it stands down below prewarm", async () => {
@@ -624,6 +1092,830 @@ describe("SessionLcm", () => {
 		});
 		await lcm.close();
 		expect((await lcm.status()).runtime.pressure).toBeUndefined();
+	});
+
+	it("uses a maintenance pressure floor once without changing dispatched route history", async () => {
+		const manager = SessionManager.inMemory("/maintenance-pressure-intent");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const projectionLimits = vi.fn(() => ({
+			sourceTokens: 60,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		const { lcm } = createHarness(manager, context, undefined, undefined, projectionLimits);
+		const input = manager.buildSessionContext().messages;
+
+		const decision = await lcm.ownsRequest(input, undefined, 150);
+		expect(decision).toMatchObject({ kind: "owned", projection: { ready: true } });
+		expect((await lcm.status()).runtime.lastRequestRoute).toBeUndefined();
+
+		const projected = await lcm.project(input);
+		expect(projected.owned).toBe(true);
+		expect(lcm.commitPrimaryRequestRoute(projected.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.pressure).toMatchObject({ requestTokens: 150, armTokens: 150 });
+		const committedRoute = (await lcm.status()).runtime.lastRequestRoute;
+		expect(committedRoute).toMatchObject({ kind: "lossless" });
+
+		expect(await lcm.ownsRequest(input, undefined, 150)).toMatchObject({ kind: "owned" });
+		expect((await lcm.status()).runtime.lastRequestRoute).toEqual(committedRoute);
+		expect((await lcm.project(input)).owned).toBe(true);
+		expect((await lcm.project(input)).owned).toBe(false);
+		expect((await lcm.status()).runtime.lastRequestRoute).toEqual(committedRoute);
+		await lcm.close();
+	});
+
+	it("clears a maintenance pressure intent when primary messages mismatch", async () => {
+		const manager = SessionManager.inMemory("/maintenance-pressure-mismatch");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 60,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		const input = manager.buildSessionContext().messages;
+		expect(await lcm.ownsRequest(input, undefined, 150)).toMatchObject({ kind: "owned" });
+
+		const mismatched = [{ role: "developer", content: "different primary payload", timestamp: 1 } as AgentMessage];
+		expect((await lcm.project(mismatched)).owned).toBe(false);
+		expect((await lcm.project(input)).owned).toBe(false);
+		await lcm.close();
+	});
+
+	it("rearms an owned maintenance intent for the post-drop retry payload", async () => {
+		const manager = SessionManager.inMemory("/maintenance-pressure-rearm");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 60,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		const retry = manager.buildSessionContext().messages;
+		const truncated = [
+			...retry,
+			{ ...createAssistantMessage("truncated"), stopReason: "length" as const, timestamp: 2 },
+		];
+		expect(await lcm.ownsRequest(truncated, undefined, 150)).toMatchObject({ kind: "owned" });
+		const rearm = lcm as SessionLcm & {
+			rearmPrimaryIntent(messages: readonly AgentMessage[], requestTokensFloor: number): void;
+		};
+		expect(typeof rearm.rearmPrimaryIntent).toBe("function");
+		if (typeof rearm.rearmPrimaryIntent === "function") rearm.rearmPrimaryIntent(retry, 150);
+
+		expect((await lcm.project(retry)).owned).toBe(true);
+		await lcm.close();
+	});
+
+	it("preserves an owned mid-run floor when steering and asides extend the provider request", async () => {
+		const manager = SessionManager.inMemory("/maintenance-pressure-final-payload");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 60,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		const retry = manager.buildSessionContext().messages;
+		expect(await lcm.ownsRequest(retry, undefined, 150)).toMatchObject({ kind: "owned" });
+		const finalPayload = [
+			...retry,
+			{ role: "developer", content: "queued steering", timestamp: 2 } as AgentMessage,
+			{
+				role: "custom",
+				customType: "test-aside",
+				content: "late aside",
+				display: false,
+				attribution: "agent",
+				timestamp: 3,
+			} as AgentMessage,
+		];
+
+		expect((await lcm.project(finalPayload)).owned).toBe(true);
+		expect((await lcm.status()).runtime.pressure).toMatchObject({ requestTokens: 150, armTokens: 150 });
+		await lcm.close();
+	});
+
+	it("returns a request-local maintenance fallback without staging route history", async () => {
+		const manager = SessionManager.inMemory("/maintenance-local-fallback");
+		appendUser(manager, "uncovered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: false,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: [],
+			uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: 0,
+			estimatedTokens: 0,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context);
+
+		expect(await lcm.ownsRequest(manager.buildSessionContext().messages, undefined, 150)).toEqual({
+			kind: "native",
+			fallback: { category: "unfit", reason: "coverage_gap" },
+		});
+		const runtime = (await lcm.status()).runtime;
+		expect(runtime.lastRequestRoute).toBeUndefined();
+		expect(runtime.lastTakeover).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("keeps coverage readiness independent and derives health from current durable failures", async () => {
+		const manager = SessionManager.inMemory("/independent-runtime-status");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context);
+
+		expect((await lcm.project(manager.buildSessionContext().messages)).owned).toBe(true);
+		expect((await lcm.status()).runtime).toMatchObject({ health: "healthy", coverageReadiness: "ready" });
+
+		context.seedFailure("preferred", context.now + 10_000, "preferred");
+		const degraded = (await lcm.status()).runtime;
+		expect(degraded).toMatchObject({ health: "degraded", coverageReadiness: "ready" });
+		expect(degraded.lastFailure).toBeUndefined();
+
+		context.now += 10_000;
+		const due = (await lcm.status()).runtime;
+		expect(due).toMatchObject({ health: "degraded", coverageReadiness: "ready" });
+		expect(due.summaryBackoff).toBeUndefined();
+		context.failureRecords.clear();
+		const recovered = (await lcm.status()).runtime;
+		expect(recovered).toMatchObject({ health: "healthy", coverageReadiness: "ready" });
+		expect(recovered.lastFailure).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("clears provider degradation only after an accepted summary succeeds", async () => {
+		const manager = SessionManager.inMemory("/provider-health-success");
+		appendUser(manager, "retry job", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("health-recovery"));
+		const pendingProjection = context.projectImpl;
+		context.projectImpl = (request, snapshot) => ({
+			...pendingProjection(request, snapshot),
+			ready: context.completedJobIds.has("health-recovery"),
+		});
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		complete
+			.mockRejectedValueOnce(new LcmCompletionError("retry later", { provider: "test", retryAfterMs: 10_000 }))
+			.mockResolvedValue("recovered summary");
+
+		const projection = lcm.project(manager.buildSessionContext().messages);
+		await context.summaryFailed.promise;
+		expect((await lcm.status()).runtime.health).toBe("degraded");
+
+		context.now += 10_000;
+		await lcm.retrySummaries("all");
+		await settleUntil(() => context.completedJobIds.has("health-recovery"), "successful health recovery");
+		await projection;
+		await flushScheduler();
+		expect((await lcm.status()).runtime.health).toBe("healthy");
+		await lcm.close();
+	});
+
+	it("reads terminal availability once per provider-failure settlement", async () => {
+		const manager = SessionManager.inMemory("/terminal-availability-read");
+		appendUser(manager, "retry job", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("terminal-availability", { transportRetryCount: 4 }));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const failureGate = Promise.withResolvers<void>();
+		complete.mockImplementation(async () => {
+			await failureGate.promise;
+			throw new LcmCompletionError("fifth failure", { provider: "test" });
+		});
+
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => complete.mock.calls.length === 1, "terminal provider attempt");
+			const readsBeforeSettlement = context.availabilityCalls.length;
+			failureGate.resolve();
+			await settleUntil(
+				() => context.availabilityCalls.length > readsBeforeSettlement,
+				"terminal availability snapshot",
+			);
+			await flushScheduler();
+
+			expect(context.availabilityCalls.length - readsBeforeSettlement).toBe(1);
+		} finally {
+			failureGate.resolve();
+			await lcm.close();
+		}
+	});
+
+	it("lets an accepted summary clear provider exhaustion without erasing diagnostics", async () => {
+		const manager = SessionManager.inMemory("/provider-exhaustion-success");
+		appendUser(manager, "retry job", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("exhausted", { transportRetryCount: 4 }));
+		const { lcm, complete } = createHarness(manager, context);
+		complete
+			.mockRejectedValueOnce(new LcmCompletionError("fifth failure", { provider: "test" }))
+			.mockResolvedValue("recovered summary");
+
+		const exhaustedProjection = lcm.project(manager.buildSessionContext().messages);
+		await context.summaryFailed.promise;
+		const exhaustedResult = await exhaustedProjection;
+		expect(lcm.commitPrimaryRequestRoute(exhaustedResult.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime).toMatchObject({
+			health: "degraded",
+			lastFailure: { category: "provider", reason: "provider_exhausted" },
+		});
+
+		context.jobs = [];
+		context.failureRecords.clear();
+		context.queuedJobs = 0;
+		context.relevantPendingJobs = 0;
+		context.queueJobs(summaryJob("recovered"));
+		await lcm.retrySummaries("all");
+		await settleUntil(() => context.completedJobIds.has("recovered"), "post-exhaustion summary success");
+		await flushScheduler();
+		expect((await lcm.status()).runtime).toMatchObject({
+			health: "healthy",
+			lastFailure: { category: "provider", reason: "provider_exhausted" },
+		});
+		await lcm.close();
+	});
+
+	for (const recovery of ["peer completion", "branch rewrite"] as const) {
+		it(`restores health after ${recovery} removes current durable provider failures without erasing diagnostics`, async () => {
+			const suffix = recovery === "peer completion" ? "peer" : "rewrite";
+			const manager = SessionManager.inMemory(`/provider-health-${suffix}`);
+			appendUser(manager, "initial request", 1);
+			if (recovery === "branch rewrite") appendUser(manager, "old branch tail", 2);
+			const context = new FakeLcmContext();
+			const jobId = `exhausted-${suffix}`;
+			context.queueJobs(summaryJob(jobId, { transportRetryCount: 4 }));
+			const { lcm, complete } = createHarness(manager, context);
+			complete.mockRejectedValueOnce(new LcmCompletionError("fifth failure", { provider: "test" }));
+
+			try {
+				const pending = lcm.project(manager.buildSessionContext().messages);
+				await context.summaryFailed.promise;
+				const result = await pending;
+				expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+				const degraded = (await lcm.status()).runtime;
+				expect(degraded).toMatchObject({
+					health: "degraded",
+					lastFailure: { category: "provider", reason: "provider_exhausted" },
+				});
+
+				context.jobs = [];
+				context.failureRecords.clear();
+				context.queuedJobs = 0;
+				context.relevantPendingJobs = 0;
+				context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, `health-${suffix}`);
+				if (recovery === "peer completion") {
+					context.completedJobIds.add(jobId);
+				} else {
+					manager.branch(manager.getBranch()[0]!.id);
+					appendUser(manager, "rewritten branch", 3);
+					await lcm.rebind();
+				}
+
+				const recovered = (await lcm.status()).runtime;
+				expect(recovered.health).toBe("healthy");
+				expect(recovered.lastFailure).toEqual(degraded.lastFailure);
+			} finally {
+				await lcm.close();
+			}
+		});
+	}
+
+	it("does not treat a lifecycle-aborted retry as provider recovery", async () => {
+		const manager = SessionManager.inMemory("/provider-health-abort");
+		appendUser(manager, "retry job", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("health-abort"));
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		const retryStarted = Promise.withResolvers<void>();
+		complete
+			.mockRejectedValueOnce(new LcmCompletionError("retry later", { provider: "test", retryAfterMs: 10_000 }))
+			.mockImplementation(
+				request =>
+					new Promise<string>((_resolve, reject) => {
+						retryStarted.resolve();
+						if (request.signal?.aborted) {
+							reject(new LcmCompletionError("lifecycle abort", { provider: "test", category: "aborted" }));
+						} else {
+							request.signal?.addEventListener(
+								"abort",
+								() =>
+									reject(new LcmCompletionError("lifecycle abort", { provider: "test", category: "aborted" })),
+								{ once: true },
+							);
+						}
+					}),
+			);
+
+		void lcm.project(manager.buildSessionContext().messages);
+		await context.summaryFailed.promise;
+		expect((await lcm.status()).runtime.health).toBe("degraded");
+		context.now += 10_000;
+		await lcm.retrySummaries("all");
+		await retryStarted.promise;
+		await lcm.rebind();
+
+		expect((await lcm.status()).runtime.health).toBe("degraded");
+		await lcm.close();
+	});
+
+	for (const [label, nonAccepted] of [
+		["lease-lost", { accepted: false, reason: "lease_lost" }],
+		["stale", { accepted: false, reason: "stale" }],
+		["escalated", { accepted: false, reason: "escalated", stage: "aggressive" }],
+		["deterministic-failed", { accepted: false, reason: "deterministic_failed" }],
+	] as const) {
+		it(`does not clear provider degradation for a ${label} completion`, async () => {
+			const manager = SessionManager.inMemory(`/provider-health-${label}`);
+			appendUser(manager, "retry job", 1);
+			const context = new FakeLcmContext();
+			const jobId = `health-${label}`;
+			context.queueJobs(summaryJob(jobId));
+			const completeSummaryJob = context.completeSummaryJob.bind(context);
+			context.completeSummaryJob = (lease, completion) => {
+				if (!context.leasedJobs.has(lease.jobId)) return completeSummaryJob(lease, completion);
+				context.leasedJobs.delete(lease.jobId);
+				context.queuedJobs = Math.max(0, context.queuedJobs - 1);
+				context.relevantPendingJobs = Math.max(0, (context.relevantPendingJobs ?? 0) - 1);
+				return nonAccepted;
+			};
+			const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+			const attemptStarted = Promise.withResolvers<void>();
+			const releaseAttempt = Promise.withResolvers<void>();
+			complete.mockImplementation(async () => {
+				attemptStarted.resolve();
+				await releaseAttempt.promise;
+				return "non-accepted summary";
+			});
+
+			try {
+				await lcm.project(manager.buildSessionContext().messages);
+				await attemptStarted.promise;
+				context.seedFailure("prior-provider-failure", context.now + 10_000, "preferred");
+				expect((await lcm.status()).runtime.health).toBe("degraded");
+				context.failureRecords.clear();
+				releaseAttempt.resolve();
+				await settleUntil(() => !context.leasedJobs.has(jobId), `${label} completion`);
+				await flushScheduler();
+				expect(context.completedJobIds.has(jobId)).toBe(false);
+				expect((await lcm.status()).runtime.health).toBe("degraded");
+			} finally {
+				releaseAttempt.resolve();
+				await lcm.close();
+			}
+		});
+	}
+
+	for (const reason of ["coverage_gap", "assembly_invalid", "fit_invariant"] as const) {
+		const clearsOnReconcile = reason === "coverage_gap";
+		it(`an unchanged complete reconcile ${clearsOnReconcile ? "clears" : "does not clear"} ${reason} while preserving lastFailure`, async () => {
+			const manager = SessionManager.inMemory(`/unchanged-reconcile-${reason}`);
+			if (reason === "assembly_invalid") {
+				manager.appendMessage({ ...createAssistantMessage("first assistant"), timestamp: 1 });
+				manager.appendMessage({ ...createAssistantMessage("latest assistant"), timestamp: 2 });
+			} else {
+				appendUser(manager, "first request", 1);
+				appendUser(manager, "active request", 2);
+			}
+			const context = new FakeLcmContext();
+			let coverageAvailable = reason !== "coverage_gap";
+			context.projectImpl = (_request, snapshot) => {
+				const ready = readyHistoricalProjection(snapshot, `unchanged-${reason}`);
+				return coverageAvailable
+					? ready
+					: {
+							...ready,
+							ready: false,
+							historical: [],
+							freshTailSourceIds: [],
+							uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+							selectedLevelCounts: {},
+							coveredSourceCount: 0,
+							freshSourceCount: 0,
+							estimatedTokens: 0,
+						};
+			};
+			const measurements =
+				reason === "fit_invariant" ? () => ({ tokens: 2, upperBound: 2 }) : () => ({ tokens: 1, upperBound: 1 });
+			const { lcm } = createHarness(
+				manager,
+				context,
+				undefined,
+				undefined,
+				undefined,
+				20,
+				undefined,
+				1,
+				measurements,
+			);
+
+			try {
+				const result = await lcm.project(manager.buildSessionContext().messages);
+				expect(result.owned).toBe(false);
+				expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+				const failed = (await lcm.status()).runtime;
+				expect(failed).toMatchObject({
+					health: "degraded",
+					lastFailure: { category: "unfit", reason },
+				});
+
+				coverageAvailable = true;
+				context.reconcile = snapshot => ({
+					changed: false,
+					revision: 1,
+					activeSources: snapshot.entries.length,
+					insertedSources: 0,
+					tombstonedSources: 0,
+					queuedJobs: 0,
+					reusedSummaries: 0,
+				});
+				manager.appendCustomEntry("lcm-health-probe", { reason });
+				const reconciled = (await lcm.status()).runtime;
+				expect(reconciled.health).toBe(clearsOnReconcile ? "healthy" : "degraded");
+				expect(reconciled.lastFailure).toEqual(failed.lastFailure);
+			} finally {
+				await lcm.close();
+			}
+		});
+	}
+
+	it("commits only an exact current primary route and fences rebinds by full scope", async () => {
+		const manager = SessionManager.inMemory("/primary-route-fencing");
+		appendUser(manager, "covered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context);
+
+		const first = await lcm.project(manager.buildSessionContext().messages);
+		expect(first.routeKey).toBeDefined();
+		expect((await lcm.status()).runtime.lastRequestRoute).toBeUndefined();
+		expect(lcm.commitPrimaryRequestRoute(first.routeKey)).toBe(true);
+		const committed = (await lcm.status()).runtime;
+		expect(committed.lastRequestRoute).toMatchObject({ kind: "lossless", metrics: { revision: 1 } });
+		expect(committed.lastTakeover).toMatchObject({ revision: 1 });
+
+		appendUser(manager, "same-session revision", 2);
+		const second = await lcm.project(manager.buildSessionContext().messages);
+		expect(second.routeKey).toBeDefined();
+		appendUser(manager, "mutated before dispatch", 3);
+		expect(lcm.commitPrimaryRequestRoute(second.routeKey)).toBe(false);
+
+		const third = await lcm.project(manager.buildSessionContext().messages);
+		expect(third.routeKey).toBeDefined();
+		manager.branch(manager.getBranch()[0]!.id);
+		appendUser(manager, "same revision number on another branch", 4);
+		await lcm.rebind();
+		expect(lcm.commitPrimaryRequestRoute(third.routeKey)).toBe(false);
+		const rebound = (await lcm.status()).runtime;
+		expect(rebound.lastRequestRoute).toEqual(committed.lastRequestRoute);
+		expect(rebound.lastTakeover).toEqual(committed.lastTakeover);
+
+		await manager.newSession();
+		appendUser(manager, "new session", 5);
+		await lcm.rebind();
+		const nextSession = (await lcm.status()).runtime;
+		expect(nextSession.lastRequestRoute).toBeUndefined();
+		expect(nextSession.lastTakeover).toBeUndefined();
+		expect(nextSession.lastFailure).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("stages a first fallback against the exact reconciled scope", async () => {
+		const manager = SessionManager.inMemory("/first-fallback-scope");
+		appendUser(manager, "uncovered request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: false,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: [],
+			uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: 0,
+			estimatedTokens: 0,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		const branch = (await lcm.status()).runtime.currentBranch;
+		expect(result.routeKey?.scope).toMatchObject({
+			projectId: branch?.projectId,
+			branchId: branch?.branchId,
+			revision: branch?.revision,
+		});
+		expect(typeof result.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "unfit",
+			reason: "coverage_gap",
+		});
+		await lcm.close();
+	});
+
+	it("stages first-request irreducible and store fallbacks against the normalized input", async () => {
+		const irreducibleManager = SessionManager.inMemory("/first-irreducible-scope");
+		appendUser(irreducibleManager, "oversized request", 1);
+		const irreducibleHarness = createHarness(irreducibleManager, undefined, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 0,
+			freshTail: { maxSources: 32, maxTokens: 20_000 },
+		}));
+		const irreducible = await irreducibleHarness.lcm.project(irreducibleManager.buildSessionContext().messages);
+		expect(typeof irreducible.routeKey?.scope?.projectId).toBe("string");
+		expect(typeof irreducible.routeKey?.scope?.branchId).toBe("string");
+		expect(typeof irreducible.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(irreducible.routeKey?.scope).not.toHaveProperty("revision");
+		expect(irreducibleHarness.openContext).not.toHaveBeenCalled();
+		expect(irreducibleHarness.lcm.commitPrimaryRequestRoute(irreducible.routeKey)).toBe(true);
+		expect((await irreducibleHarness.lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "unfit",
+			reason: "irreducible_input",
+		});
+		await irreducibleHarness.lcm.close();
+
+		const storeManager = SessionManager.inMemory("/first-store-scope");
+		appendUser(storeManager, "store request", 1);
+		const storeHarness = createHarness(storeManager, undefined, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 80,
+			freshTail: { maxSources: 8, maxTokens: 40 },
+		}));
+		storeHarness.openContext.mockRejectedValueOnce(new Error("store unavailable"));
+		const store = await storeHarness.lcm.project(storeManager.buildSessionContext().messages);
+		expect(typeof store.routeKey?.scope?.projectId).toBe("string");
+		expect(typeof store.routeKey?.scope?.branchId).toBe("string");
+		expect(typeof store.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(store.routeKey?.scope).not.toHaveProperty("revision");
+		expect(storeHarness.lcm.commitPrimaryRequestRoute(store.routeKey)).toBe(true);
+		expect((await storeHarness.lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "store",
+		});
+		await storeHarness.lcm.close();
+	});
+
+	it("rejects a route when the journal changes while project identity resolves", async () => {
+		const manager = SessionManager.inMemory("/deferred-route-scope");
+		appendUser(manager, "original request", 1);
+		const started = Promise.withResolvers<void>();
+		const resolved = Promise.withResolvers<{ projectId: string; rootPath: string; storePath: string }>();
+		const { lcm, openContext } = createHarness(
+			manager,
+			undefined,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 41,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 80,
+				freshTail: { maxSources: 8, maxTokens: 40 },
+			}),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			async () => {
+				started.resolve();
+				return resolved.promise;
+			},
+		);
+		const pending = lcm.project(manager.buildSessionContext().messages);
+		await started.promise;
+		appendUser(manager, "appended during resolution", 2);
+		resolved.resolve({ projectId: "deferred-project", rootPath: "/tmp", storePath: "/tmp/context.sqlite" });
+		const result = await pending;
+		expect(result.routeKey).toBeUndefined();
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(false);
+		expect(openContext).not.toHaveBeenCalled();
+		await lcm.close();
+	});
+
+	it("commits a scoped store fallback when project resolution fails", async () => {
+		const manager = SessionManager.inMemory("/failed-route-scope");
+		appendUser(manager, "store request", 1);
+		const { lcm, openContext } = createHarness(
+			manager,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			async () => {
+				throw new Error("project unavailable");
+			},
+		);
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		expect(typeof result.routeKey?.scope?.projectId).toBe("string");
+		expect(typeof result.routeKey?.scope?.branchId).toBe("string");
+		expect(typeof result.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "store",
+		});
+		expect(openContext).not.toHaveBeenCalled();
+		await lcm.close();
+	});
+
+	it("keeps a below-hard project resolution rejection as native passthrough", async () => {
+		const manager = SessionManager.inMemory("/failed-below-hard-route-scope");
+		appendUser(manager, "warming request", 1);
+		const { lcm, openContext } = createHarness(
+			manager,
+			undefined,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 41,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 80,
+				freshTail: { maxSources: 8, maxTokens: 40 },
+			}),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			async () => {
+				throw new Error("project unavailable");
+			},
+		);
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		const runtime = (await lcm.status()).runtime;
+		expect(runtime.lastRequestRoute).toMatchObject({ kind: "native_passthrough", reason: "below_hard" });
+		expect(runtime.lastFailure).toBeUndefined();
+		expect(openContext).not.toHaveBeenCalled();
+		await lcm.close();
+	});
+
+	it("keeps a complete irreducible request ready and records its dispatched fallback", async () => {
+		const manager = SessionManager.inMemory("/irreducible-route");
+		appendUser(manager, "covered request", 1);
+
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		let irreducible = false;
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: irreducible ? 0 : 100_000,
+			freshTail: { maxSources: 32, maxTokens: 20_000 },
+		}));
+
+		const owned = await lcm.project(manager.buildSessionContext().messages);
+		expect(owned.routeKey).toBeDefined();
+		expect(lcm.commitPrimaryRequestRoute(owned.routeKey)).toBe(true);
+		irreducible = true;
+		const fallback = await lcm.project(manager.buildSessionContext().messages);
+		expect(fallback.routeKey).toBeDefined();
+		expect(lcm.commitPrimaryRequestRoute(fallback.routeKey)).toBe(true);
+		const status = (await lcm.status()).runtime;
+		expect(status).toMatchObject({
+			health: "healthy",
+			coverageReadiness: "ready",
+			lastRequestRoute: {
+				kind: "native_fallback",
+				category: "unfit",
+				reason: "irreducible_input",
+			},
+			lastFailure: { category: "unfit", reason: "irreducible_input" },
+		});
+		expect(status.lastTakeover).toBeDefined();
+		await lcm.close();
 	});
 
 	it("refuses a cue search whose expected revision no longer matches the branch", async () => {
@@ -660,6 +1952,14 @@ describe("SessionLcm", () => {
 		const result = await lcm.project(input);
 		expect(result.messages).toBe(input);
 		expect(result.owned).toBe(false);
+		expect(typeof result.routeKey?.scope?.projectId).toBe("string");
+		expect(typeof result.routeKey?.scope?.branchId).toBe("string");
+		expect(typeof result.routeKey?.scope?.inputAnchor).toBe("string");
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_passthrough",
+			reason: "below_hard",
+		});
 		await completionStarted.promise;
 		expect(context.completedJobIds.size).toBe(0);
 		expect(context.reconcileOptions[0]?.summarize).toEqual({
@@ -932,13 +2232,12 @@ describe("SessionLcm", () => {
 		await settleUntil(() => context.leasedJobs.size === 1, "reclaimed structural-abort job");
 		const reclaimed = context.leasedJobs.get("structural-abort")!;
 		expect(reclaimed.leaseToken).not.toBe(firstRelease.leaseToken);
-		expect(context.releaseSummaryJob(reclaimed.jobId, firstRelease.leaseToken)).toBe(false);
+		expect(context.releaseSummaryJob({ ...reclaimed, leaseToken: firstRelease.leaseToken })).toBe(false);
 		expect(context.leasedJobs.get(reclaimed.jobId)?.leaseToken).toBe(reclaimed.leaseToken);
 		expect(status.runtime.summaryBackoff).toBeUndefined();
 		expect(status.store?.jobs.failed).toBe(0);
-		expect(status.runtime.phase).not.toBe("degraded");
-		expect(status.runtime.lastFailureCategory).toBeUndefined();
-		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
+		expect(status.runtime.health).toBe("healthy");
+		expect(status.runtime.lastFailure).toBeUndefined();
 		await lcm.rebind();
 		expect(context.releaseCalls.at(-1)).toEqual({
 			jobId: reclaimed.jobId,
@@ -994,6 +2293,309 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
+	it("aborts resolver-key drift before transport and retries under the rotated epoch", async () => {
+		const manager = SessionManager.inMemory("/dispatch-key-drift");
+		appendUser(manager, "drift", 1);
+		const context = new FakeLcmContext();
+		context.preResolvedModelOverride = "provider/claimed-model";
+		context.resolvedModelOverride = "provider/actual-model";
+		context.queueJobs(summaryJob("drift"));
+		const { lcm, complete, resolveSummaryModel } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+		);
+		resolveSummaryModel.mockImplementation(() =>
+			context.claimCalls.length === 0 ? "provider/claimed-model" : "provider/actual-model",
+		);
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => context.completedJobIds.has("drift"), "rotated policy completion");
+			expect(complete).toHaveBeenCalledTimes(1);
+			expect(context.claimCalls).toHaveLength(2);
+			expect(context.retryPolicy).toEqual({ retryKey: "provider/actual-model", retryEpoch: 2 });
+			expect([...context.attemptRows.values()]).toHaveLength(1);
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("re-resolves the selector after provider setup before starting a durable attempt", async () => {
+		const manager = SessionManager.inMemory("/api-key-model-drift");
+		appendUser(manager, "drift during provider setup", 1);
+		const context = new FakeLcmContext();
+		context.preResolvedModelOverride = "provider/model-a";
+		context.queueJobs(summaryJob("api-key-model-drift"));
+		let switched = false;
+		context.beforeAttemptStart = () => {
+			if (switched) return;
+			switched = true;
+			context.preResolvedModelOverride = "provider/model-b";
+		};
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => context.completedJobIds.has("api-key-model-drift"), "post-setup model retry");
+			expect(complete).toHaveBeenCalledTimes(1);
+			expect(context.claimCalls).toHaveLength(2);
+			expect(context.retryPolicy).toEqual({ retryKey: "provider/model-b", retryEpoch: 2 });
+			expect([...context.attemptRows.values()]).toHaveLength(1);
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("aborts old-epoch siblings and restarts the summary run after retry-policy rotation", async () => {
+		const manager = SessionManager.inMemory("/multi-worker-policy-rotation");
+		appendUser(manager, "rotate concurrent summaries", 1);
+		const context = new FakeLcmContext();
+		context.preResolvedModelOverride = "provider/model-a";
+		context.queueJobs(summaryJob("rotate-a"), summaryJob("rotate-b"), summaryJob("rotate-c"));
+		const oldAttemptsStarted = Promise.withResolvers<void>();
+		let providerSetups = 0;
+		context.beforeAttemptStart = async () => {
+			providerSetups++;
+			if (providerSetups !== 3) return;
+			await oldAttemptsStarted.promise;
+			context.preResolvedModelOverride = "provider/model-b";
+		};
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+			20,
+			undefined,
+			3,
+		);
+		const oldEpochSignals: AbortSignal[] = [];
+		let samePolicyNoopAbortedSibling = false;
+		complete.mockImplementation(request => {
+			if (oldEpochSignals.length >= 2) return Promise.resolve("rotated summary");
+			const signal = request.signal!;
+			oldEpochSignals.push(signal);
+			if (oldEpochSignals.length === 2) {
+				samePolicyNoopAbortedSibling = oldEpochSignals[0]!.aborted;
+				oldAttemptsStarted.resolve();
+			}
+			return new Promise<string>((_resolve, reject) => {
+				const rejectAbort = () =>
+					reject(new LcmCompletionError("old retry epoch aborted", { provider: "test", category: "aborted" }));
+				if (signal.aborted) rejectAbort();
+				else signal.addEventListener("abort", rejectAbort, { once: true });
+			});
+		});
+
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => context.completedJobIds.size === 3, "rotated summary run completion");
+			expect(oldEpochSignals).toHaveLength(2);
+			expect(samePolicyNoopAbortedSibling).toBe(false);
+			expect(oldEpochSignals.every(signal => signal.aborted)).toBe(true);
+			expect(complete).toHaveBeenCalledTimes(5);
+			expect(context.failureCalls).toHaveLength(0);
+			expect(context.retryPolicy).toEqual({ retryKey: "provider/model-b", retryEpoch: 2 });
+		} finally {
+			oldAttemptsStarted.resolve();
+			await lcm.close();
+		}
+	});
+
+	it("does not consume a durable retry before provider dispatch starts", async () => {
+		const manager = SessionManager.inMemory("/predispatch-provider-failure");
+		appendUser(manager, "provider setup fails", 1);
+		const context = new FakeLcmContext();
+		const jobId = "predispatch-provider-failure";
+		context.queueJobs(summaryJob(jobId, { transportRetryCount: 4 }));
+		context.beforeAttemptStart = () => {
+			throw new LcmCompletionError("provider credential configuration unavailable", {
+				provider: "test-provider",
+				category: "provider_key_mismatch",
+			});
+		};
+		const { lcm, complete } = createHarness(manager, context);
+
+		try {
+			const projection = lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(
+				() => context.releaseCalls.some(release => release.jobId === jobId && release.accepted),
+				"predispatch lease release",
+			);
+			const result = await projection;
+			expect(complete).not.toHaveBeenCalled();
+			expect(context.attemptRows.size).toBe(0);
+			expect(context.failureCalls).toHaveLength(0);
+			expect(context.jobs.find(job => job.jobId === jobId)?.transportRetryCount).toBe(4);
+			expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+			expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+				kind: "native_fallback",
+				category: "provider",
+				reason: "provider_key_mismatch",
+			});
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("adopts a persisted concrete key for @smol after reopen and owns the hard projection", async () => {
+		const manager = SessionManager.inMemory("/selector-reopen");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const firstContext = new FakeLcmContext();
+		firstContext.resolvedModelOverride = "provider/actual-model";
+		firstContext.queueJobs(summaryJob("initial"));
+		const first = createHarness(manager, firstContext, undefined, undefined, softProjectionLimits);
+		try {
+			await first.lcm.project(manager.buildSessionContext().messages);
+			await settleUntil(() => firstContext.completedJobIds.has("initial"), "initial concrete-key completion");
+			expect(firstContext.retryPolicyCalls[0]?.retryKey).toBe("provider/actual-model");
+			expect(firstContext.retryPolicy).toEqual({ retryKey: "provider/actual-model", retryEpoch: 1 });
+		} finally {
+			await first.lcm.close();
+		}
+
+		const context = new FakeLcmContext();
+		context.retryPolicy = { ...firstContext.retryPolicy! };
+		context.retryPolicyToken = firstContext.retryPolicyToken;
+		context.resolvedModelOverride = "provider/actual-model";
+		context.queueJobs({
+			...summaryJob("reopened"),
+			retryKey: context.retryPolicy.retryKey,
+			retryEpoch: context.retryPolicy.retryEpoch,
+			leasePolicyToken: context.retryPolicyToken,
+		});
+		const pendingProjection = context.projectImpl;
+		context.projectImpl = (request, snapshot) =>
+			context.completedJobIds.has("reopened")
+				? readyHistoricalProjection(snapshot, "summary_handle_reopened")
+				: pendingProjection(request, snapshot);
+		const reopened = createHarness(manager, context);
+		reopened.lcm.configure({ summaryModel: "@smol" });
+		try {
+			const result = await reopened.lcm.project(manager.buildSessionContext().messages);
+			expect(result.owned).toBe(true);
+			expect(reopened.complete).toHaveBeenCalledTimes(1);
+			expect(context.retryPolicy).toEqual({ retryKey: "provider/actual-model", retryEpoch: 1 });
+			expect([...context.attemptRows.values()]).toHaveLength(1);
+		} finally {
+			await reopened.lcm.close();
+		}
+	});
+
+	it("keeps a genuine policy mismatch degraded until an explicit model change", async () => {
+		const manager = SessionManager.inMemory("/selector-policy-mismatch");
+		appendUser(manager, "mismatch", 1);
+		const context = new FakeLcmContext();
+		context.retryPolicy = { retryKey: "provider/persisted-model", retryEpoch: 7 };
+		context.retryPolicyToken = "policy-7";
+		context.queueJobs({
+			...summaryJob("mismatch"),
+			retryKey: context.retryPolicy.retryKey,
+			retryEpoch: context.retryPolicy.retryEpoch,
+			leasePolicyToken: context.retryPolicyToken,
+		});
+		const { lcm, complete } = createHarness(manager, context);
+		lcm.configure({ summaryModel: "provider/configured-model" });
+		try {
+			const result = await lcm.project(manager.buildSessionContext().messages);
+			expect(result.owned).toBe(false);
+			expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+			const status = (await lcm.status()).runtime;
+			expect(status).toMatchObject({
+				health: "degraded",
+				lastFailure: { category: "provider", reason: "provider_key_mismatch" },
+			});
+			expect(status.summaryBackoff).toBeUndefined();
+			expect(context.retryPolicy).toEqual({ retryKey: "provider/persisted-model", retryEpoch: 7 });
+			expect(complete).not.toHaveBeenCalled();
+			lcm.configure({ summaryModel: "provider/recovered-model" });
+			expect((await lcm.status()).runtime.health).toBe("healthy");
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("clears a concurrent policy mismatch when the accepted worker outlives its coordinator", async () => {
+		const manager = SessionManager.inMemory("/selector-policy-mismatch-success");
+		appendUser(manager, "mismatch", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("mismatch-recovery"));
+		const attemptStarted = Promise.withResolvers<void>();
+		const releaseAttempt = Promise.withResolvers<void>();
+		const { lcm, complete, resolveSummaryModel } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			softProjectionLimits,
+		);
+		complete.mockImplementation(async () => {
+			attemptStarted.resolve();
+			await releaseAttempt.promise;
+			return "recovered summary";
+		});
+
+		try {
+			await lcm.project(manager.buildSessionContext().messages);
+			await attemptStarted.promise;
+			const resolverCalls = resolveSummaryModel.mock.calls.length;
+			resolveSummaryModel.mockImplementation(() => {
+				throw new Error("resolver unavailable");
+			});
+			lcm.configure({ summaryModel: "@smol", maxConcurrentSummaries: 2 });
+			await lcm.status();
+			await flushScheduler();
+			expect(resolveSummaryModel.mock.calls.length).toBeGreaterThan(resolverCalls);
+			expect((await lcm.status()).runtime.health).toBe("degraded");
+
+			resolveSummaryModel.mockReturnValue("test-provider/test-model");
+			releaseAttempt.resolve();
+			await settleUntil(() => context.completedJobIds.has("mismatch-recovery"), "policy-mismatch recovery");
+			await flushScheduler();
+			const runtime = (await lcm.status()).runtime;
+			expect(runtime.summaryWorkers.active).toBe(0);
+			expect(runtime.health).toBe("healthy");
+		} finally {
+			releaseAttempt.resolve();
+			await lcm.close();
+		}
+	});
+
+	it("retry all refreshes preferred and fallback cooldowns without advancing the clock", async () => {
+		const manager = SessionManager.inMemory("/manual-retry-all-cooldowns");
+		appendUser(manager, "retry backlog", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(
+			summaryJob("preferred-retry-all"),
+			summaryJob("fallback-retry-all", { queueClass: "fallback" }),
+		);
+		context.seedFailure("preferred-retry-all", context.now + 50_000, "preferred");
+		context.seedFailure("fallback-retry-all", context.now + 60_000, "fallback");
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, softProjectionLimits);
+		try {
+			const hydrated = await lcm.status();
+			expect(hydrated.runtime.summaryBackoff).toEqual({
+				preferred: context.now + 50_000,
+				fallback: context.now + 60_000,
+			});
+			const unchangedNow = context.now;
+			const availability = await lcm.retrySummaries("all");
+			expect(context.now).toBe(unchangedNow);
+			expect(availability?.runnable).toBe(1);
+			expect((await lcm.status()).runtime.summaryBackoff).toBeUndefined();
+			await settleUntil(() => context.completedJobIds.size === 2, "manual retry-all completions");
+			expect(complete).toHaveBeenCalledTimes(2);
+			expect([...context.completedJobIds]).toEqual(["preferred-retry-all", "fallback-retry-all"]);
+		} finally {
+			await lcm.close();
+		}
+	});
+
 	it("hydrates durable preferred and fallback failures and prunes peer-completed records", async () => {
 		const manager = SessionManager.inMemory("/durable-failure-hydration");
 		appendUser(manager, "durable failures", 1);
@@ -1003,7 +2605,7 @@ describe("SessionLcm", () => {
 		const { lcm } = createHarness(manager, context);
 
 		const hydrated = await lcm.status();
-		expect(hydrated.runtime.phase).toBe("degraded");
+		expect(hydrated.runtime.health).toBe("degraded");
 		expect(hydrated.runtime.summaryBackoff).toEqual({
 			preferred: context.now + 10_000,
 			fallback: context.now + 20_000,
@@ -1130,7 +2732,7 @@ describe("SessionLcm", () => {
 		expect(context.claimCalls.slice(preferredClaimStart).some(call => call.allowFallback === false)).toBe(true);
 		expect(context.maxLeased).toBe(2);
 		expect(context.leasedJobs.has("held-fallback")).toBe(true);
-		expect(status.runtime.phase).not.toBe("degraded");
+		expect(status.runtime.health).toBe("degraded");
 		expect(status.runtime.summaryWorkers).toEqual({ active: 1, limit: 2 });
 		expect(status.store?.jobs).toMatchObject({ leased: 1, failed: 1, completed: 1 });
 		heldGate.resolve();
@@ -1138,47 +2740,199 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
-	it("keeps one provider failure visible after its sibling succeeds", async () => {
-		const manager = SessionManager.inMemory("/sibling-failure");
-		appendUser(manager, "sibling jobs", 1);
-		const context = new FakeLcmContext();
-		context.queueJobs(summaryJob("failing-sibling"), summaryJob("successful-sibling"));
-		const { lcm, complete } = createHarness(
-			manager,
-			context,
-			undefined,
-			undefined,
-			softProjectionLimits,
-			20,
-			undefined,
-			2,
-		);
-		const successGate = Promise.withResolvers<void>();
-		const successStarted = Promise.withResolvers<void>();
-		complete.mockImplementation(async request => {
-			if (request.prompt.includes("source-failing-sibling")) {
-				throw new LcmCompletionError("bounded provider failure", { provider: "test" });
-			}
-			successStarted.resolve();
-			await successGate.promise;
-			return "successful sibling";
-		});
+	for (const failureFirst of [true, false] as const) {
+		it(`keeps a provider failure visible when its sibling settles ${failureFirst ? "after" : "before"} it`, async () => {
+			const manager = SessionManager.inMemory(`/sibling-failure-${failureFirst ? "first" : "last"}`);
+			appendUser(manager, "sibling jobs", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob("failing-sibling"), summaryJob("successful-sibling"));
+			const { lcm, complete } = createHarness(
+				manager,
+				context,
+				undefined,
+				undefined,
+				softProjectionLimits,
+				20,
+				undefined,
+				2,
+			);
+			const failureGate = Promise.withResolvers<void>();
+			const successGate = Promise.withResolvers<void>();
+			const failureStarted = Promise.withResolvers<void>();
+			const successStarted = Promise.withResolvers<void>();
+			complete.mockImplementation(async request => {
+				const failing = request.prompt.includes("source-failing-sibling");
+				(failing ? failureStarted : successStarted).resolve();
+				await (failing ? failureGate : successGate).promise;
+				if (failing) throw new LcmCompletionError("bounded provider failure", { provider: "test" });
+				return "successful sibling";
+			});
 
-		await lcm.project(manager.buildSessionContext().messages);
-		await Promise.all([context.summaryFailed.promise, successStarted.promise]);
-		successGate.resolve();
-		await settleUntil(() => context.completedJobIds.has("successful-sibling"), "successful sibling settlement");
-		const status = await lcm.status();
-		expect(context.completedJobIds.has("failing-sibling")).toBe(false);
-		expect(context.failureRecords.get("failing-sibling")).toEqual({
-			jobId: "failing-sibling",
-			availableAt: context.now + 2_000,
-			queueClass: "preferred",
+			await lcm.project(manager.buildSessionContext().messages);
+			await Promise.all([failureStarted.promise, successStarted.promise]);
+			(failureFirst ? failureGate : successGate).resolve();
+			await settleUntil(
+				() =>
+					failureFirst
+						? context.failureRecords.has("failing-sibling")
+						: context.completedJobIds.has("successful-sibling"),
+				"first sibling settlement",
+			);
+			(failureFirst ? successGate : failureGate).resolve();
+			await settleUntil(
+				() => context.failureRecords.has("failing-sibling") && context.completedJobIds.has("successful-sibling"),
+				"both sibling settlements",
+			);
+			await flushScheduler();
+			const status = await lcm.status();
+			expect(context.completedJobIds.has("failing-sibling")).toBe(false);
+			expect(context.failureRecords.get("failing-sibling")).toEqual({
+				jobId: "failing-sibling",
+				availableAt: context.now + 2_000,
+				queueClass: "preferred",
+			});
+			expect(status.runtime.summaryBackoff).toEqual({ preferred: context.now + 2_000 });
+			expect(status.runtime.health).toBe("degraded");
+			await lcm.close();
 		});
-		expect(status.runtime.summaryBackoff).toEqual({ preferred: context.now + 2_000 });
-		expect(status.runtime.lastFailureCategory).toBe("provider");
-		await lcm.close();
-	});
+	}
+
+	for (const terminalFirst of [true, false] as const) {
+		it(`keeps required provider exhaustion degraded when the accepted sibling settles ${terminalFirst ? "after" : "before"} it`, async () => {
+			const manager = SessionManager.inMemory(`/exhausted-sibling-${terminalFirst ? "first" : "last"}`);
+			appendUser(manager, "exhausted sibling jobs", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(
+				summaryJob("exhausted-sibling", { transportRetryCount: 4 }),
+				summaryJob("accepted-sibling"),
+				summaryJob("held-sibling"),
+			);
+			const { lcm, complete } = createHarness(
+				manager,
+				context,
+				undefined,
+				undefined,
+				softProjectionLimits,
+				20,
+				undefined,
+				3,
+			);
+			const failureGate = Promise.withResolvers<void>();
+			const acceptedGate = Promise.withResolvers<void>();
+			const heldGate = Promise.withResolvers<void>();
+			const failureStarted = Promise.withResolvers<void>();
+			const acceptedStarted = Promise.withResolvers<void>();
+			const heldStarted = Promise.withResolvers<void>();
+			complete.mockImplementation(async request => {
+				const failing = request.prompt.includes("source-exhausted-sibling");
+				const accepted = request.prompt.includes("source-accepted-sibling");
+				(failing ? failureStarted : accepted ? acceptedStarted : heldStarted).resolve();
+				await (failing ? failureGate : accepted ? acceptedGate : heldGate).promise;
+				if (failing) throw new LcmCompletionError("fifth provider failure", { provider: "test" });
+				return accepted ? "accepted sibling" : "held sibling";
+			});
+
+			try {
+				await lcm.project(manager.buildSessionContext().messages);
+				await Promise.all([failureStarted.promise, acceptedStarted.promise, heldStarted.promise]);
+				(terminalFirst ? failureGate : acceptedGate).resolve();
+				await settleUntil(
+					() =>
+						terminalFirst
+							? context.failureRecords.has("exhausted-sibling")
+							: context.completedJobIds.has("accepted-sibling"),
+					"first exhausted-sibling settlement",
+				);
+				await waitForSummaryWorkerCount(lcm, 2);
+				if (terminalFirst) expect((await lcm.status()).runtime.health).toBe("degraded");
+				(terminalFirst ? acceptedGate : failureGate).resolve();
+				await settleUntil(
+					() =>
+						context.completedJobIds.has("accepted-sibling") &&
+						context.jobs.some(job => job.jobId === "exhausted-sibling" && job.transportRetryCount === 5),
+					"mixed exhaustion settlement",
+				);
+				await waitForSummaryWorkerCount(lcm, 1);
+
+				expect((await lcm.status()).runtime.health).toBe("degraded");
+			} finally {
+				failureGate.resolve();
+				acceptedGate.resolve();
+				heldGate.resolve();
+				await lcm.close();
+			}
+		});
+	}
+
+	for (const terminalFirst of [true, false] as const) {
+		it(`keeps a required policy mismatch degraded when the accepted sibling settles ${terminalFirst ? "after" : "before"} it`, async () => {
+			const manager = SessionManager.inMemory(`/mismatched-sibling-${terminalFirst ? "first" : "last"}`);
+			appendUser(manager, "mismatched sibling jobs", 1);
+			const context = new FakeLcmContext();
+			context.queueJobs(summaryJob("accepted-policy-sibling"), summaryJob("held-policy-sibling"), {
+				...summaryJob("mismatched-policy-sibling"),
+				retryEpoch: terminalFirst ? 2 : 1,
+			});
+			const completeSummaryJob = context.completeSummaryJob.bind(context);
+			if (!terminalFirst) {
+				context.completeSummaryJob = (lease, completion) => {
+					const result = completeSummaryJob(lease, completion);
+					if (result.accepted && lease.jobId === "accepted-policy-sibling") {
+						context.jobs = context.jobs.map(job =>
+							job.jobId === "mismatched-policy-sibling" ? { ...job, retryEpoch: 2 } : job,
+						);
+					}
+					return result;
+				};
+			}
+			const { lcm, complete } = createHarness(
+				manager,
+				context,
+				undefined,
+				undefined,
+				softProjectionLimits,
+				20,
+				undefined,
+				terminalFirst ? 3 : 2,
+			);
+			const acceptedGate = Promise.withResolvers<void>();
+			const heldGate = Promise.withResolvers<void>();
+			const acceptedStarted = Promise.withResolvers<void>();
+			const heldStarted = Promise.withResolvers<void>();
+			complete.mockImplementation(async request => {
+				const accepted = request.prompt.includes("source-accepted-policy-sibling");
+				const held = request.prompt.includes("source-held-policy-sibling");
+				if (!accepted && !held) throw new Error("mismatched policy sibling must not dispatch");
+				(accepted ? acceptedStarted : heldStarted).resolve();
+				if (accepted && terminalFirst) await acceptedGate.promise;
+				if (held) await heldGate.promise;
+				return accepted ? "accepted policy sibling" : "held policy sibling";
+			});
+
+			try {
+				await lcm.project(manager.buildSessionContext().messages);
+				await Promise.all([acceptedStarted.promise, heldStarted.promise]);
+				if (terminalFirst) {
+					await settleUntil(() => context.availabilityCalls.length > 0, "policy mismatch before accepted sibling");
+					await flushScheduler();
+					expect((await lcm.status()).runtime.health).toBe("degraded");
+					acceptedGate.resolve();
+				}
+				await settleUntil(
+					() => context.completedJobIds.has("accepted-policy-sibling"),
+					"accepted policy sibling settlement",
+				);
+				await waitForSummaryWorkerCount(lcm, 1);
+
+				expect(context.completedJobIds.has("mismatched-policy-sibling")).toBe(false);
+				expect((await lcm.status()).runtime.health).toBe("degraded");
+			} finally {
+				acceptedGate.resolve();
+				heldGate.resolve();
+				await lcm.close();
+			}
+		});
+	}
 
 	for (const unfitFirst of [true, false] as const) {
 		it(`keeps preferred unfit degraded when its sibling settles ${unfitFirst ? "after" : "before"} it`, async () => {
@@ -1208,11 +2962,11 @@ describe("SessionLcm", () => {
 				return unfit ? "unfit summary" : "sibling summary";
 			});
 			const completeSummaryJob = context.completeSummaryJob.bind(context);
-			context.completeSummaryJob = (jobId, leaseToken, completion) => {
-				if (jobId !== "preferred-unfit") return completeSummaryJob(jobId, leaseToken, completion);
-				const leased = context.leasedJobs.get(jobId);
-				if (leased?.leaseToken !== leaseToken) return { accepted: false, reason: "lease_lost" };
-				context.leasedJobs.delete(jobId);
+			context.completeSummaryJob = (lease, completion) => {
+				if (lease.jobId !== "preferred-unfit") return completeSummaryJob(lease, completion);
+				const leased = context.leasedJobs.get(lease.jobId);
+				if (leased?.leaseToken !== lease.leaseToken) return { accepted: false, reason: "lease_lost" };
+				context.leasedJobs.delete(lease.jobId);
 				context.queuedJobs = Math.max(0, context.queuedJobs - 1);
 				if (context.relevantPendingJobs !== undefined) {
 					context.relevantPendingJobs = Math.max(0, context.relevantPendingJobs - 1);
@@ -1235,16 +2989,17 @@ describe("SessionLcm", () => {
 			const afterBoth = await lcm.status();
 
 			if (unfitFirst) {
-				expect(afterFirst.runtime.phase).toBe("degraded");
-				expect(afterFirst.runtime.lastFailureCategory).toBe("unfit");
+				expect(afterFirst.runtime.health).toBe("degraded");
+				expect(afterFirst.runtime.lastFailure).toBeUndefined();
 			}
-			expect(afterBoth.runtime.phase).toBe("degraded");
-			expect(afterBoth.runtime.lastFailureCategory).toBe("unfit");
+			expect(afterBoth.runtime.health).toBe("degraded");
+			expect(afterBoth.runtime.lastFailure).toBeUndefined();
 
 			context.projectImpl = (_request, snapshot) => ({
 				revision: 2,
 				ready: true,
 				historical: [],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
 				uncoveredSourceIds: [],
 				sourceTokens: snapshot.entries.length,
@@ -1258,8 +3013,8 @@ describe("SessionLcm", () => {
 			const fitted = await lcm.project(manager.buildSessionContext().messages);
 			const active = await lcm.status();
 			expect(fitted.owned).toBe(true);
-			expect(active.runtime.phase).toBe("active");
-			expect(active.runtime.lastFailureCategory).toBeUndefined();
+			expect(active.runtime).toMatchObject({ health: "healthy", coverageReadiness: "ready" });
+			expect(active.runtime.lastFailure).toBeUndefined();
 			await lcm.close();
 		});
 	}
@@ -1268,7 +3023,7 @@ describe("SessionLcm", () => {
 		const cases = [
 			{ retry: 0, hint: 45_000, expected: 45_000 },
 			{ retry: 3, hint: undefined, expected: 16_000 },
-			{ retry: 9, hint: undefined, expected: 32_000 },
+			{ retry: 4, hint: undefined, expected: 32_000 },
 		] as const;
 		for (const testCase of cases) {
 			const manager = SessionManager.inMemory(`/retry-delay-${testCase.retry}`);
@@ -1302,6 +3057,7 @@ describe("SessionLcm", () => {
 			revision: 1,
 			ready: true,
 			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
 			uncoveredSourceIds: [],
 			sourceTokens: snapshot.entries.length,
@@ -1316,11 +3072,10 @@ describe("SessionLcm", () => {
 		const result = await lcm.project(manager.buildSessionContext().messages);
 		expect(result.owned).toBe(true);
 		expect(context.reconcileAttempts).toBe(2);
-		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
 		await lcm.close();
 	});
 
-	it("fails open without retrying non-contention errors and clears the fallback annotation on rebind", async () => {
+	it("fails open without retrying non-contention errors and preserves diagnostic status on rebind", async () => {
 		const manager = SessionManager.inMemory("/non-contention-fail-open");
 		appendUser(manager, "store failure", 1);
 		const context = new FakeLcmContext();
@@ -1334,9 +3089,10 @@ describe("SessionLcm", () => {
 		expect(result.owned).toBe(false);
 		expect(context.reconcileAttempts).toBe(1);
 		expect(complete).not.toHaveBeenCalled();
-		expect((await lcm.status()).runtime.lastFailureCategory).toBe("store");
+		const failedStatus = (await lcm.status()).runtime;
+		expect(failedStatus.health).toBe("degraded");
+		expect(failedStatus.lastFailure).toBeUndefined();
 		await lcm.rebind();
-		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
 		await lcm.close();
 	});
 
@@ -1359,7 +3115,7 @@ describe("SessionLcm", () => {
 
 		const status = await lcm.status();
 
-		expect(status.runtime.phase).toBe("quarantined");
+		expect(status.runtime.health).toBe("quarantined");
 		expect(status.store).toMatchObject({
 			quarantined: true,
 			storage: { databaseBytes: 1_024, walBytes: 256, quarantineBytes: 128 },
@@ -1422,6 +3178,7 @@ describe("SessionLcm", () => {
 			revision: context.snapshots.length,
 			ready: true,
 			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
 			uncoveredSourceIds: [],
 			sourceTokens: snapshot.entries.length,
@@ -1451,7 +3208,7 @@ describe("SessionLcm", () => {
 		expect(superseded.projectionState).toBe("unevaluated");
 		expect(superseded.projection).toBeUndefined();
 		expect(superseded.sourceTokens).toBeGreaterThan(39);
-		expect((await lcm.status()).runtime.phase).toBe("warming");
+		expect((await lcm.status()).runtime).toMatchObject({ health: "healthy", coverageReadiness: "ready" });
 		atHard = true;
 
 		appendUser(manager, "same branch revision", 3);
@@ -1486,6 +3243,7 @@ describe("SessionLcm", () => {
 			revision: context.snapshots.length,
 			ready: true,
 			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
 			uncoveredSourceIds: [],
 			sourceTokens: snapshot.entries.length,
@@ -1521,9 +3279,54 @@ describe("SessionLcm", () => {
 		const status = await lcm.status();
 		expect(status.runtime.currentBranch?.projectionState).toBe("unevaluated");
 		expect(status.runtime.currentBranch?.projection).toBeUndefined();
-		expect(status.runtime.phase).not.toBe("active");
-		expect(status.runtime.lastFailureCategory).toBeUndefined();
-		expect(lcm.takePendingFallbackCategory()).toBeUndefined();
+		expect(status.runtime.health).toBe("healthy");
+		expect(status.runtime.lastFailure).toBeUndefined();
+		await lcm.close();
+	});
+
+	it("aborts a maintenance decision superseded by a newer primary projection", async () => {
+		const manager = SessionManager.inMemory("/maintenance-projection-attempt-freshness");
+		appendUser(manager, "overlapping request", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("superseded-maintenance"));
+		context.projectImpl = (_request, snapshot) => ({
+			revision: context.snapshots.length,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: context.queuedJobs,
+		});
+		let requestCount = 0;
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: requestCount++ === 0 ? 101 : 79,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 32, maxTokens: 20_000 },
+		}));
+		const completionStarted = Promise.withResolvers<void>();
+		const completionGate = Promise.withResolvers<void>();
+		complete.mockImplementation(async () => {
+			completionStarted.resolve();
+			await completionGate.promise;
+			return "redacted summary";
+		});
+		const input = manager.buildSessionContext().messages;
+
+		const staleMaintenance = lcm.ownsRequest(input, undefined, 150);
+		await completionStarted.promise;
+		expect((await lcm.project(input)).owned).toBe(false);
+		completionGate.resolve();
+
+		expect(await staleMaintenance).toEqual({ kind: "aborted" });
+		expect((await lcm.project(input)).owned).toBe(false);
 		await lcm.close();
 	});
 
@@ -1536,7 +3339,8 @@ describe("SessionLcm", () => {
 		context.queuedJobs = 1;
 		context.job = summaryJob("hard");
 		context.projectImpl = (_request, snapshot) => {
-			const old = snapshot.entries[1]!;
+			const historical = snapshot.entries.slice(0, -1);
+			const old = historical.at(-1)!;
 			const fresh = snapshot.entries.at(-1)!;
 			return {
 				revision: 2,
@@ -1549,7 +3353,7 @@ describe("SessionLcm", () => {
 						level: 0,
 						redactedText: "older facts",
 						tokenCount: 2,
-						sourceIds: [old.entryId],
+						sourceIds: historical.map(entry => entry.entryId),
 						citations: [
 							{
 								...snapshot.scope,
@@ -1562,11 +3366,12 @@ describe("SessionLcm", () => {
 						files: [],
 					},
 				],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: [fresh.entryId],
 				uncoveredSourceIds: [],
 				sourceTokens: 90,
 				selectedLevelCounts: { 0: 1 },
-				coveredSourceCount: 1,
+				coveredSourceCount: historical.length,
 				freshSourceCount: 1,
 				estimatedTokens: 12,
 				pendingJobs: context.queuedJobs,
@@ -1585,7 +3390,7 @@ describe("SessionLcm", () => {
 		});
 		await lcm.rebind();
 		const rebound = await lcm.status();
-		expect(rebound.runtime.phase).toBe("idle");
+		expect(rebound.runtime).toMatchObject({ health: "healthy", coverageReadiness: "idle" });
 		expect(rebound.runtime.currentBranch).toMatchObject({ projectionState: "unevaluated" });
 		expect(rebound.runtime.currentBranch?.projection).toBeUndefined();
 		await lcm.close();
@@ -1599,7 +3404,8 @@ describe("SessionLcm", () => {
 		const context = new FakeLcmContext();
 		context.queueJobs(summaryJob("older-fallback", { queueClass: "fallback" }));
 		context.projectImpl = (_request, snapshot) => {
-			const old = snapshot.entries[1]!;
+			const historical = snapshot.entries.slice(0, -1);
+			const old = historical.at(-1)!;
 			const fresh = snapshot.entries.at(-1)!;
 			return {
 				revision: 3,
@@ -1612,7 +3418,7 @@ describe("SessionLcm", () => {
 						level: 0,
 						redactedText: "current branch facts",
 						tokenCount: 3,
-						sourceIds: [old.entryId],
+						sourceIds: historical.map(entry => entry.entryId),
 						citations: [
 							{
 								...snapshot.scope,
@@ -1625,11 +3431,12 @@ describe("SessionLcm", () => {
 						files: [],
 					},
 				],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: [fresh.entryId],
 				uncoveredSourceIds: [],
 				sourceTokens: 90,
 				selectedLevelCounts: { 0: 1 },
-				coveredSourceCount: 1,
+				coveredSourceCount: historical.length,
 				freshSourceCount: 1,
 				estimatedTokens: 14,
 				pendingJobs: context.relevantPendingJobs ?? 0,
@@ -1769,16 +3576,15 @@ describe("SessionLcm", () => {
 		}
 	});
 
-	it("re-projects on the poll tick so a peer commit lands before the foreground deadline", async () => {
+	it("re-projects on poll ticks until a peer commit lands during the foreground wait", async () => {
 		const manager = SessionManager.inMemory("/peer-progress-poll");
 		const first = appendUser(manager, "first", 1);
 		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
 		appendUser(manager, "active", 3);
 		const context = new FakeLcmContext();
-		// One job exists but is permanently unclaimable here: a peer holds it, and the only
-		// local wake is that peer's lease expiry, far past the foreground deadline. The local
-		// worker pool emits a couple of settle signals and then goes quiet forever, so
-		// reaching the eighth read is only possible by repeated poll ticks re-reading the store.
+		// A peer holds the only job with a far-future lease expiry. The local worker pool
+		// emits a couple of settle signals and then goes quiet, so reaching the eighth read
+		// is only possible by repeated poll ticks re-reading the store.
 		context.queueJobs(summaryJob("peer-held"));
 		context.deferredClaims = Number.MAX_SAFE_INTEGER;
 		context.nextDelayMs = 600_000;
@@ -1788,7 +3594,8 @@ describe("SessionLcm", () => {
 		context.projectImpl = (request, snapshot) => {
 			// The peer commits partway through, emitting no local signal of any kind.
 			if (++reads < readsBeforePeerCommit) return notReady(request, snapshot);
-			const old = snapshot.entries[1]!;
+			const historical = snapshot.entries.slice(0, -1);
+			const old = historical.at(-1)!;
 			const fresh = snapshot.entries.at(-1)!;
 			return {
 				revision: 2,
@@ -1801,7 +3608,7 @@ describe("SessionLcm", () => {
 						level: 0,
 						redactedText: "facts committed by a peer process",
 						tokenCount: 2,
-						sourceIds: [old.entryId],
+						sourceIds: historical.map(entry => entry.entryId),
 						citations: [
 							{
 								...snapshot.scope,
@@ -1814,11 +3621,12 @@ describe("SessionLcm", () => {
 						files: [],
 					},
 				],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: [fresh.entryId],
 				uncoveredSourceIds: [],
 				sourceTokens: 90,
 				selectedLevelCounts: { 0: 1 },
-				coveredSourceCount: 1,
+				coveredSourceCount: historical.length,
 				freshSourceCount: 1,
 				estimatedTokens: 12,
 				pendingJobs: 0,
@@ -1848,18 +3656,131 @@ describe("SessionLcm", () => {
 		}
 	});
 
-	it("normalizes the configured projection wait to the supported window", () => {
-		expect(normalizeLcmHardProjectionWaitMs(undefined)).toBe(60_000);
-		expect(normalizeLcmHardProjectionWaitMs(30_000)).toBe(30_000);
-		expect(normalizeLcmHardProjectionWaitMs(15_000)).toBe(15_000);
-		// Hand-written config is clamped to the supported window at both ends.
-		expect(normalizeLcmHardProjectionWaitMs(1_000)).toBe(15_000);
-		expect(normalizeLcmHardProjectionWaitMs(600_000)).toBe(60_000);
-		// Anything that is not a finite integer falls back to the default.
-		expect(normalizeLcmHardProjectionWaitMs(30_000.5)).toBe(60_000);
-		expect(normalizeLcmHardProjectionWaitMs(Number.NaN)).toBe(60_000);
-		expect(normalizeLcmHardProjectionWaitMs("30000")).toBe(60_000);
-		expect(normalizeLcmHardProjectionWaitMs(null)).toBe(60_000);
+	it("refreshes a resolved retry policy and reaches ownership across summary waves", async () => {
+		const manager = SessionManager.inMemory("/runnable-summary-waves");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.resolvedModelOverride = "provider/actual-model";
+		let stalePolicyRead = false;
+		const summaryJobAvailability = context.summaryJobAvailability.bind(context);
+		context.summaryJobAvailability = (request, policy, limit) => {
+			if (
+				context.retryPolicy?.retryKey === "provider/actual-model" &&
+				(policy.retryKey !== context.retryPolicy.retryKey || policy.retryEpoch !== context.retryPolicy.retryEpoch)
+			) {
+				stalePolicyRead = true;
+			}
+			return summaryJobAvailability(request, policy, limit);
+		};
+		context.queueJobs(summaryJob("wave-1"));
+		const pendingProjection = context.projectImpl;
+		context.projectImpl = (request, snapshot) =>
+			context.completedJobIds.has("wave-2")
+				? readyHistoricalProjection(snapshot, "summary_handle_wave_2")
+				: pendingProjection(request, snapshot);
+		const completeSummaryJob = context.completeSummaryJob.bind(context);
+		context.completeSummaryJob = (lease, completion) => {
+			const result = completeSummaryJob(lease, completion);
+			if (result.accepted && lease.jobId === "wave-1") {
+				context.queueJobs({
+					...summaryJob("wave-2"),
+					retryKey: context.retryPolicy!.retryKey,
+					retryEpoch: context.retryPolicy!.retryEpoch,
+				});
+			}
+			return result;
+		};
+		const { lcm, complete } = createHarness(manager, context);
+
+		try {
+			const result = await lcm.project(manager.buildSessionContext().messages);
+			expect(stalePolicyRead).toBe(false);
+			expect(result.owned).toBe(true);
+			expect(complete).toHaveBeenCalledTimes(2);
+			expect([...context.completedJobIds]).toEqual(["wave-1", "wave-2"]);
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("keeps a hard request pending while mixed availability still has runnable work", async () => {
+		const manager = SessionManager.inMemory("/mixed-runnable-summary-waves");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("mixed-wave-1"));
+		const pendingProjection = context.projectImpl;
+		context.projectImpl = (request, snapshot) =>
+			context.completedJobIds.has("mixed-wave-2")
+				? readyHistoricalProjection(snapshot, "summary_handle_mixed_wave_2")
+				: pendingProjection(request, snapshot);
+		const completeSummaryJob = context.completeSummaryJob.bind(context);
+		context.completeSummaryJob = (lease, completion) => {
+			const result = completeSummaryJob(lease, completion);
+			if (result.accepted && lease.jobId === "mixed-wave-1") {
+				context.queueJobs(summaryJob("mixed-wave-2"));
+				context.relevantPendingJobs = 2;
+				context.deferredClaims = 1;
+			}
+			return result;
+		};
+		let mixedAvailability: SummaryJobAvailability | undefined;
+		const summaryJobAvailability = context.summaryJobAvailability.bind(context);
+		context.summaryJobAvailability = (request, policy, limit) => {
+			const availability = summaryJobAvailability(request, policy, limit);
+			if (availability.runnable > 0 && availability.missing > 0) mixedAvailability = { ...availability };
+			return availability;
+		};
+		const { lcm, complete } = createHarness(manager, context);
+
+		try {
+			const result = await lcm.project(manager.buildSessionContext().messages);
+			expect(mixedAvailability).toMatchObject({ runnable: 1, missing: 1 });
+			expect(result.owned).toBe(true);
+			expect(complete).toHaveBeenCalledTimes(2);
+			expect([...context.completedJobIds]).toEqual(["mixed-wave-1", "mixed-wave-2"]);
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("waits without a wall deadline and returns promptly only when the caller aborts", async () => {
+		vi.useFakeTimers();
+		const manager = SessionManager.inMemory("/cancellation-only-foreground-wait");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("peer-held"));
+		context.deferredClaims = Number.MAX_SAFE_INTEGER;
+		context.nextDelayMs = 600_000;
+		const controller = new AbortController();
+		const { lcm } = createHarness(manager, context, undefined, undefined, undefined, 20, undefined, 1, undefined, 5);
+		let settled = false;
+		try {
+			const projection = lcm.project(manager.buildSessionContext().messages, controller.signal).then(result => {
+				settled = true;
+				return result;
+			});
+			await settleUntil(() => context.projectionCalls > 0, "foreground projection began");
+			context.now += 60_001;
+			vi.advanceTimersByTime(60_001);
+			await flushScheduler();
+			await flushScheduler();
+			await flushScheduler();
+			expect(settled).toBe(false);
+			vi.useRealTimers();
+			controller.abort("caller cancelled");
+			await flushScheduler();
+			expect((await projection).owned).toBe(false);
+			expect(settled).toBe(true);
+		} finally {
+			vi.useRealTimers();
+			await lcm.close();
+		}
 	});
 
 	it("seeds this session's prior LCM spend from the ledger at bind and stamps the session on attempts", async () => {
@@ -1882,36 +3803,259 @@ describe("SessionLcm", () => {
 		}
 	});
 
-	it("lets the injected wait seam outrank the configured projection wait", async () => {
-		const manager = SessionManager.inMemory("/wait-precedence");
+	it("keeps a 48-hour Retry-After pending until caller cancellation without provider exhaustion", async () => {
+		const manager = SessionManager.inMemory("/retryable-backoff-cancel");
 		appendUser(manager, "first", 1);
 		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
 		appendUser(manager, "active", 3);
 		const context = new FakeLcmContext();
-		context.queueJobs(summaryJob("never-ready"));
-		context.deferredClaims = Number.MAX_SAFE_INTEGER;
-		context.nextDelayMs = 600_000;
-		// A 60 s configured wait must not override the 20 ms injected seam: if precedence
-		// inverted, this projection would block for a full minute instead of failing open.
-		// The poll stays at its production interval so the 20 ms deadline is what expires.
+		context.queueJobs(summaryJob("retryable"));
+		const retryAfterMs = 48 * 60 * 60_000;
+		const { lcm, complete } = createHarness(manager, context, undefined, undefined, undefined, 5);
+		complete.mockRejectedValue(new LcmCompletionError("retry later", { provider: "test", retryAfterMs }));
+		const controller = new AbortController();
+		let settled = false;
+		try {
+			const pending = lcm.project(manager.buildSessionContext().messages, controller.signal).then(result => {
+				settled = true;
+				return result;
+			});
+			await context.summaryFailed.promise;
+			await flushScheduler();
+			expect(settled).toBe(false);
+			expect(context.failureCalls).toHaveLength(1);
+			expect(context.failureRecords.get("retryable")?.availableAt).toBe(context.now + retryAfterMs);
+			controller.abort("caller cancelled");
+			expect((await pending).owned).toBe(false);
+			const runtime = (await lcm.status()).runtime;
+			expect(runtime.lastRequestRoute).toBeUndefined();
+			expect(runtime.lastFailure).toBeUndefined();
+		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("cancels provider preparation without recording a transport failure", async () => {
+		const manager = SessionManager.inMemory("/provider-preparation-cancel");
+		appendUser(manager, "cancel", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("preparation-cancel"));
 		const { lcm } = createHarness(
 			manager,
 			context,
 			undefined,
 			undefined,
 			undefined,
-			20,
+			5,
 			undefined,
+			1,
 			undefined,
-			undefined,
-			undefined,
+			5,
 			60_000,
 		);
+		const preparationStarted = Promise.withResolvers<void>();
+		const unblockPreparation = Promise.withResolvers<void>();
+		context.beforeAttemptStart = async () => {
+			preparationStarted.resolve();
+			await unblockPreparation.promise;
+		};
+		const controller = new AbortController();
 		try {
-			const result = await lcm.project(manager.buildSessionContext().messages);
-			expect(result.owned).toBe(false);
-			expect(lcm.takePendingFallbackCategory()).toBe("deadline");
+			const pending = lcm.project(manager.buildSessionContext().messages, controller.signal);
+			await preparationStarted.promise;
+			controller.abort("caller cancelled");
+			expect((await pending).owned).toBe(false);
+			expect(context.failureCalls).toHaveLength(0);
+			expect(context.attemptRows.size).toBe(0);
+			expect(context.leasedJobs.get("preparation-cancel")?.transportRetryCount).toBe(0);
+			unblockPreparation.resolve();
+			await flushScheduler();
 		} finally {
+			await lcm.close();
+		}
+	});
+
+	it("backs off complete timeouts and exhausts on the fifth without an attempt row", async () => {
+		vi.useFakeTimers();
+		const manager = SessionManager.inMemory("/provider-preparation-timeout");
+		appendUser(manager, "timeout", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("preparation-timeout"));
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			5,
+			undefined,
+			1,
+			undefined,
+			5,
+			25,
+		);
+		const preparationStarted = Array.from({ length: 5 }, () => Promise.withResolvers<void>());
+		const releasePreparation = Array.from({ length: 5 }, () => Promise.withResolvers<void>());
+		let preparationCalls = 0;
+		context.beforeAttemptStart = async () => {
+			const index = preparationCalls++;
+			preparationStarted[index]!.resolve();
+			await releasePreparation[index]!.promise;
+		};
+		try {
+			const pending = lcm.project(manager.buildSessionContext().messages);
+			for (let attempt = 0; attempt < 5; attempt++) {
+				await preparationStarted[attempt]!.promise;
+				context.now += 25;
+				vi.advanceTimersByTime(25);
+				await settleUntil(
+					() => context.failureCalls.length === attempt + 1,
+					`preparation timeout ${attempt + 1} settled`,
+				);
+				expect(context.failedError).toBe("Summary provider preparation timed out");
+				expect(context.attemptRows.size).toBe(0);
+				expect(context.jobs.find(job => job.jobId === "preparation-timeout")?.transportRetryCount).toBe(
+					attempt + 1,
+				);
+				expect(complete).not.toHaveBeenCalled();
+				if (attempt === 0) {
+					const retryAt = context.failureRecords.get("preparation-timeout")?.availableAt;
+					expect(retryAt).toBe(context.now + 2_000);
+					const backedOff = (await lcm.status()).runtime;
+					expect(backedOff.summaryBackoff).toEqual({ preferred: retryAt });
+					expect(backedOff.lastFailure).toBeUndefined();
+				}
+				if (attempt === 4) break;
+				await flushScheduler();
+				const retryAt = context.failureRecords.get("preparation-timeout")!.availableAt;
+				const delay = retryAt - context.now;
+				context.now = retryAt;
+				vi.advanceTimersByTime(delay);
+			}
+
+			const terminal = await pending;
+			expect(terminal.owned).toBe(false);
+			expect(lcm.commitPrimaryRequestRoute(terminal.routeKey)).toBe(true);
+			const exhausted = (await lcm.status()).runtime;
+			expect(exhausted.lastFailure).toMatchObject({ category: "provider", reason: "provider_exhausted" });
+			expect(exhausted.summaryBackoff).toBeUndefined();
+			expect(context.failureCalls).toHaveLength(5);
+			expect(context.attemptRows.size).toBe(0);
+		} finally {
+			for (const gate of releasePreparation) gate.resolve();
+			await flushScheduler();
+			vi.useRealTimers();
+			await lcm.close();
+		}
+	});
+
+	it("keeps one absolute provider deadline and enriches late usage", async () => {
+		vi.useFakeTimers();
+		const manager = SessionManager.inMemory("/provider-attempt-timeout");
+		appendUser(manager, "timeout", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("timeout"));
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			undefined,
+			5,
+			undefined,
+			1,
+			undefined,
+			5,
+			25,
+		);
+		const lateCompletion = Promise.withResolvers<string>();
+		complete.mockImplementation(() => lateCompletion.promise);
+		const attemptMayStart = Promise.withResolvers<void>();
+		const attemptStartPending = Promise.withResolvers<void>();
+		context.beforeAttemptStart = async request => {
+			expect(request.providerSessionKey).toBe("timeout:1");
+			attemptStartPending.resolve();
+			await attemptMayStart.promise;
+		};
+		const controller = new AbortController();
+		try {
+			const pending = lcm.project(manager.buildSessionContext().messages, controller.signal);
+			await attemptStartPending.promise;
+			vi.advanceTimersByTime(24);
+			await flushScheduler();
+			expect(complete).not.toHaveBeenCalled();
+			expect(context.failureCalls).toHaveLength(0);
+			expect(context.attemptRows.size).toBe(0);
+			attemptMayStart.resolve();
+			await settleUntil(() => complete.mock.calls.length === 1, "provider attempt started");
+			vi.advanceTimersByTime(1);
+			await settleUntil(() => context.failureCalls.length === 1, "timed-out attempt settled");
+			expect(context.failedError).toBe("Summary provider attempt timed out");
+			expect(context.failureCalls[0]?.retryDelayMs).toBe(2_000);
+			expect(context.attemptRows.get("attempt-1")?.outcome).toBe("transport_error");
+			expect(context.attemptRows.get("attempt-1")?.usage).toBeUndefined();
+			expect(context.retryPolicy).toEqual({ retryKey: "test-provider/test-model", retryEpoch: 1 });
+			const projectId = context.snapshots.at(-1)!.scope.projectId;
+			expect(
+				context.configureSummaryRetryPolicy(projectId, "test-provider/replacement-model", {
+					expected: { retryKey: "test-provider/test-model", retryEpoch: 1 },
+				}),
+			).toEqual({ kind: "ready", retryKey: "test-provider/replacement-model", retryEpoch: 2 });
+			expect(context.leasedJobs.has("timeout")).toBe(false);
+			lateCompletion.resolve("late summary");
+			await settleUntil(() => context.attemptRows.get("attempt-1")?.usage !== undefined, "late usage enrichment");
+			expect(context.attemptRows.get("attempt-1")?.outcome).toBe("transport_error");
+			expect(context.attemptRows.get("attempt-1")?.usage?.totalTokens).toBe(184);
+			expect(context.attemptRows.get("attempt-1")?.usage?.cost.total).toBe(0.0019);
+			controller.abort("caller cancelled");
+			await pending;
+		} finally {
+			vi.useRealTimers();
+			await lcm.close();
+		}
+	});
+
+	it("settles and later enriches an accepted attempt abandoned by lifecycle abort", async () => {
+		const manager = SessionManager.inMemory("/provider-attempt-caller-abort");
+		appendUser(manager, "abort after dispatch", 1);
+		const context = new FakeLcmContext();
+		context.queueJobs(summaryJob("caller-abort"));
+		const { lcm, complete } = createHarness(manager, context);
+		const dispatched = Promise.withResolvers<void>();
+		const lateCompletion = Promise.withResolvers<string>();
+		complete.mockImplementation(async () => {
+			dispatched.resolve();
+			return lateCompletion.promise;
+		});
+		const controller = new AbortController();
+		try {
+			const pending = lcm.project(manager.buildSessionContext().messages, controller.signal);
+			await dispatched.promise;
+			expect(context.attemptRows.get("attempt-1")?.outcome).toBe("in_flight");
+			lcm.beginDispose();
+			controller.abort("caller cancelled");
+			expect((await pending).owned).toBe(false);
+			await settleUntil(
+				() => context.attemptRows.get("attempt-1")?.outcome !== "in_flight",
+				"abort attempt settled",
+			);
+			expect(context.attemptRows.get("attempt-1")?.outcome).toBe("stale");
+			expect(context.attemptRows.get("attempt-1")?.usage).toBeUndefined();
+			expect(context.completedJobIds.has("caller-abort")).toBe(false);
+			expect(context.lastCompletion).toBeUndefined();
+
+			lateCompletion.resolve("late summary must not publish");
+			await settleUntil(
+				() => context.attemptRows.get("attempt-1")?.usage !== undefined,
+				"late abort usage enrichment",
+			);
+			expect(context.attemptRows.get("attempt-1")?.outcome).toBe("stale");
+			expect(context.completedJobIds.has("caller-abort")).toBe(false);
+			expect(context.lastCompletion).toBeUndefined();
+			expect(context.failureCalls).toHaveLength(0);
+			expect(context.leasedJobs.has("caller-abort")).toBe(false);
+		} finally {
+			lateCompletion.resolve("late summary must not publish");
 			await lcm.close();
 		}
 	});
@@ -2253,7 +4397,8 @@ describe("SessionLcm", () => {
 		const live: AgentMessage = { role: "user", content: [{ type: "text", text: "live" }], timestamp: 3 };
 		const { lcm, context } = createHarness(manager);
 		context.projectImpl = (_request, snapshot) => {
-			const old = snapshot.entries[1]!;
+			const historical = snapshot.entries.slice(0, -1);
+			const old = historical.at(-1)!;
 			const fresh = snapshot.entries.at(-1)!;
 			return {
 				revision: 1,
@@ -2266,7 +4411,7 @@ describe("SessionLcm", () => {
 						level: 0,
 						redactedText: "older facts",
 						tokenCount: 3,
-						sourceIds: [old.entryId],
+						sourceIds: historical.map(entry => entry.entryId),
 						citations: [
 							{
 								...snapshot.scope,
@@ -2279,11 +4424,12 @@ describe("SessionLcm", () => {
 						files: [],
 					},
 				],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: [fresh.entryId],
 				uncoveredSourceIds: [],
 				sourceTokens: snapshot.entries.length,
 				selectedLevelCounts: { 0: 1 },
-				coveredSourceCount: 1,
+				coveredSourceCount: historical.length,
 				freshSourceCount: 1,
 				estimatedTokens: 10,
 				pendingJobs: 0,
@@ -2321,7 +4467,7 @@ describe("SessionLcm", () => {
 		expect(result.projection).toMatchObject({
 			sourceTokens: context.snapshots.at(-1)!.entries.length,
 			selectedLevelCounts: { 0: 1 },
-			coveredSourceCount: 1,
+			coveredSourceCount: 2,
 			freshSourceCount: 1,
 		});
 		expect(manager.getBranch()).not.toContainEqual(
@@ -2333,12 +4479,39 @@ describe("SessionLcm", () => {
 		await lcm.close();
 	});
 
-	it("annotates projected summaries with bounded file handles so compaction keeps file awareness", async () => {
+	it("bounds projected file handles without marking untruncated summary text as an excerpt", async () => {
 		const manager = SessionManager.inMemory("/projected-files");
 		appendUser(manager, "first", 1);
 		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
 		appendUser(manager, "active", 3);
-		const { lcm, context } = createHarness(manager);
+		const context = new FakeLcmContext();
+		const measure = (messages: readonly AgentMessage[]) => {
+			const historical = messages.find(message => message.role === "historicalContext");
+			const citedContent = historical?.redactedCitedContent ?? "";
+			const tokens = citedContent.includes("data-2.csv") || citedContent.includes("[Summary excerpt;") ? 101 : 100;
+			const upperBound = messages.reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+				0,
+			);
+			return { tokens, upperBound: Math.max(tokens, upperBound) };
+		};
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 101,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 32, maxTokens: 20_000 },
+			}),
+			20,
+			undefined,
+			1,
+			measure,
+		);
 		const files = Array.from({ length: 5 }, (_, index) => ({
 			fileId: `file_${index}`,
 			contentHash: `${index}`.repeat(64),
@@ -2349,7 +4522,8 @@ describe("SessionLcm", () => {
 			explorationSummary: `Columns (1): c${index}`,
 		}));
 		context.projectImpl = (_request, snapshot) => {
-			const old = snapshot.entries[1]!;
+			const historical = snapshot.entries.slice(0, -1);
+			const old = historical.at(-1)!;
 			const fresh = snapshot.entries.at(-1)!;
 			return {
 				revision: 1,
@@ -2362,7 +4536,7 @@ describe("SessionLcm", () => {
 						level: 0,
 						redactedText: "older facts about the datasets",
 						tokenCount: 3,
-						sourceIds: [old.entryId],
+						sourceIds: historical.map(entry => entry.entryId),
 						citations: [
 							{
 								...snapshot.scope,
@@ -2375,11 +4549,12 @@ describe("SessionLcm", () => {
 						files,
 					},
 				],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
 				freshTailSourceIds: [fresh.entryId],
 				uncoveredSourceIds: [],
 				sourceTokens: snapshot.entries.length,
 				selectedLevelCounts: { 0: 1 },
-				coveredSourceCount: 1,
+				coveredSourceCount: historical.length,
 				freshSourceCount: 1,
 				estimatedTokens: 10,
 				pendingJobs: 0,
@@ -2397,12 +4572,13 @@ describe("SessionLcm", () => {
 			)
 			.join("\n");
 
+		expect(providerText).toContain("older facts about the datasets");
+		expect(providerText).not.toContain("[Summary excerpt;");
 		expect(providerText).toContain("[Files: ");
-		// Three per summary keeps the active context bounded; the rest are counted, not dropped silently.
-		expect(providerText).toContain("(+2 more)");
+		expect(providerText).toContain("(+3 more)");
 		expect(providerText).toContain("data-0.csv");
-		expect(providerText).toContain("data-2.csv");
-		expect(providerText).not.toContain("data-3.csv");
+		expect(providerText).toContain("data-1.csv");
+		expect(providerText).not.toContain("data-2.csv");
 
 		const fileHandles = (providerText.match(/lcm-handle:v1:[A-Za-z0-9_-]+/g) ?? [])
 			.map(token => decodeLcmHandle(token))
@@ -2410,7 +4586,6 @@ describe("SessionLcm", () => {
 		expect(fileHandles).toEqual([
 			{ kind: "file", reference: { ...scope, fileId: "file_0" } },
 			{ kind: "file", reference: { ...scope, fileId: "file_1" } },
-			{ kind: "file", reference: { ...scope, fileId: "file_2" } },
 		]);
 		await lcm.close();
 	});
@@ -2453,13 +4628,638 @@ describe("SessionLcm", () => {
 		expect(mention?.files?.[0]?.fileId).toMatch(/^file_[a-f0-9]{64}$/);
 	});
 
+	it("owns a fresh-tail-only projection only when its real rendered input fits", async () => {
+		const manager = SessionManager.inMemory("/fresh-tail-only-fit");
+		appendUser(manager, "fresh request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const measurements = vi.fn(() => ({ tokens: 90, upperBound: 90 }));
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 101,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measurements,
+		);
+		const input = manager.buildSessionContext().messages;
+
+		const projectionCallsBefore = context.projectionCalls;
+		const result = await lcm.project(input);
+
+		expect(result.owned).toBe(true);
+		expect(result.messages).toBe(input);
+		expect(measurements).toHaveBeenCalledTimes(1);
+		expect(context.projectionCalls - projectionCallsBefore).toBe(2);
+		await lcm.close();
+	});
+
+	it("rerenders and remeasures the same input without retaining a fitted payload", async () => {
+		const manager = SessionManager.inMemory("/fresh-primary-render");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		let summaryText = "first rendered metadata";
+		context.projectImpl = (_request, snapshot) => {
+			const projection = readyHistoricalProjection(snapshot, "fresh-render-handle");
+			return {
+				...projection,
+				historical: [{ ...projection.historical[0]!, redactedText: summaryText }],
+			};
+		};
+		let measuredTokens = 50;
+		const measurements = vi.fn((messages: AgentMessage[]) => ({
+			tokens: measuredTokens,
+			upperBound: Math.max(
+				measuredTokens,
+				messages.reduce((total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message), 0),
+			),
+		}));
+		const { lcm, complete } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 101,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measurements,
+		);
+		const input = manager.buildSessionContext().messages;
+
+		expect(await lcm.ownsRequest(input, undefined, 150)).toMatchObject({ kind: "owned" });
+		context.reconcile = () => ({
+			changed: false,
+			revision: 1,
+			activeSources: 3,
+			insertedSources: 0,
+			tombstonedSources: 0,
+			queuedJobs: 0,
+			reusedSummaries: 0,
+		});
+		measurements.mockClear();
+
+		const first = await lcm.project(input);
+		expect(first.projectionTokenMeasurements).toBe(1);
+		expect(first.candidateTokens).toBe(50);
+		expect(first.messages.find(message => message.role === "historicalContext")?.redactedCitedContent).toContain(
+			"first rendered metadata",
+		);
+
+		measuredTokens = 60;
+		const repeated = await lcm.project(input);
+		expect(repeated.messages).not.toBe(first.messages);
+		expect(repeated.projectionTokenMeasurements).toBe(1);
+		expect(repeated.candidateTokens).toBe(60);
+
+		summaryText = "updated rendered metadata";
+		measuredTokens = 70;
+		const updated = await lcm.project(input);
+		const updatedText = updated.messages.find(message => message.role === "historicalContext")?.redactedCitedContent;
+		expect(updatedText).toContain("updated rendered metadata");
+		expect(updatedText).not.toContain("first rendered metadata");
+		expect(updated.projectionTokenMeasurements).toBe(1);
+		expect(updated.candidateTokens).toBe(70);
+		expect(measurements).toHaveBeenCalledTimes(3);
+		expect(complete).not.toHaveBeenCalled();
+		await lcm.close();
+	});
+
+	it("classifies mandatory fresh input above the real budget as irreducible", async () => {
+		const manager = SessionManager.inMemory("/fresh-tail-only-unfit");
+		appendUser(manager, "fresh request", 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: snapshot.entries.length,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 101,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			() => ({ tokens: 101, upperBound: 101 }),
+		);
+		const input = manager.buildSessionContext().messages;
+		const result = await lcm.project(input);
+
+		expect(result.owned).toBe(false);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "unfit",
+			reason: "irreducible_input",
+		});
+		await lcm.close();
+	});
+
+	it("fits fair bounded head-tail excerpts with bounded unique measurements", async () => {
+		const manager = SessionManager.inMemory("/adaptive-fair-fit");
+		for (const [index, text] of ["first", "second", "third", "active"].entries()) {
+			appendUser(manager, text, index + 1);
+		}
+		let freshTailMaxSources = 1;
+		const context = new FakeLcmContext();
+		const labels = ["A", "B", "C"];
+		context.projectImpl = (request, snapshot) => {
+			const freshSourceCount = request.freshTail.maxSources;
+			const historicalSources = snapshot.entries.slice(0, -freshSourceCount);
+			const fresh = snapshot.entries.slice(-freshSourceCount);
+			return {
+				revision: 1,
+				ready: true,
+				historical: labels.slice(0, historicalSources.length).map((label, index) => ({
+					kind: "summary" as const,
+					summaryId: `summary-${label}`,
+					summaryHandle: `handle-${label}`,
+					level: 0,
+					redactedText: `${label}-FIRST\n${label.repeat(600)}\n${label}-LAST`,
+					tokenCount: 200,
+					sourceIds: [historicalSources[index]!.entryId],
+					citations: [],
+					files: [],
+				})),
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+				freshTailSourceIds: fresh.map(entry => entry.entryId),
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: { 0: historicalSources.length },
+				coveredSourceCount: historicalSources.length,
+				freshSourceCount,
+				estimatedTokens: 650,
+				pendingJobs: 0,
+			};
+		};
+		const excerptBytes = (messages: readonly AgentMessage[]): number[] => {
+			const historical = messages.find(message => message.role === "historicalContext");
+			if (!historical?.redactedCitedContent.includes("[Summary excerpt;")) return [];
+			return historical.redactedCitedContent
+				.split("[Summary excerpt; use the handle below to expand.]\n")
+				.slice(1)
+				.map(block => {
+					const end = block.indexOf("\n[Summary:");
+					return Buffer.byteLength(end < 0 ? "" : block.slice(0, end), "utf8");
+				});
+		};
+		const measure = (messages: readonly AgentMessage[]) => {
+			const upperBound = messages.reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+				0,
+			);
+			const historical = messages.find(message => message.role === "historicalContext");
+			if (!historical) return { tokens: 40, upperBound: Math.max(40, upperBound) };
+			const excerpts = excerptBytes(messages);
+			if (excerpts.length === 0) return { tokens: 1_000, upperBound: Math.max(1_000, upperBound) };
+			const retained = excerpts.reduce((total, bytes) => total + bytes, 0);
+			return {
+				tokens: 40 + Math.ceil(retained / 4),
+				upperBound: Math.max(40 + Math.ceil(retained / 4), upperBound),
+			};
+		};
+		const measurements = vi.fn(measure);
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 201,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 200,
+				freshTail: { maxSources: freshTailMaxSources, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measurements,
+		);
+
+		const input = manager.buildSessionContext().messages;
+		const projectionCallsBefore = context.projectionCalls;
+		const result = await lcm.project(input);
+
+		expect(result.owned).toBe(true);
+		const historical = result.messages.find(message => message.role === "historicalContext");
+		expect(historical?.redactedCitedContent.match(/\[Summary excerpt;/g)).toHaveLength(3);
+		for (const label of labels) {
+			expect(historical?.redactedCitedContent).toContain(`${label}-FIRST`);
+			expect(historical?.redactedCitedContent).toContain(`${label}-LAST`);
+		}
+		const retained = excerptBytes(result.messages);
+		expect(Math.max(...retained) - Math.min(...retained)).toBeLessThanOrEqual(1);
+		const finalMeasurement = measure(result.messages);
+		expect(finalMeasurement.tokens).toBeGreaterThanOrEqual(140);
+		expect(finalMeasurement.tokens).toBeLessThanOrEqual(200);
+		const initialMeasurementCount = measurements.mock.calls.length;
+		expect(initialMeasurementCount).toBeLessThanOrEqual(MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS);
+		const rendered = measurements.mock.calls.map(([messages]) => JSON.stringify(messages));
+		expect(new Set(rendered).size).toBe(rendered.length);
+		expect(context.projectionCalls - projectionCallsBefore).toBe(2);
+		expect(context.reconcileAttempts).toBe(1);
+		lcm.recordPendingPrimaryProviderTokens(result.routeKey, finalMeasurement.tokens);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "lossless",
+			metrics: {
+				messageTokenBudget: 200,
+				candidateTokens: finalMeasurement.tokens,
+				projectionTokenMeasurements: initialMeasurementCount,
+			},
+		});
+		context.reconcile = () => ({
+			changed: false,
+			revision: 1,
+			activeSources: 4,
+			insertedSources: 0,
+			tombstonedSources: 0,
+			queuedJobs: 0,
+			reusedSummaries: 0,
+		});
+		const measurementCountBeforeRepeated = measurements.mock.calls.length;
+		const repeated = await lcm.project(input);
+		expect(repeated.messages).not.toBe(result.messages);
+		expect(repeated.projectionTokenMeasurements).toBe(initialMeasurementCount);
+		expect(measurements).toHaveBeenCalledTimes(measurementCountBeforeRepeated + initialMeasurementCount);
+		labels[2] = "D";
+		const changedSummary = await lcm.project(input);
+		expect(changedSummary.messages).not.toBe(result.messages);
+		expect(
+			changedSummary.messages.find(message => message.role === "historicalContext")?.redactedCitedContent,
+		).toContain("D-FIRST");
+		freshTailMaxSources = 2;
+		const changedTail = await lcm.project(input);
+		expect(changedTail.messages).not.toBe(result.messages);
+		expect(
+			changedTail.messages.find(message => message.role === "historicalContext")?.redactedCitedContent,
+		).not.toContain("D-FIRST");
+		expect(
+			changedTail.messages.some(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(block => block.type === "text" && block.text === "third"),
+			),
+		).toBe(true);
+		lcm.recordPendingPrimaryProviderTokens(changedTail.routeKey, 201);
+		expect(lcm.commitPrimaryRequestRoute(changedTail.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "unfit",
+			reason: "fit_invariant",
+			metrics: { messageTokenBudget: 200, candidateTokens: 201 },
+		});
+		await lcm.close();
+	});
+
+	it("measures zero-text candidates before dropping conservatively expensive file handles", async () => {
+		const manager = SessionManager.inMemory("/adaptive-file-fit");
+		for (let index = 0; index < 5; index++) appendUser(manager, `message-${index}`, index + 1);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => {
+			const historical = snapshot.entries.slice(0, -1);
+			const fresh = snapshot.entries.at(-1)!;
+			return {
+				revision: 1,
+				ready: true,
+				historical: historical.map((source, summaryIndex) => ({
+					kind: "summary" as const,
+					summaryId: `summary-files-${summaryIndex}`,
+					summaryHandle: `handle-files-${summaryIndex}`,
+					level: 0,
+					redactedText: `summary facts ${summaryIndex}`,
+					tokenCount: 4,
+					sourceIds: [source.entryId],
+					citations: [],
+					files: Array.from({ length: 3 }, (_, fileIndex) => {
+						const ordinal = summaryIndex * 3 + fileIndex;
+						return {
+							fileId: `fit-file-${ordinal}`,
+							contentHash: ordinal.toString(16).padStart(2, "0").repeat(32),
+							path: `/repo/fit-${ordinal}.txt`,
+							fileType: "txt",
+							byteSize: 100,
+							tokenCount: 25,
+							explorationSummary: `file ${ordinal}`,
+						};
+					}),
+				})),
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+				freshTailSourceIds: [fresh.entryId],
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: { 0: historical.length },
+				coveredSourceCount: historical.length,
+				freshSourceCount: 1,
+				estimatedTokens: 1_000,
+				pendingJobs: 0,
+			};
+		};
+		const retainedSummaryTextBytes = (messages: readonly AgentMessage[]) => {
+			const text = messages.find(message => message.role === "historicalContext")?.redactedCitedContent ?? "";
+			const marker = "[Summary excerpt; use the handle below to expand.]\n";
+			if (!text.includes(marker)) return -1;
+			return text
+				.split(marker)
+				.slice(1)
+				.reduce((total, block) => {
+					const end = block.indexOf("\n[Summary:");
+					return total + Buffer.byteLength(end < 0 ? "" : block.slice(0, end), "utf8");
+				}, 0);
+		};
+		const measure = (messages: readonly AgentMessage[]) => {
+			const upperBound = messages.reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+				0,
+			);
+			if (!messages.some(message => message.role === "historicalContext")) {
+				return { tokens: 40, upperBound: Math.max(40, upperBound) };
+			}
+			const retained = retainedSummaryTextBytes(messages);
+			const tokens = retained === 0 ? 80 : 1_000;
+			return { tokens, upperBound: Math.max(tokens, upperBound) };
+		};
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 201,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 1, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measure,
+		);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		const citedContent =
+			result.messages.find(message => message.role === "historicalContext")?.redactedCitedContent ?? "";
+		const selectedFileIds = (citedContent.match(/lcm-handle:v1:[A-Za-z0-9_-]+/g) ?? []).flatMap(token => {
+			const handle = decodeLcmHandle(token);
+			return handle.kind === "file" ? [handle.reference.fileId] : [];
+		});
+		const finalMeasurement = measure(result.messages);
+
+		expect(result.owned).toBe(true);
+		expect(selectedFileIds).toEqual([
+			"fit-file-0",
+			"fit-file-1",
+			"fit-file-2",
+			"fit-file-3",
+			"fit-file-4",
+			"fit-file-5",
+			"fit-file-6",
+			"fit-file-7",
+			"fit-file-8",
+			"fit-file-9",
+			"fit-file-10",
+			"fit-file-11",
+		]);
+		expect(finalMeasurement.tokens).toBe(80);
+		expect(finalMeasurement.tokens).toBeLessThanOrEqual(100);
+		expect(finalMeasurement.upperBound).toBeGreaterThan(100);
+		await lcm.close();
+	});
+
+	it("continues above a non-monotone estimator failure and selects a later fitting render", async () => {
+		const manager = SessionManager.inMemory("/adaptive-non-monotone-fit");
+		appendUser(manager, "first", 1);
+		appendUser(manager, "older", 2);
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => {
+			const projection = readyHistoricalProjection(snapshot, "non-monotone-handle");
+			return {
+				...projection,
+				historical: [{ ...projection.historical[0]!, redactedText: `FIRST\n${"x".repeat(1_200)}\nLAST` }],
+			};
+		};
+		const retainedBytes = (messages: readonly AgentMessage[]) => {
+			const text = messages.find(message => message.role === "historicalContext")?.redactedCitedContent ?? "";
+			if (!text.includes("[Summary excerpt;")) return -1;
+			const start = text.indexOf("\n") + 1;
+			const end = text.indexOf("\n[Summary:", start);
+			return end < 0 ? 0 : Buffer.byteLength(text.slice(start, end), "utf8");
+		};
+		const observed: Array<{ retained: number; tokens: number }> = [];
+		const measurements = vi.fn((messages: readonly AgentMessage[]) => {
+			const upperBound = messages.reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+				0,
+			);
+			if (!messages.some(message => message.role === "historicalContext")) {
+				return { tokens: 40, upperBound: Math.max(40, upperBound) };
+			}
+			const retained = retainedBytes(messages);
+			if (retained < 0) return { tokens: 1_000, upperBound: Math.max(1_000, upperBound) };
+			const tokens = retained < 170 ? 40 + retained : retained < 500 ? 400 : retained < 800 ? 180 : 400;
+			observed.push({ retained, tokens });
+			return { tokens, upperBound: Math.max(tokens, upperBound) };
+		});
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 201,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 200,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measurements,
+		);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		const selected = retainedBytes(result.messages);
+
+		expect(result.owned).toBe(true);
+		const richestMeasuredFit = Math.max(
+			...observed.filter(sample => sample.tokens <= 200).map(sample => sample.retained),
+		);
+		expect(selected).toBe(richestMeasuredFit);
+		expect(selected).toBeGreaterThan(606);
+		expect(observed.some(sample => sample.retained < selected && sample.tokens > 200)).toBe(true);
+		expect(measurements.mock.calls.length).toBeLessThanOrEqual(MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS);
+		await lcm.close();
+	});
+
+	it("uses eight evenly spaced refinements to find a non-monotone fitting island", async () => {
+		const manager = SessionManager.inMemory("/adaptive-refinement-fit");
+		appendUser(manager, "first", 1);
+		appendUser(manager, "older", 2);
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => {
+			const projection = readyHistoricalProjection(snapshot, "refinement-handle");
+			return {
+				...projection,
+				historical: [{ ...projection.historical[0]!, redactedText: `FIRST\n${"x".repeat(1_189)}\nLAST` }],
+			};
+		};
+		const retainedBytes = (messages: readonly AgentMessage[]) => {
+			const text = messages.find(message => message.role === "historicalContext")?.redactedCitedContent ?? "";
+			if (!text.includes("[Summary excerpt;")) return -1;
+			const start = text.indexOf("\n") + 1;
+			const end = text.indexOf("\n[Summary:", start);
+			return end < 0 ? 0 : Buffer.byteLength(text.slice(start, end), "utf8");
+		};
+		const measure = (messages: readonly AgentMessage[]) => {
+			const upperBound = messages.reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+				0,
+			);
+			if (!messages.some(message => message.role === "historicalContext")) {
+				return { tokens: 40, upperBound: Math.max(40, upperBound) };
+			}
+			const retained = retainedBytes(messages);
+			const tokens = retained === 0 ? 80 : retained === 1_050 ? 180 : 400;
+			return { tokens, upperBound: Math.max(tokens, upperBound) };
+		};
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 201,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 200,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			measure,
+		);
+
+		const result = await lcm.project(manager.buildSessionContext().messages);
+		const finalMeasurement = measure(result.messages);
+
+		expect(result.owned).toBe(true);
+		expect(retainedBytes(result.messages)).toBe(1_050);
+		expect(finalMeasurement.tokens).toBe(180);
+		expect(finalMeasurement.tokens).toBeLessThanOrEqual(200);
+		await lcm.close();
+	});
+
+	it("uses minimum-representation fallback when required input fits but every handle marker does not", async () => {
+		const manager = SessionManager.inMemory("/minimum-representation-fit");
+		appendUser(manager, "first", 1);
+		appendUser(manager, "older", 2);
+		appendUser(manager, "active", 3);
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, "minimum-handle");
+		const { lcm } = createHarness(
+			manager,
+			context,
+			undefined,
+			undefined,
+			() => ({
+				sourceTokens: 201,
+				prewarmThresholdTokens: 40,
+				hardThresholdTokens: 100,
+				tokenBudget: 100,
+				freshTail: { maxSources: 8, maxTokens: 100 },
+			}),
+			20,
+			undefined,
+			1,
+			messages => {
+				const upperBound = messages.reduce(
+					(total, message) => total + estimateLcmProjectionMessageTokenUpperBound(message),
+					0,
+				);
+				return messages.some(message => message.role === "historicalContext")
+					? { tokens: 101, upperBound: Math.max(101, upperBound) }
+					: { tokens: 60, upperBound: Math.max(60, upperBound) };
+			},
+		);
+		const input = manager.buildSessionContext().messages;
+		const result = await lcm.project(input);
+
+		expect(result.messages).toBe(input);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime.lastRequestRoute).toMatchObject({
+			kind: "native_fallback",
+			category: "unfit",
+			reason: "minimum_representation",
+		});
+		await lcm.close();
+	});
+
 	it("fails open to the exact native input when handle-bearing history does not fit", async () => {
 		const manager = SessionManager.inMemory("/unfitted-handle-history");
 		appendUser(manager, "first", 1);
 		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
 		appendUser(manager, "active", 3);
 		const context = new FakeLcmContext();
-		const projectionFits = vi.fn((_messages: AgentMessage[]) => false);
+		const projectionTokenMeasurements = vi.fn((messages: AgentMessage[]) =>
+			messages.some(message => message.role === "historicalContext")
+				? { tokens: Number.MAX_SAFE_INTEGER, upperBound: Number.MAX_SAFE_INTEGER }
+				: { tokens: 1, upperBound: 1 },
+		);
 		const { lcm } = createHarness(
 			manager,
 			context,
@@ -2469,7 +5269,7 @@ describe("SessionLcm", () => {
 			20,
 			undefined,
 			1,
-			projectionFits,
+			projectionTokenMeasurements,
 		);
 		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, "summary-handle");
 		const input = manager.buildSessionContext().messages;
@@ -2480,9 +5280,11 @@ describe("SessionLcm", () => {
 		expect(result.messages).toBe(input);
 		expect(result.messages).toEqual(input);
 		expect(result.messages.some(message => message.role === "historicalContext")).toBe(false);
-		expect(projectionFits).toHaveBeenCalledTimes(1);
-		const candidate = projectionFits.mock.calls[0]![0];
-		expect(JSON.stringify(convertToLlm(candidate))).toContain("lcm-handle:v1:");
+		expect(projectionTokenMeasurements).toHaveBeenCalled();
+		const candidate = projectionTokenMeasurements.mock.calls.find(([messages]) =>
+			messages.some(message => message.role === "historicalContext"),
+		)?.[0];
+		expect(JSON.stringify(convertToLlm(candidate ?? []))).toContain("lcm-handle:v1:");
 		await lcm.close();
 	});
 
@@ -2500,7 +5302,7 @@ describe("SessionLcm", () => {
 			}),
 		).toThrow("LCM handle token exceeds 4096 characters");
 		const context = new FakeLcmContext();
-		const projectionFits = vi.fn((_messages: AgentMessage[]) => true);
+		const projectionTokenMeasurements = vi.fn((_messages: AgentMessage[]) => ({ tokens: 0, upperBound: 0 }));
 		const { lcm } = createHarness(
 			manager,
 			context,
@@ -2510,7 +5312,7 @@ describe("SessionLcm", () => {
 			20,
 			undefined,
 			1,
-			projectionFits,
+			projectionTokenMeasurements,
 		);
 		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, summaryHandle);
 		const input = manager.buildSessionContext().messages;
@@ -2522,7 +5324,7 @@ describe("SessionLcm", () => {
 		expect(result.messages).toEqual(input);
 		expect(result.messages.some(message => message.role === "historicalContext")).toBe(false);
 		expect(JSON.stringify(result.messages)).not.toContain("[handle unavailable]");
-		expect(projectionFits).not.toHaveBeenCalled();
+		expect(projectionTokenMeasurements).not.toHaveBeenCalled();
 		await lcm.close();
 	});
 
@@ -2544,26 +5346,54 @@ describe("SessionLcm", () => {
 		await Promise.all([a.lcm.close(), b.lcm.close()]);
 	});
 
-	it("fails open to the exact native input and records redacted summary failure without journal mutation", async () => {
+	it("keeps the fifth failure degraded as provider exhaustion until rebuild", async () => {
 		const manager = SessionManager.inMemory("/worktree-a");
 		appendUser(manager, "first", 1);
 		const context = new FakeLcmContext();
+		const pendingProjection = context.projectImpl;
+		context.projectImpl = (request, snapshot) => ({
+			...pendingProjection(request, snapshot),
+			revision: context.snapshots.length,
+		});
 		const { lcm, complete } = createHarness(manager, context, undefined, undefined, undefined, 5);
 		context.queueJobs({
 			...summaryJob("failure"),
 			inputs: [{ kind: "source", id: "source-1", redactedText: "safe", tokenCount: 8 }],
 		});
-		complete.mockRejectedValueOnce(
-			new LcmCompletionError("raw-secret summary failed", { provider: "test-provider" }),
-		);
-		const input = manager.buildSessionContext().messages;
-		const output = await lcm.project(input);
-		expect(output.messages).toBe(input);
-		expect(output.owned).toBe(false);
-		expect(context.failedError).toContain("#SECRET");
-		expect(lcm.takePendingFallbackCategory()).toBe("provider");
-		expect(context.failedError).not.toContain("raw-secret");
-		expect(manager.getBranch()).toHaveLength(1);
-		await lcm.close();
+		complete.mockRejectedValue(new LcmCompletionError("raw-secret summary failed", { provider: "test-provider" }));
+		try {
+			const input = manager.buildSessionContext().messages;
+			const pending = lcm.project(input);
+			for (let attempt = 1; attempt <= 5; attempt++) {
+				await settleUntil(() => context.failureCalls.length === attempt, `provider failure ${attempt}`);
+				if (attempt < 5) {
+					context.now = context.failureRecords.get("failure")!.availableAt;
+					await lcm.retrySummaries("all");
+				}
+			}
+			const output = await pending;
+			expect(output.messages).toBe(input);
+			expect(output.owned).toBe(false);
+			expect(context.failedError).toContain("#SECRET");
+			expect(context.failedError).not.toContain("raw-secret");
+			expect(complete).toHaveBeenCalledTimes(5);
+			expect(output).not.toHaveProperty("maintenanceFallback");
+			expect(manager.getBranch()).toHaveLength(1);
+			expect(lcm.commitPrimaryRequestRoute(output.routeKey)).toBe(true);
+			const status = (await lcm.status()).runtime;
+			expect(status).toMatchObject({
+				health: "degraded",
+				lastFailure: { category: "provider", reason: "provider_exhausted" },
+			});
+			expect(status.summaryBackoff).toBeUndefined();
+			context.jobs = [];
+			context.failureRecords.clear();
+			context.queuedJobs = 0;
+			context.relevantPendingJobs = 0;
+			expect(await lcm.rebuild()).not.toBeNull();
+			expect((await lcm.status()).runtime.health).toBe("healthy");
+		} finally {
+			await lcm.close();
+		}
 	});
 });

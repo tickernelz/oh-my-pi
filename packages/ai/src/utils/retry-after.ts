@@ -1,6 +1,12 @@
+import { extractRetryHint } from "@oh-my-pi/pi-utils";
+
 export type HeadersLike = Headers | Record<string, string | undefined> | undefined | null;
 
 const RETRY_AFTER_HINT = "retry-after-ms=";
+
+export function getRetryAfterMsFromErrorMessage(message: string): number | undefined {
+	return extractRetryHint(undefined, message);
+}
 
 export function formatErrorMessageWithRetryAfter(error: unknown, headers?: HeadersLike): string {
 	const message = error instanceof Error ? error.message : JSON.stringify(error);

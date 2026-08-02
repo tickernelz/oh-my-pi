@@ -45,9 +45,9 @@ describe("extractRetryHint – header parsing", () => {
 		expect(extractRetryHint(headers)).toBe(30_000);
 	});
 
-	it("prefers retry-after over x-ratelimit-reset-after when both are present", () => {
+	it("uses the longest valid header hint", () => {
 		const headers = new Headers({ "retry-after": "5", "x-ratelimit-reset-after": "30" });
-		expect(extractRetryHint(headers)).toBe(5_000);
+		expect(extractRetryHint(headers)).toBe(30_000);
 	});
 });
 

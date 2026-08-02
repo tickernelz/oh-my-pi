@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import {
@@ -327,7 +327,23 @@ describe("RPC subagent registry", () => {
 		registry.setSubscriptionLevel("events");
 		const projectionPayload: SubagentEventPayload = {
 			id: "SubagentA",
-			event: { type: "lcm_projection", projection: {} as ContextProjection },
+			event: {
+				type: "lcm_projection",
+				projection: {
+					revision: 0,
+					activeSourceFingerprint: activeSourceFingerprint([]),
+					ready: true,
+					historical: [],
+					freshTailSourceIds: [],
+					uncoveredSourceIds: [],
+					sourceTokens: 0,
+					selectedLevelCounts: {},
+					coveredSourceCount: 0,
+					freshSourceCount: 0,
+					estimatedTokens: 0,
+					pendingJobs: 0,
+				} satisfies ContextProjection,
+			},
 		};
 		const ordinaryPayload: SubagentEventPayload = {
 			id: "SubagentA",

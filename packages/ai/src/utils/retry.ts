@@ -21,8 +21,9 @@ const COPILOT_RETRY_AFTER_MAX_WAIT_MS = 30_000;
  */
 export async function callWithCopilotModelRetry<T>(
 	fn: () => Promise<T>,
-	options: { provider: string; signal?: AbortSignal; retryBaseDelayMs?: number },
+	options: { provider: string; signal?: AbortSignal; retryBaseDelayMs?: number; disableProviderRetries?: boolean },
 ): Promise<T> {
+	if (options.disableProviderRetries) return fn();
 	if (options.provider !== "github-copilot") return fn();
 
 	let lastError: unknown;

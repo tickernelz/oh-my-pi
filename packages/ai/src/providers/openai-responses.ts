@@ -544,6 +544,7 @@ const streamOpenAIResponsesOnce = (
 								body: requestParams,
 								signal: requestSignal,
 								fetch: options?.fetch,
+								disableProviderRetries: options?.disableProviderRetries,
 								// Transient 408/429/5xx get Retry-After-aware transport
 								// retries; the first-event watchdog aborts `requestSignal`,
 								// so retries cannot extend the caller's deadline.
@@ -561,7 +562,11 @@ const streamOpenAIResponsesOnce = (
 							if (requestTimeout !== undefined) clearTimeout(requestTimeout);
 						}
 					},
-					{ provider: model.provider, signal: requestSignal },
+					{
+						provider: model.provider,
+						signal: requestSignal,
+						disableProviderRetries: options?.disableProviderRetries,
+					},
 				);
 			};
 			let strictRetryAvailable = true;
@@ -589,6 +594,31 @@ const streamOpenAIResponsesOnce = (
 										explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
 									})
 								: undefined;
+						const compiledGrammarTooLarge =
+							isOpenRouterAnthropicModel(model) &&
+							isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse);
+						const canRetryWithoutStrictTools =
+							strictRetryAvailable &&
+							!requestSignal.aborted &&
+							(compiledGrammarTooLarge ||
+								shouldRetryWithoutStrictTools(
+									error,
+									capturedErrorResponse,
+									activeStrictToolsApplied,
+									context.tools,
+								));
+						if (options?.disableProviderRetries) {
+							if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
+								rememberOpenAIReasoningEffortFallback(
+									providerSessionState,
+									activeReasoningEffortFallbackKey,
+									reasoningEffortFallback,
+								);
+							} else if (canRetryWithoutStrictTools) {
+								disableStrictToolsForScope(providerSessionState, strictToolsScope);
+							}
+							throw error;
+						}
 						if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
 							const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 							if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
@@ -603,19 +633,6 @@ const streamOpenAIResponsesOnce = (
 							};
 							continue;
 						}
-						const compiledGrammarTooLarge =
-							isOpenRouterAnthropicModel(model) &&
-							isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse);
-						const canRetryWithoutStrictTools =
-							strictRetryAvailable &&
-							!requestSignal.aborted &&
-							(compiledGrammarTooLarge ||
-								shouldRetryWithoutStrictTools(
-									error,
-									capturedErrorResponse,
-									activeStrictToolsApplied,
-									context.tools,
-								));
 						if (canRetryWithoutStrictTools) {
 							strictRetryAvailable = false;
 							forceDisableStrictTools = true;
@@ -775,6 +792,7 @@ const streamOpenAIResponsesOnce = (
 					const streamFailure = abortTracker.getLocalAbortReason() ?? error;
 					const canRetry =
 						!sawReplayUnsafeOutput &&
+						!options?.disableProviderRetries &&
 						!requestSignal.aborted &&
 						!abortTracker.wasCallerAbort() &&
 						transientStreamRetryAttempt < OPENAI_RESPONSES_MAX_TRANSIENT_STREAM_RETRIES &&

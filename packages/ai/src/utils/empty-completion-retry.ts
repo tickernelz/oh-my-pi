@@ -63,6 +63,7 @@ function isMeaningfulCompletionEvent(event: AssistantMessageEvent): boolean {
 interface EmptyCompletionRetryOptions {
 	signal?: AbortSignal;
 	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	disableProviderRetries?: boolean;
 }
 
 /**
@@ -118,6 +119,7 @@ export function withEmptyCompletionRetry<M, O extends EmptyCompletionRetryOption
 			const message = terminal?.type === "done" ? terminal.message : undefined;
 			const isRetryableEmpty =
 				!committed &&
+				!options?.disableProviderRetries &&
 				message !== undefined &&
 				message.stopReason === "stop" &&
 				!message.errorMessage &&

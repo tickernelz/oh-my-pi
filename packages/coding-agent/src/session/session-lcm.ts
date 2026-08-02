@@ -14,17 +14,20 @@ import type {
 	SourceSnapshot,
 	SummaryFailureAttemptOutcome,
 	SummaryJob,
+	SummaryJobAvailability,
+	SummaryJobLease,
 	SummaryLocalAttemptOutcome,
 	SummaryProviderAttempt,
 	SummaryProviderAttemptStart,
+	SummaryRetryPolicy,
 } from "@oh-my-pi/lcm-context";
-import { isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, isLcmSqliteContentionError, openLcmContext } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { hasMatch, search as nativeSearch } from "@oh-my-pi/pi-natives";
 
-import { logger, pathIsWithin, prompt } from "@oh-my-pi/pi-utils";
+import { logger, pathIsWithin, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type {
 	LcmDescription,
 	LcmExpandOptions,
@@ -34,6 +37,7 @@ import type {
 } from "../lcm/operations";
 import { encodeLcmHandle } from "../lcm/operations";
 import { type LcmProject, resolveLcmProject } from "../lcm/project-identity";
+import lcmSummaryExcerptPrompt from "../prompts/lcm/summary-excerpt.md" with { type: "text" };
 import lcmSummarySystemPrompt from "../prompts/lcm/summary-system.md" with { type: "text" };
 import lcmSummaryUserPrompt from "../prompts/lcm/summary-user.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -56,10 +60,9 @@ import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persist
 
 const SUMMARY_LEASE_MS = 10 * 60_000;
 const SUMMARY_RETRY_DELAY_MS = 2_000;
-/** Longest provider-requested delay retained by the durable summary scheduler. */
-const SUMMARY_RETRY_AFTER_MAX_MS = 24 * 60 * 60_000;
 const SUMMARY_MAX_OUTPUT_TOKENS = 2_048;
-const HARD_PROJECTION_WAIT_MS = 60_000;
+const SUMMARY_PROVIDER_RETRY_LIMIT = 5;
+const SUMMARY_PROVIDER_ATTEMPT_TIMEOUT_MS = 5 * 60_000;
 /** Mirrors `lcm-context`'s unexported `DEFAULT_LEAF_MAX_TOKENS`; the adapter must name its own default. */
 const DEFAULT_LEAF_CHUNK_TOKENS = 4_000;
 /** The project store is shared across processes and peer completions raise no local signal. */
@@ -71,6 +74,12 @@ const ARTIFACT_REF_PATTERN = /(?:artifact:\/\/\d+|blob:sha256:[a-f0-9]{64})/g;
 /** Caps on file handles spliced into the active context, per summary and per projection. */
 const PROJECTED_FILES_PER_SUMMARY = 3;
 const PROJECTED_FILES_TOTAL = 12;
+const BOUNDED_SUMMARY_MARKER = lcmSummaryExcerptPrompt.trim();
+const PROJECTION_GEOMETRIC_FRACTIONS = [1 / 8, 1 / 4, 1 / 2, 1] as const;
+const PROJECTION_FIT_REFINEMENT_COUNT = 8;
+export const MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS =
+	(PROJECTED_FILES_TOTAL + 1) * 2 + 1 + PROJECTION_GEOMETRIC_FRACTIONS.length + PROJECTION_FIT_REFINEMENT_COUNT;
+export const MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS = MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS + 1;
 
 /**
  * Rust-backed matcher handed to the derived store. Its engine is linear-time, so a
@@ -84,8 +93,32 @@ const NATIVE_REGEX_ENGINE: LcmRegexEngine = {
 	},
 };
 
-export type LcmRuntimePhase = "disabled" | "uninitialized" | "idle" | "warming" | "active" | "degraded" | "quarantined";
-export type LcmCompletionErrorCategory = "provider_error" | "transport_error" | "empty_output" | "aborted";
+export type LcmRuntimeHealth = "disabled" | "uninitialized" | "healthy" | "degraded" | "quarantined";
+export type LcmCoverageReadiness = "idle" | "warming" | "ready";
+export type LcmProjectionFailureReason =
+	| "coverage_gap"
+	| "assembly_invalid"
+	| "irreducible_input"
+	| "minimum_representation"
+	| "provider_key_mismatch"
+	| "provider_exhausted"
+	| "fit_invariant";
+
+export type LcmProjectionFallback = {
+	category: LcmFallbackCategory;
+	reason?: LcmProjectionFailureReason;
+};
+
+export type LcmOwnershipDecision =
+	| { kind: "owned"; projection: ContextProjection }
+	| { kind: "native"; fallback?: LcmProjectionFallback }
+	| { kind: "aborted" };
+export type LcmCompletionErrorCategory =
+	| "provider_error"
+	| "transport_error"
+	| "empty_output"
+	| "provider_key_mismatch"
+	| "aborted";
 
 export class LcmCompletionError extends Error {
 	readonly provider: string | undefined;
@@ -111,7 +144,7 @@ export class LcmCompletionError extends Error {
 		const retryAfterMs = options.retryAfterMs;
 		this.retryAfterMs =
 			typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
-				? Math.min(SUMMARY_RETRY_AFTER_MAX_MS, Math.ceil(retryAfterMs))
+				? Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(retryAfterMs))
 				: undefined;
 		this.attempt = options.attempt;
 		this.category = options.category ?? "transport_error";
@@ -129,12 +162,6 @@ export function normalizeLcmMaxConcurrentSummaries(value: unknown): number {
 		: 1;
 }
 
-export function normalizeLcmHardProjectionWaitMs(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
-		? Math.max(15_000, Math.min(60_000, value))
-		: HARD_PROJECTION_WAIT_MS;
-}
-
 /** Leaf chunk sizes are clamped to measured presets: an arbitrary value has no benchmark behind it. */
 export function normalizeLcmLeafChunkTokens(value: unknown): number {
 	return value === 8_000 ? 8_000 : DEFAULT_LEAF_CHUNK_TOKENS;
@@ -145,6 +172,7 @@ export interface LcmProjectionAggregate {
 	sourceTokens: number;
 	selectedLevelCounts: Readonly<Record<number, number>>;
 	coveredSourceCount: number;
+	uncoveredSourceCount: number;
 	freshSourceCount: number;
 	estimatedTokens: number;
 	pendingJobs: number;
@@ -173,8 +201,33 @@ export interface LcmProjectionPressure {
 	hardThresholdTokens: number;
 }
 
+export interface LcmRouteMetrics {
+	observedAt: number;
+	pressure?: LcmProjectionPressure;
+	revision?: number;
+	messageTokenBudget?: number;
+	candidateTokens?: number;
+	projectionTokenMeasurements?: number;
+	projection?: LcmProjectionAggregate;
+}
+
+export type LcmPrimaryRequestRoute =
+	| { kind: "lossless"; metrics: LcmRouteMetrics }
+	| {
+			kind: "native_passthrough";
+			reason: "below_prewarm" | "below_hard" | "unavailable";
+			metrics: LcmRouteMetrics;
+	  }
+	| {
+			kind: "native_fallback";
+			category: LcmFallbackCategory;
+			reason?: LcmProjectionFailureReason;
+			metrics: LcmRouteMetrics;
+	  };
+
 export interface LcmRuntimeStatus {
-	phase: LcmRuntimePhase;
+	health: LcmRuntimeHealth;
+	coverageReadiness?: LcmCoverageReadiness;
 	summaryWorkers: { active: number; limit: number };
 	/** Live request pressure sampled at the most recent projection attempt. Absent before the first one. */
 	pressure?: LcmProjectionPressure;
@@ -182,7 +235,13 @@ export interface LcmRuntimeStatus {
 	summaryModelSelector?: string;
 	resolvedSummaryModel?: string;
 	currentBranch?: LcmCurrentBranchStatus;
-	lastFailureCategory?: LcmFallbackCategory;
+	lastRequestRoute?: LcmPrimaryRequestRoute;
+	lastTakeover?: LcmRouteMetrics;
+	lastFailure?: {
+		observedAt: number;
+		category: LcmFallbackCategory;
+		reason?: LcmProjectionFailureReason;
+	};
 	retryAt?: number;
 }
 
@@ -207,6 +266,12 @@ export interface LcmPublicStatus {
 }
 
 export interface LcmCompletionRequest {
+	/** Stable opaque identity shared by transport attempts for one durable summary-job epoch. */
+	providerSessionKey?: string;
+	/** Stable durable job identity used to retire state from superseded retry epochs. */
+	providerSessionFamilyKey?: string;
+	/** Keep learned transport compatibility state only when this failure can durably retry. */
+	retainProviderStateOnFailure?: boolean;
 	systemPrompt: string;
 	prompt: string;
 	maxOutputTokens: number;
@@ -253,23 +318,25 @@ export interface SessionLcmHost {
 	sessionManager: SessionLcmJournal;
 	obfuscator?: Pick<SecretObfuscator, "hasSecrets" | "obfuscate">;
 	projectionLimits(messages: readonly AgentMessage[]): LcmProjectionLimits | undefined;
-	projectionFits(messages: readonly AgentMessage[]): boolean;
+	projectionTokenMeasurements(messages: readonly AgentMessage[]): { tokens: number; upperBound: number };
 	complete(request: LcmCompletionRequest): Promise<LcmCompletionResult>;
+	resolveSummaryModel?(selector: string): string;
 }
 
 export interface SessionLcmDependencies {
 	openContext?: typeof openLcmContext;
 	resolveProject?: typeof resolveLcmProject;
-	hardWaitMs?: number;
 	peerPollMs?: number;
+	providerAttemptTimeoutMs?: number;
 	now?: () => number;
+	/** Observation-only hook for focused measurement-budget tests and benches. */
+	onProjectionTokenMeasurement?: () => void;
 }
 
 export interface SessionLcmOptions {
 	agentDir?: string;
 	summaryModel?: string;
 	maxConcurrentSummaries?: number;
-	hardProjectionWaitMs?: number;
 	leafChunkTokens?: number;
 	registerProject?: (project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>;
 	dependencies?: SessionLcmDependencies;
@@ -301,30 +368,81 @@ interface NormalizedBranch {
 	fileReferences: Map<string, ActiveFileReference>;
 }
 
+export interface LcmPrimaryRouteKey {
+	readonly generation: number;
+	readonly projectionAttempt: number;
+	readonly sessionId: string;
+	readonly scope?: Readonly<{
+		projectId: string;
+		branchId: string;
+		inputAnchor: string;
+		revision?: number;
+	}>;
+}
+
+type LcmPrimaryRouteScope = NonNullable<LcmPrimaryRouteKey["scope"]>;
+
+interface LcmPrimaryRouteScopeSource {
+	generation: number;
+	projectionAttempt: number;
+	sessionId: string;
+	cwd: string;
+	branchId: string;
+	inputAnchor: string;
+	fallbackProjectId: string;
+	project?: LcmProjectBinding;
+}
+
+type ProjectionFailure = { category: LcmFallbackCategory; reason?: LcmProjectionFailureReason };
+
+interface PendingPrimaryRoute {
+	key: LcmPrimaryRouteKey;
+	route: LcmPrimaryRequestRoute;
+}
+
+interface PrimaryPressureIntent {
+	generation: number;
+	baseMessageFingerprint: string;
+	baseMessageCount: number;
+	requestTokensFloor: number;
+}
+
 export interface SessionLcmProjectResult {
 	messages: AgentMessage[];
 	owned: boolean;
 	/** Present only when a complete, locally fitted projection owns the request. */
 	projection?: ContextProjection;
+	/** Opaque staged-route key consumed only by the immediately following primary dispatch. */
+	routeKey?: LcmPrimaryRouteKey;
+	/** Exact fitted message tokens already measured by SessionLcm. */
+	candidateTokens?: number;
+	/** LCM-controlled message budget used for this fitted render. */
+	messageTokenBudget?: number;
+	/** Real provider-representation measurements consumed by this projection attempt. */
+	projectionTokenMeasurements?: number;
 }
 
-type ProjectAttempt = SessionLcmProjectResult;
+type ProjectAttempt = SessionLcmProjectResult & {
+	maintenanceFallback?: LcmProjectionFallback;
+	aborted?: true;
+};
 
 interface ProjectionCheck {
 	result: ProjectAttempt;
 	projection?: ContextProjection;
-	terminal?: LcmFallbackCategory;
+	terminal?: { category: LcmFallbackCategory; reason?: LcmProjectionFailureReason };
+	candidateTokens?: number;
+	measurementCount?: number;
 }
 
 type SummaryQueueClass = SummaryJob["queueClass"];
 
 type SummaryWorkerOutcome =
 	| {
-			status: "completed" | "escalated" | "stale" | "lease_lost" | "unfit" | "aborted";
+			status: "completed" | "escalated" | "stale" | "lease_lost" | "unfit" | "aborted" | "provider_failed";
 			jobId: string;
 			queueClass: SummaryQueueClass;
 	  }
-	| { status: "provider_failed"; jobId: string; queueClass: SummaryQueueClass; retryAt: number }
 	| { status: "store_failed"; jobId: string; queueClass: SummaryQueueClass; error: unknown };
 
 interface ProjectionRequest {
@@ -372,6 +490,17 @@ function stableValue(value: unknown, refs: Set<string>): unknown {
 
 function stableStringify(value: unknown): string {
 	return JSON.stringify(value) ?? "null";
+}
+
+function primaryPressureFingerprint(messages: readonly AgentMessage[], messageCount = messages.length): string {
+	const hash = new Bun.CryptoHasher("sha256");
+	hash.update("omp:lcm-primary-pressure-intent:v1");
+	for (let index = 0; index < messageCount; index++) {
+		const serialized = stableStringify(stableValue(messages[index]!, new Set()));
+		hash.update(`\0${Buffer.byteLength(serialized, "utf8")}\0`);
+		hash.update(serialized);
+	}
+	return hash.digest("hex");
 }
 
 function sanitizedContent(content: unknown, refs: Set<string>): unknown[] {
@@ -586,6 +715,11 @@ function branchAnchor(manager: SessionLcmJournal, entries: readonly SessionEntry
 	].join("\0");
 }
 
+function fallbackRouteProjectId(cwd: string): string {
+	const digest = new Bun.CryptoHasher("sha256").update(`omp-lcm-route-project:v1\0${path.resolve(cwd)}`).digest("hex");
+	return `route-v1-${digest}`;
+}
+
 function messageIdentity(message: AgentMessage): string {
 	const persisted = sessionMessagePersistenceKey(message);
 	if (persisted) return persisted;
@@ -608,9 +742,27 @@ function messageIdentity(message: AgentMessage): string {
 
 /** Estimate the provider-visible cost of one message in an LCM projection. */
 export function estimateLcmProjectionMessageTokens(message: AgentMessage): number {
+	if (message.role === "developer") return estimateTokens({ ...message, role: "user" });
 	if (message.role !== "historicalContext") return estimateTokens(message);
 	const providerMessage = convertToLlm([message])[0];
 	return providerMessage ? estimateTokens(providerMessage) : Number.POSITIVE_INFINITY;
+}
+
+export function estimateLcmProjectionMessageTokenUpperBound(message: AgentMessage): number {
+	if (message.role !== "historicalContext") return estimateLcmProjectionMessageTokens(message);
+	const providerMessages = convertToLlm([message]);
+	if (providerMessages.length === 0) return Number.POSITIVE_INFINITY;
+	let bytes = 0;
+	for (const providerMessage of providerMessages) {
+		if (typeof providerMessage.content === "string") {
+			bytes += Buffer.byteLength(providerMessage.content, "utf8");
+			continue;
+		}
+		for (const block of providerMessage.content) {
+			if (block.type === "text") bytes += Buffer.byteLength(block.text, "utf8");
+		}
+	}
+	return bytes;
 }
 
 function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext): AgentMessage[] {
@@ -634,16 +786,57 @@ function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext
 	return [...messages];
 }
 
-function historicalText(projection: ContextProjection, scope: ContextScope): string {
-	// File handles keep the model aware of files it saw before compaction. Bounded because
-	// this text enters the active context; an oversized block would fail the projection fit.
-	let fileBudget = PROJECTED_FILES_TOTAL;
+interface HistoricalRenderLimits {
+	maxSummaryTextBytes?: number;
+	maxFiles: number;
+}
+
+function historicalSummaryExcerpts(projection: ContextProjection, maxTextBytes: number): string[] {
+	const sizes = projection.historical.map(item => Buffer.byteLength(item.redactedText, "utf8"));
+	const totalBytes = sizes.reduce((total, size) => total + size, 0);
+	let remaining = Math.max(0, Math.min(Math.floor(maxTextBytes), totalBytes));
+	if (remaining === 0) return sizes.map(() => "");
+	const ordered = sizes.map((bytes, index) => ({ bytes, index })).sort((left, right) => left.bytes - right.bytes);
+	let level = 0;
+	let active = ordered.length;
+	let cursor = 0;
+	while (cursor < ordered.length && active > 0) {
+		const next = ordered[cursor]!.bytes;
+		const cost = (next - level) * active;
+		if (cost > remaining) break;
+		remaining -= cost;
+		level = next;
+		while (cursor < ordered.length && ordered[cursor]!.bytes === next) {
+			cursor++;
+			active--;
+		}
+	}
+	const share = active > 0 ? Math.floor(remaining / active) : 0;
+	let remainder = active > 0 ? remaining % active : 0;
+	const allocations = sizes.map(size => {
+		if (size <= level) return size;
+		const extra = remainder > 0 ? 1 : 0;
+		if (remainder > 0) remainder--;
+		return Math.min(size, level + share + extra);
+	});
+	return projection.historical.map((item, index) => utf8HeadTail(item.redactedText, allocations[index]!));
+}
+
+function historicalText(projection: ContextProjection, scope: ContextScope, limits?: HistoricalRenderLimits): string {
+	const maxSummaryTextBytes = limits?.maxSummaryTextBytes;
+	const bounded = maxSummaryTextBytes !== undefined;
+	const excerpts = bounded ? historicalSummaryExcerpts(projection, maxSummaryTextBytes) : undefined;
+	let fileBudget = Math.max(0, Math.min(PROJECTED_FILES_TOTAL, Math.floor(limits?.maxFiles ?? PROJECTED_FILES_TOTAL)));
 	return projection.historical
-		.map(item => {
-			const summary = `${item.redactedText}\n[Summary: ${encodeLcmHandle({
+		.map((item, index) => {
+			const handle = encodeLcmHandle({
 				kind: "summary",
 				reference: { ...scope, summaryHandle: item.summaryHandle },
-			})}]`;
+			});
+			const excerpt = excerpts?.[index] ?? item.redactedText;
+			const summary = bounded
+				? `${BOUNDED_SUMMARY_MARKER}\n${excerpt ? `${excerpt}\n` : ""}[Summary: ${handle}]`
+				: `${excerpt}\n[Summary: ${handle}]`;
 			const allowed = Math.min(item.files.length, PROJECTED_FILES_PER_SUMMARY, fileBudget);
 			if (allowed <= 0) return summary;
 			fileBudget -= allowed;
@@ -685,10 +878,51 @@ function projectionAggregate(projection: ContextProjection): LcmProjectionAggreg
 		sourceTokens: projection.sourceTokens,
 		selectedLevelCounts: projection.selectedLevelCounts,
 		coveredSourceCount: projection.coveredSourceCount,
+		uncoveredSourceCount: projection.uncoveredSourceIds.length,
 		freshSourceCount: projection.freshSourceCount,
 		estimatedTokens: projection.estimatedTokens,
 		pendingJobs: projection.pendingJobs,
 	};
+}
+
+function hasExactProjectionCoverage(projection: ContextProjection, activeSources: readonly SourceEntry[]): boolean {
+	if (!projection.ready || projection.uncoveredSourceIds.length > 0) return false;
+	const seen = new Set<string>();
+	let historicalCount = 0;
+	let freshCount = 0;
+	let duplicate = false;
+	const frontierFingerprint = activeSourceFingerprint(
+		(function* () {
+			for (const item of projection.historical) {
+				for (const sourceId of item.sourceIds) {
+					historicalCount++;
+					if (seen.has(sourceId)) duplicate = true;
+					seen.add(sourceId);
+					yield sourceId;
+				}
+			}
+			for (const sourceId of projection.freshTailSourceIds) {
+				freshCount++;
+				if (seen.has(sourceId)) duplicate = true;
+				seen.add(sourceId);
+				yield sourceId;
+			}
+		})(),
+	);
+	const snapshotFingerprint = activeSourceFingerprint(
+		(function* () {
+			for (const source of activeSources) yield source.entryId;
+		})(),
+	);
+	return (
+		!duplicate &&
+		historicalCount === projection.coveredSourceCount &&
+		freshCount === projection.freshSourceCount &&
+		historicalCount + freshCount === activeSources.length &&
+		seen.size === activeSources.length &&
+		frontierFingerprint === projection.activeSourceFingerprint &&
+		projection.activeSourceFingerprint === snapshotFingerprint
+	);
 }
 
 function normalizedSourceTokens(snapshot: SourceSnapshot): number {
@@ -714,6 +948,49 @@ function utf8Prefix(text: string, maxBytes: number): string {
 	}
 	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1]!)) low--;
 	return text.slice(0, low);
+}
+
+function utf8Suffix(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const middle = Math.floor((low + high) / 2);
+		if (Buffer.byteLength(text.slice(middle), "utf8") <= maxBytes) high = middle;
+		else low = middle + 1;
+	}
+	const code = text.charCodeAt(low);
+	if (code >= 0xdc00 && code <= 0xdfff) low++;
+	return text.slice(low);
+}
+
+function utf8HeadTail(text: string, maxTextBytes: number): string {
+	const maxBytes = Math.max(0, Math.floor(maxTextBytes));
+	if (maxBytes === 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	const separator = "\n…\n";
+	const separatorBytes = Buffer.byteLength(separator, "utf8");
+	if (maxBytes <= separatorBytes) {
+		const head = utf8Prefix(text, Math.ceil(maxBytes / 2));
+		return head + utf8Suffix(text, maxBytes - Buffer.byteLength(head, "utf8"));
+	}
+	const contentBytes = maxBytes - separatorBytes;
+	const firstBreak = text.indexOf("\n");
+	const lastBreak = text.lastIndexOf("\n");
+	const firstLineBytes = Buffer.byteLength(firstBreak >= 0 ? text.slice(0, firstBreak) : text, "utf8");
+	const lastLineBytes = Buffer.byteLength(lastBreak >= 0 ? text.slice(lastBreak + 1) : text, "utf8");
+	let headBytes: number;
+	let tailBytes: number;
+	if (firstBreak >= 0 && lastBreak > firstBreak && firstLineBytes + lastLineBytes <= contentBytes) {
+		const extra = contentBytes - firstLineBytes - lastLineBytes;
+		headBytes = firstLineBytes + Math.ceil(extra / 2);
+		tailBytes = lastLineBytes + Math.floor(extra / 2);
+	} else {
+		headBytes = Math.ceil(contentBytes / 2);
+		tailBytes = Math.floor(contentBytes / 2);
+	}
+	return `${utf8Prefix(text, headBytes)}${separator}${utf8Suffix(text, tailBytes)}`;
 }
 
 function deterministicSummary(job: SummaryJob): string {
@@ -831,10 +1108,9 @@ export class SessionLcm {
 	readonly #registerProject:
 		| ((project: LcmProject, journal: { sessionDir: string; sessionFile?: string }) => Promise<void>)
 		| undefined;
-	#hardWaitMs: number;
-	readonly #hardWaitFixed: boolean;
 	readonly #peerPollMs: number;
 	readonly #now: () => number;
+	readonly #providerAttemptTimeoutMs: number;
 	readonly #spendEpoch: number;
 	#priorSpendUsd = 0;
 	readonly #workerId = `omp-lcm:${Bun.randomUUIDv7()}`;
@@ -872,12 +1148,21 @@ export class SessionLcm {
 	#summaryWakeTask: Promise<void> | undefined;
 	#resolveSummaryWake: (() => void) | undefined;
 	#closeTask: Promise<void> | undefined;
+	#summaryRetryPolicy: SummaryRetryPolicy | undefined;
+	#summaryPolicyMismatch = false;
 	#unsubscribeDurableEntries: (() => void) | undefined;
 	#registeredJournalKey: string | undefined;
-	#runtimePhase: LcmRuntimePhase = "uninitialized";
+	#runtimeHealth: LcmRuntimeHealth = "uninitialized";
+	#coverageReadiness: LcmCoverageReadiness | undefined;
 	#currentBranch: LcmCurrentBranchStatus | undefined;
-	#lastFailureCategory: LcmFallbackCategory | undefined;
-	#pendingFallbackCategory: LcmFallbackCategory | undefined;
+	#healthFailure: ProjectionFailure | undefined;
+	#providerFailureScope: ContextScope | undefined;
+	#nextPrimaryPressureIntent: PrimaryPressureIntent | undefined;
+	#pendingPrimaryRoute: PendingPrimaryRoute | undefined;
+	#lastRequestRoute: LcmPrimaryRequestRoute | undefined;
+	#lastTakeover: LcmRouteMetrics | undefined;
+	#lastFailure: LcmRuntimeStatus["lastFailure"];
+	#observedSessionId: string;
 	#retryAt: number | undefined;
 	#resolvedSummaryModel: string | undefined;
 	readonly #preferredFailures = new Map<string, number>();
@@ -894,13 +1179,14 @@ export class SessionLcm {
 		this.#openContext = options.dependencies?.openContext ?? openLcmContext;
 		this.#resolveProject = options.dependencies?.resolveProject ?? resolveLcmProject;
 		this.#registerProject = options.registerProject;
-		this.#hardWaitFixed = options.dependencies?.hardWaitMs !== undefined;
-		this.#hardWaitMs = this.#hardWaitFixed
-			? Math.max(1, options.dependencies?.hardWaitMs ?? HARD_PROJECTION_WAIT_MS)
-			: normalizeLcmHardProjectionWaitMs(options.hardProjectionWaitMs);
+		this.#providerAttemptTimeoutMs = Math.max(
+			1,
+			options.dependencies?.providerAttemptTimeoutMs ?? SUMMARY_PROVIDER_ATTEMPT_TIMEOUT_MS,
+		);
 		this.#peerPollMs = Math.max(1, options.dependencies?.peerPollMs ?? PEER_PROGRESS_POLL_MS);
 		this.#now = options.dependencies?.now ?? Date.now;
 		this.#spendEpoch = this.#now();
+		this.#observedSessionId = host.sessionManager.getSessionId();
 		this.#unsubscribeDurableEntries = host.sessionManager.subscribeToDurableEntries(() => {
 			this.#dirty = true;
 			if (this.#project && !this.#disposed) void this.#registerJournalHint(this.#project);
@@ -911,16 +1197,19 @@ export class SessionLcm {
 		return !this.#disposed;
 	}
 
-	configure(
-		options: Pick<SessionLcmOptions, "summaryModel" | "maxConcurrentSummaries" | "hardProjectionWaitMs">,
-	): void {
+	configure(options: Pick<SessionLcmOptions, "summaryModel" | "maxConcurrentSummaries">): void {
 		const nextModel = typeof options.summaryModel === "string" ? options.summaryModel.trim() || undefined : undefined;
-		if (nextModel !== this.#summaryModel) this.#resolvedSummaryModel = undefined;
+		if (nextModel !== this.#summaryModel) {
+			this.#resolvedSummaryModel = undefined;
+			this.#summaryPolicyMismatch = false;
+			this.#summaryRestartRequested = true;
+			this.#summaryAbortController?.abort("LCM summary model changed");
+			this.#clearProviderDegradation(true);
+		}
 		this.#summaryModel = nextModel;
 		this.#maxConcurrentSummaries = normalizeLcmMaxConcurrentSummaries(options.maxConcurrentSummaries);
 		// `leafChunkTokens` is deliberately absent: the store bakes `leafChunk` in at open time and
 		// existing spans were built under the old chunking, so a live change would mix policies.
-		if (!this.#hardWaitFixed) this.#hardWaitMs = normalizeLcmHardProjectionWaitMs(options.hardProjectionWaitMs);
 		this.#signalSummaryCapacity();
 		if (this.#context) this.#startSummaryJobs();
 	}
@@ -930,17 +1219,66 @@ export class SessionLcm {
 		return this.#priorSpendUsd;
 	}
 
-	takePendingFallbackCategory(): LcmFallbackCategory | undefined {
-		const category = this.#pendingFallbackCategory;
-		this.#pendingFallbackCategory = undefined;
-		return category;
+	commitPrimaryRequestRoute(key: LcmPrimaryRouteKey | undefined): boolean {
+		const pending = this.#pendingPrimaryRoute;
+		if (!key || !pending || pending.key !== key || !this.#isCurrentRouteKey(key)) return false;
+		this.#pendingPrimaryRoute = undefined;
+		this.#lastRequestRoute = pending.route;
+		if (pending.route.kind === "lossless") this.#lastTakeover = pending.route.metrics;
+		if (pending.route.kind === "native_fallback") {
+			this.#lastFailure = {
+				observedAt: pending.route.metrics.observedAt,
+				category: pending.route.category,
+				...(pending.route.reason ? { reason: pending.route.reason } : {}),
+			};
+		}
+		return true;
+	}
+
+	recordPendingPrimaryProviderTokens(
+		key: LcmPrimaryRouteKey | undefined,
+		tokens: number,
+		projectionTokenMeasurements?: number,
+	): void {
+		const pending = this.#pendingPrimaryRoute;
+		if (
+			!key ||
+			!pending ||
+			pending.key !== key ||
+			pending.route.kind !== "lossless" ||
+			!Number.isSafeInteger(tokens) ||
+			tokens < 0 ||
+			!this.#isCurrentRouteKey(key)
+		) {
+			return;
+		}
+		const metrics = {
+			...pending.route.metrics,
+			candidateTokens: tokens,
+			...(projectionTokenMeasurements !== undefined &&
+			Number.isSafeInteger(projectionTokenMeasurements) &&
+			projectionTokenMeasurements >= 0
+				? { projectionTokenMeasurements }
+				: {}),
+		};
+		if (
+			(metrics.messageTokenBudget !== undefined && tokens > metrics.messageTokenBudget) ||
+			(metrics.projectionTokenMeasurements ?? 0) > MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS
+		) {
+			const failure = { category: "unfit", reason: "fit_invariant" } as const;
+			pending.route = { kind: "native_fallback", ...failure, metrics };
+			this.#noteFailure(failure);
+			return;
+		}
+		pending.route = { ...pending.route, metrics };
 	}
 
 	#runtimeStatus(): LcmRuntimeStatus {
 		const preferred = this.#maxFailureDeadline(this.#preferredFailures);
 		const fallback = this.#maxFailureDeadline(this.#fallbackFailures);
 		return {
-			phase: this.#runtimePhase,
+			health: this.#runtimeHealth,
+			...(this.#coverageReadiness ? { coverageReadiness: this.#coverageReadiness } : {}),
 			summaryWorkers: { active: this.#activeSummaryJobs.size, limit: this.#maxConcurrentSummaries },
 			...(this.#lastPressure ? { pressure: this.#lastPressure } : {}),
 			...(preferred === undefined && fallback === undefined
@@ -954,7 +1292,9 @@ export class SessionLcm {
 			summaryModelSelector: this.#summaryModel ?? "@smol",
 			...(this.#resolvedSummaryModel ? { resolvedSummaryModel: this.#resolvedSummaryModel } : {}),
 			...(this.#currentBranch ? { currentBranch: this.#currentBranch } : {}),
-			...(this.#lastFailureCategory ? { lastFailureCategory: this.#lastFailureCategory } : {}),
+			...(this.#lastRequestRoute ? { lastRequestRoute: this.#lastRequestRoute } : {}),
+			...(this.#lastTakeover ? { lastTakeover: this.#lastTakeover } : {}),
+			...(this.#lastFailure ? { lastFailure: this.#lastFailure } : {}),
 			...(this.#retryAt === undefined ? {} : { retryAt: this.#retryAt }),
 		};
 	}
@@ -967,6 +1307,175 @@ export class SessionLcm {
 		this.#activeBranch = undefined;
 		this.#currentBranch = undefined;
 		this.#activeFileReferences.clear();
+	}
+
+	#syncSessionIdentity(): void {
+		const sessionId = this.#host.sessionManager.getSessionId();
+		if (sessionId === this.#observedSessionId) return;
+		this.#observedSessionId = sessionId;
+		this.#pendingPrimaryRoute = undefined;
+		this.#lastRequestRoute = undefined;
+		this.#lastTakeover = undefined;
+		this.#lastFailure = undefined;
+		this.#lastPressure = undefined;
+		this.#nextPrimaryPressureIntent = undefined;
+	}
+
+	#routeMetrics(
+		limits?: LcmProjectionLimits,
+		projection?: ContextProjection,
+		candidateTokens?: number,
+		projectionTokenMeasurements?: number,
+	): LcmRouteMetrics {
+		return {
+			observedAt: this.#now(),
+			...(this.#lastPressure ? { pressure: this.#lastPressure } : {}),
+			...(projection?.revision !== undefined
+				? { revision: projection.revision }
+				: this.#currentBranch
+					? { revision: this.#currentBranch.revision }
+					: {}),
+			...(limits ? { messageTokenBudget: limits.tokenBudget } : {}),
+			...(candidateTokens !== undefined ? { candidateTokens } : {}),
+			...(projectionTokenMeasurements !== undefined ? { projectionTokenMeasurements } : {}),
+			...(projection ? { projection: projectionAggregate(projection) } : {}),
+		};
+	}
+
+	#capturePrimaryRouteScopeSource(attempt: number): LcmPrimaryRouteScopeSource | undefined {
+		if (this.#disposed || attempt !== this.#projectionAttempt) return undefined;
+		const manager = this.#host.sessionManager;
+		const entries = manager.getBranch();
+		const cwd = manager.getCwd();
+		return {
+			generation: this.#generation,
+			projectionAttempt: attempt,
+			sessionId: manager.getSessionId(),
+			cwd,
+			branchId: branchId(manager, entries),
+			inputAnchor: branchAnchor(manager, entries),
+			fallbackProjectId: fallbackRouteProjectId(cwd),
+			...(this.#boundCwd === cwd && this.#project ? { project: this.#project } : {}),
+		};
+	}
+
+	#primaryRouteScopeSourceIsCurrent(source: LcmPrimaryRouteScopeSource): boolean {
+		return (
+			source.generation === this.#generation &&
+			source.projectionAttempt === this.#projectionAttempt &&
+			source.sessionId === this.#observedSessionId &&
+			source.cwd === this.#host.sessionManager.getCwd() &&
+			this.#primaryRouteScopeIsCurrent({
+				projectId: source.fallbackProjectId,
+				branchId: source.branchId,
+				inputAnchor: source.inputAnchor,
+			})
+		);
+	}
+
+	async #resolvePrimaryRouteScope(
+		source: LcmPrimaryRouteScopeSource,
+	): Promise<{ scope: LcmPrimaryRouteScope; error?: unknown }> {
+		let project = source.project;
+		try {
+			project ??= await this.#resolveProject(source.cwd, this.#agentDir);
+		} catch (error) {
+			return {
+				scope: {
+					projectId: source.fallbackProjectId,
+					branchId: source.branchId,
+					inputAnchor: source.inputAnchor,
+				},
+				error,
+			};
+		}
+		return {
+			scope: {
+				projectId: project.projectId,
+				branchId: source.branchId,
+				inputAnchor: source.inputAnchor,
+			},
+		};
+	}
+
+	#primaryRouteScopeIsCurrent(scope: LcmPrimaryRouteScope): boolean {
+		const manager = this.#host.sessionManager;
+		const entries = manager.getBranch();
+		if (
+			manager.getSessionId() !== this.#observedSessionId ||
+			branchId(manager, entries) !== scope.branchId ||
+			branchAnchor(manager, entries) !== scope.inputAnchor
+		) {
+			return false;
+		}
+		if (scope.revision === undefined) return true;
+		const branch = this.#currentBranch;
+		return (
+			branch?.projectId === scope.projectId &&
+			branch.sessionId === this.#observedSessionId &&
+			branch.branchId === scope.branchId &&
+			branch.revision === scope.revision
+		);
+	}
+
+	#withPrimaryRouteRevision(
+		scope: LcmPrimaryRouteScope | undefined,
+		revision: number | undefined,
+	): LcmPrimaryRouteScope | undefined {
+		return scope && revision !== undefined ? { ...scope, revision } : scope;
+	}
+
+	#withMatchingActiveRevision(scope: LcmPrimaryRouteScope | undefined): LcmPrimaryRouteScope | undefined {
+		const active = this.#activeBranch;
+		const current = this.#currentBranch;
+		if (!scope || !active || !current) return scope;
+		const activeScope = active.snapshot.scope;
+		if (
+			active.anchor !== scope.inputAnchor ||
+			activeScope.projectId !== scope.projectId ||
+			activeScope.sessionId !== this.#observedSessionId ||
+			activeScope.branchId !== scope.branchId ||
+			current.projectId !== scope.projectId ||
+			current.sessionId !== this.#observedSessionId ||
+			current.branchId !== scope.branchId
+		) {
+			return scope;
+		}
+		return this.#withPrimaryRouteRevision(scope, current.revision);
+	}
+
+	#stagePrimaryRoute(
+		route: LcmPrimaryRequestRoute,
+		attempt: number,
+		scope?: LcmPrimaryRouteScope,
+	): LcmPrimaryRouteKey | undefined {
+		if (this.#disposed || attempt !== this.#projectionAttempt) return undefined;
+		const sessionId = this.#host.sessionManager.getSessionId();
+		if (sessionId !== this.#observedSessionId) return undefined;
+		if (!scope && !(route.kind === "native_passthrough" && route.reason === "unavailable")) return undefined;
+		if (scope && !this.#primaryRouteScopeIsCurrent(scope)) return undefined;
+		const key: LcmPrimaryRouteKey = {
+			generation: this.#generation,
+			projectionAttempt: attempt,
+			sessionId,
+			...(scope ? { scope } : {}),
+		};
+		this.#pendingPrimaryRoute = { key, route };
+		return key;
+	}
+
+	#isCurrentRouteKey(key: LcmPrimaryRouteKey): boolean {
+		if (
+			this.#disposed ||
+			key.generation !== this.#generation ||
+			key.projectionAttempt !== this.#projectionAttempt ||
+			key.sessionId !== this.#observedSessionId ||
+			key.sessionId !== this.#host.sessionManager.getSessionId()
+		) {
+			return false;
+		}
+		if (!key.scope) return true;
+		return this.#primaryRouteScopeIsCurrent(key.scope);
 	}
 
 	#activateBranch(normalized: NormalizedBranch, revision: number): void {
@@ -991,8 +1500,8 @@ export class SessionLcm {
 					sourceTokens: normalizedSourceTokens(normalized.snapshot),
 					projectionState: "unevaluated",
 				};
-		if (!sameRevision && this.#runtimePhase === "active") {
-			this.#runtimePhase = this.#lastProjectionRequest ? "warming" : "idle";
+		if (!sameRevision) {
+			this.#coverageReadiness = this.#lastProjectionRequest ? "warming" : "idle";
 		}
 		this.#activeFileReferences = normalized.fileReferences;
 	}
@@ -1014,20 +1523,52 @@ export class SessionLcm {
 		}
 	}
 
-	#noteFailure(category: LcmFallbackCategory, retryAt?: number): void {
-		this.#runtimePhase = "degraded";
-		this.#lastFailureCategory = category;
+	#noteFailure(failure: ProjectionFailure, retryAt?: number): void {
+		const nonDegrading =
+			failure.category === "unfit" &&
+			(failure.reason === "irreducible_input" || failure.reason === "minimum_representation");
+		if (!nonDegrading) {
+			this.#healthFailure = failure;
+			this.#runtimeHealth = "degraded";
+			if (failure.category === "provider") this.#providerFailureScope = this.#activeBranch?.snapshot.scope;
+		}
 		this.#retryAt = retryAt;
+	}
+
+	#clearProviderDegradation(clearBackoff = false): void {
+		if (clearBackoff) {
+			this.#preferredFailures.clear();
+			this.#fallbackFailures.clear();
+			this.#retryAt = undefined;
+		}
+		if (this.#healthFailure?.category === "provider") {
+			this.#healthFailure = undefined;
+			this.#providerFailureScope = undefined;
+		}
+		this.#summaryPolicyMismatch = false;
+		this.#restoreHealth();
 	}
 
 	#hasPreferredHealthFailure(): boolean {
 		return this.#preferredUnfit || this.#preferredFailures.size > 0;
 	}
 
-	#failOpen(category: LcmFallbackCategory, attempt: number): void {
+	#restoreHealth(): void {
+		if (this.#runtimeHealth === "quarantined") return;
+		this.#runtimeHealth =
+			this.#healthFailure ||
+			this.#preferredUnfit ||
+			this.#preferredFailures.size > 0 ||
+			this.#fallbackFailures.size > 0
+				? "degraded"
+				: this.#context
+					? "healthy"
+					: "uninitialized";
+	}
+
+	#failOpen(failure: ProjectionFailure, attempt: number): void {
 		if (attempt !== this.#projectionAttempt) return;
-		this.#noteFailure(category, this.#retryAt);
-		this.#pendingFallbackCategory = category;
+		this.#noteFailure(failure, this.#retryAt);
 	}
 
 	#invalidateProjectionForRequest(): void {
@@ -1042,36 +1583,35 @@ export class SessionLcm {
 			sourceTokens: currentBranch.sourceTokens,
 			projectionState: "unevaluated",
 		};
-		if (this.#runtimePhase === "active") {
-			this.#runtimePhase = this.#hasPreferredHealthFailure()
-				? "degraded"
-				: this.#summaryTask || this.#summaryWakeTask || this.#activeSummaryJobs.size > 0
-					? "warming"
-					: "idle";
-		}
 	}
+
 	#noteProjection(projection: ContextProjection, fitted: boolean, attempt: number): void {
 		const currentBranch = this.#currentBranch;
-		if (attempt !== this.#projectionAttempt || !currentBranch || currentBranch.revision !== projection.revision)
+		if (
+			attempt !== this.#projectionAttempt ||
+			!currentBranch ||
+			currentBranch.projectId !== this.#activeBranch?.snapshot.scope.projectId ||
+			currentBranch.sessionId !== this.#activeBranch.snapshot.scope.sessionId ||
+			currentBranch.branchId !== this.#activeBranch.snapshot.scope.branchId ||
+			currentBranch.revision !== projection.revision
+		) {
 			return;
+		}
 		this.#currentBranch = {
 			...currentBranch,
 			projectionState: fitted ? "fitted" : "unfitted",
 			projection: projectionAggregate(projection),
 		};
-		if (!fitted) {
-			this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
-			return;
-		}
+		const complete =
+			projection.pendingJobs === 0 && hasExactProjectionCoverage(projection, this.#activeBranch.snapshot.entries);
+		this.#coverageReadiness = complete ? "ready" : "warming";
+		if (!complete) return;
 		this.#preferredUnfit = false;
-		this.#runtimePhase = "active";
-		this.#pendingFallbackCategory = undefined;
-		if (this.#preferredFailures.size === 0 && this.#fallbackFailures.size === 0) {
-			this.#lastFailureCategory = undefined;
-			this.#retryAt = undefined;
-		} else {
-			this.#lastFailureCategory = "provider";
+		if (this.#healthFailure?.category === "store" || this.#healthFailure?.category === "unfit") {
+			this.#healthFailure = undefined;
 		}
+		if (this.#preferredFailures.size === 0 && this.#fallbackFailures.size === 0) this.#retryAt = undefined;
+		this.#restoreHealth();
 	}
 
 	#signalSummaryCapacity(): void {
@@ -1093,11 +1633,16 @@ export class SessionLcm {
 		return deadline;
 	}
 
-	#syncSummaryFailures(context: LcmContext): void {
-		const failures = context.summaryJobFailures(this.#activeBranch?.snapshot.scope);
+	#syncSummaryFailures(context: LcmContext): ProjectionFailure | undefined {
+		const policy = this.#configureSummaryRetryPolicy(context);
+		const failures = policy
+			? context.summaryJobFailures(policy, SUMMARY_PROVIDER_RETRY_LIMIT, this.#activeBranch?.snapshot.scope)
+			: [];
 		this.#preferredFailures.clear();
 		this.#fallbackFailures.clear();
+		const now = this.#now();
 		for (const failure of failures) {
+			if (failure.availableAt <= now) continue;
 			(failure.queueClass === "preferred" ? this.#preferredFailures : this.#fallbackFailures).set(
 				failure.jobId,
 				failure.availableAt,
@@ -1107,13 +1652,64 @@ export class SessionLcm {
 		const fallback = this.#maxFailureDeadline(this.#fallbackFailures);
 		this.#retryAt =
 			preferred === undefined ? fallback : fallback === undefined ? preferred : Math.max(preferred, fallback);
-		if (preferred !== undefined || fallback !== undefined) {
-			this.#lastFailureCategory = "provider";
-			if (this.#hasPreferredHealthFailure() && this.#runtimePhase !== "active") this.#runtimePhase = "degraded";
-		} else if (this.#lastFailureCategory === "provider") {
-			this.#lastFailureCategory = this.#preferredUnfit ? "unfit" : undefined;
-			if (this.#runtimePhase === "degraded" && !this.#preferredUnfit) this.#runtimePhase = "warming";
+		const terminalFailure = this.#currentProviderTerminalFailure(context, policy ?? this.#summaryRetryPolicy);
+		const providerFailure = terminalFailure ?? (failures.length > 0 ? { category: "provider" as const } : undefined);
+		if (providerFailure) {
+			this.#healthFailure = providerFailure;
+			this.#providerFailureScope = this.#activeBranch?.snapshot.scope;
+			this.#runtimeHealth = "degraded";
+		} else if (this.#healthFailure?.category === "provider") {
+			const activeScope = this.#activeBranch?.snapshot.scope;
+			const failedScope = this.#providerFailureScope;
+			const scopeChanged =
+				activeScope !== undefined &&
+				failedScope !== undefined &&
+				(activeScope.projectId !== failedScope.projectId ||
+					activeScope.sessionId !== failedScope.sessionId ||
+					activeScope.branchId !== failedScope.branchId);
+			const activeSources = this.#activeBranch?.snapshot.entries;
+			const projection = scopeChanged ? undefined : this.#projectForScheduling(context);
+			const coverageRecovered =
+				projection !== undefined &&
+				activeSources !== undefined &&
+				projection.pendingJobs === 0 &&
+				hasExactProjectionCoverage(projection, activeSources);
+			if (scopeChanged || coverageRecovered) {
+				this.#healthFailure = undefined;
+				this.#providerFailureScope = undefined;
+			}
 		}
+		this.#restoreHealth();
+		return terminalFailure;
+	}
+
+	#currentProviderTerminalFailure(
+		context: LcmContext,
+		policy: SummaryRetryPolicy | undefined,
+	): ProjectionFailure | undefined {
+		const scope = this.#activeBranch?.snapshot.scope;
+		const request = this.#lastProjectionRequest;
+		if (!scope || !request || !policy) return undefined;
+		const availability = context.summaryJobAvailability(
+			{
+				...scope,
+				tokenBudget: request.limits.tokenBudget,
+				freshTail: request.limits.freshTail,
+			},
+			policy,
+			SUMMARY_PROVIDER_RETRY_LIMIT,
+		);
+		const unresolved =
+			availability.runnable +
+			availability.leased +
+			availability.backoff +
+			availability.exhausted +
+			availability.missing +
+			availability.policyMismatch;
+		if ((this.#summaryPolicyMismatch && unresolved > 0) || availability.policyMismatch > 0) {
+			return { category: "provider", reason: "provider_key_mismatch" };
+		}
+		return availability.exhausted > 0 ? { category: "provider", reason: "provider_exhausted" } : undefined;
 	}
 
 	#clearSummaryWake(): void {
@@ -1146,26 +1742,6 @@ export class SessionLcm {
 		}, delay);
 	}
 
-	async #waitWithinDeadline(
-		task: Promise<unknown>,
-		signal: AbortSignal | undefined,
-		deadline: number,
-	): Promise<boolean> {
-		if (signal?.aborted) return false;
-		const remaining = deadline - this.#now();
-		if (remaining <= 0) return false;
-		const timeout = Promise.withResolvers<false>();
-		const timer = setTimeout(() => timeout.resolve(false), remaining);
-		const onAbort = (): void => timeout.resolve(false);
-		signal?.addEventListener("abort", onAbort, { once: true });
-		try {
-			return await Promise.race([task.then(() => true as const), timeout.promise]);
-		} finally {
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-		}
-	}
-
 	#enqueue<T>(operation: () => Promise<T> | T): Promise<T> {
 		const run = async (): Promise<T> => {
 			for (let attempt = 0; ; attempt++) {
@@ -1190,9 +1766,10 @@ export class SessionLcm {
 		deferredSummarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> = false,
 	): Promise<LcmContext | undefined> {
 		if (this.#disposed) return undefined;
+		this.#syncSessionIdentity();
 		const cwd = this.#host.sessionManager.getCwd();
 		if (this.#boundCwd !== undefined && this.#boundCwd !== cwd) {
-			this.#pendingFallbackCategory = undefined;
+			this.#nextPrimaryPressureIntent = undefined;
 			this.#preferredUnfit = false;
 		}
 		if (this.#context && this.#boundCwd !== undefined && this.#boundCwd !== cwd && this.#summaryTask) {
@@ -1227,7 +1804,7 @@ export class SessionLcm {
 			project = await this.#resolveProject(cwd, this.#agentDir);
 		} catch (error) {
 			logger.warn("LCM project resolution failed; using native context", { error: errorLabel(error) });
-			this.#noteFailure("store");
+			this.#noteFailure({ category: "store" });
 			return undefined;
 		}
 		if (this.#disposed || generation !== this.#generation || cwd !== this.#host.sessionManager.getCwd())
@@ -1245,12 +1822,14 @@ export class SessionLcm {
 			this.#clearActiveBranch();
 		}
 		if (projectChanged) {
-			this.#pendingFallbackCategory = undefined;
+			this.#nextPrimaryPressureIntent = undefined;
 			this.#preferredUnfit = false;
 			this.#preferredFailures.clear();
 			this.#fallbackFailures.clear();
+			this.#summaryRetryPolicy = undefined;
+			this.#summaryPolicyMismatch = false;
 			this.#retryAt = undefined;
-			if (this.#lastFailureCategory === "provider") this.#lastFailureCategory = undefined;
+			if (this.#healthFailure?.category === "provider") this.#healthFailure = undefined;
 			this.#resolvedSummaryModel = undefined;
 		}
 
@@ -1269,13 +1848,15 @@ export class SessionLcm {
 			});
 		} catch (error) {
 			logger.warn("LCM store open failed; using native context", { error: errorLabel(error) });
-			this.#noteFailure("store");
+			this.#noteFailure({ category: "store" });
 			return undefined;
 		}
 		if (this.#disposed || generation !== this.#generation || cwd !== this.#host.sessionManager.getCwd()) {
 			context.close();
 			return undefined;
 		}
+		this.#summaryRetryPolicy = undefined;
+		this.#summaryPolicyMismatch = false;
 
 		this.#context = context;
 		try {
@@ -1285,12 +1866,13 @@ export class SessionLcm {
 		}
 		this.#project = project;
 		this.#boundCwd = cwd;
-		this.#runtimePhase = "idle";
+		if (this.#healthFailure?.category === "store") this.#healthFailure = undefined;
+		this.#coverageReadiness ??= "idle";
+		this.#restoreHealth();
 		return context;
 	}
 
 	#normalizeActiveBranch(project: LcmProjectBinding): NormalizedBranch {
-		this.#clearActiveBranch();
 		return normalizeLcmBranchState(
 			this.#host.sessionManager,
 			project.projectId,
@@ -1309,6 +1891,55 @@ export class SessionLcm {
 			freshTail: request.limits.freshTail,
 		});
 		return projection;
+	}
+
+	#configureSummaryRetryPolicy(
+		context: LcmContext,
+		force = false,
+		resolvedRetryKey?: string,
+	): SummaryRetryPolicy | undefined {
+		const project = this.#project;
+		if (!project) return undefined;
+		if (this.#summaryPolicyMismatch && !force) return undefined;
+		const selector = this.#summaryModel ?? "@smol";
+		let retryKey = resolvedRetryKey;
+		if (!retryKey && this.#host.resolveSummaryModel) {
+			try {
+				retryKey = this.#host.resolveSummaryModel(selector);
+			} catch {
+				this.#summaryPolicyMismatch = true;
+				return undefined;
+			}
+		} else if (!retryKey) {
+			retryKey = this.#resolvedSummaryModel ?? (!selector.startsWith("@") ? selector : undefined);
+		}
+		if (retryKey) this.#resolvedSummaryModel = retryKey;
+		if (!retryKey) {
+			this.#summaryPolicyMismatch = true;
+			return undefined;
+		}
+		const current = this.#summaryRetryPolicy;
+		const result = context.configureSummaryRetryPolicy(project.projectId, retryKey, {
+			...(current ? { expected: current } : {}),
+			...(force ? { force: true } : {}),
+		});
+		const accepted = { retryKey: result.retryKey, retryEpoch: result.retryEpoch };
+		const rotated =
+			current !== undefined &&
+			(current.retryKey !== accepted.retryKey || current.retryEpoch !== accepted.retryEpoch);
+		this.#summaryRetryPolicy = accepted;
+		if (rotated && this.#summaryAbortController && !this.#summaryAbortController.signal.aborted) {
+			this.#summaryRetryDeferred = false;
+			this.#summaryRestartRequested = true;
+			this.#summaryAbortController.abort("LCM summary retry policy changed");
+			this.#signalSummaryCapacity();
+		}
+		if (result.kind === "conflict") {
+			this.#summaryPolicyMismatch = result.retryKey !== retryKey;
+			return this.#summaryPolicyMismatch ? undefined : accepted;
+		}
+		this.#summaryPolicyMismatch = false;
+		return accepted;
 	}
 
 	async #drainReconcile(open: boolean): Promise<boolean> {
@@ -1349,8 +1980,18 @@ export class SessionLcm {
 					summarize === false
 						? this.#projectForScheduling(context)
 						: context.project({ ...scope, tokenBudget: summarize.tokenBudget, freshTail: summarize.freshTail });
-				if (projection && this.#runtimePhase !== "active") {
-					this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
+				if (projection) {
+					const complete =
+						projection.pendingJobs === 0 && hasExactProjectionCoverage(projection, normalized.snapshot.entries);
+					this.#coverageReadiness = complete ? "ready" : "warming";
+					if (
+						complete &&
+						(this.#healthFailure?.category === "store" ||
+							(this.#healthFailure?.category === "unfit" && this.#healthFailure.reason === "coverage_gap"))
+					) {
+						this.#healthFailure = undefined;
+					}
+					this.#restoreHealth();
 				}
 				const allowFallback = projection === undefined || projection.pendingJobs === 0;
 				const preferredRetryAt = this.#maxFailureDeadline(this.#preferredFailures);
@@ -1361,13 +2002,12 @@ export class SessionLcm {
 				}
 				const fallbackBlocked = allowFallback && fallbackRetryAt !== undefined && fallbackRetryAt > this.#now();
 				const effectiveAllowFallback = allowFallback && !fallbackBlocked;
-				const delayMs = context.nextSummaryJobDelayMs(scope, effectiveAllowFallback);
-				if (
-					this.#runtimePhase !== "active" &&
-					!this.#hasPreferredHealthFailure() &&
-					(delayMs !== null || fallbackBlocked)
-				) {
-					this.#runtimePhase = "warming";
+				const policy = this.#summaryPolicyMismatch ? undefined : this.#summaryRetryPolicy;
+				const delayMs = policy
+					? context.nextSummaryJobDelayMs(policy, SUMMARY_PROVIDER_RETRY_LIMIT, scope, effectiveAllowFallback)
+					: null;
+				if (!this.#hasPreferredHealthFailure() && (delayMs !== null || fallbackBlocked)) {
+					this.#coverageReadiness = "warming";
 				}
 				if (delayMs === 0) this.#startSummaryJobs();
 				else if (delayMs !== null) this.#scheduleSummaryWake(context, generation, delayMs);
@@ -1381,8 +2021,7 @@ export class SessionLcm {
 					throw error;
 				}
 				logger.warn("LCM reconcile failed; using native context", { error: errorLabel(error) });
-				this.#noteFailure("store");
-				this.#clearActiveBranch();
+				this.#noteFailure({ category: "store" });
 				return false;
 			}
 		}
@@ -1464,7 +2103,7 @@ export class SessionLcm {
 			error => {
 				clear();
 				if (!this.#disposed && generation === this.#generation && context === this.#context) {
-					this.#noteFailure("store");
+					this.#noteFailure({ category: "store" });
 					logger.warn("LCM summary worker failed", { error: errorLabel(error) });
 				}
 			},
@@ -1478,6 +2117,7 @@ export class SessionLcm {
 		let storeFailed = false;
 		let preferredExhaustedWithoutProjection = false;
 		let preferredWorkObserved = false;
+		let terminalProviderFailureObserved = false;
 		const recordStoreError = (error: unknown): void => {
 			if (storeFailed) return;
 			storeFailed = true;
@@ -1506,13 +2146,16 @@ export class SessionLcm {
 			if (settled.length > 0) {
 				await Promise.resolve();
 				const batch = settled.splice(0);
-				const activeBeforeBatch = this.#runtimePhase === "active";
+				const readyBeforeBatch = this.#coverageReadiness === "ready";
 				let preferredUnfitObserved = false;
 				let unfitObserved = false;
 				let progressObserved = false;
+				let completedObserved = false;
 				for (const outcome of batch) {
 					this.#activeSummaryJobs.delete(outcome.jobId);
 					switch (outcome.status) {
+						case "provider_failed":
+							break;
 						case "store_failed":
 							recordStoreError(outcome.error);
 							break;
@@ -1523,25 +2166,41 @@ export class SessionLcm {
 							if (outcome.queueClass === "preferred") {
 								preferredUnfitObserved = true;
 								unfitObserved = true;
-							} else if (!activeBeforeBatch) {
+							} else if (!readyBeforeBatch) {
 								unfitObserved = true;
 							}
 							break;
 						case "completed":
+							completedObserved = true;
+							progressObserved = true;
+							break;
 						case "escalated":
 							progressObserved = true;
 							break;
 					}
 				}
+				if (completedObserved) this.#clearProviderDegradation();
 				if (preferredUnfitObserved) this.#preferredUnfit = true;
-				if (unfitObserved) this.#noteFailure("unfit");
-				else if (progressObserved && this.#runtimePhase !== "active") {
-					this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
+				if (unfitObserved) this.#noteFailure({ category: "unfit", reason: "coverage_gap" });
+				else if (progressObserved) {
+					if (this.#coverageReadiness !== "ready") this.#coverageReadiness = "warming";
+					this.#restoreHealth();
 				}
+				let terminalProviderFailure: ProjectionFailure | undefined;
 				try {
-					await this.#enqueue(() => this.#syncSummaryFailures(context));
+					await this.#enqueue(() => {
+						terminalProviderFailure = this.#syncSummaryFailures(context);
+					});
 				} catch (error) {
 					recordStoreError(error);
+				}
+				if (terminalProviderFailure) {
+					terminalProviderFailureObserved = true;
+					this.#noteFailure(terminalProviderFailure);
+				}
+				if (terminalProviderFailureObserved && this.#activeSummaryJobs.size === 0) {
+					this.#summaryRestartRequested = false;
+					return;
 				}
 			}
 
@@ -1552,13 +2211,16 @@ export class SessionLcm {
 					continue;
 				}
 				if (storeFailed) throw firstStoreError;
-				this.#summaryRetryDeferred = true;
-				this.#summaryRestartRequested = false;
+				this.#summaryRetryDeferred = !this.#summaryRestartRequested;
 				return;
 			}
 
 			let blockedWakeMs: number | null = null;
-			while (isCurrent() && this.#activeSummaryJobs.size < this.#maxConcurrentSummaries) {
+			while (
+				isCurrent() &&
+				!terminalProviderFailureObserved &&
+				this.#activeSummaryJobs.size < this.#maxConcurrentSummaries
+			) {
 				let claimed: {
 					job: SummaryJob | undefined;
 					summaryModel: string;
@@ -1566,6 +2228,7 @@ export class SessionLcm {
 					preferredOnly: boolean;
 					cancelled?: boolean;
 					handoff?: boolean;
+					failure?: ProjectionFailure;
 				};
 				try {
 					claimed = await this.#enqueue(() => {
@@ -1611,7 +2274,21 @@ export class SessionLcm {
 						const fallbackBlocked =
 							allowFallback && fallbackRetryAt !== undefined && fallbackRetryAt > this.#now();
 						const effectiveAllowFallback = allowFallback && !fallbackBlocked;
+						const policy = this.#configureSummaryRetryPolicy(context);
+						if (!policy) {
+							return {
+								job: undefined,
+								summaryModel: "",
+								delayMs: null,
+								preferredOnly: !allowFallback,
+								failure: this.#summaryPolicyMismatch
+									? { category: "provider", reason: "provider_key_mismatch" }
+									: undefined,
+							};
+						}
 						const job = context.claimSummaryJobs({
+							...policy,
+							maxTransportRetries: SUMMARY_PROVIDER_RETRY_LIMIT,
 							workerId: this.#workerId,
 							leaseMs: SUMMARY_LEASE_MS,
 							limit: 1,
@@ -1621,13 +2298,36 @@ export class SessionLcm {
 						})[0];
 						const delayMs = job
 							? null
-							: (context.nextSummaryJobDelayMs(scope, effectiveAllowFallback) ??
-								(fallbackBlocked && fallbackRetryAt !== undefined ? fallbackRetryAt - this.#now() : null));
+							: (context.nextSummaryJobDelayMs(
+									policy,
+									SUMMARY_PROVIDER_RETRY_LIMIT,
+									scope,
+									effectiveAllowFallback,
+								) ?? (fallbackBlocked && fallbackRetryAt !== undefined ? fallbackRetryAt - this.#now() : null));
+						let failure: ProjectionFailure | undefined;
+						const request = this.#lastProjectionRequest;
+						if (!job && delayMs === null && projection?.pendingJobs && scope && request) {
+							const availability = context.summaryJobAvailability(
+								{
+									...scope,
+									tokenBudget: request.limits.tokenBudget,
+									freshTail: request.limits.freshTail,
+								},
+								policy,
+								SUMMARY_PROVIDER_RETRY_LIMIT,
+							);
+							if (availability.policyMismatch > 0) {
+								failure = { category: "provider", reason: "provider_key_mismatch" };
+							} else if (availability.exhausted > 0) {
+								failure = { category: "provider", reason: "provider_exhausted" };
+							}
+						}
 						return {
 							job,
 							summaryModel: this.#summaryModel ?? "@smol",
 							delayMs,
 							preferredOnly: !allowFallback,
+							failure,
 						};
 					});
 				} catch (error) {
@@ -1640,7 +2340,7 @@ export class SessionLcm {
 					(!isCurrent() || this.#activeSummaryJobs.size >= this.#maxConcurrentSummaries || settled.length > 0)
 				) {
 					try {
-						await this.#enqueue(() => context.releaseSummaryJob(claimed.job!.jobId, claimed.job!.leaseToken));
+						await this.#enqueue(() => context.releaseSummaryJob(claimed.job!));
 					} catch (error) {
 						recordStoreError(error);
 						this.#summaryAbortController?.abort("LCM summary store failure");
@@ -1648,6 +2348,13 @@ export class SessionLcm {
 					break;
 				}
 				if (!claimed.job) {
+					if (claimed.failure) {
+						this.#noteFailure(claimed.failure);
+						this.#summaryRestartRequested = false;
+						if (this.#activeSummaryJobs.size === 0) return;
+						terminalProviderFailureObserved = true;
+						break;
+					}
 					if (claimed.cancelled || claimed.handoff) break;
 					if (claimed.preferredOnly && claimed.delayMs === null && this.#activeSummaryJobs.size === 0) {
 						preferredExhaustedWithoutProjection = true;
@@ -1692,6 +2399,7 @@ export class SessionLcm {
 		signal: AbortSignal,
 	): Promise<SummaryWorkerOutcome> {
 		const base = { jobId: job.jobId, queueClass: job.queueClass };
+		let lease: SummaryJobLease = job;
 		const jobController = new AbortController();
 		const jobSignal = AbortSignal.any([signal, jobController.signal]);
 		let leaseLost = false;
@@ -1703,6 +2411,17 @@ export class SessionLcm {
 			if (storeFailed) return;
 			storeFailed = true;
 			firstStoreError = error;
+		};
+		let releaseLeaseTask: Promise<void> | undefined;
+		const releaseLease = (): Promise<void> => {
+			if (terminal) return Promise.resolve();
+			releaseLeaseTask ??= this.#enqueue(() => context.releaseSummaryJob(lease)).then(
+				() => undefined,
+				error => {
+					recordStoreError(error);
+				},
+			);
+			return releaseLeaseTask;
 		};
 		const renewLease = setInterval(
 			() => {
@@ -1716,12 +2435,15 @@ export class SessionLcm {
 					) {
 						return undefined;
 					}
-					return context.extendSummaryJob(job.jobId, job.leaseToken, SUMMARY_LEASE_MS);
+					return context.extendSummaryJob(lease, SUMMARY_LEASE_MS);
 				})
-					.then(extended => {
-						if (extended === false) {
+					.then(nonce => {
+						if (nonce === undefined) return;
+						if (nonce === null) {
 							leaseLost = true;
 							jobController.abort("LCM summary lease lost");
+						} else {
+							lease = { ...lease, leaseMutationNonce: nonce };
 						}
 					})
 					.catch(error => {
@@ -1743,14 +2465,12 @@ export class SessionLcm {
 				let resolvedModel: string | undefined;
 				let providerAttempt: SummaryProviderAttempt | undefined;
 				const settleAttempt = async (
-					attempt: SummaryProviderAttempt | undefined,
+					attempt: SummaryProviderAttempt | SummaryProviderAttemptStart | undefined,
 					requested: SummaryLocalAttemptOutcome,
 				): Promise<void> => {
 					if (!attempt) return;
 					try {
-						await this.#enqueue(() =>
-							context.settleSummaryAttempt(job.jobId, job.leaseToken, attempt, requested),
-						);
+						await this.#enqueue(() => context.settleSummaryAttempt(lease, attempt, requested));
 					} catch (error) {
 						recordStoreError(error);
 					}
@@ -1777,14 +2497,33 @@ export class SessionLcm {
 						strategy: job.strategy,
 					};
 					let completion: LcmCompletionResult;
+					let providerAttemptStart: SummaryProviderAttemptStart | undefined;
+					const providerTimeoutController = new AbortController();
+					let providerTimedOut = false;
+					let providerTimeoutMessage = "Summary provider preparation timed out";
+					const providerDeadline = Promise.withResolvers<never>();
+					const expireProvider = () => {
+						providerTimedOut = true;
+						providerTimeoutController.abort(new DOMException(providerTimeoutMessage, "TimeoutError"));
+						providerDeadline.reject(
+							new LcmCompletionError(providerTimeoutMessage, { category: "transport_error" }),
+						);
+					};
+					const providerTimer = setTimeout(expireProvider, this.#providerAttemptTimeoutMs);
+					const completionSignal = AbortSignal.any([jobSignal, providerTimeoutController.signal]);
+					let retryPolicyRotated = false;
+					let completionTask: Promise<LcmCompletionResult> | undefined;
 					try {
-						completion = await this.#host.complete({
+						completionTask = this.#host.complete({
 							systemPrompt,
 							prompt: userPrompt,
 							maxOutputTokens: job.outputTokenBudget,
 							oneshotKind: "lcm_summary",
 							modelSelector: summaryModel,
-							signal: jobSignal,
+							providerSessionKey: `${job.jobId}:${lease.retryEpoch}`,
+							providerSessionFamilyKey: job.jobId,
+							retainProviderStateOnFailure: job.transportRetryCount + 1 < SUMMARY_PROVIDER_RETRY_LIMIT,
+							signal: completionSignal,
 							onResolvedModel: model => {
 								resolvedModel = model;
 								this.#resolvedSummaryModel = model;
@@ -1793,6 +2532,7 @@ export class SessionLcm {
 								try {
 									return await this.#enqueue(() => {
 										if (
+											providerTimedOut ||
 											jobSignal.aborted ||
 											this.#disposed ||
 											generation !== this.#generation ||
@@ -1800,7 +2540,23 @@ export class SessionLcm {
 										) {
 											return false;
 										}
-										return context.beginSummaryAttempt(job.jobId, job.leaseToken, start, startProvenance);
+										const policy = this.#configureSummaryRetryPolicy(context);
+										if (
+											!policy ||
+											!resolvedModel ||
+											policy.retryKey !== resolvedModel ||
+											policy.retryKey !== lease.retryKey ||
+											policy.retryEpoch !== lease.retryEpoch
+										) {
+											retryPolicyRotated = true;
+											return false;
+										}
+										const accepted = context.beginSummaryAttempt(lease, start, startProvenance);
+										if (accepted) {
+											providerAttemptStart = start;
+											providerTimeoutMessage = "Summary provider attempt timed out";
+										}
+										return accepted;
 									});
 								} catch (error) {
 									recordStoreError(error);
@@ -1808,29 +2564,69 @@ export class SessionLcm {
 								}
 							},
 						});
+						completion = await untilAborted(jobSignal, Promise.race([completionTask, providerDeadline.promise]));
+						clearTimeout(providerTimer);
 					} catch (error) {
-						if (storeFailed) return { status: "store_failed", ...base, error: firstStoreError };
+						clearTimeout(providerTimer);
 						const completionError = error instanceof LcmCompletionError ? error : undefined;
-						const failedAttempt = completionError?.attempt;
-						if (completionError?.category === "aborted") {
-							await settleAttempt(failedAttempt, "aborted");
-							return { status: "aborted", ...base };
+						const completedAttempt = completionError?.attempt;
+						const acceptedAttempt = completedAttempt ?? providerAttemptStart;
+						const attachLateAttemptSettlement = (requested: SummaryLocalAttemptOutcome): void => {
+							if (!completionTask || !providerAttemptStart || completedAttempt) return;
+							void completionTask.then(
+								late =>
+									this.#enqueue(() => context.settleSummaryAttempt(lease, late.attempt, requested)).catch(
+										settleError =>
+											logger.debug("LCM late abandoned-attempt settlement failed", {
+												error: errorLabel(settleError),
+											}),
+									),
+								lateError => {
+									const lateAttempt = lateError instanceof LcmCompletionError ? lateError.attempt : undefined;
+									if (!lateAttempt) return;
+									void this.#enqueue(() => context.settleSummaryAttempt(lease, lateAttempt, requested)).catch(
+										settleError =>
+											logger.debug("LCM late abandoned-attempt settlement failed", {
+												error: errorLabel(settleError),
+											}),
+									);
+								},
+							);
+						};
+						const settleAbandonedAttempt = async (requested: SummaryLocalAttemptOutcome): Promise<void> => {
+							await renewalTask;
+							await settleAttempt(acceptedAttempt, requested);
+							await releaseLease();
+							attachLateAttemptSettlement(requested);
+						};
+						if (storeFailed) {
+							await settleAbandonedAttempt("aborted");
+							return { status: "store_failed", ...base, error: firstStoreError };
 						}
 						if (leaseLost) {
-							await settleAttempt(failedAttempt, "lease_lost");
+							await settleAbandonedAttempt("lease_lost");
 							return { status: "lease_lost", ...base };
 						}
-						if (this.#disposed || jobSignal.aborted) {
-							await settleAttempt(failedAttempt, "aborted");
+						if (generation !== this.#generation || context !== this.#context) {
+							await settleAbandonedAttempt("stale");
 							return { status: "aborted", ...base };
 						}
-						if (generation !== this.#generation || context !== this.#context) {
-							await settleAttempt(failedAttempt, "stale");
+						if (this.#disposed || jobSignal.aborted) {
+							await settleAbandonedAttempt("aborted");
 							return { status: "aborted", ...base };
+						}
+						if (completionError?.category === "aborted" && !providerTimedOut) {
+							const requested = retryPolicyRotated ? "stale" : "aborted";
+							await settleAbandonedAttempt(requested);
+							return { status: retryPolicyRotated ? "stale" : "aborted", ...base };
 						}
 						if (!completionError && isStructuredAbortError(error)) {
-							await settleAttempt(failedAttempt, "aborted");
+							await settleAbandonedAttempt("aborted");
 							return { status: "aborted", ...base };
+						}
+						if (!providerAttemptStart && !completedAttempt && !providerTimedOut) {
+							this.#summaryPolicyMismatch = true;
+							return { status: "stale", ...base };
 						}
 						const failureAt = this.#now();
 						const retryDelayMs = Math.min(
@@ -1846,20 +2642,30 @@ export class SessionLcm {
 							...(resolvedModel ? { resolvedModel } : {}),
 							strategy: job.strategy,
 						};
-						const failureOutcome: SummaryFailureAttemptOutcome = completionError?.category ?? "transport_error";
+						const failureOutcome: SummaryFailureAttemptOutcome =
+							providerTimedOut ||
+							!completionError ||
+							completionError.category === "aborted" ||
+							completionError.category === "provider_key_mismatch"
+								? "transport_error"
+								: completionError.category;
 						const failed = await this.#enqueue(() =>
 							context.failSummaryJob(
-								job.jobId,
-								job.leaseToken,
-								completionError ? this.#redact(completionError.message) : "Summary completion failed",
+								lease,
+								providerTimedOut
+									? providerTimeoutMessage
+									: completionError
+										? this.#redact(completionError.message)
+										: "Summary completion failed",
 								retryDelayMs,
 								provenance,
-								failedAttempt ? { attempt: failedAttempt, outcome: failureOutcome } : undefined,
+								acceptedAttempt ? { attempt: acceptedAttempt, outcome: failureOutcome } : undefined,
 							),
 						);
+						attachLateAttemptSettlement(leaseLost ? "lease_lost" : "aborted");
 						if (!failed) return { status: "stale", ...base };
 						terminal = true;
-						return { status: "provider_failed", ...base, retryAt: failureAt + retryDelayMs };
+						return { status: "provider_failed", ...base };
 					}
 					const dispatched = completion.attempt;
 					providerAttempt = dispatched;
@@ -1871,8 +2677,7 @@ export class SessionLcm {
 						);
 						const failed = await this.#enqueue(() =>
 							context.failSummaryJob(
-								job.jobId,
-								job.leaseToken,
+								lease,
 								"Summary completion returned no text",
 								retryDelayMs,
 								{
@@ -1886,7 +2691,7 @@ export class SessionLcm {
 						);
 						if (!failed) return { status: "stale", ...base };
 						terminal = true;
-						return { status: "provider_failed", ...base, retryAt: this.#now() + retryDelayMs };
+						return { status: "provider_failed", ...base };
 					}
 				}
 
@@ -1910,7 +2715,7 @@ export class SessionLcm {
 					strategy: job.strategy,
 				};
 				const result = await this.#enqueue(() =>
-					context.completeSummaryJob(job.jobId, job.leaseToken, {
+					context.completeSummaryJob(lease, {
 						redactedText,
 						provenance,
 						...(providerAttempt ? { attempt: providerAttempt } : {}),
@@ -1939,13 +2744,7 @@ export class SessionLcm {
 			jobController.abort("LCM summary completion settled");
 			if (storeFailed) outcome = { status: "store_failed", ...base, error: firstStoreError };
 			else if (leaseLost && !terminal) outcome = { status: "lease_lost", ...base };
-			if (!terminal) {
-				try {
-					await this.#enqueue(() => context.releaseSummaryJob(job.jobId, job.leaseToken));
-				} catch (error) {
-					recordStoreError(error);
-				}
-			}
+			await releaseLease();
 			if (storeFailed) outcome = { status: "store_failed", ...base, error: firstStoreError };
 		}
 		return outcome;
@@ -1956,7 +2755,7 @@ export class SessionLcm {
 		if (attempt !== this.#projectionAttempt) return { result: native };
 		const context = this.#context;
 		const branch = this.#activeBranch;
-		if (!context || !branch || this.#dirty) return { result: native, terminal: "store" };
+		if (!context || !branch || this.#dirty) return { result: native, terminal: { category: "store" } };
 		let projection = context.project({
 			...branch.snapshot.scope,
 			tokenBudget: limits.tokenBudget,
@@ -1975,7 +2774,7 @@ export class SessionLcm {
 			});
 		}
 		if (this.#currentBranch?.revision !== projection.revision) {
-			return { result: native, projection, terminal: "store" };
+			return { result: native, projection, terminal: { category: "store" } };
 		}
 		if (projection.pendingJobs > 0 && !this.#summaryRetryDeferred && !this.#summaryTask && !this.#summaryWakeTask) {
 			this.#startSummaryJobs();
@@ -1986,101 +2785,391 @@ export class SessionLcm {
 		}
 		if (!projection.ready || projection.uncoveredSourceIds.length > 0) {
 			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
+			return { result: native, projection, terminal: { category: "unfit", reason: "coverage_gap" } };
 		}
-
-		if (projection.historical.length === 0) {
-			if (!this.#host.projectionFits(messages)) {
-				this.#noteProjection(projection, false, attempt);
-				return { result: native, projection, terminal: "unfit" };
-			}
+		if (!hasExactProjectionCoverage(projection, branch.snapshot.entries)) {
+			this.#noteProjection(projection, false, attempt);
+			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
+		}
+		let measurementCount = 0;
+		const fitted = (projectedMessages: AgentMessage[], candidateTokens: number): ProjectionCheck => {
 			this.#noteProjection(projection, true, attempt);
-			return { result: { messages: messages as AgentMessage[], owned: true, projection }, projection };
+			return {
+				result: {
+					messages: projectedMessages,
+					owned: true,
+					projection,
+					candidateTokens,
+					messageTokenBudget: limits.tokenBudget,
+					projectionTokenMeasurements: measurementCount,
+				},
+				projection,
+				candidateTokens,
+				measurementCount,
+			};
+		};
+
+		const validMeasurement = (measurement: { tokens: number; upperBound: number }): boolean =>
+			Number.isSafeInteger(measurement.tokens) &&
+			measurement.tokens >= 0 &&
+			Number.isSafeInteger(measurement.upperBound) &&
+			measurement.upperBound >= measurement.tokens;
+		if (projection.historical.length === 0) {
+			measurementCount++;
+			const measurement = this.#host.projectionTokenMeasurements(messages);
+			if (!validMeasurement(measurement)) {
+				this.#noteProjection(projection, false, attempt);
+				return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+			}
+			if (measurement.tokens > limits.tokenBudget) {
+				this.#noteProjection(projection, false, attempt);
+				return {
+					result: native,
+					projection,
+					terminal: { category: "unfit", reason: "irreducible_input" },
+					candidateTokens: measurement.tokens,
+				};
+			}
+			return fitted(messages as AgentMessage[], measurement.tokens);
 		}
 
 		const firstUserSourceId = branch.firstUserSourceId;
 		if (!firstUserSourceId) {
 			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
+			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
 		}
 		const wanted = new Set(projection.freshTailSourceIds);
 		wanted.add(firstUserSourceId);
-		const projected: AgentMessage[] = [];
+		const requiredMessages: AgentMessage[] = [];
 		let firstUserIndex = -1;
 		let foundFresh = 0;
 		for (const item of branch.ordered) {
 			if (!wanted.has(item.source.entryId)) continue;
 			if (projection.freshTailSourceIds.includes(item.source.entryId)) foundFresh++;
-			if (item.source.entryId === firstUserSourceId) firstUserIndex = projected.length;
-			projected.push(item.message);
+			if (item.source.entryId === firstUserSourceId) firstUserIndex = requiredMessages.length;
+			requiredMessages.push(item.message);
 		}
 		if (foundFresh !== projection.freshTailSourceIds.length || firstUserIndex < 0) {
 			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
+			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
 		}
 
-		projected.push(...liveSuffix(messages, this.#host.sessionManager.buildSessionContext()));
-		const activeFinalUserIndex = projected.findLastIndex(message => message.role === "user");
-		if (activeFinalUserIndex <= firstUserIndex || projected[firstUserIndex + 1]?.role === "toolResult") {
+		requiredMessages.push(...liveSuffix(messages, this.#host.sessionManager.buildSessionContext()));
+		const activeFinalUserIndex = requiredMessages.findLastIndex(message => message.role === "user");
+		if (activeFinalUserIndex <= firstUserIndex || requiredMessages[firstUserIndex + 1]?.role === "toolResult") {
 			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
+			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
 		}
 
-		const citedContent = historicalText(projection, branch.snapshot.scope);
-		if (!citedContent) {
+		type Candidate = {
+			messages: AgentMessage[];
+			tokens: number;
+			upperBound: number;
+			retainedSummaryTextBytes: number;
+			summaryTextCap: number;
+		};
+		const firstUser = requiredMessages[firstUserIndex]!;
+		const measuredByRender = new Map<string, Candidate>();
+		let invalidMeasurement = false;
+		const measure = (
+			candidateMessages: AgentMessage[],
+			renderKey: string,
+			retainedSummaryTextBytes: number,
+			summaryTextCap: number,
+		): Candidate | undefined => {
+			const cached = measuredByRender.get(renderKey);
+			if (cached) return cached;
+			const measurement = this.#host.projectionTokenMeasurements(candidateMessages);
+			measurementCount++;
+			if (!validMeasurement(measurement)) {
+				invalidMeasurement = true;
+				return undefined;
+			}
+			const candidate = { ...measurement, messages: candidateMessages, retainedSummaryTextBytes, summaryTextCap };
+			measuredByRender.set(renderKey, candidate);
+			return candidate;
+		};
+		const render = (renderLimits?: HistoricalRenderLimits): Candidate | undefined => {
+			const citedContent = historicalText(projection, branch.snapshot.scope, renderLimits);
+			if (!citedContent) return undefined;
+			const cached = measuredByRender.get(citedContent);
+			if (cached) return cached;
+			const cap = renderLimits?.maxSummaryTextBytes;
+			const excerpts =
+				cap === undefined
+					? projection.historical.map(item => item.redactedText)
+					: historicalSummaryExcerpts(projection, cap);
+			const retainedSummaryTextBytes = excerpts.reduce(
+				(total, excerpt) => total + Buffer.byteLength(excerpt, "utf8"),
+				0,
+			);
+			const candidateMessages = requiredMessages.slice();
+			candidateMessages.splice(
+				firstUserIndex + 1,
+				0,
+				createHistoricalContextMessage({ redactedCitedContent: citedContent, timestamp: firstUser.timestamp }),
+			);
+			return measure(candidateMessages, citedContent, retainedSummaryTextBytes, cap ?? retainedSummaryTextBytes);
+		};
+		let fullRender: Candidate | undefined;
+		try {
+			const fullContent = historicalText(projection, branch.snapshot.scope);
+			if (!fullContent) throw new Error("empty historical render");
+			const fullHistorical = createHistoricalContextMessage({
+				redactedCitedContent: fullContent,
+				timestamp: firstUser.timestamp,
+			});
+			const fullMessages = requiredMessages.slice();
+			fullMessages.splice(firstUserIndex + 1, 0, fullHistorical);
+			const totalTextBytes = projection.historical.reduce(
+				(total, item) => total + Buffer.byteLength(item.redactedText, "utf8"),
+				0,
+			);
+			fullRender = measure(fullMessages, fullContent, totalTextBytes, totalTextBytes);
+			if (!fullRender || invalidMeasurement) {
+				this.#noteProjection(projection, false, attempt);
+				return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+			}
+			const fixedUpperBound = fullRender.upperBound - estimateLcmProjectionMessageTokenUpperBound(fullHistorical);
+			if (!Number.isSafeInteger(fixedUpperBound) || fixedUpperBound < 0) {
+				this.#noteProjection(projection, false, attempt);
+				return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+			}
+			const boundedHistoricalUpperBound = (maxSummaryTextBytes: number, maxFiles: number): number => {
+				const citedContent = historicalText(projection, branch.snapshot.scope, { maxSummaryTextBytes, maxFiles });
+				const historical = createHistoricalContextMessage({
+					redactedCitedContent: citedContent,
+					timestamp: firstUser.timestamp,
+				});
+				return fixedUpperBound + estimateLcmProjectionMessageTokenUpperBound(historical);
+			};
+			if (fullRender.tokens <= limits.tokenBudget) {
+				return fitted(fullRender.messages, fullRender.tokens);
+			}
+
+			let maxFiles = PROJECTED_FILES_TOTAL;
+			let zero: Candidate | undefined;
+			let minimumUpperBoundFits = false;
+			let minimumRepresentationTokens = 0;
+			for (let candidateMaxFiles = PROJECTED_FILES_TOTAL; candidateMaxFiles >= 0; candidateMaxFiles--) {
+				const fullText =
+					candidateMaxFiles === PROJECTED_FILES_TOTAL ? fullRender : render({ maxFiles: candidateMaxFiles });
+				if (!fullText || invalidMeasurement) {
+					this.#noteProjection(projection, false, attempt);
+					return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+				}
+				if (fullText.tokens <= limits.tokenBudget) {
+					return fitted(fullText.messages, fullText.tokens);
+				}
+
+				const upperBoundFits = boundedHistoricalUpperBound(0, candidateMaxFiles) <= limits.tokenBudget;
+				const candidate = render({ maxSummaryTextBytes: 0, maxFiles: candidateMaxFiles });
+				if (!candidate || invalidMeasurement) {
+					this.#noteProjection(projection, false, attempt);
+					return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+				}
+				minimumRepresentationTokens = candidate.tokens;
+				if (candidate.tokens <= limits.tokenBudget) {
+					maxFiles = candidateMaxFiles;
+					zero = candidate;
+					minimumUpperBoundFits = upperBoundFits;
+					break;
+				}
+				if (upperBoundFits) {
+					this.#noteProjection(projection, false, attempt);
+					return {
+						result: native,
+						projection,
+						terminal: { category: "unfit", reason: "fit_invariant" },
+						candidateTokens: candidate.tokens,
+					};
+				}
+			}
+
+			if (!zero) {
+				const required = measure(requiredMessages, "", 0, 0);
+				if (!required || invalidMeasurement) {
+					this.#noteProjection(projection, false, attempt);
+					return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+				}
+				const irreducible = required.tokens > limits.tokenBudget;
+				this.#noteProjection(projection, false, attempt);
+				return {
+					result: native,
+					projection,
+					terminal: {
+						category: "unfit",
+						reason: irreducible ? "irreducible_input" : "minimum_representation",
+					},
+					candidateTokens: irreducible ? required.tokens : minimumRepresentationTokens,
+				};
+			}
+
+			let best = zero;
+			const seenCaps = new Set<number>([0]);
+			const evaluateCap = (rawCap: number): void => {
+				const cap = Math.max(0, Math.min(totalTextBytes, Math.round(rawCap)));
+				if (seenCaps.has(cap)) return;
+				seenCaps.add(cap);
+				const candidate = render({ maxSummaryTextBytes: cap, maxFiles });
+				if (
+					candidate &&
+					candidate.tokens <= limits.tokenBudget &&
+					candidate.retainedSummaryTextBytes > best.retainedSummaryTextBytes
+				) {
+					best = candidate;
+				}
+			};
+
+			let conservativeSafeCap = 0;
+			if (minimumUpperBoundFits) {
+				let lower = 0;
+				let upper = totalTextBytes;
+				for (let step = 0; step < 53 && lower < upper; step++) {
+					const midpoint = lower + Math.ceil((upper - lower) / 2);
+					if (boundedHistoricalUpperBound(midpoint, maxFiles) <= limits.tokenBudget) lower = midpoint;
+					else upper = midpoint - 1;
+				}
+				conservativeSafeCap = lower;
+			}
+
+			evaluateCap(conservativeSafeCap);
+			const geometricSpan = totalTextBytes - conservativeSafeCap;
+			for (const fraction of PROJECTION_GEOMETRIC_FRACTIONS) {
+				evaluateCap(conservativeSafeCap + geometricSpan * fraction);
+			}
+			const refinementFloor = best.summaryTextCap;
+			const refinementSpan = totalTextBytes - refinementFloor;
+			for (let step = 1; step <= PROJECTION_FIT_REFINEMENT_COUNT; step++) {
+				evaluateCap(refinementFloor + (refinementSpan * step) / PROJECTION_FIT_REFINEMENT_COUNT);
+			}
+
+			if (invalidMeasurement || best.tokens > limits.tokenBudget) {
+				this.#noteProjection(projection, false, attempt);
+				return { result: native, projection, terminal: { category: "unfit", reason: "fit_invariant" } };
+			}
+			return fitted(best.messages, best.tokens);
+		} catch {
 			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
+			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
 		}
-		const firstUser = projected[firstUserIndex]!;
-		projected.splice(
-			firstUserIndex + 1,
-			0,
-			createHistoricalContextMessage({ redactedCitedContent: citedContent, timestamp: firstUser.timestamp }),
-		);
-		if (!this.#host.projectionFits(projected)) {
-			this.#noteProjection(projection, false, attempt);
-			return { result: native, projection, terminal: "unfit" };
-		}
-		this.#noteProjection(projection, true, attempt);
-		return { result: { messages: projected, owned: true, projection }, projection };
 	}
 
-	async #attemptProjection(messages: readonly AgentMessage[], signal?: AbortSignal): Promise<ProjectAttempt> {
+	async #attemptProjection(
+		messages: readonly AgentMessage[],
+		signal?: AbortSignal,
+		origin: "primary" | "maintenance" = "primary",
+		requestTokensFloor?: number,
+	): Promise<ProjectAttempt> {
 		const native: ProjectAttempt = { messages: messages as AgentMessage[], owned: false };
-		if (this.#disposed || signal?.aborted) return native;
+		const aborted = (): ProjectAttempt => ({ ...native, aborted: true });
+		if (this.#disposed || signal?.aborted) return aborted();
+		this.#syncSessionIdentity();
 		const attempt = ++this.#projectionAttempt;
 		const isCurrent = (): boolean => attempt === this.#projectionAttempt && !this.#disposed;
+		if (origin === "primary") this.#pendingPrimaryRoute = undefined;
+		const finish = (
+			result: ProjectAttempt,
+			route: LcmPrimaryRequestRoute,
+			scope?: LcmPrimaryRouteScope,
+		): ProjectAttempt => {
+			if (signal?.aborted || !isCurrent()) return origin === "maintenance" ? aborted() : result;
+			if (origin === "maintenance") {
+				return route.kind === "native_fallback"
+					? {
+							...result,
+							maintenanceFallback: {
+								category: route.category,
+								...(route.reason ? { reason: route.reason } : {}),
+							},
+						}
+					: result;
+			}
+			const routeKey = this.#stagePrimaryRoute(route, attempt, scope);
+			return routeKey ? { ...result, routeKey } : result;
+		};
 		this.#lastProjectionRequest = undefined;
 		this.#lastPressure = undefined;
 		this.#invalidateProjectionForRequest();
 		const limits = this.#host.projectionLimits(messages);
-		if (!limits) return native;
-		// The live request shrinks on every native compaction while the branch LCM must
-		// cover only grows, so arming reads whichever is larger. Ownership below still
-		// reads the live request, which is what actually overflows.
-		const armTokens = Math.max(limits.sourceTokens, this.#currentBranch?.sourceTokens ?? 0);
-		// Recorded before the arming gate so `/lcm status` can distinguish a deliberate
-		// stand-down from never having measured anything.
+		if (!limits) {
+			return finish(native, { kind: "native_passthrough", reason: "unavailable", metrics: this.#routeMetrics() });
+		}
+		const routeScopeSource = origin === "primary" ? this.#capturePrimaryRouteScopeSource(attempt) : undefined;
+		const requestTokens = Math.max(limits.sourceTokens, requestTokensFloor ?? 0);
+		const armTokens = Math.max(requestTokens, this.#currentBranch?.sourceTokens ?? 0);
 		this.#lastPressure = {
-			requestTokens: limits.sourceTokens,
+			requestTokens,
 			armTokens,
 			prewarmThresholdTokens: limits.prewarmThresholdTokens,
 			hardThresholdTokens: limits.hardThresholdTokens,
 		};
-		if (armTokens < limits.prewarmThresholdTokens) return native;
-		// Strictly greater, matching native `shouldCompact`: at exact equality native
-		// leaves the request alone, so blocking the turn for a projection would be waste.
-		const atHard = limits.sourceTokens > limits.hardThresholdTokens;
+		let routeScope: LcmPrimaryRouteScope | undefined = routeScopeSource
+			? {
+					projectId: routeScopeSource.project?.projectId ?? routeScopeSource.fallbackProjectId,
+					branchId: routeScopeSource.branchId,
+					inputAnchor: routeScopeSource.inputAnchor,
+				}
+			: undefined;
+		if (armTokens < limits.prewarmThresholdTokens) {
+			this.#coverageReadiness = "idle";
+			return finish(
+				native,
+				{
+					kind: "native_passthrough",
+					reason: "below_prewarm",
+					metrics: this.#routeMetrics(limits),
+				},
+				this.#withMatchingActiveRevision(routeScope),
+			);
+		}
+		const atHard = requestTokens > limits.hardThresholdTokens;
+		if (routeScopeSource) {
+			const resolved = await this.#resolvePrimaryRouteScope(routeScopeSource);
+			if (!isCurrent() || signal?.aborted || !this.#primaryRouteScopeSourceIsCurrent(routeScopeSource))
+				return native;
+			routeScope = resolved.scope;
+			if (resolved.error !== undefined) {
+				logger.warn("LCM project resolution failed; using native context", { error: errorLabel(resolved.error) });
+				const failure = { category: "store" } as const;
+				this.#failOpen(failure, attempt);
+				return finish(
+					native,
+					atHard
+						? { kind: "native_fallback", ...failure, metrics: this.#routeMetrics(limits) }
+						: { kind: "native_passthrough", reason: "below_hard", metrics: this.#routeMetrics(limits) },
+					routeScope,
+				);
+			}
+		}
 		if (limits.tokenBudget < 1 || limits.freshTail.maxSources < 1 || limits.freshTail.maxTokens < 1) {
-			if (atHard) this.#failOpen("unfit", attempt);
-			return native;
+			if (!atHard) {
+				return finish(
+					native,
+					{
+						kind: "native_passthrough",
+						reason: "below_hard",
+						metrics: this.#routeMetrics(limits),
+					},
+					this.#withMatchingActiveRevision(routeScope),
+				);
+			}
+			const failure = { category: "unfit", reason: "irreducible_input" } as const;
+			this.#failOpen(failure, attempt);
+			return finish(
+				native,
+				{
+					kind: "native_fallback",
+					...failure,
+					metrics: this.#routeMetrics(limits),
+				},
+				routeScope,
+			);
 		}
 
 		this.#summaryRetryDeferred = false;
 		this.#lastProjectionRequest = { limits, armTokens };
-		if (this.#runtimePhase !== "active") {
-			this.#runtimePhase = this.#hasPreferredHealthFailure() ? "degraded" : "warming";
-		}
+		if (this.#coverageReadiness !== "ready") this.#coverageReadiness = "warming";
 		const reconcile = this.#requestReconcile(true, {
 			tokenBudget: limits.tokenBudget,
 			freshTail: limits.freshTail,
@@ -2089,20 +3178,36 @@ export class SessionLcm {
 			void reconcile.catch(error => {
 				if (isCurrent()) logger.debug("LCM background reconcile failed", { error: errorLabel(error) });
 			});
-			return native;
+			// Preserve the pre-existing fire-and-forget head start after asynchronous scope capture.
+			await Promise.resolve();
+			if (!isCurrent() || signal?.aborted) return native;
+			return finish(
+				native,
+				{
+					kind: "native_passthrough",
+					reason: "below_hard",
+					metrics: this.#routeMetrics(limits),
+				},
+				this.#withMatchingActiveRevision(routeScope),
+			);
 		}
 
-		const deadline = this.#now() + this.#hardWaitMs;
 		try {
-			const reconciledWithinDeadline = await this.#waitWithinDeadline(reconcile, signal, deadline);
+			const reconciled = await untilAborted(signal, reconcile);
 			if (!isCurrent() || signal?.aborted) return native;
-			if (!reconciledWithinDeadline) {
-				this.#failOpen("deadline", attempt);
-				return native;
-			}
-			if (!(await reconcile)) {
-				if (isCurrent() && !signal?.aborted) this.#failOpen(this.#lastFailureCategory ?? "store", attempt);
-				return native;
+			if (!reconciled) {
+				if (!isCurrent() || signal?.aborted) return native;
+				const failure = this.#healthFailure ?? { category: "store" as const };
+				this.#failOpen(failure, attempt);
+				return finish(
+					native,
+					{
+						kind: "native_fallback",
+						...failure,
+						metrics: this.#routeMetrics(limits),
+					},
+					routeScope,
+				);
 			}
 			if (!isCurrent() || signal?.aborted) return native;
 
@@ -2111,58 +3216,201 @@ export class SessionLcm {
 				const settlement = this.#summaryProgressSignal.promise;
 				const check = await this.#enqueue(() => this.#projectCurrent(messages, limits, attempt));
 				if (!isCurrent()) return native;
-				if (check.result.owned) return check.result;
+				if (check.result.owned) {
+					return finish(
+						check.result,
+						{
+							kind: "lossless",
+							metrics: this.#routeMetrics(
+								limits,
+								check.projection,
+								check.candidateTokens,
+								check.measurementCount,
+							),
+						},
+						this.#withPrimaryRouteRevision(routeScope, check.projection?.revision),
+					);
+				}
 				if (check.terminal) {
 					this.#failOpen(check.terminal, attempt);
-					return native;
+					return finish(
+						check.result,
+						{
+							kind: "native_fallback",
+							...check.terminal,
+							metrics: this.#routeMetrics(limits, check.projection, check.candidateTokens),
+						},
+						this.#withPrimaryRouteRevision(routeScope, check.projection?.revision),
+					);
 				}
 				if (progressVersion !== this.#summaryProgressVersion) continue;
+				let failure: ProjectionFailure | undefined;
+				let availability: SummaryJobAvailability | undefined;
+				if (this.#summaryPolicyMismatch) {
+					failure = { category: "provider", reason: "provider_key_mismatch" };
+				} else if (check.projection && check.projection.pendingJobs > 0) {
+					availability = await this.#enqueue(() => {
+						const context = this.#context;
+						if (!context) return undefined;
+						const policy = this.#configureSummaryRetryPolicy(context);
+						return policy
+							? context.summaryJobAvailability(
+									{
+										...this.#activeBranch!.snapshot.scope,
+										tokenBudget: limits.tokenBudget,
+										freshTail: limits.freshTail,
+									},
+									policy,
+									SUMMARY_PROVIDER_RETRY_LIMIT,
+								)
+							: undefined;
+					});
+					if (!availability || availability.policyMismatch > 0) {
+						failure = { category: "provider", reason: "provider_key_mismatch" };
+					} else if (availability.exhausted > 0) {
+						failure = { category: "provider", reason: "provider_exhausted" };
+					} else if (availability.runnable > 0) {
+						this.#startSummaryJobs();
+					} else if (availability.backoff > 0 && availability.nextAvailableAt !== undefined) {
+						this.#scheduleSummaryWake(
+							this.#context!,
+							this.#generation,
+							availability.nextAvailableAt - this.#now(),
+						);
+					} else if (availability.leased === 0) {
+						failure = { category: "unfit", reason: "coverage_gap" };
+					}
+				} else {
+					failure = { category: "unfit", reason: "coverage_gap" };
+				}
+				if (failure) {
+					this.#failOpen(failure, attempt);
+					return finish(
+						native,
+						{ kind: "native_fallback", ...failure, metrics: this.#routeMetrics(limits, check.projection) },
+						this.#withPrimaryRouteRevision(routeScope, check.projection?.revision),
+					);
+				}
 				const background = this.#summaryTask ?? this.#summaryWakeTask;
-				if (!background) {
-					this.#failOpen(this.#lastFailureCategory ?? "unfit", attempt);
-					return native;
-				}
-				const progress = Promise.race([background, settlement, Bun.sleep(this.#peerPollMs)]);
-				const progressedWithinDeadline = await this.#waitWithinDeadline(progress, signal, deadline);
-				if (!isCurrent() || signal?.aborted) return native;
-				if (!progressedWithinDeadline) {
-					this.#failOpen(this.#lastFailureCategory === "provider" ? "provider" : "deadline", attempt);
-					return native;
-				}
+				const progress = Promise.race([
+					...(background ? [background] : []),
+					settlement,
+					Bun.sleep(this.#peerPollMs),
+				]);
+				await untilAborted(signal, progress);
 			}
 			return native;
 		} catch (error) {
 			if (!isCurrent() || signal?.aborted) return native;
 			logger.warn("LCM projection failed; using native context", { error: errorLabel(error) });
-			this.#failOpen("store", attempt);
-			return native;
+			const failure = { category: "store" } as const;
+			this.#failOpen(failure, attempt);
+			return finish(
+				native,
+				{
+					kind: "native_fallback",
+					...failure,
+					metrics: this.#routeMetrics(limits),
+				},
+				routeScope,
+			);
 		}
 	}
 
 	/** Project the primary provider request, or return the input unchanged on any unsafe state. */
 	async project(messages: AgentMessage[], signal?: AbortSignal): Promise<SessionLcmProjectResult> {
-		return this.#attemptProjection(messages, signal);
+		const intent = this.#nextPrimaryPressureIntent;
+		this.#nextPrimaryPressureIntent = undefined;
+		const requestTokensFloor =
+			intent?.generation === this.#generation &&
+			messages.length >= intent.baseMessageCount &&
+			intent.baseMessageFingerprint === primaryPressureFingerprint(messages, intent.baseMessageCount)
+				? intent.requestTokensFloor
+				: undefined;
+		const attempt = await this.#attemptProjection(messages, signal, "primary", requestTokensFloor);
+		return {
+			messages: attempt.messages,
+			owned: attempt.owned,
+			...(attempt.projection ? { projection: attempt.projection } : {}),
+			...(attempt.routeKey ? { routeKey: attempt.routeKey } : {}),
+			...(attempt.candidateTokens !== undefined ? { candidateTokens: attempt.candidateTokens } : {}),
+			...(attempt.messageTokenBudget !== undefined ? { messageTokenBudget: attempt.messageTokenBudget } : {}),
+			...(attempt.projectionTokenMeasurements !== undefined
+				? { projectionTokenMeasurements: attempt.projectionTokenMeasurements }
+				: {}),
+		};
 	}
 
-	/** Whether a ready, locally fitting Lossless projection owns this automatic maintenance request. */
-	async ownsRequest(messages: readonly AgentMessage[], signal?: AbortSignal): Promise<boolean> {
-		return (await this.#attemptProjection(messages, signal)).owned;
+	rearmPrimaryIntent(messages: readonly AgentMessage[], requestTokensFloor?: number): void {
+		const intent = this.#nextPrimaryPressureIntent;
+		const floor = requestTokensFloor ?? intent?.requestTokensFloor;
+		if (
+			this.#disposed ||
+			!intent ||
+			intent.generation !== this.#generation ||
+			typeof floor !== "number" ||
+			!Number.isSafeInteger(floor) ||
+			floor < 0
+		) {
+			return;
+		}
+		this.#nextPrimaryPressureIntent = {
+			generation: this.#generation,
+			baseMessageFingerprint: primaryPressureFingerprint(messages),
+			baseMessageCount: messages.length,
+			requestTokensFloor: floor,
+		};
+	}
+
+	/** Decide whether Lossless owns one automatic maintenance request. */
+	async ownsRequest(
+		messages: readonly AgentMessage[],
+		signal?: AbortSignal,
+		requestTokensFloor?: number,
+	): Promise<LcmOwnershipDecision> {
+		this.#nextPrimaryPressureIntent = undefined;
+		const generation = this.#generation;
+		const projectionAttempt = this.#projectionAttempt + 1;
+		const attempt = await this.#attemptProjection(messages, signal, "maintenance", requestTokensFloor);
+		if (
+			attempt.aborted ||
+			signal?.aborted ||
+			generation !== this.#generation ||
+			projectionAttempt !== this.#projectionAttempt
+		) {
+			return { kind: "aborted" };
+		}
+		if (attempt.owned && attempt.projection) {
+			this.#nextPrimaryPressureIntent = {
+				generation,
+				baseMessageFingerprint: primaryPressureFingerprint(messages),
+				baseMessageCount: messages.length,
+				requestTokensFloor: Math.max(0, requestTokensFloor ?? 0),
+			};
+			return { kind: "owned", projection: attempt.projection };
+		}
+		return {
+			kind: "native",
+			...(attempt.maintenanceFallback ? { fallback: attempt.maintenanceFallback } : {}),
+		};
 	}
 
 	/** Mark branch/cwd transitions dirty without opening or reconciling below the automatic threshold. */
 	async rebind(): Promise<void> {
 		if (this.#disposed) return;
+		this.#syncSessionIdentity();
 		this.#generation++;
 		this.#projectionAttempt++;
 		this.#dirty = true;
 		this.#summaryRestartRequested = false;
 		this.#deferReconcileUntilSummarySettles = false;
 		this.#summaryRetryDeferred = false;
-		this.#pendingFallbackCategory = undefined;
+		this.#nextPrimaryPressureIntent = undefined;
+		this.#pendingPrimaryRoute = undefined;
 		this.#preferredUnfit = false;
 		this.#lastProjectionRequest = undefined;
 		this.#lastPressure = undefined;
-		this.#runtimePhase = "idle";
+		this.#coverageReadiness = "idle";
 		this.#clearActiveBranch();
 		const drain = this.#summaryTask;
 		this.#summaryAbortController?.abort("LCM session binding changed");
@@ -2171,13 +3419,14 @@ export class SessionLcm {
 		try {
 			await drain;
 		} catch (error) {
-			this.#noteFailure("store");
+			this.#noteFailure({ category: "store" });
 			throw error;
 		}
 	}
 
 	async status(): Promise<LcmPublicStatus> {
 		const manager = this.#host.sessionManager;
+		this.#syncSessionIdentity();
 		const cwd = manager.getCwd();
 		const activeAnchor = branchAnchor(manager, manager.getBranch());
 		if (this.#dirty || !this.#context || this.#boundCwd !== cwd || this.#activeBranch?.anchor !== activeAnchor) {
@@ -2205,7 +3454,14 @@ export class SessionLcm {
 				storage: contextStatus.storage,
 				latestRecovery: contextStatus.latestRecovery,
 			};
-			if (store.quarantined) this.#runtimePhase = "quarantined";
+			if (store.quarantined) {
+				this.#runtimeHealth = "quarantined";
+				this.#coverageReadiness = undefined;
+			} else if (this.#runtimeHealth === "quarantined") {
+				this.#runtimeHealth = "healthy";
+				this.#coverageReadiness ??= "idle";
+				this.#restoreHealth();
+			}
 			return { runtime: this.#runtimeStatus(), store };
 		});
 	}
@@ -2223,6 +3479,8 @@ export class SessionLcm {
 			try {
 				const normalized = this.#normalizeActiveBranch(project);
 				const result = context.rebuild([normalized.snapshot]);
+				this.#summaryRetryPolicy = undefined;
+				this.#clearProviderDegradation(true);
 				const reconciled = context.reconcile(normalized.snapshot, { summarize: false });
 				this.#activateBranch(normalized, reconciled.revision);
 				this.#syncSummaryFailures(context);
@@ -2248,6 +3506,8 @@ export class SessionLcm {
 				const active = this.#normalizeActiveBranch(project);
 				const activeSnapshot = active.snapshot;
 				const result = context.rebuild(snapshots);
+				this.#summaryRetryPolicy = undefined;
+				this.#clearProviderDegradation(true);
 				const activeRebuilt = snapshots.some(
 					snapshot =>
 						snapshot.scope.sessionId === activeSnapshot.scope.sessionId &&
@@ -2280,6 +3540,32 @@ export class SessionLcm {
 	async purge(): Promise<PurgeResult | null> {
 		if (!(await this.#requestReconcile(true))) return null;
 		return this.#enqueue(() => this.#context?.purge() ?? null);
+	}
+
+	async retrySummaries(mode: "due" | "all" = "due"): Promise<SummaryJobAvailability | null> {
+		const messages = this.#host.sessionManager.buildSessionContext().messages;
+		const limits = this.#host.projectionLimits(messages);
+		if (!limits) return null;
+		if (!(await this.#requestReconcile(true, { tokenBudget: limits.tokenBudget, freshTail: limits.freshTail }))) {
+			return null;
+		}
+		const availability = await this.#enqueue(() => {
+			const context = this.#context;
+			const scope = this.#activeBranch?.snapshot.scope;
+			if (!context || !scope) return null;
+			const policy = this.#configureSummaryRetryPolicy(context);
+			if (!policy) return null;
+			const availability = context.retrySummaryJobs(
+				{ ...scope, tokenBudget: limits.tokenBudget, freshTail: limits.freshTail },
+				policy,
+				SUMMARY_PROVIDER_RETRY_LIMIT,
+				mode,
+			);
+			this.#syncSummaryFailures(context);
+			return availability;
+		});
+		if (availability?.runnable) this.#startSummaryJobs();
+		return availability;
 	}
 
 	async search(query: string, options: LcmSearchOptions = {}): Promise<SearchHit[]> {
@@ -2429,6 +3715,7 @@ export class SessionLcm {
 		this.#summaryRestartRequested = false;
 		this.#deferReconcileUntilSummarySettles = false;
 		this.#summaryRetryDeferred = false;
+		this.#nextPrimaryPressureIntent = undefined;
 		this.#unsubscribeDurableEntries?.();
 		this.#unsubscribeDurableEntries = undefined;
 		this.#summaryAbortController?.abort();

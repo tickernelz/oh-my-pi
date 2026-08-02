@@ -343,6 +343,104 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual(["xhigh", "max"]);
 	});
 
+	it("learns Chat Completions reasoning fallback without a second single-attempt request", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1
+					? invalidReasoningResponse("reasoning_effort", "xhigh")
+					: createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = () =>
+			streamOpenAICompletions(createCompletionsModel(), testContext, {
+				apiKey: "test-key",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning: "xhigh",
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = bodies.length;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "max"]);
+	});
+
+	it("learns Responses reasoning fallback without a second single-attempt request", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1
+					? invalidReasoningResponse("reasoning.effort", "xhigh")
+					: createResponsesSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = () =>
+			streamOpenAIResponses(createResponsesModel(), testContext, {
+				apiKey: "test-key",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning: "xhigh",
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = bodies.length;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual(["xhigh", "max"]);
+	});
+
+	it("learns Azure Responses reasoning fallback without a second single-attempt request", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1
+					? invalidReasoningResponse("reasoning.effort", "xhigh")
+					: createResponsesSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = () =>
+			streamAzureOpenAIResponses(createAzureResponsesModel(), testContext, {
+				apiKey: "test-key",
+				azureApiVersion: "v1",
+				azureBaseUrl: "https://azure.example.test/openai/v1",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning: "xhigh",
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = bodies.length;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual(["xhigh", "max"]);
+	});
+
 	it("does not retry unrelated reasoning parameter errors", async () => {
 		let attempts = 0;
 		const fetchMock: FetchImpl = Object.assign(

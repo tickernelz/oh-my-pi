@@ -3060,7 +3060,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal) => {
 			const projected = session ? await session.projectLcmContext(messages, signal) : messages;
-			return await sideTransformContext(projected, signal);
+			const transformed = await sideTransformContext(projected, signal);
+			return session ? session.bindPrimaryProviderRequestMessages(projected, transformed) : transformed;
 		};
 		// Per-request provider-context transforms. Obfuscate FIRST so secrets are
 		// redacted from text before snapcompact rasterizes it into PNG frames, then
@@ -3160,6 +3161,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			deadline: options.deadline,
 			transformContext,
 			transformProviderContext,
+			beforeProviderDispatch: (messages, signal) => {
+				session?.beginPrimaryProviderRequest(messages, signal);
+				if (!notifyFirstChatDispatch) return;
+				const cb = notifyFirstChatDispatch;
+				notifyFirstChatDispatch = undefined;
+				try {
+					cb();
+				} catch (err) {
+					logger.warn("onFirstChatDispatch hook threw", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			},
+			afterProviderResponse: (messages, response) => session?.completePrimaryProviderRequest(messages, response),
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
 			interruptMode: settings.get("interruptMode") ?? "immediate",
@@ -3175,21 +3190,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId)),
-			streamFn: (streamModel, context, streamOptions) => {
-				session?.beginPrimaryProviderRequest();
-				if (notifyFirstChatDispatch) {
-					const cb = notifyFirstChatDispatch;
-					notifyFirstChatDispatch = undefined;
-					try {
-						cb();
-					} catch (err) {
-						logger.warn("onFirstChatDispatch hook threw", {
-							error: err instanceof Error ? err.message : String(err),
-						});
-					}
-				}
-				return settingsAwareStreamFn(streamModel, context, streamOptions);
-			},
+			streamFn: settingsAwareStreamFn,
 			cursorExecHandlers,
 			getCursorTools: () => (toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
 			transformToolCallArguments,
@@ -3348,7 +3349,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				agentDir,
 				summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
 				maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
-				hardProjectionWaitMs: settings.get("context.lossless.hardProjectionWaitMs"),
 				leafChunkTokens: settings.get("context.lossless.leafChunkTokens"),
 				registerProject: async (project, journal) => {
 					await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);

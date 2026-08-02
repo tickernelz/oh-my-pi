@@ -6,6 +6,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
 import { encodeStream, formatError, parseRequest } from "@oh-my-pi/pi-ai/providers/pi-native-server";
 import type {
 	AssistantMessage,
@@ -256,6 +257,44 @@ describe("pi-native gateway cache controls", () => {
 				promptCacheKey: "bench-cache-pair",
 				statefulResponses: false,
 			});
+		} finally {
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
+	});
+
+	it("preserves single-attempt policy across one pi-native gateway wire call", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-retry-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.setRuntimeApiKey("openrouter", "test-key");
+		const mock = createMockModel({ provider: "openrouter", id: "pi-native-retry" });
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => mock,
+			version: "test",
+		});
+
+		try {
+			mock.push({ content: ["ok"] });
+			let gatewayWireCalls = 0;
+			const result = await streamPiNative({ ...mock, baseUrl: handle.url }, baseContext, {
+				apiKey: "test-token",
+				disableProviderRetries: true,
+				fetch: async (input, init) => {
+					gatewayWireCalls++;
+					return fetch(input, init);
+				},
+			}).result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(gatewayWireCalls).toBe(1);
+			expect(mock.calls).toHaveLength(1);
+			expect(mock.calls[0]?.options?.disableProviderRetries).toBe(true);
 		} finally {
 			await handle.close();
 			storage.close();

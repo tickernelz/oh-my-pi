@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
@@ -63,6 +63,7 @@ describe("post-compaction transcript reuse", () => {
 
 		const projection = {
 			revision: 1,
+			activeSourceFingerprint: activeSourceFingerprint(["source-a", "fresh"]),
 			ready: true,
 			historical: [
 				{

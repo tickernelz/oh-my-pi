@@ -19,6 +19,8 @@ import type {
 	SummaryProviderUsage,
 } from "@oh-my-pi/lcm-context";
 import {
+	estimateLcmProjectionMessageTokenUpperBound,
+	estimateLcmProjectionMessageTokens,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
@@ -46,7 +48,6 @@ const MIN_LEAF_JOBS = 16;
 const SOURCE_COUNT = MIN_LEAF_JOBS * 24 + 1;
 const DELAY_MS = envInteger("LCM_BACKLOG_DELAY_MS", 25, 0);
 const SAMPLES = envInteger("LCM_BACKLOG_SAMPLES", 5, 1);
-const HARD_WAIT_MS = Math.min(2_147_000_000, Math.max(30_000, (DELAY_MS + 1) * SOURCE_COUNT * 2));
 
 interface Stats {
 	medianMs: number;
@@ -187,11 +188,20 @@ async function runSample(
 				sourceTokens: SOURCE_COUNT * 100,
 				prewarmThresholdTokens: 1,
 				hardThresholdTokens: 1,
-				tokenBudget: 256,
+				tokenBudget: 60_000,
 				freshTail: { maxSources: 1, maxTokens: 128 },
 			}),
-			projectionFits: () => true,
 			complete,
+			resolveSummaryModel: () => "benchmark/fixed-delay",
+			projectionTokenMeasurements: messages => {
+				let tokens = 0;
+				let upperBound = 0;
+				for (const message of messages) {
+					tokens += estimateLcmProjectionMessageTokens(message);
+					upperBound += estimateLcmProjectionMessageTokenUpperBound(message);
+				}
+				return { tokens, upperBound };
+			},
 		},
 		{
 			summaryModel: "@smol",
@@ -202,7 +212,6 @@ async function runSample(
 					rootPath: projectRoot,
 					storePath,
 				}),
-				hardWaitMs: HARD_WAIT_MS,
 			},
 		},
 	);

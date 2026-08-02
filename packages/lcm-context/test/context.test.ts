@@ -5,11 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+	activeSourceFingerprint,
 	type ContextScope,
 	isLcmSqliteContentionError,
 	isLcmSqliteCorruptionError,
 	type LcmContext,
 	openLcmContext,
+	type ProjectionRequest,
 	type SearchHit,
 	type SourceEntry,
 	type SourceSnapshot,
@@ -22,6 +24,37 @@ import {
 } from "../src/schema";
 
 const MAIN: ContextScope = { projectId: "project", sessionId: "session", branchId: "main" };
+
+interface AvailabilityFixture {
+	request: ProjectionRequest;
+	spanCount: number;
+	parentSpanCount: number;
+}
+
+function retryClaimPolicy(context: LcmContext, projectId = MAIN.projectId) {
+	const policy = context.configureSummaryRetryPolicy(projectId, "test-provider/test-model");
+	return { retryKey: policy.retryKey, retryEpoch: policy.retryEpoch, maxTransportRetries: 5 };
+}
+
+function removeSchema10RetryAuthority(db: Database): void {
+	for (const trigger of [
+		"summary_jobs_authorized_insert",
+		"summary_jobs_authorized_update",
+		"summary_jobs_authorization_cleanup",
+	]) {
+		db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+	}
+	db.run("DROP TABLE IF EXISTS summary_retry_policies");
+	const columns = new Set(
+		db
+			.query<{ name: string }, []>("PRAGMA table_info(summary_jobs)")
+			.all()
+			.map(column => column.name),
+	);
+	for (const column of ["lease_mutation_nonce", "lease_policy_token", "retry_epoch"]) {
+		if (columns.has(column)) db.run(`ALTER TABLE summary_jobs DROP COLUMN ${column}`);
+	}
+}
 
 /**
  * The package takes no runtime dependency on a regex engine, so tests inject one.
@@ -82,13 +115,14 @@ function snapshot(scope: ContextScope, entries: readonly SourceEntry[]): SourceS
 function completeEveryJob(context: LcmContext): void {
 	for (let round = 0; round < 100; round++) {
 		const [job] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "summarizer",
 			leaseMs: 60_000,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
 		if (!job) return;
-		const result = context.completeSummaryJob(job.jobId, job.leaseToken, {
+		const result = context.completeSummaryJob(job, {
 			redactedText: `s${job.level}`,
 			tokenCount: 1,
 		});
@@ -355,19 +389,26 @@ describe("LCM context contracts", () => {
 		const migrationPath = path.join(tempDir, "v4.db");
 		const db = new Database(migrationPath);
 		try {
+			initializeLcmSchema(db, 1_000);
+			removeSchema10RetryAuthority(db);
+			db.run("DROP TRIGGER summaries_stable_handle_required");
+			db.run("DROP TRIGGER summaries_stable_handle_update_required");
+			db.run("DROP INDEX summaries_stable_handle");
+			db.run("DROP TABLE branch_summary_spans");
+			db.run("DROP TABLE summary_attempts");
+			db.run("DROP TABLE source_files");
+			db.run("DROP TABLE file_records");
+			db.run("ALTER TABLE summaries DROP COLUMN stable_handle");
 			db.run(
-				"CREATE TABLE summaries (summary_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, level INTEGER NOT NULL)",
+				`INSERT INTO source_contents
+					(source_key, project_id, content_hash, timestamp_ms, kind, redacted_text, artifact_refs, token_count, created_at)
+				 VALUES ('source-v4', 'project', 'hash-v4', 1, 'message', 'legacy source', '[]', 3, 1)`,
 			);
 			db.run(
-				"CREATE TABLE summary_children (summary_id TEXT NOT NULL, ordinal INTEGER NOT NULL, child_summary_id TEXT NOT NULL)",
+				`INSERT INTO summaries
+					(summary_id, project_id, input_hash, level, redacted_text, token_count, created_at)
+				 VALUES ('sum-v4', 'project', 'input-v4', 0, 'legacy summary', 3, 1)`,
 			);
-			db.run(
-				"CREATE TABLE summary_lineage (summary_id TEXT NOT NULL, ordinal INTEGER NOT NULL, source_key TEXT NOT NULL)",
-			);
-			db.run("CREATE TABLE summary_jobs (job_id TEXT PRIMARY KEY, status TEXT NOT NULL)");
-			db.run("CREATE TABLE job_inputs (job_id TEXT NOT NULL)");
-			db.run("CREATE TABLE job_lineage (job_id TEXT NOT NULL)");
-			db.run("INSERT INTO summaries (summary_id, project_id, level) VALUES ('sum-v4', 'project', 0)");
 			db.run("INSERT INTO summary_lineage (summary_id, ordinal, source_key) VALUES ('sum-v4', 0, 'source-v4')");
 			db.run("PRAGMA user_version = 4");
 
@@ -389,6 +430,7 @@ describe("LCM context contracts", () => {
 		const db = new Database(migrationPath);
 		try {
 			initializeLcmSchema(db, 1_000);
+			removeSchema10RetryAuthority(db);
 			db.run(
 				`INSERT INTO source_contents
 					(source_key, project_id, content_hash, timestamp_ms, kind, redacted_text, artifact_refs, token_count, created_at)
@@ -454,6 +496,7 @@ describe("LCM context contracts", () => {
 			// and legacy jobs keyed by unrelated hashes are not claimable yet.
 			expect(
 				migrated.claimSummaryJobs({
+					...retryClaimPolicy(migrated),
 					workerId: "migration-worker",
 					leaseMs: 1_000,
 					limit: 2,
@@ -466,6 +509,7 @@ describe("LCM context contracts", () => {
 			const source = entry(MAIN, "e1", "source text long enough to summarize");
 			expect(migrated.reconcile(snapshot(MAIN, [source]))).toMatchObject({ queuedJobs: 1 });
 			const claimed = migrated.claimSummaryJobs({
+				...retryClaimPolicy(migrated),
 				workerId: "migration-worker",
 				leaseMs: 1_000,
 				limit: 2,
@@ -493,6 +537,7 @@ describe("LCM context contracts", () => {
 		const db = new Database(migrationPath);
 		try {
 			initializeLcmSchema(db, 1_000);
+			removeSchema10RetryAuthority(db);
 			db.run("DROP TRIGGER summaries_stable_handle_required");
 			db.run("DROP TRIGGER summaries_stable_handle_update_required");
 			db.run("DROP INDEX summaries_stable_handle");
@@ -1504,13 +1549,14 @@ describe("LCM context contracts", () => {
 	test("successful completion removes duplicated job payload", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "source text long enough to summarize safely")]));
 		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 1_000,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
 		expect(claim).toBeDefined();
-		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "ok" })).toMatchObject({
+		expect(context.completeSummaryJob(claim!, { redactedText: "ok" })).toMatchObject({
 			accepted: true,
 		});
 		const observer = new Database(dbPath, { readonly: true, strict: true });
@@ -1534,6 +1580,7 @@ describe("LCM context contracts", () => {
 		const original = entry(MAIN, "e1", "original source text long enough to summarize");
 		context.reconcile(snapshot(MAIN, [original]));
 		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "first-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1541,7 +1588,7 @@ describe("LCM context contracts", () => {
 		});
 		expect(claim).toBeDefined();
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e2", "replacement source text long enough to summarize")]));
-		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "stale" })).toEqual({
+		expect(context.completeSummaryJob(claim!, { redactedText: "stale" })).toEqual({
 			accepted: false,
 			reason: "stale",
 		});
@@ -1563,6 +1610,7 @@ describe("LCM context contracts", () => {
 			observer.close();
 		}
 		const [requeued] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "second-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1572,7 +1620,7 @@ describe("LCM context contracts", () => {
 		});
 		expect(requeued?.jobId).toBe(claim!.jobId);
 		expect(requeued?.inputs[0]?.redactedText).toBe(original.redactedText);
-		expect(context.completeSummaryJob(requeued!.jobId, requeued!.leaseToken, { redactedText: "ok" })).toMatchObject({
+		expect(context.completeSummaryJob(requeued!, { redactedText: "ok" })).toMatchObject({
 			accepted: true,
 		});
 	});
@@ -1580,16 +1628,18 @@ describe("LCM context contracts", () => {
 	test("a failed completion remains durably retryable without corrupting committed sources", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "durable source")]));
 		const [crashed] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "crashing-worker",
 			leaseMs: 1_000,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
 		expect(crashed).toBeDefined();
-		expect(context.failSummaryJob(crashed!.jobId, crashed!.leaseToken, "CompletionError", 50)).toBe(true);
+		expect(context.failSummaryJob(crashed!, "CompletionError", 50)).toBe(true);
 		expect(context.status().jobs.failed).toBe(1);
 		now += 50;
 		const retried = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "replacement-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1604,6 +1654,7 @@ describe("LCM context contracts", () => {
 			snapshot(MAIN, [entry(MAIN, "e1", "durable source survives an abandoned completion worker restart")]),
 		);
 		const [abandoned] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "departed-worker",
 			leaseMs: 100,
 			limit: 1,
@@ -1620,6 +1671,7 @@ describe("LCM context contracts", () => {
 			now: () => now,
 		});
 		const [reclaimed] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "replacement-worker",
 			leaseMs: 100,
 			limit: 1,
@@ -1634,7 +1686,56 @@ describe("LCM context contracts", () => {
 		).toEqual(["e1"]);
 	});
 
-	test("projection covers each source at most once and preserves branch order", async () => {
+	test("unchanged reconcile policy is write-free and one policy change updates one row", () => {
+		const sources = [entry(MAIN, "policy-1", "policy source")];
+		const summarize = { tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		context.reconcile(snapshot(MAIN, sources), { summarize });
+		const baseline = context.status().performance?.reconcileRowsChanged;
+		expect(baseline).toBeDefined();
+
+		context.reconcile(snapshot(MAIN, sources), { summarize });
+		expect(context.status().performance?.reconcileRowsChanged).toBe(baseline);
+
+		context.reconcile(snapshot(MAIN, sources), {
+			summarize: { ...summarize, freshTail: { ...summarize.freshTail, maxTokens: 101 } },
+		});
+		expect(context.status().performance?.reconcileRowsChanged).toBe(baseline! + 1);
+	});
+
+	test("empty projection has the canonical active-source fingerprint", () => {
+		const projection = context.project({
+			...MAIN,
+			branchId: "missing",
+			tokenBudget: 100,
+			freshTail: { maxSources: 1, maxTokens: 100 },
+		});
+		expect(projection).toMatchObject({
+			ready: true,
+			historical: [],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: [],
+			activeSourceFingerprint: "7e4e64063bdbd631e20e792ad8b273c6a28859d6434a7ff6368e368e02cb41dd",
+		});
+	});
+
+	test("active-source fingerprint preserves Unicode UTF-8 length framing", () => {
+		const sourceIds = ["ascii", "é", "東京", "😀", "e\u0301"];
+		const hasher = new Bun.CryptoHasher("sha256");
+		const encoder = new TextEncoder();
+		const length = new Uint8Array(4);
+		for (const value of ["lcm-active-source-fingerprint-v1", ...sourceIds]) {
+			const bytes = encoder.encode(value);
+			length[0] = bytes.byteLength >>> 24;
+			length[1] = bytes.byteLength >>> 16;
+			length[2] = bytes.byteLength >>> 8;
+			length[3] = bytes.byteLength;
+			hasher.update(length);
+			hasher.update(bytes);
+		}
+		expect(activeSourceFingerprint(sourceIds)).toBe(hasher.digest("hex"));
+	});
+
+	test("projection proves each active source exactly once in branch order", async () => {
 		const sources = [
 			entry(MAIN, "e1", "one"),
 			entry(MAIN, "e2", "two", "e1"),
@@ -1653,13 +1754,84 @@ describe("LCM context contracts", () => {
 		expect(projection.ready).toBe(true);
 		expect(covered).toEqual(["e1", "e2", "e3", "e4", "e5"]);
 		expect(new Set(covered).size).toBe(covered.length);
-		expect(projection.estimatedTokens).toBeLessThanOrEqual(100);
+		expect(projection.activeSourceFingerprint).toBe(
+			"f51cd95960048a52c03f683bc313b86566d41843c20473951496b118ca4be4e6",
+		);
+		expect(
+			context.project({ ...MAIN, tokenBudget: 5, freshTail: { maxSources: 5, maxTokens: 5 } })
+				.activeSourceFingerprint,
+		).toBe(projection.activeSourceFingerprint);
+
+		const reordered = [
+			entry(MAIN, "e1", "one"),
+			entry(MAIN, "e3", "three", "e1"),
+			entry(MAIN, "e2", "two", "e3"),
+			entry(MAIN, "e4", "four", "e2"),
+			entry(MAIN, "e5", "five", "e4"),
+		];
+		context.reconcile(snapshot(MAIN, reordered), { summarize: false });
+		const reorderedProjection = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 5, maxTokens: 100 },
+		});
+		expect(reorderedProjection.activeSourceFingerprint).toBe(
+			"b7e6ada60580ecbfb33769f6814866fffb8bc4a2011e87f5f1b1cf40e735fb4b",
+		);
+		expect(reorderedProjection.activeSourceFingerprint).not.toBe(projection.activeSourceFingerprint);
+	});
+
+	test("projection keeps the complete canonical frontier beyond the token target", () => {
+		const sources = [
+			entry(MAIN, "budget-1", "first historical source long enough for a three token summary"),
+			entry(MAIN, "budget-2", "second historical source long enough for a three token summary", "budget-1"),
+			entry(MAIN, "budget-3", "third historical source long enough for a three token summary", "budget-2"),
+			entry(MAIN, "budget-4", "fourth historical source long enough for a three token summary", "budget-3"),
+			entry(MAIN, "budget-5", "tail x", "budget-4"),
+		];
+		context.reconcile(snapshot(MAIN, sources));
+		let completed = 0;
+		for (;;) {
+			const [job] = context.claimSummaryJobs({
+				...retryClaimPolicy(context),
+				workerId: "coverage-worker",
+				leaseMs: 60_000,
+				limit: 1,
+				maxOutputTokens: 100,
+			});
+			if (!job) break;
+			const tokenCount = job.level === 1 ? 5 : job.sourceCount === 1 ? 1 : 3;
+			expect(
+				context.completeSummaryJob(job, {
+					redactedText: "x",
+					tokenCount,
+				}),
+			).toMatchObject({ accepted: true });
+			completed++;
+		}
+		expect(completed).toBe(4);
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 5,
+			freshTail: { maxSources: 1, maxTokens: 5 },
+		});
+		expect(projection).toMatchObject({
+			ready: true,
+			uncoveredSourceIds: [],
+			freshTailSourceIds: ["budget-5"],
+			selectedLevelCounts: { 1: 1 },
+		});
+		expect(projection.historical).toHaveLength(1);
+		expect(projection.historical[0]?.sourceIds).toEqual(["budget-1", "budget-2", "budget-3", "budget-4"]);
+		expect(projection.estimatedTokens).toBeGreaterThan(5);
 	});
 
 	test("summary expansion cites each repeated source-key occurrence in branch order", async () => {
 		const first = entry(MAIN, "e1", "identical source content long enough to produce one useful leaf summary");
 		const second = { ...first, entryId: "e2", parentId: first.entryId };
-		context.reconcile(snapshot(MAIN, [first, second]));
+		const fresh = entry(MAIN, "e3", "fresh tail", second.entryId);
+		context.reconcile(snapshot(MAIN, [first, second, fresh]));
 		completeEveryJob(context);
 
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
@@ -1677,7 +1849,7 @@ describe("LCM context contracts", () => {
 		]);
 	});
 
-	test("fresh-tail cut includes an assistant and every parallel tool result as one atomic closure", async () => {
+	test("fresh-tail cut never splits an assistant and its parallel tool results", async () => {
 		const sources = [
 			entry(MAIN, "e1", "older context that can be summarized before the active tool turn"),
 			{ ...entry(MAIN, "e2", "assistant issued two parallel tool calls", "e1", "tool-turn"), kind: "assistant" },
@@ -1690,10 +1862,55 @@ describe("LCM context contracts", () => {
 
 		const projection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 2, maxTokens: 100 } });
 		const historicalIds = projection.historical.flatMap(item => item.sourceIds);
-		expect(projection.freshTailSourceIds).toEqual(["e2", "e3", "e4", "e5"]);
-		expect(historicalIds).toEqual(["e1"]);
+		expect(projection.freshTailSourceIds).toEqual(["e5"]);
+		expect(historicalIds).toEqual(["e1", "e2", "e3", "e4"]);
 		expect([...historicalIds, ...projection.freshTailSourceIds]).toEqual(sources.map(source => source.entryId));
 		expect(historicalIds.filter(sourceId => projection.freshTailSourceIds.includes(sourceId))).toEqual([]);
+	});
+
+	test("fresh tail always includes an oversized newest atomic unit", () => {
+		const sources = [
+			entry(MAIN, "tail-old", "older source"),
+			entry(MAIN, "tail-new-1", "oversized newest assistant", "tail-old", "newest-turn"),
+			entry(MAIN, "tail-new-2", "oversized newest tool result", "tail-new-1", "newest-turn"),
+		];
+		context.reconcile(snapshot(MAIN, sources), { summarize: false });
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 1,
+			freshTail: { maxSources: 1, maxTokens: 1 },
+		});
+		expect(projection.freshTailSourceIds).toEqual(["tail-new-1", "tail-new-2"]);
+		expect(projection.uncoveredSourceIds).toEqual(["tail-old"]);
+	});
+
+	test("fresh tail counts the newest source against the source target", () => {
+		const sources = [
+			entry(MAIN, "source-old", "old"),
+			entry(MAIN, "source-middle", "middle", "source-old"),
+			entry(MAIN, "source-new", "new", "source-middle"),
+		];
+		const summarize = { tokenBudget: 100, freshTail: { maxSources: 2, maxTokens: 100 } };
+
+		expect(context.reconcile(snapshot(MAIN, sources), { summarize })).toMatchObject({ queuedJobs: 1 });
+		const projection = context.project({ ...MAIN, ...summarize });
+		expect(projection.freshTailSourceIds).toEqual(["source-middle", "source-new"]);
+		expect(projection.uncoveredSourceIds).toEqual(["source-old"]);
+	});
+
+	test("fresh tail counts the newest tokens against the token target", () => {
+		const sources = [
+			entry(MAIN, "token-old", "12345678"),
+			entry(MAIN, "token-middle", "abcdefgh", "token-old"),
+			entry(MAIN, "token-new", "ABCDEFGH", "token-middle"),
+		];
+		const summarize = { tokenBudget: 100, freshTail: { maxSources: 10, maxTokens: 4 } };
+
+		expect(context.reconcile(snapshot(MAIN, sources), { summarize })).toMatchObject({ queuedJobs: 1 });
+		const projection = context.project({ ...MAIN, ...summarize });
+		expect(projection.freshTailSourceIds).toEqual(["token-middle", "token-new"]);
+		expect(projection.uncoveredSourceIds).toEqual(["token-old"]);
 	});
 
 	test("branches stay isolated while identical source prefixes reuse summaries", async () => {
@@ -1719,8 +1936,88 @@ describe("LCM context contracts", () => {
 
 		const mainProjection = context.project({ ...MAIN, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
 		const forkProjection = context.project({ ...fork, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
-		expect(mainProjection.historical.flatMap(item => item.sourceIds)).toEqual(["e1", "e2", "e3", "e4"]);
-		expect(forkProjection.historical.flatMap(item => item.sourceIds)).toEqual(["e1", "e2", "f3", "f4"]);
+		expect([
+			...mainProjection.historical.flatMap(item => item.sourceIds),
+			...mainProjection.freshTailSourceIds,
+		]).toEqual(["e1", "e2", "e3", "e4"]);
+		expect([
+			...forkProjection.historical.flatMap(item => item.sourceIds),
+			...forkProjection.freshTailSourceIds,
+		]).toEqual(["e1", "e2", "f3", "f4"]);
+		expect(mainProjection.freshTailSourceIds).toEqual(["e3", "e4"]);
+		expect(forkProjection.freshTailSourceIds).toEqual(["f3", "f4"]);
+	});
+
+	test("projection frontier and fingerprint come from one SQLite read snapshot", async () => {
+		const original = [
+			entry(MAIN, "snap-old-1", "old source one long enough to summarize"),
+			entry(MAIN, "snap-old-2", "old source two long enough to summarize", "snap-old-1"),
+			entry(MAIN, "snap-old-3", "old source three long enough to summarize", "snap-old-2"),
+		];
+		const replacement = [
+			entry(MAIN, "snap-new-1", "new source one"),
+			entry(MAIN, "snap-new-2", "new source two", "snap-new-1"),
+			entry(MAIN, "snap-new-3", "new source three", "snap-new-2"),
+		];
+		context.reconcile(snapshot(MAIN, original));
+		completeEveryJob(context);
+		const writer = await openLcmContext({ dbPath, now: () => now });
+		const realQuery = Database.prototype.query;
+		let injected = false;
+		const queryImplementation = function (this: Database, sql: string): unknown {
+			const statement = Reflect.apply(realQuery, this, [sql]) as object & {
+				all: (...bindings: unknown[]) => unknown[];
+			};
+			if (injected || !sql.includes("JOIN source_contents sc") || !sql.includes("ORDER BY bs.position")) {
+				return statement;
+			}
+			const all = statement.all.bind(statement);
+			return new Proxy(statement, {
+				get(target, property) {
+					if (property !== "all") return Reflect.get(target, property, target);
+					return (...bindings: unknown[]) => {
+						const rows = all(...bindings);
+						injected = true;
+						expect(writer.reconcile(snapshot(MAIN, replacement), { summarize: false }).changed).toBe(true);
+						return rows;
+					};
+				},
+			});
+		} as unknown as typeof Database.prototype.query;
+		const querySpy = spyOn(Database.prototype, "query").mockImplementation(queryImplementation);
+		try {
+			const duringWrite = context.project({
+				...MAIN,
+				tokenBudget: 100,
+				freshTail: { maxSources: 0, maxTokens: 0 },
+			});
+			expect(injected).toBe(true);
+			expect(duringWrite).toMatchObject({
+				revision: 1,
+				ready: true,
+				uncoveredSourceIds: [],
+				freshTailSourceIds: ["snap-old-3"],
+				activeSourceFingerprint: "9e30d3b69de5056091117b7512a363d24488f4ff4760b42cca0fd4061fdfaab8",
+			});
+			expect(duringWrite.historical.flatMap(item => item.sourceIds)).toEqual(["snap-old-1", "snap-old-2"]);
+		} finally {
+			querySpy.mockRestore();
+			writer.close();
+		}
+
+		const afterWrite = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 3, maxTokens: 100 },
+		});
+		expect(afterWrite).toMatchObject({
+			revision: 2,
+			ready: true,
+			historical: [],
+			freshTailSourceIds: ["snap-new-1", "snap-new-2", "snap-new-3"],
+			uncoveredSourceIds: [],
+			activeSourceFingerprint: "6c02b8c7c700169ff070f919299f253badebcb4cec9daf91471b67e4260f9777",
+		});
 	});
 
 	test("shared summaries never cross a different branch's atomic boundaries", async () => {
@@ -1740,7 +2037,7 @@ describe("LCM context contracts", () => {
 				entry(fork, "e3", mainSources[2]!.redactedText, "e2", "fork-tool-turn"),
 			]),
 		);
-		const projection = context.project({ ...fork, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } });
+		const projection = context.project({ ...fork, tokenBudget: 100, freshTail: { maxSources: 0, maxTokens: 0 } });
 		expect(projection.freshTailSourceIds).toEqual(["e2", "e3"]);
 		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual([]);
 		expect(projection.uncoveredSourceIds).toEqual(["e1"]);
@@ -1773,6 +2070,7 @@ describe("LCM context contracts", () => {
 		).toBe(0);
 
 		const [preferred] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "main-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1782,7 +2080,7 @@ describe("LCM context contracts", () => {
 		});
 		expect(preferred?.queueClass).toBe("preferred");
 		expect(
-			context.completeSummaryJob(preferred!.jobId, preferred!.leaseToken, {
+			context.completeSummaryJob(preferred!, {
 				redactedText: "main summary",
 				tokenCount: 1,
 			}),
@@ -1802,6 +2100,7 @@ describe("LCM context contracts", () => {
 		context.reconcile(snapshot(fork, [entry(fork, "f1", "fallback branch work long enough to summarize")]));
 
 		const preferredOnly = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "preferred-only",
 			leaseMs: 1_000,
 			limit: 2,
@@ -1811,9 +2110,10 @@ describe("LCM context contracts", () => {
 		});
 		expect(preferredOnly).toHaveLength(1);
 		expect(preferredOnly[0]?.queueClass).toBe("preferred");
-		expect(context.releaseSummaryJob(preferredOnly[0]!.jobId, preferredOnly[0]!.leaseToken)).toBe(true);
+		expect(context.releaseSummaryJob(preferredOnly[0]!)).toBe(true);
 
 		const mixed = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "mixed",
 			leaseMs: 1_000,
 			limit: 2,
@@ -1839,6 +2139,7 @@ describe("LCM context contracts", () => {
 		);
 		expect(
 			context.claimSummaryJobs({
+				...retryClaimPolicy(context),
 				workerId: "preferred-only",
 				leaseMs: 1_000,
 				limit: 1,
@@ -1848,6 +2149,7 @@ describe("LCM context contracts", () => {
 			}),
 		).toEqual([]);
 		const [fallback] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "fallback-allowed",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1863,6 +2165,7 @@ describe("LCM context contracts", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "p1", "preferred failure input long enough to summarize")]));
 		context.reconcile(snapshot(fork, [entry(fork, "f1", "fallback failure input long enough to summarize")]));
 		const [preferred] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "preferred-failure",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1870,8 +2173,9 @@ describe("LCM context contracts", () => {
 			preferredScope: MAIN,
 			allowFallback: false,
 		});
-		expect(context.failSummaryJob(preferred!.jobId, preferred!.leaseToken, "ProviderError", 100)).toBe(true);
+		expect(context.failSummaryJob(preferred!, "ProviderError", 100)).toBe(true);
 		const [fallback] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "fallback-failure",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1880,7 +2184,7 @@ describe("LCM context contracts", () => {
 			allowFallback: true,
 		});
 		expect(fallback?.queueClass).toBe("fallback");
-		expect(context.failSummaryJob(fallback!.jobId, fallback!.leaseToken, "ProviderError", 0)).toBe(true);
+		expect(context.failSummaryJob(fallback!, "ProviderError", 0)).toBe(true);
 
 		context.close();
 		context = await openLcmContext({
@@ -1890,20 +2194,22 @@ describe("LCM context contracts", () => {
 			tombstoneRetentionMs: 100,
 			now: () => now,
 		});
-		const failures = context.summaryJobFailures(MAIN);
+		const retryPolicy = retryClaimPolicy(context);
+		const failures = context.summaryJobFailures(retryPolicy, retryPolicy.maxTransportRetries, MAIN);
 		expect(failures.find(failure => failure.queueClass === "preferred")).toMatchObject({
 			jobId: preferred!.jobId,
 			availableAt: now + 100,
 		});
 		expect(failures.find(failure => failure.queueClass === "fallback")).toMatchObject({
 			jobId: fallback!.jobId,
-			availableAt: now,
+			availableAt: now + 1,
 		});
-		expect(context.nextSummaryJobDelayMs(MAIN, false)).toBe(100);
-		expect(context.nextSummaryJobDelayMs(MAIN, true)).toBe(0);
+		expect(context.nextSummaryJobDelayMs(retryPolicy, retryPolicy.maxTransportRetries, MAIN, false)).toBe(100);
+		expect(context.nextSummaryJobDelayMs(retryPolicy, retryPolicy.maxTransportRetries, MAIN, true)).toBe(1);
 
 		now += 100;
 		const [retry] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "preferred-retry",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1911,25 +2217,27 @@ describe("LCM context contracts", () => {
 			preferredScope: MAIN,
 			allowFallback: false,
 		});
-		expect(
-			context.completeSummaryJob(retry!.jobId, retry!.leaseToken, { redactedText: "recovered", tokenCount: 1 }),
-		).toMatchObject({ accepted: true });
-		expect(context.summaryJobFailures(MAIN)).toEqual([
-			{ jobId: fallback!.jobId, availableAt: now - 100, queueClass: "fallback" },
+		expect(context.completeSummaryJob(retry!, { redactedText: "recovered", tokenCount: 1 })).toMatchObject({
+			accepted: true,
+		});
+		expect(context.summaryJobFailures(retryPolicy, retryPolicy.maxTransportRetries, MAIN)).toEqual([
+			{ jobId: fallback!.jobId, availableAt: now - 99, queueClass: "fallback" },
 		]);
 	});
 
 	test("release accepts an expired matching token but rejects a replaced owner", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "release input long enough to summarize")]));
 		const [expired] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker-a",
 			leaseMs: 100,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
 		now += 101;
-		expect(context.releaseSummaryJob(expired!.jobId, expired!.leaseToken)).toBe(true);
+		expect(context.releaseSummaryJob(expired!)).toBe(true);
 		const [replaced] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker-b",
 			leaseMs: 100,
 			limit: 1,
@@ -1937,27 +2245,41 @@ describe("LCM context contracts", () => {
 		});
 		now += 101;
 		const [owner] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker-c",
 			leaseMs: 100,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
 		expect(owner?.leaseToken).not.toBe(replaced?.leaseToken);
-		expect(context.releaseSummaryJob(replaced!.jobId, replaced!.leaseToken)).toBe(false);
-		expect(context.releaseSummaryJob(owner!.jobId, owner!.leaseToken)).toBe(true);
+		expect(context.releaseSummaryJob(replaced!)).toBe(false);
+		expect(context.releaseSummaryJob(owner!)).toBe(true);
 		expect(context.status().jobs.pending).toBe(1);
 	});
 
 	test("leases are exclusive, reclaimable, and reject an expired owner's result", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "lease input")]));
-		const first = context.claimSummaryJobs({ workerId: "worker-a", leaseMs: 100, limit: 1, maxOutputTokens: 100 });
+		const first = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
+			workerId: "worker-a",
+			leaseMs: 100,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
 		expect(first).toHaveLength(1);
-		expect(context.claimSummaryJobs({ workerId: "worker-b", leaseMs: 100, limit: 1, maxOutputTokens: 100 })).toEqual(
-			[],
-		);
+		expect(
+			context.claimSummaryJobs({
+				...retryClaimPolicy(context),
+				workerId: "worker-b",
+				leaseMs: 100,
+				limit: 1,
+				maxOutputTokens: 100,
+			}),
+		).toEqual([]);
 
 		now += 101;
 		const replacement = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker-b",
 			leaseMs: 100,
 			limit: 1,
@@ -1965,13 +2287,13 @@ describe("LCM context contracts", () => {
 		});
 		expect(replacement).toHaveLength(1);
 		expect(replacement[0]?.leaseToken).not.toBe(first[0]?.leaseToken);
-		expect(context.completeSummaryJob(first[0]!.jobId, first[0]!.leaseToken, { redactedText: "late" })).toEqual({
+		expect(context.completeSummaryJob(first[0]!, { redactedText: "late" })).toEqual({
 			accepted: false,
 			reason: "lease_lost",
 		});
-		expect(
-			context.completeSummaryJob(replacement[0]!.jobId, replacement[0]!.leaseToken, { redactedText: "accepted" }),
-		).toMatchObject({ accepted: true });
+		expect(context.completeSummaryJob(replacement[0]!, { redactedText: "accepted" })).toMatchObject({
+			accepted: true,
+		});
 	});
 
 	test("completion rejects forged token counts and non-compressing output, then remains retryable", () => {
@@ -1979,6 +2301,7 @@ describe("LCM context contracts", () => {
 			"this source is intentionally long so returning it unchanged cannot be mistaken for compression";
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", sourceText)]));
 		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -1987,9 +2310,7 @@ describe("LCM context contracts", () => {
 		expect(claim?.inputTokenCount).toBeGreaterThan(claim?.outputTokenBudget ?? 0);
 		// The nominal cap is a floor now: the ratio-derived budget wins when it is larger.
 		expect(claim?.outputTokenBudget).toBe(Math.ceil(claim!.inputTokenCount / 2));
-		expect(
-			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: sourceText, tokenCount: 1 }),
-		).toEqual({
+		expect(context.completeSummaryJob(claim!, { redactedText: sourceText, tokenCount: 1 })).toEqual({
 			accepted: false,
 			reason: "escalated",
 			stage: "aggressive",
@@ -1997,14 +2318,14 @@ describe("LCM context contracts", () => {
 		expect(context.status().jobs.pending).toBe(1);
 
 		const [retry] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "replacement",
 			leaseMs: 1_000,
 			limit: 1,
 			maxOutputTokens: 2,
 		});
-		expect(
-			context.completeSummaryJob(retry!.jobId, retry!.leaseToken, { redactedText: "ok", tokenCount: 1 }),
-		).toMatchObject({
+		expect(retry?.transportRetryCount).toBe(0);
+		expect(context.completeSummaryJob(retry!, { redactedText: "ok", tokenCount: 1 })).toMatchObject({
 			accepted: true,
 		});
 	});
@@ -2013,6 +2334,7 @@ describe("LCM context contracts", () => {
 		// ceil(19388/4) = 4847 estimated tokens in one leaf.
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
 		const [normal] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
@@ -2021,35 +2343,59 @@ describe("LCM context contracts", () => {
 		expect(normal?.inputTokenCount).toBe(4_847);
 		expect(normal?.outputTokenBudget).toBe(2_424);
 		// 3,200 estimated tokens compresses the input but clears ceil(2424 * 1.3) = 3152.
-		expect(
-			context.completeSummaryJob(normal!.jobId, normal!.leaseToken, { redactedText: "y".repeat(12_800) }),
-		).toEqual({ accepted: false, reason: "escalated", stage: "aggressive" });
+		expect(context.completeSummaryJob(normal!, { redactedText: "y".repeat(12_800) })).toEqual({
+			accepted: false,
+			reason: "escalated",
+			stage: "aggressive",
+		});
 
 		const [aggressive] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
 			maxOutputTokens: 2_048,
 		});
 		expect(aggressive?.outputTokenBudget).toBe(1_212);
-		expect(
-			context.completeSummaryJob(aggressive!.jobId, aggressive!.leaseToken, { redactedText: "y".repeat(8_000) }),
-		).toEqual({ accepted: false, reason: "escalated", stage: "deterministic" });
+		expect(context.completeSummaryJob(aggressive!, { redactedText: "y".repeat(8_000) })).toEqual({
+			accepted: false,
+			reason: "escalated",
+			stage: "deterministic",
+		});
 
 		// Deterministic keeps the aggressive budget instead of collapsing to 512.
 		const [deterministic] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
 			maxOutputTokens: 2_048,
 		});
 		expect(deterministic?.outputTokenBudget).toBe(1_212);
+		expect(deterministic?.transportRetryCount).toBe(0);
+		expect(context.completeSummaryJob(deterministic!, { redactedText: "y".repeat(8_000) })).toEqual({
+			accepted: false,
+			reason: "deterministic_failed",
+		});
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ status: string; transport_retry_count: number }, [string]>(
+						"SELECT status, transport_retry_count FROM summary_jobs WHERE job_id = ?",
+					)
+					.get(deterministic!.jobId),
+			).toEqual({ status: "obsolete", transport_retry_count: 0 });
+		} finally {
+			observer.close();
+		}
 	});
 
 	test("the node ceiling, not the tolerance, bounds an oversized atomic leaf", () => {
 		// ceil(70920/4) = 17730 tokens: one indivisible unit far above any leaf chunk target.
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(70_920))]));
 		const [normal] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
@@ -2058,11 +2404,14 @@ describe("LCM context contracts", () => {
 		expect(normal?.inputTokenCount).toBe(17_730);
 		expect(normal?.outputTokenBudget).toBe(4_096);
 		// 4,500 tokens sits below ceil(4096 * 1.3) = 5325 and is still rejected by the ceiling.
-		expect(
-			context.completeSummaryJob(normal!.jobId, normal!.leaseToken, { redactedText: "y".repeat(18_000) }),
-		).toEqual({ accepted: false, reason: "escalated", stage: "aggressive" });
+		expect(context.completeSummaryJob(normal!, { redactedText: "y".repeat(18_000) })).toEqual({
+			accepted: false,
+			reason: "escalated",
+			stage: "aggressive",
+		});
 
 		const [aggressive] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
@@ -2072,17 +2421,20 @@ describe("LCM context contracts", () => {
 	});
 
 	test("accepts a cap-honoring completion exactly at the leased budget", () => {
-		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const summarized = entry(MAIN, "e1", "x".repeat(19_388));
+		context.reconcile(snapshot(MAIN, [summarized]));
 		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
 			maxOutputTokens: 2_048,
 		});
 		expect(claim?.outputTokenBudget).toBe(2_424);
-		expect(
-			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "y".repeat(2_424 * 4) }),
-		).toMatchObject({ accepted: true });
+		expect(context.completeSummaryJob(claim!, { redactedText: "y".repeat(2_424 * 4) })).toMatchObject({
+			accepted: true,
+		});
+		context.reconcile(snapshot(MAIN, [summarized, entry(MAIN, "e2", "fresh tail", "e1")]), { summarize: false });
 		expect(
 			context.project({ ...MAIN, tokenBudget: 4_000, freshTail: { maxSources: 0, maxTokens: 0 } }).historical[0]
 				?.tokenCount,
@@ -2090,8 +2442,10 @@ describe("LCM context contracts", () => {
 	});
 
 	test("accepts bounded overshoot and still projects a complete cover", () => {
-		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const summarized = entry(MAIN, "e1", "x".repeat(19_388));
+		context.reconcile(snapshot(MAIN, [summarized]));
 		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
@@ -2099,9 +2453,10 @@ describe("LCM context contracts", () => {
 		});
 		expect(claim?.outputTokenBudget).toBe(2_424);
 		// 2,600 tokens overshoots the budget 1.07x, inside ceil(2424 * 1.3) = 3152.
-		expect(
-			context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "y".repeat(10_400) }),
-		).toMatchObject({ accepted: true });
+		expect(context.completeSummaryJob(claim!, { redactedText: "y".repeat(10_400) })).toMatchObject({
+			accepted: true,
+		});
+		context.reconcile(snapshot(MAIN, [summarized, entry(MAIN, "e2", "fresh tail", "e1")]), { summarize: false });
 
 		const projection = context.project({
 			...MAIN,
@@ -2116,7 +2471,8 @@ describe("LCM context contracts", () => {
 	});
 
 	test("a peer handle's completion becomes visible to another open handle with no local signal", async () => {
-		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
+		const summarized = entry(MAIN, "e1", "x".repeat(19_388));
+		context.reconcile(snapshot(MAIN, [summarized]));
 		const peer = await openLcmContext({
 			dbPath,
 			leafChunk: { maxSources: 2, maxTokens: 10_000 },
@@ -2127,19 +2483,30 @@ describe("LCM context contracts", () => {
 		});
 		try {
 			const [leased] = peer.claimSummaryJobs({
+				...retryClaimPolicy(peer),
 				workerId: "peer",
 				leaseMs: 600_000,
 				limit: 1,
 				maxOutputTokens: 2_048,
 			});
 			expect(leased).toBeDefined();
+			context.reconcile(snapshot(MAIN, [summarized, entry(MAIN, "e2", "fresh tail", "e1")]), {
+				summarize: false,
+			});
 
 			// The local handle can neither claim the peer's job nor learn anything sooner than
 			// the peer lease expiry, so a wake-only strategy would sleep for the full 600 s.
 			expect(
-				context.claimSummaryJobs({ workerId: "local", leaseMs: 60_000, limit: 1, maxOutputTokens: 2_048 }),
+				context.claimSummaryJobs({
+					...retryClaimPolicy(context),
+					workerId: "local",
+					leaseMs: 60_000,
+					limit: 1,
+					maxOutputTokens: 2_048,
+				}),
 			).toEqual([]);
-			expect(context.nextSummaryJobDelayMs(MAIN)).toBe(600_000);
+			const sharedPolicy = retryClaimPolicy(context);
+			expect(context.nextSummaryJobDelayMs(sharedPolicy, sharedPolicy.maxTransportRetries, MAIN)).toBe(600_000);
 			const before = context.project({
 				...MAIN,
 				tokenBudget: 4_000,
@@ -2148,9 +2515,9 @@ describe("LCM context contracts", () => {
 			expect(before.historical).toEqual([]);
 			expect(before.pendingJobs).toBe(1);
 
-			expect(
-				peer.completeSummaryJob(leased!.jobId, leased!.leaseToken, { redactedText: "y".repeat(4_000) }),
-			).toMatchObject({ accepted: true });
+			expect(peer.completeSummaryJob(leased!, { redactedText: "y".repeat(4_000) })).toMatchObject({
+				accepted: true,
+			});
 
 			// Re-reading is the only notification that exists across handles.
 			const after = context.project({
@@ -2176,6 +2543,7 @@ describe("LCM context contracts", () => {
 		context.reconcile(snapshot(MAIN, original));
 		const claim = context
 			.claimSummaryJobs({
+				...retryClaimPolicy(context),
 				workerId: "worker",
 				leaseMs: 1_000,
 				limit: 10,
@@ -2190,7 +2558,7 @@ describe("LCM context contracts", () => {
 				{ ...original[2]!, atomicGroupId: "tool-turn" },
 			]),
 		);
-		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "ok" })).toEqual({
+		expect(context.completeSummaryJob(claim!, { redactedText: "ok" })).toEqual({
 			accepted: false,
 			reason: "stale",
 		});
@@ -2198,10 +2566,16 @@ describe("LCM context contracts", () => {
 
 	test("completion rejects a still-leased result whose source lineage disappeared", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "old lineage")]));
-		const [claim] = context.claimSummaryJobs({ workerId: "worker", leaseMs: 1_000, limit: 1, maxOutputTokens: 100 });
+		const [claim] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
+			workerId: "worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
 		expect(claim).toBeDefined();
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e2", "replacement lineage")]));
-		expect(context.completeSummaryJob(claim!.jobId, claim!.leaseToken, { redactedText: "stale summary" })).toEqual({
+		expect(context.completeSummaryJob(claim!, { redactedText: "stale summary" })).toEqual({
 			accepted: false,
 			reason: "stale",
 		});
@@ -2466,6 +2840,7 @@ describe("LCM context contracts", () => {
 		const db = new Database(migrationPath);
 		try {
 			initializeLcmSchema(db, 1_000);
+			removeSchema10RetryAuthority(db);
 			db.run("DROP TABLE branch_summary_spans");
 			// v7 predates session attribution, so the synthetic database must not carry it either.
 			db.run("ALTER TABLE summary_attempts DROP COLUMN session_id");
@@ -2500,6 +2875,7 @@ describe("LCM context contracts", () => {
 			}
 			expect(
 				migrated.claimSummaryJobs({
+					...retryClaimPolicy(migrated),
 					workerId: "v7-migration-worker",
 					leaseMs: 1_000,
 					limit: 1,
@@ -2514,6 +2890,7 @@ describe("LCM context contracts", () => {
 	test("attributes attempt spend to its session and excludes anything at or after the epoch", () => {
 		context.reconcile(snapshot(MAIN, [entry(MAIN, "e1", "x".repeat(19_388))]));
 		const [job] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "worker",
 			leaseMs: 60_000,
 			limit: 1,
@@ -2529,14 +2906,13 @@ describe("LCM context contracts", () => {
 		};
 		expect(
 			context.beginSummaryAttempt(
-				job!.jobId,
-				job!.leaseToken,
+				job!,
 				{ attemptId: "attempt-s1", startedAt: now, provider: "p", model: "m" },
 				{ promptHash: "hash-s1", sessionId: "s1", strategy: "preserve_details" },
 			),
 		).toBe(true);
 		expect(
-			context.completeSummaryJob(job!.jobId, job!.leaseToken, {
+			context.completeSummaryJob(job!, {
 				redactedText: "y".repeat(4_000),
 				attempt: { attemptId: "attempt-s1", startedAt: now, completedAt: now, provider: "p", model: "m", usage },
 			}),
@@ -2553,6 +2929,7 @@ describe("LCM context contracts", () => {
 		const db = new Database(migrationPath);
 		try {
 			initializeLcmSchema(db, 1_000);
+			removeSchema10RetryAuthority(db);
 			db.run("ALTER TABLE summary_attempts DROP COLUMN session_id");
 			db.run(
 				`INSERT INTO summary_attempts
@@ -2652,7 +3029,7 @@ describe("LCM context contracts", () => {
 		const projection = context.project({
 			...MAIN,
 			tokenBudget: 100,
-			freshTail: { maxSources: 2, maxTokens: 100 },
+			freshTail: { maxSources: 1, maxTokens: 100 },
 		});
 		expect(projection).toMatchObject({
 			ready: true,
@@ -2667,21 +3044,28 @@ describe("LCM context contracts", () => {
 	});
 
 	test("completed children make projection ready while their condensation parent is pending", () => {
-		const sources = Array.from({ length: 4 }, (_, index) =>
-			entry(MAIN, `pending-${index + 1}`, `pending source ${index + 1}`, index === 0 ? null : `pending-${index}`),
-		);
+		const sources = Array.from({ length: 6 }, (_, index) => ({
+			...entry(
+				MAIN,
+				`pending-${index + 1}`,
+				`pending source ${index + 1}`,
+				index === 0 ? null : `pending-${index}`,
+				index >= 4 ? "pending-tail" : undefined,
+			),
+		}));
 		context.reconcile(snapshot(MAIN, sources));
-		for (let index = 0; index < 2; index++) {
+		for (let index = 0; index < 3; index++) {
 			const [leaf] = context.claimSummaryJobs({
+				...retryClaimPolicy(context),
 				workerId: `leaf-worker-${index}`,
 				leaseMs: 1_000,
 				limit: 1,
 				maxOutputTokens: 100,
 			});
 			expect(leaf?.level).toBe(0);
-			expect(
-				context.completeSummaryJob(leaf!.jobId, leaf!.leaseToken, { redactedText: `leaf ${index}`, tokenCount: 1 }),
-			).toMatchObject({ accepted: true });
+			expect(context.completeSummaryJob(leaf!, { redactedText: `leaf ${index}`, tokenCount: 1 })).toMatchObject({
+				accepted: true,
+			});
 		}
 
 		const projection = context.project({
@@ -2689,8 +3073,15 @@ describe("LCM context contracts", () => {
 			tokenBudget: 100,
 			freshTail: { maxSources: 0, maxTokens: 0 },
 		});
-		expect(projection).toMatchObject({ ready: true, pendingJobs: 0, uncoveredSourceIds: [] });
-		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual(sources.map(source => source.entryId));
+		expect(projection).toMatchObject({
+			ready: true,
+			pendingJobs: 0,
+			uncoveredSourceIds: [],
+			freshTailSourceIds: ["pending-5", "pending-6"],
+		});
+		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual(
+			sources.slice(0, 4).map(source => source.entryId),
+		);
 		const observer = new Database(dbPath, { readonly: true, strict: true });
 		try {
 			expect(
@@ -2714,17 +3105,17 @@ describe("LCM context contracts", () => {
 		];
 		context.reconcile(snapshot(MAIN, original));
 		const [prefixJob] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "prefix-worker",
 			leaseMs: 1_000,
 			limit: 1,
 			maxOutputTokens: 100,
 		});
-		expect(
-			context.completeSummaryJob(prefixJob!.jobId, prefixJob!.leaseToken, { redactedText: "prefix", tokenCount: 1 }),
-		).toMatchObject({
+		expect(context.completeSummaryJob(prefixJob!, { redactedText: "prefix", tokenCount: 1 })).toMatchObject({
 			accepted: true,
 		});
 		const [staleJob] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "stale-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -2753,9 +3144,7 @@ describe("LCM context contracts", () => {
 			entry(MAIN, "safe-4", "replacement source four", "safe-3"),
 		];
 		expect(context.reconcile(snapshot(MAIN, diverged)).revision).toBe(2);
-		expect(
-			context.completeSummaryJob(staleJob!.jobId, staleJob!.leaseToken, { redactedText: "late", tokenCount: 1 }),
-		).toEqual({
+		expect(context.completeSummaryJob(staleJob!, { redactedText: "late", tokenCount: 1 })).toEqual({
 			accepted: false,
 			reason: "stale",
 		});
@@ -2867,6 +3256,7 @@ describe("LCM context contracts", () => {
 		const before = readBranchB();
 		for (let index = 0; index < 2; index++) {
 			const [job] = context.claimSummaryJobs({
+				...retryClaimPolicy(context),
 				workerId: `affected-worker-${index}`,
 				leaseMs: 1_000,
 				limit: 1,
@@ -2875,9 +3265,7 @@ describe("LCM context contracts", () => {
 				allowFallback: false,
 			});
 			expect(job?.level).toBe(0);
-			expect(
-				context.completeSummaryJob(job!.jobId, job!.leaseToken, { redactedText: `a${index}`, tokenCount: 1 }),
-			).toMatchObject({
+			expect(context.completeSummaryJob(job!, { redactedText: `a${index}`, tokenCount: 1 })).toMatchObject({
 				accepted: true,
 			});
 		}
@@ -2930,7 +3318,8 @@ describe("LCM context contracts", () => {
 		} finally {
 			repaired.close();
 		}
-		context.reconcile(snapshot(MAIN, sources));
+		const withFresh = [...sources, entry(MAIN, "repair-3", "fresh tail", "repair-2")];
+		context.reconcile(snapshot(MAIN, withFresh), { summarize: false });
 		const projection = context.project({
 			...MAIN,
 			tokenBudget: 100,
@@ -3022,6 +3411,7 @@ describe("LCM context contracts", () => {
 		];
 		context.reconcile(snapshot(MAIN, sources));
 		const [job] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "purge-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -3043,8 +3433,8 @@ describe("LCM context contracts", () => {
 			},
 		};
 		const provenance = { promptHash: "purge-prompt", strategy: job!.strategy };
-		expect(context.beginSummaryAttempt(job!.jobId, job!.leaseToken, attempt, provenance)).toBe(true);
-		const completion = context.completeSummaryJob(job!.jobId, job!.leaseToken, {
+		expect(context.beginSummaryAttempt(job!, attempt, provenance)).toBe(true);
+		const completion = context.completeSummaryJob(job!, {
 			redactedText: "purged",
 			tokenCount: 1,
 			attempt,
@@ -3096,11 +3486,74 @@ describe("LCM context contracts", () => {
 		}
 	});
 
+	test("settles a start-only cancellation and enriches late billed usage", () => {
+		context.reconcile(snapshot(MAIN, [entry(MAIN, "cancel-attempt", "cancelled attempt source to summarize")]));
+		const [job] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
+			workerId: "cancel-attempt-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+		});
+		const start = { attemptId: "cancel-attempt", startedAt: now, provider: "provider", model: "model" };
+		expect(context.beginSummaryAttempt(job!, start, { promptHash: "cancel-prompt", strategy: job!.strategy })).toBe(
+			true,
+		);
+		now += 50;
+		expect(context.settleSummaryAttempt(job!, start, "aborted")).toBe("aborted");
+		expect(
+			context.settleSummaryAttempt(
+				job!,
+				{
+					...start,
+					completedAt: now + 1,
+					usage: {
+						input: 4,
+						output: 2,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 6,
+						cost: { input: 0.4, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.6 },
+					},
+				},
+				"aborted",
+			),
+		).toBe("aborted");
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<
+						{
+							outcome: string;
+							started_at: number;
+							completed_at: number;
+							total_tokens: number;
+							cost_total: number;
+						},
+						[string]
+					>(
+						"SELECT outcome, started_at, completed_at, total_tokens, cost_total FROM summary_attempts WHERE attempt_id = ?",
+					)
+					.get(start.attemptId),
+			).toEqual({
+				outcome: "aborted",
+				started_at: start.startedAt,
+				completed_at: now + 1,
+				total_tokens: 6,
+				cost_total: 0.6,
+			});
+		} finally {
+			observer.close();
+		}
+	});
+
 	test("attempt-bearing failure settles stale placement without retry mutation", () => {
 		context.reconcile(
 			snapshot(MAIN, [entry(MAIN, "stale-attempt-1", "stale attempt source long enough to summarize")]),
 		);
 		const [job] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "stale-attempt-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -3108,7 +3561,7 @@ describe("LCM context contracts", () => {
 		});
 		const start = { attemptId: "stale-attempt", startedAt: now, provider: "provider", model: "model" };
 		const provenance = { promptHash: "stale-prompt", strategy: job!.strategy };
-		expect(context.beginSummaryAttempt(job!.jobId, job!.leaseToken, start, provenance)).toBe(true);
+		expect(context.beginSummaryAttempt(job!, start, provenance)).toBe(true);
 		const observer = new Database(dbPath, { readonly: true, strict: true });
 		const before = observer
 			.query<{ status: string; available_at: number; transport_retry_count: number }, [string]>(
@@ -3130,12 +3583,12 @@ describe("LCM context contracts", () => {
 			},
 		};
 		expect(
-			context.failSummaryJob(job!.jobId, job!.leaseToken, "provider failure", 500, provenance, {
+			context.failSummaryJob(job!, "provider failure", 500, provenance, {
 				attempt,
 				outcome: "provider_error",
 			}),
 		).toBe(false);
-		expect(context.settleSummaryAttempt(job!.jobId, job!.leaseToken, attempt, "aborted")).toBeNull();
+		expect(context.settleSummaryAttempt(job!, attempt, "aborted")).toBeNull();
 
 		const settled = new Database(dbPath, { readonly: true, strict: true });
 		try {
@@ -3188,6 +3641,7 @@ describe("LCM context contracts", () => {
 			snapshot(MAIN, [entry(MAIN, "lease-attempt", "lease attempt source long enough to summarize")]),
 		);
 		const [original] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "original-worker",
 			leaseMs: 100,
 			limit: 1,
@@ -3195,9 +3649,10 @@ describe("LCM context contracts", () => {
 		});
 		const start = { attemptId: "lease-lost-attempt", startedAt: now, provider: "provider", model: "model" };
 		const provenance = { promptHash: "lease-prompt", strategy: original!.strategy };
-		expect(context.beginSummaryAttempt(original!.jobId, original!.leaseToken, start, provenance)).toBe(true);
+		expect(context.beginSummaryAttempt(original!, start, provenance)).toBe(true);
 		now += 101;
 		const [successor] = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
 			workerId: "successor-worker",
 			leaseMs: 1_000,
 			limit: 1,
@@ -3228,7 +3683,7 @@ describe("LCM context contracts", () => {
 			},
 		};
 		expect(
-			context.failSummaryJob(original!.jobId, original!.leaseToken, "late transport failure", 500, provenance, {
+			context.failSummaryJob(original!, "late transport failure", 500, provenance, {
 				attempt,
 				outcome: "transport_error",
 			}),
@@ -3275,6 +3730,1064 @@ describe("LCM context contracts", () => {
 			});
 		} finally {
 			settled.close();
+		}
+	});
+
+	test("migrates a live v9 connection into blocked schema-10 retry authority", () => {
+		const migrationPath = path.join(tempDir, "retry-v9.db");
+		const legacy = new Database(migrationPath, { strict: true });
+		let migrator: Database | undefined;
+		try {
+			initializeLcmSchema(legacy, 1_000);
+			if (LCM_SCHEMA_VERSION >= 10) {
+				legacy.run("DROP TRIGGER summary_jobs_authorized_insert");
+				legacy.run("DROP TRIGGER summary_jobs_authorized_update");
+				legacy.run("DROP TRIGGER summary_jobs_authorization_cleanup");
+				legacy.run("DROP TABLE summary_retry_policies");
+				legacy.run("ALTER TABLE summary_jobs DROP COLUMN lease_mutation_nonce");
+				legacy.run("ALTER TABLE summary_jobs DROP COLUMN lease_policy_token");
+				legacy.run("ALTER TABLE summary_jobs DROP COLUMN retry_epoch");
+				legacy.run("PRAGMA user_version = 9");
+			}
+			legacy.run(
+				"INSERT INTO branches(project_id, session_id, branch_id, reconciled_at) VALUES ('project', 'session', 'main', 1)",
+			);
+			const branchId = Number(legacy.query<{ id: number }, []>("SELECT id FROM branches").get()!.id);
+			legacy.run(
+				`INSERT INTO summary_jobs(
+					job_id, project_id, input_hash, level, origin_branch_row_id, origin_revision, status,
+					worker_id, lease_token, lease_expires_at, attempt_count, available_at, created_at, updated_at,
+					lease_input_tokens, lease_output_budget, transport_retry_count
+				) VALUES ('job-v9', 'project', 'input-v9', 0, ?, 1, 'leased',
+					'legacy-worker', 'legacy-lease', 999999, 4, 1, 1, 1, 10, 5, 4)`,
+				[branchId],
+			);
+
+			migrator = new Database(migrationPath, { strict: true });
+			initializeLcmSchema(migrator, 1_000);
+			expect(migrator.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(10);
+			expect(
+				migrator
+					.query<{ retry_key: string | null; epoch: number; claim_token: string | null }, [string]>(
+						"SELECT retry_key, epoch, claim_token FROM summary_retry_policies WHERE project_id = ?",
+					)
+					.get("project"),
+			).toEqual({ retry_key: null, epoch: 0, claim_token: null });
+			expect(
+				migrator
+					.query<
+						{
+							status: string;
+							worker_id: string | null;
+							lease_token: string | null;
+							retry_epoch: number;
+							lease_policy_token: string | null;
+							lease_mutation_nonce: string | null;
+						},
+						[string]
+					>(
+						"SELECT status, worker_id, lease_token, retry_epoch, lease_policy_token, lease_mutation_nonce FROM summary_jobs WHERE job_id = ?",
+					)
+					.get("job-v9"),
+			).toEqual({
+				status: "pending",
+				worker_id: null,
+				lease_token: null,
+				retry_epoch: 0,
+				lease_policy_token: null,
+				lease_mutation_nonce: null,
+			});
+			expect(() =>
+				legacy.run(
+					"UPDATE summary_jobs SET status = 'leased', worker_id = 'legacy', lease_token = 'legacy-new', lease_expires_at = 1000000 WHERE job_id = 'job-v9'",
+				),
+			).toThrow("unauthorized lease");
+		} finally {
+			migrator?.close(false);
+			legacy.close(false);
+		}
+	});
+
+	test("initializes migrated selector history from the caller-resolved concrete model", async () => {
+		const migrationPath = path.join(tempDir, "retry-v9-model-identity.db");
+		const legacyAvailableAt = now + 10_000;
+		const legacy = new Database(migrationPath, { strict: true });
+		try {
+			initializeLcmSchema(legacy, 1_000);
+			removeSchema10RetryAuthority(legacy);
+			legacy.run("PRAGMA user_version = 9");
+			for (const projectId of ["same-model", "changed-model"]) {
+				legacy.run(
+					"INSERT INTO branches(project_id, session_id, branch_id, reconciled_at) VALUES (?, ?, 'main', 1)",
+					[projectId, `${projectId}-session`],
+				);
+				const branchId = Number(
+					legacy.query<{ id: number }, [string]>("SELECT id FROM branches WHERE project_id = ?").get(projectId)!
+						.id,
+				);
+				legacy.run(
+					`INSERT INTO summary_jobs(
+						job_id, project_id, input_hash, level, origin_branch_row_id, origin_revision, status,
+						attempt_count, available_at, last_error, created_at, updated_at, transport_retry_count,
+						last_model_selector, last_resolved_model
+					) VALUES (?, ?, ?, 0, ?, 1, 'failed', 4, ?, 'legacy transport error', 1, 1, 4, '@smol', 'provider/original')`,
+					[`${projectId}-job`, projectId, `${projectId}-input`, branchId, legacyAvailableAt],
+				);
+			}
+		} finally {
+			legacy.close(false);
+		}
+
+		const migrated = await openLcmContext({ dbPath: migrationPath, now: () => now, regexEngine: TEST_REGEX_ENGINE });
+		try {
+			expect(migrated.configureSummaryRetryPolicy("same-model", "provider/original")).toMatchObject({
+				kind: "ready",
+				retryKey: "provider/original",
+				retryEpoch: 1,
+			});
+			expect(migrated.configureSummaryRetryPolicy("changed-model", "provider/replacement")).toMatchObject({
+				kind: "ready",
+				retryKey: "provider/replacement",
+				retryEpoch: 1,
+			});
+			const observer = new Database(migrationPath, { readonly: true, strict: true });
+			try {
+				const readState = (jobId: string) =>
+					observer
+						.query<
+							{
+								status: string;
+								transport_retry_count: number;
+								available_at: number;
+								last_error: string | null;
+								retry_epoch: number;
+							},
+							[string]
+						>(
+							"SELECT status, transport_retry_count, available_at, last_error, retry_epoch FROM summary_jobs WHERE job_id = ?",
+						)
+						.get(jobId);
+				expect(readState("same-model-job")).toEqual({
+					status: "failed",
+					transport_retry_count: 4,
+					available_at: legacyAvailableAt,
+					last_error: "legacy transport error",
+					retry_epoch: 1,
+				});
+				expect(readState("changed-model-job")).toEqual({
+					status: "pending",
+					transport_retry_count: 0,
+					available_at: now,
+					last_error: null,
+					retry_epoch: 1,
+				});
+			} finally {
+				observer.close();
+			}
+		} finally {
+			migrated.close();
+		}
+	});
+
+	test("reads summary job availability from one snapshot during peer completion", async () => {
+		const sources = [
+			entry(MAIN, "snapshot-1", "first availability source"),
+			entry(MAIN, "snapshot-2", "second availability source", "snapshot-1"),
+			entry(MAIN, "snapshot-3", "mandatory fresh source", "snapshot-2"),
+		];
+		context.reconcile(snapshot(MAIN, sources));
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		const [leased] = context.claimSummaryJobs({
+			...policy,
+			maxTransportRetries: 5,
+			workerId: "peer-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(leased).toBeDefined();
+
+		let armed = false;
+		let completed = false;
+		const observer = await openLcmContext({
+			dbPath,
+			leafChunk: { maxSources: 2, maxTokens: 10_000 },
+			condenseFanIn: 2,
+			tombstoneRetentionMs: 100,
+			now: () => {
+				if (armed && !completed) {
+					completed = context.completeSummaryJob(leased!, { redactedText: "ok", tokenCount: 1 }).accepted;
+				}
+				return now;
+			},
+			regexEngine: TEST_REGEX_ENGINE,
+		});
+		try {
+			armed = true;
+			expect(observer.summaryJobAvailability(request, policy, 5)).toMatchObject({
+				runnable: 0,
+				leased: 1,
+				backoff: 0,
+				exhausted: 0,
+				missing: 0,
+				policyMismatch: 0,
+			});
+			expect(completed).toBe(true);
+			expect(observer.project(request)).toMatchObject({ ready: true, pendingJobs: 0, uncoveredSourceIds: [] });
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("same-key and conflict retry-policy checks remain read-only under a peer writer", async () => {
+		const policyPath = path.join(tempDir, "policy-fast-path.db");
+		const policyContext = await openLcmContext({
+			dbPath: policyPath,
+			busyTimeoutMs: 0,
+			now: () => now,
+			regexEngine: TEST_REGEX_ENGINE,
+		});
+		try {
+			const policy = policyContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/current");
+			if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+			const writer = new Database(policyPath, { strict: true });
+			try {
+				writer.run("BEGIN IMMEDIATE");
+				expect(policyContext.configureSummaryRetryPolicy(MAIN.projectId, policy.retryKey)).toEqual(policy);
+				expect(policyContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/other")).toEqual({
+					kind: "conflict",
+					retryKey: policy.retryKey,
+					retryEpoch: policy.retryEpoch,
+				});
+			} finally {
+				if (writer.inTransaction) writer.run("ROLLBACK");
+				writer.close();
+			}
+		} finally {
+			policyContext.close();
+		}
+	});
+
+	test("classifies mixed summary job availability in one constant executed-statement snapshot", () => {
+		const createFixture = (branchId: string, repetitions: number): AvailabilityFixture => {
+			const scope = { ...MAIN, branchId };
+			const spanCount = repetitions * 6;
+			const parentSpanCount = repetitions;
+			const leafSpanCount = spanCount + parentSpanCount * 2;
+			const sources = Array.from({ length: leafSpanCount * 2 + 1 }, (_, index) =>
+				entry(
+					scope,
+					`${branchId}-${index + 1}`,
+					`${branchId} availability source ${index + 1}`,
+					index === 0 ? null : `${branchId}-${index}`,
+				),
+			);
+			const request: ProjectionRequest = {
+				...scope,
+				tokenBudget: 100,
+				freshTail: { maxSources: 1, maxTokens: 100 },
+			};
+			context.reconcile(snapshot(scope, sources), { summarize: request });
+			return { request, spanCount, parentSpanCount };
+		};
+
+		const smallFixture = createFixture("availability-small", 1);
+		const largeFixture = createFixture("availability-large", 10);
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+
+		const fixtureDb = new Database(dbPath, { strict: true });
+		try {
+			const claimToken = fixtureDb
+				.query<{ claim_token: string | null }, [string]>(
+					"SELECT claim_token FROM summary_retry_policies WHERE project_id = ?",
+				)
+				.get(MAIN.projectId)?.claim_token;
+			if (!claimToken) throw new Error("retry policy claim token is missing");
+
+			const seedFixture = (fixture: AvailabilityFixture) => {
+				const jobs = fixtureDb
+					.query<
+						{
+							job_id: string;
+							input_hash: string;
+							branch_row_id: number;
+							revision: number;
+							start_position: number;
+							end_position: number;
+						},
+						[string, string, string]
+					>(
+						`SELECT j.job_id, j.input_hash, s.branch_row_id, s.revision, s.start_position, s.end_position
+						 FROM branches b
+						 JOIN branch_summary_spans s ON s.branch_row_id = b.id AND s.revision = b.revision
+						 JOIN summary_jobs j ON j.project_id = b.project_id AND j.input_hash = s.input_hash
+						 WHERE b.project_id = ? AND b.session_id = ? AND b.branch_id = ?
+						   AND s.level = 0 AND s.frontier = 1 AND s.summary_id IS NULL
+						 ORDER BY s.start_position`,
+					)
+					.all(fixture.request.projectId, fixture.request.sessionId, fixture.request.branchId);
+				expect(jobs).toHaveLength(fixture.spanCount + fixture.parentSpanCount * 2);
+
+				const classificationJobs: typeof jobs = [];
+				for (let parentIndex = 0; parentIndex < fixture.parentSpanCount; parentIndex++) {
+					const groupStart = parentIndex * 8;
+					const children = jobs.slice(groupStart, groupStart + 2);
+					const first = children[0];
+					const last = children[1];
+					if (!first || !last) throw new Error("parent fixture children are missing");
+					for (const child of children) {
+						const summaryId = `fixture-summary-${child.job_id}`;
+						fixtureDb.run(
+							`INSERT INTO summaries
+							 (summary_id, stable_handle, project_id, input_hash, level, redacted_text, token_count, created_at)
+							 VALUES (?, ?, ?, ?, 0, 'covered child', 1, ?)`,
+							[summaryId, `fixture-handle-${child.job_id}`, MAIN.projectId, child.input_hash, now],
+						);
+						fixtureDb.run(
+							"UPDATE summary_jobs SET status = 'completed', result_summary_id = ?, updated_at = ? WHERE job_id = ?",
+							[summaryId, now, child.job_id],
+						);
+						fixtureDb.run(
+							`UPDATE branch_summary_spans SET summary_id = ?, frontier = 0
+							 WHERE branch_row_id = ? AND revision = ? AND level = 0
+							   AND start_position = ? AND end_position = ?`,
+							[summaryId, child.branch_row_id, child.revision, child.start_position, child.end_position],
+						);
+					}
+					const parentInputHash = `fixture-parent-${fixture.request.branchId}-${parentIndex}`;
+					fixtureDb.run(
+						`INSERT INTO summary_jobs
+						 (job_id, project_id, input_hash, level, origin_branch_row_id, origin_revision,
+						  status, available_at, created_at, updated_at, retry_epoch)
+						 VALUES (?, ?, ?, 1, ?, ?, 'pending', ?, ?, ?, ?)`,
+						[
+							`fixture-parent-job-${fixture.request.branchId}-${parentIndex}`,
+							MAIN.projectId,
+							parentInputHash,
+							first.branch_row_id,
+							first.revision,
+							now,
+							now,
+							now,
+							policy.retryEpoch,
+						],
+					);
+					fixtureDb.run(
+						`INSERT INTO branch_summary_spans
+						 (branch_row_id, revision, level, start_position, end_position, input_hash, summary_id, frontier)
+						 VALUES (?, ?, 1, ?, ?, ?, NULL, 1)`,
+						[first.branch_row_id, first.revision, first.start_position, last.end_position, parentInputHash],
+					);
+					classificationJobs.push(...jobs.slice(groupStart + 2, groupStart + 8));
+				}
+				expect(classificationJobs).toHaveLength(fixture.spanCount);
+				for (const [index, job] of classificationJobs.entries()) {
+					switch (index % 6) {
+						case 0:
+							break;
+						case 1:
+							fixtureDb.run(
+								`UPDATE summary_jobs SET status = 'leased', worker_id = ?, lease_token = ?,
+								 lease_expires_at = ?, lease_input_tokens = 1, lease_output_budget = 100,
+								 lease_policy_token = ?, lease_mutation_nonce = ?, updated_at = ? WHERE job_id = ?`,
+								[
+									`worker-${job.job_id}`,
+									`lease-${job.job_id}`,
+									now + 1_000,
+									claimToken,
+									`nonce-${job.job_id}`,
+									now,
+									job.job_id,
+								],
+							);
+							break;
+						case 2:
+							fixtureDb.run(
+								"UPDATE summary_jobs SET status = 'failed', transport_retry_count = 1, available_at = ?, last_error = 'transport', updated_at = ? WHERE job_id = ?",
+								[now + 500, now, job.job_id],
+							);
+							break;
+						case 3:
+							fixtureDb.run(
+								"UPDATE summary_jobs SET status = 'failed', transport_retry_count = 5, last_error = 'transport', updated_at = ? WHERE job_id = ?",
+								[now, job.job_id],
+							);
+							break;
+						case 4:
+							fixtureDb.run("DELETE FROM summary_jobs WHERE job_id = ?", [job.job_id]);
+							break;
+						case 5:
+							fixtureDb.run("UPDATE summary_jobs SET retry_epoch = ? WHERE job_id = ?", [
+								policy.retryEpoch + 1,
+								job.job_id,
+							]);
+							break;
+					}
+				}
+				expect(
+					fixtureDb
+						.query<{ count: number }, [string, string, string]>(
+							`SELECT COUNT(*) AS count FROM branches b
+							 JOIN branch_summary_spans s ON s.branch_row_id = b.id AND s.revision = b.revision
+							 WHERE b.project_id = ? AND b.session_id = ? AND b.branch_id = ?
+							   AND s.level = 1 AND s.summary_id IS NULL AND s.frontier = 1`,
+						)
+						.get(fixture.request.projectId, fixture.request.sessionId, fixture.request.branchId)?.count,
+				).toBe(fixture.parentSpanCount);
+			};
+			seedFixture(smallFixture);
+			seedFixture(largeFixture);
+		} finally {
+			fixtureDb.close();
+		}
+
+		const realQuery = Database.prototype.query;
+		let statementCount = 0;
+		const queryImplementation = function (this: Database, sql: string): unknown {
+			const statement = Reflect.apply(realQuery, this, [sql]);
+			return new Proxy(statement, {
+				get(target, property) {
+					const member = Reflect.get(target, property, target);
+					if ((property === "all" || property === "get") && typeof member === "function") {
+						return (...bindings: unknown[]) => {
+							statementCount++;
+							return Reflect.apply(member, target, bindings);
+						};
+					}
+					return typeof member === "function" ? member.bind(target) : member;
+				},
+			});
+		} as unknown as typeof Database.prototype.query;
+		const querySpy = spyOn(Database.prototype, "query").mockImplementation(queryImplementation);
+		try {
+			const measure = (request: ProjectionRequest) => {
+				statementCount = 0;
+				const availability = context.summaryJobAvailability(request, policy, 5);
+				return { availability, statements: statementCount };
+			};
+			const small = measure(smallFixture.request);
+			const large = measure(largeFixture.request);
+
+			expect(small.availability).toEqual({
+				runnable: 1,
+				leased: 1,
+				backoff: 1,
+				exhausted: 1,
+				missing: 1,
+				policyMismatch: 1,
+				nextAvailableAt: now + 500,
+				nextLeaseExpiryAt: now + 1_000,
+			});
+			expect(large.availability).toEqual({
+				runnable: 10,
+				leased: 10,
+				backoff: 10,
+				exhausted: 10,
+				missing: 10,
+				policyMismatch: 10,
+				nextAvailableAt: now + 500,
+				nextLeaseExpiryAt: now + 1_000,
+			});
+			expect(small.statements).toBeGreaterThan(0);
+			expect(large.statements).toBe(small.statements);
+		} finally {
+			querySpy.mockRestore();
+		}
+	});
+
+	test("counts dispatched non-compressing responses with transport failures against the cap", () => {
+		const sources = [
+			entry(MAIN, "escalate-1", "x".repeat(400)),
+			entry(MAIN, "escalate-2", "x".repeat(400), "escalate-1"),
+			entry(MAIN, "escalate-3", "fresh", "escalate-2"),
+		];
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		context.reconcile(snapshot(MAIN, sources), { summarize: request });
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		const claim = (workerId: string) =>
+			context.claimSummaryJobs({
+				...policy,
+				maxTransportRetries: 5,
+				workerId,
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			})[0];
+		const jobAvailableAt = (jobId: string) => {
+			const observer = new Database(dbPath, { readonly: true, strict: true });
+			try {
+				return observer
+					.query<{ available_at: number }, [string]>("SELECT available_at FROM summary_jobs WHERE job_id = ?")
+					.get(jobId)!.available_at;
+			} finally {
+				observer.close();
+			}
+		};
+
+		const undispatched = claim("provider-preparation");
+		expect(undispatched?.transportRetryCount).toBe(0);
+		expect(context.failSummaryJob(undispatched!, "provider preparation", 1, undefined, undefined, false)).toBe(true);
+		now += 1;
+
+		for (let failure = 0; failure < 4; failure++) {
+			const job = claim(`transport-${failure}`);
+			expect(job?.transportRetryCount).toBe(failure);
+			expect(context.failSummaryJob(job!, "transport", 1)).toBe(true);
+			now += failure === 3 ? 10 : 1;
+		}
+		const normal = claim("non-compressing");
+		expect(normal?.transportRetryCount).toBe(4);
+		const retryAvailableAt = jobAvailableAt(normal!.jobId);
+		expect(retryAvailableAt).toBeLessThan(now);
+		const start = { attemptId: "non-compressing-attempt", startedAt: now, provider: "provider", model: "model" };
+		const provenance = { promptHash: "non-compressing-prompt", strategy: normal!.strategy };
+		expect(context.beginSummaryAttempt(normal!, start, provenance)).toBe(true);
+		expect(
+			context.completeSummaryJob(normal!, {
+				redactedText: "x".repeat(normal!.inputTokenCount * 4),
+				provenance,
+				attempt: { ...start, completedAt: now + 1 },
+			}),
+		).toEqual({ accepted: false, reason: "escalated", stage: "aggressive" });
+		expect(jobAvailableAt(normal!.jobId)).toBe(retryAvailableAt);
+		expect(context.summaryJobAvailability(request, policy, 5)).toMatchObject({ exhausted: 1, runnable: 0 });
+
+		const afterCap = context.claimSummaryJobs({
+			...policy,
+			maxTransportRetries: 5,
+			workerId: "over-cap",
+			leaseMs: 1_000,
+			limit: 10,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(afterCap.some(job => job.jobId === normal!.jobId)).toBe(false);
+		for (const job of afterCap) expect(context.releaseSummaryJob(job)).toBe(true);
+	});
+
+	test("keeps supplied completion timing for provider failures without usage", () => {
+		const sources = [
+			entry(MAIN, "no-usage-1", "provider failure source long enough to summarize"),
+			entry(MAIN, "no-usage-2", "fresh", "no-usage-1"),
+		];
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		context.reconcile(snapshot(MAIN, sources), { summarize: request });
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		const [job] = context.claimSummaryJobs({
+			...policy,
+			maxTransportRetries: 5,
+			workerId: "no-usage-worker",
+			leaseMs: 1_000,
+			limit: 1,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		const start = { attemptId: "no-usage-attempt", startedAt: now, provider: "provider", model: "model" };
+		const provenance = { promptHash: "no-usage-prompt", strategy: job!.strategy };
+		expect(context.beginSummaryAttempt(job!, start, provenance)).toBe(true);
+		expect(
+			context.failSummaryJob(job!, "provider failure", 1, provenance, {
+				attempt: { ...start, completedAt: now + 37 },
+				outcome: "provider_error",
+			}),
+		).toBe(true);
+
+		const observer = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(
+				observer
+					.query<{ completed_at: number; outcome: string; total_tokens: number | null }, [string]>(
+						"SELECT completed_at, outcome, total_tokens FROM summary_attempts WHERE attempt_id = ?",
+					)
+					.get(start.attemptId),
+			).toEqual({ completed_at: now + 37, outcome: "provider_error", total_tokens: null });
+		} finally {
+			observer.close();
+		}
+	});
+
+	test("preserves transport failures and backoff across obsolete reactivation", () => {
+		const original = [
+			entry(MAIN, "reactivate-1", "first original source"),
+			entry(MAIN, "reactivate-2", "second original source", "reactivate-1"),
+			entry(MAIN, "reactivate-3", "original fresh source", "reactivate-2"),
+		];
+		const replacement = [
+			entry(MAIN, "replacement-1", "first replacement source"),
+			entry(MAIN, "replacement-2", "second replacement source", "replacement-1"),
+			entry(MAIN, "replacement-3", "replacement fresh source", "replacement-2"),
+		];
+		context.reconcile(snapshot(MAIN, original));
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		const claim = (workerId: string, limit = 1) =>
+			context.claimSummaryJobs({
+				...policy,
+				maxTransportRetries: 5,
+				workerId,
+				leaseMs: 1_000,
+				limit,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			});
+
+		let originalJobId = "";
+		for (let failure = 0; failure < 4; failure++) {
+			const [job] = claim(`transport-${failure}`);
+			originalJobId ||= job!.jobId;
+			expect(job?.jobId).toBe(originalJobId);
+			expect(context.failSummaryJob(job!, "transport", failure === 3 ? 100 : 1)).toBe(true);
+			if (failure < 3) now += 1;
+		}
+		const readRetryState = () => {
+			const observer = new Database(dbPath, { readonly: true, strict: true });
+			try {
+				return observer
+					.query<{ status: string; transport_retry_count: number; available_at: number }, [string]>(
+						"SELECT status, transport_retry_count, available_at FROM summary_jobs WHERE job_id = ?",
+					)
+					.get(originalJobId)!;
+			} finally {
+				observer.close();
+			}
+		};
+		const failedState = readRetryState();
+		expect(failedState).toMatchObject({ status: "failed", transport_retry_count: 4 });
+
+		context.reconcile(snapshot(MAIN, replacement));
+		now += 200;
+		for (const job of claim("replacement-worker", 10)) expect(context.releaseSummaryJob(job)).toBe(true);
+		expect(readRetryState()).toEqual({
+			status: "obsolete",
+			transport_retry_count: 4,
+			available_at: failedState.available_at,
+		});
+
+		context.reconcile(snapshot(MAIN, original));
+		expect(readRetryState()).toEqual({
+			status: "pending",
+			transport_retry_count: 4,
+			available_at: failedState.available_at,
+		});
+		const reactivated = claim("reactivated", 10).find(job => job.jobId === originalJobId);
+		expect(reactivated?.transportRetryCount).toBe(4);
+		expect(context.failSummaryJob(reactivated!, "transport", 1)).toBe(true);
+		expect(context.summaryJobAvailability(request, policy, 5)).toMatchObject({ exhausted: 1, runnable: 0 });
+		const afterCap = claim("over-cap", 10);
+		expect(afterCap.some(job => job.jobId === originalJobId)).toBe(false);
+		for (const job of afterCap) expect(context.releaseSummaryJob(job)).toBe(true);
+	});
+
+	test("uses durable policy epochs, lease nonces, due backoff, and a five-call cap", () => {
+		const sources = [
+			entry(MAIN, "retry-1", "first retry source"),
+			entry(MAIN, "retry-2", "second retry source", "retry-1"),
+			entry(MAIN, "retry-3", "mandatory fresh source", "retry-2"),
+		];
+		context.reconcile(snapshot(MAIN, sources));
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		expect(policy).toMatchObject({ kind: "ready", retryKey: "provider/model", retryEpoch: 1 });
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+
+		expect(context.summaryJobAvailability(request, policy, 5)).toMatchObject({
+			runnable: 1,
+			leased: 0,
+			backoff: 0,
+			exhausted: 0,
+			missing: 0,
+			policyMismatch: 0,
+		});
+		let failedJobId: string | undefined;
+		for (let failedCalls = 0; failedCalls < 5; failedCalls++) {
+			const [job] = context.claimSummaryJobs({
+				...retryClaimPolicy(context),
+				workerId: `worker-${failedCalls}`,
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+				retryKey: policy.retryKey,
+				retryEpoch: policy.retryEpoch,
+				maxTransportRetries: 5,
+			});
+			failedJobId ??= job!.jobId;
+			expect(job!.jobId).toBe(failedJobId);
+			expect(job).toBeDefined();
+			const rotatedNonce = context.extendSummaryJob(job!, 1_000);
+			expect(rotatedNonce).not.toBeNull();
+			expect(rotatedNonce).not.toBe(job!.leaseMutationNonce);
+			expect(context.releaseSummaryJob(job!)).toBe(false);
+			job!.leaseMutationNonce = rotatedNonce!;
+			expect(context.failSummaryJob(job!, "transport", 100)).toBe(true);
+			expect(context.summaryJobAvailability(request, policy, 5)).toMatchObject({
+				runnable: 0,
+				backoff: failedCalls === 4 ? 0 : 1,
+				exhausted: failedCalls === 4 ? 1 : 0,
+			});
+			now += 100;
+		}
+		const afterCap = context.claimSummaryJobs({
+			...retryClaimPolicy(context),
+			workerId: "sixth-worker",
+			leaseMs: 1_000,
+			limit: 2,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+			retryKey: policy.retryKey,
+			retryEpoch: policy.retryEpoch,
+			maxTransportRetries: 5,
+		});
+		expect(afterCap.some(job => job.jobId === failedJobId)).toBe(false);
+		for (const job of afterCap) expect(context.releaseSummaryJob(job)).toBe(true);
+	});
+
+	test("retry all authorizes the exact policy and wakes every relevant job with one update", () => {
+		const sources = Array.from({ length: 7 }, (_, index) =>
+			entry(
+				MAIN,
+				`retry-auth-${index + 1}`,
+				`retry authorization source ${index + 1}`,
+				index === 0 ? null : `retry-auth-${index}`,
+			),
+		);
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		context.reconcile(snapshot(MAIN, sources), { summarize: request });
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/current");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		const jobs = context.claimSummaryJobs({
+			...policy,
+			maxTransportRetries: 5,
+			workerId: "retry-auth-worker",
+			leaseMs: 1_000,
+			limit: 3,
+			maxOutputTokens: 100,
+			preferredScope: MAIN,
+			allowFallback: false,
+		});
+		expect(jobs).toHaveLength(3);
+		for (const job of jobs) expect(context.failSummaryJob(job, "transport", 500)).toBe(true);
+		const readAvailableAt = () => {
+			const observer = new Database(dbPath, { readonly: true, strict: true });
+			try {
+				const statement = observer.query<{ available_at: number }, [string]>(
+					"SELECT available_at FROM summary_jobs WHERE job_id = ?",
+				);
+				return jobs.map(job => statement.get(job.jobId)!.available_at);
+			} finally {
+				observer.close();
+			}
+		};
+		const providerAvailableAt = readAvailableAt();
+		expect(providerAvailableAt).toEqual(jobs.map(() => now + 500));
+
+		const realRun = Database.prototype.run;
+		let wakeUpdates = 0;
+		const runSpy = spyOn(Database.prototype, "run").mockImplementation(function (
+			this: Database,
+			...args: Parameters<typeof realRun>
+		) {
+			if (String(args[0]).includes("UPDATE summary_jobs SET available_at =")) wakeUpdates++;
+			return realRun.apply(this, args);
+		});
+		try {
+			expect(
+				context.retrySummaryJobs(request, { retryKey: "provider/forged", retryEpoch: policy.retryEpoch }, 5, "all"),
+			).toMatchObject({ runnable: 0, backoff: 0, policyMismatch: 3 });
+			expect(readAvailableAt()).toEqual(providerAvailableAt);
+			expect(wakeUpdates).toBe(0);
+			expect(context.retrySummaryJobs(request, policy, 5, "all")).toMatchObject({
+				runnable: 3,
+				backoff: 0,
+				policyMismatch: 0,
+			});
+			expect(readAvailableAt()).toEqual(jobs.map(() => now));
+			expect(wakeUpdates).toBe(1);
+		} finally {
+			runSpy.mockRestore();
+		}
+	});
+
+	test("CAS rotation fences stale completion, manual retry preserves the cap, and rebuild advances the epoch", async () => {
+		const retryPath = path.join(tempDir, "retry-cas.db");
+		const retryContext = await openLcmContext({
+			dbPath: retryPath,
+			leafChunk: { maxSources: 24, maxTokens: 10_000 },
+			tombstoneRetentionMs: 100,
+			now: () => now,
+			regexEngine: TEST_REGEX_ENGINE,
+		});
+		const sources = [
+			entry(MAIN, "cas-1", "first CAS source"),
+			entry(MAIN, "cas-2", "second CAS source", "cas-1"),
+			entry(MAIN, "cas-3", "fresh CAS source", "cas-2"),
+		];
+		const request = { ...MAIN, tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		try {
+			retryContext.reconcile(snapshot(MAIN, sources));
+			const policyA = retryContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/a");
+			if (policyA.kind !== "ready") throw new Error("policy A did not initialize");
+			const [oldLease] = retryContext.claimSummaryJobs({
+				...policyA,
+				maxTransportRetries: 5,
+				workerId: "old-worker",
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			});
+			expect(oldLease).toBeDefined();
+			const start = { attemptId: "cas-attempt", startedAt: now, provider: "provider", model: "a" };
+			expect(
+				retryContext.beginSummaryAttempt(oldLease!, start, {
+					promptHash: "cas-prompt",
+					resolvedModel: "provider/a",
+					strategy: oldLease!.strategy,
+				}),
+			).toBe(true);
+			const direct = new Database(retryPath, { strict: true });
+			try {
+				expect(() =>
+					direct.run("UPDATE summary_jobs SET lease_policy_token = 'forged' WHERE job_id = ?", [oldLease!.jobId]),
+				).toThrow("unauthorized lease mutation");
+			} finally {
+				direct.close(false);
+			}
+
+			const conflict = retryContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/b");
+			expect(conflict).toEqual({ kind: "conflict", retryKey: policyA.retryKey, retryEpoch: policyA.retryEpoch });
+			const policyB = retryContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/b", {
+				expected: policyA,
+			});
+			expect(policyB).toMatchObject({ kind: "ready", retryKey: "provider/b", retryEpoch: 2 });
+			if (policyB.kind !== "ready") throw new Error("policy B did not rotate");
+			const staleAttempt = {
+				...start,
+				completedAt: now,
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+				},
+			};
+			expect(retryContext.completeSummaryJob(oldLease!, { redactedText: "stale", attempt: staleAttempt })).toEqual({
+				accepted: false,
+				reason: "lease_lost",
+			});
+			const staleObserver = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					staleObserver
+						.query<{ outcome: string; cost_total: number }, [string]>(
+							"SELECT outcome, cost_total FROM summary_attempts WHERE attempt_id = ?",
+						)
+						.get(start.attemptId),
+				).toEqual({ outcome: "lease_lost", cost_total: 0.3 });
+				expect(
+					staleObserver.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM summaries").get()?.count,
+				).toBe(0);
+			} finally {
+				staleObserver.close();
+			}
+
+			for (let failure = 0; failure < 5; failure++) {
+				const [job] = retryContext.claimSummaryJobs({
+					...policyB,
+					maxTransportRetries: 5,
+					workerId: `retry-${failure}`,
+					leaseMs: 1_000,
+					limit: 1,
+					maxOutputTokens: 100,
+					preferredScope: MAIN,
+					allowFallback: false,
+				});
+				expect(job).toBeDefined();
+				expect(
+					retryContext.failSummaryJob(job!, "transport", 0, {
+						promptHash: `failure-${failure}`,
+						resolvedModel: policyB.retryKey,
+						strategy: job!.strategy,
+					}),
+				).toBe(true);
+				const availability = retryContext.summaryJobAvailability(request, policyB, 5);
+				if (failure === 0) {
+					expect(availability).toMatchObject({ runnable: 0, backoff: 1, nextAvailableAt: now + 1 });
+					expect(retryContext.retrySummaryJobs(request, policyB, 5)).toMatchObject({ backoff: 1, runnable: 0 });
+					expect(retryContext.retrySummaryJobs(request, policyB, 5, "all")).toMatchObject({
+						backoff: 0,
+						runnable: 1,
+					});
+				} else if (failure < 4) {
+					retryContext.retrySummaryJobs(request, policyB, 5, "all");
+				}
+			}
+			expect(retryContext.retrySummaryJobs(request, policyB, 5, "all")).toMatchObject({
+				runnable: 0,
+				exhausted: 1,
+			});
+			expect(retryContext.configureSummaryRetryPolicy(MAIN.projectId, policyB.retryKey)).toEqual(policyB);
+			expect(retryContext.summaryJobAvailability(request, policyB, 5).exhausted).toBe(1);
+			const policyCConflict = retryContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/c");
+			expect(policyCConflict).toEqual({
+				kind: "conflict",
+				retryKey: policyB.retryKey,
+				retryEpoch: policyB.retryEpoch,
+			});
+			const policyC = retryContext.configureSummaryRetryPolicy(MAIN.projectId, "provider/c", { expected: policyB });
+			if (policyC.kind !== "ready") throw new Error("policy C did not rotate");
+			expect(retryContext.summaryJobAvailability(request, policyC, 5)).toMatchObject({ runnable: 1, exhausted: 0 });
+			const [recovered] = retryContext.claimSummaryJobs({
+				...policyC,
+				maxTransportRetries: 5,
+				workerId: "recovered-worker",
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			});
+			const timeoutStart = {
+				attemptId: "attempt-timeout",
+				startedAt: now,
+				provider: "provider",
+				model: "c",
+			};
+			const timeoutProvenance = {
+				promptHash: "timeout",
+				resolvedModel: policyC.retryKey,
+				strategy: recovered!.strategy,
+			};
+			expect(retryContext.beginSummaryAttempt(recovered!, timeoutStart, timeoutProvenance)).toBe(true);
+			expect(
+				retryContext.failSummaryJob(recovered!, "provider timeout", 1, timeoutProvenance, {
+					attempt: timeoutStart,
+					outcome: "transport_error",
+				}),
+			).toBe(true);
+			const timeoutObserver = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					timeoutObserver
+						.query<{ outcome: string; total_tokens: number | null }, [string]>(
+							"SELECT outcome, total_tokens FROM summary_attempts WHERE attempt_id = ?",
+						)
+						.get(timeoutStart.attemptId),
+				).toEqual({ outcome: "transport_error", total_tokens: null });
+			} finally {
+				timeoutObserver.close();
+			}
+			expect(
+				retryContext.settleSummaryAttempt(
+					recovered!,
+					{
+						...timeoutStart,
+						completedAt: now + 1,
+						usage: {
+							input: 1,
+							output: 2,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 3,
+							cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+						},
+					},
+					"aborted",
+				),
+			).toBe("transport_error");
+			const enrichedTimeout = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					enrichedTimeout
+						.query<{ outcome: string; total_tokens: number; cost_total: number }, [string]>(
+							"SELECT outcome, total_tokens, cost_total FROM summary_attempts WHERE attempt_id = ?",
+						)
+						.get(timeoutStart.attemptId),
+				).toEqual({ outcome: "transport_error", total_tokens: 3, cost_total: 0.3 });
+			} finally {
+				enrichedTimeout.close();
+			}
+			now += 1;
+			const [recoveredAfterTimeout] = retryContext.claimSummaryJobs({
+				...policyC,
+				maxTransportRetries: 5,
+				workerId: "recovered-after-timeout",
+				leaseMs: 1_000,
+				limit: 1,
+				maxOutputTokens: 100,
+				preferredScope: MAIN,
+				allowFallback: false,
+			});
+			expect(
+				retryContext.completeSummaryJob(recoveredAfterTimeout!, {
+					redactedText: "recovered",
+					provenance: {
+						promptHash: "recovered",
+						resolvedModel: policyC.retryKey,
+						strategy: recoveredAfterTimeout!.strategy,
+					},
+				}),
+			).toMatchObject({ accepted: true });
+			const successObserver = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					successObserver
+						.query<{ transport_retry_count: number }, [string]>(
+							"SELECT transport_retry_count FROM summary_jobs WHERE job_id = ?",
+						)
+						.get(recoveredAfterTimeout!.jobId)?.transport_retry_count,
+				).toBe(0);
+			} finally {
+				successObserver.close();
+			}
+
+			retryContext.rebuild([snapshot(MAIN, sources)]);
+			const rebuilt = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					rebuilt
+						.query<{ retry_key: string; epoch: number }, [string]>(
+							"SELECT retry_key, epoch FROM summary_retry_policies WHERE project_id = ?",
+						)
+						.get(MAIN.projectId),
+				).toEqual({ retry_key: policyC.retryKey, epoch: policyC.retryEpoch + 1 });
+				expect(
+					rebuilt.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM summary_attempts").get()?.count,
+				).toBe(2);
+			} finally {
+				rebuilt.close();
+			}
+			now += 101;
+			retryContext.purge();
+			const afterGc = new Database(retryPath, { readonly: true, strict: true });
+			try {
+				expect(
+					afterGc.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM summary_retry_policies").get()
+						?.count,
+				).toBe(1);
+			} finally {
+				afterGc.close();
+			}
+		} finally {
+			retryContext.close();
 		}
 	});
 });

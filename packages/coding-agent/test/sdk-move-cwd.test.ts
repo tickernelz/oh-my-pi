@@ -83,7 +83,7 @@ describe("createAgentSession cwd after /move", () => {
 			}
 			expect(await session.lcmStatus()).toMatchObject({
 				runtime: {
-					phase: "disabled",
+					health: "disabled",
 					summaryWorkers: { active: 0, limit: 1 },
 				},
 			});
@@ -174,7 +174,7 @@ describe("createAgentSession cwd after /move", () => {
 			expect(session.lcmEnabled).toBe(false);
 			expect(await session.lcmStatus()).toMatchObject({
 				runtime: {
-					phase: "disabled",
+					health: "disabled",
 					summaryWorkers: { active: 0, limit: 4 },
 				},
 			});

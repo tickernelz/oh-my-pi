@@ -87,6 +87,7 @@ describe("streamSimple resolver auth retry", () => {
 	it("retries with a refreshed key when a 401 is thrown before the first event", async () => {
 		const keys: unknown[] = [];
 		const contexts: ApiKeyResolveContext[] = [];
+		let transportFences = 0;
 		registerCustomApi(
 			API,
 			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
@@ -103,6 +104,9 @@ describe("streamSimple resolver auth retry", () => {
 				contexts.push(ctx);
 				return ctx.error === undefined ? "old-key" : ctx.lastChance ? "switch-key" : "refresh-key";
 			},
+			beforeTransportDispatch: () => {
+				transportFences++;
+			},
 		});
 		for await (const _event of stream) {
 			// drain
@@ -112,6 +116,7 @@ describe("streamSimple resolver auth retry", () => {
 		// Initial resolve, then step (b) refresh-same — the switch step is never reached.
 		expect(keys).toEqual(["old-key", "refresh-key"]);
 		expect(keys.every(key => typeof key === "string")).toBe(true);
+		expect(transportFences).toBe(2);
 		expect(contexts.map(ctx => ({ lastChance: ctx.lastChance, hasError: ctx.error !== undefined }))).toEqual([
 			{ lastChance: false, hasError: false },
 			{ lastChance: false, hasError: true },
@@ -197,6 +202,119 @@ describe("streamSimple resolver auth retry", () => {
 
 		expect((await stream.result()).content).toEqual([{ type: "text", text: "ok" }]);
 		expect(keys).toEqual(["old-key", "new-key"]);
+	});
+
+	it("disableProviderRetries advances the resolver without retrying replay-safe 401/403/429 requests", async () => {
+		const failures = [
+			{ status: 401, message: "401 authentication_error" },
+			{ status: 403, message: "403 permission_denied" },
+			{
+				status: 429,
+				message: "You have hit your ChatGPT usage limit (pro plan). Try again later.",
+			},
+		];
+		let activeFailure = failures[0]!;
+		let healthyKey = "";
+		let wireKeys: unknown[] = [];
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				pushKey(wireKeys, options);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (options?.apiKey === healthyKey) {
+						ok(stream);
+						return;
+					}
+					stream.push({ type: "start", partial: assistant() });
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: assistantError(activeFailure.message, activeFailure.status),
+					});
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		for (const failure of failures) {
+			activeFailure = failure;
+			const failedKey = `failed-${failure.status}`;
+			healthyKey = `healthy-${failure.status}`;
+			wireKeys = [];
+			const contexts: ApiKeyResolveContext[] = [];
+			let currentKey = failedKey;
+			const apiKey = async (ctx: ApiKeyResolveContext): Promise<string> => {
+				contexts.push(ctx);
+				if (ctx.error !== undefined) currentKey = healthyKey;
+				return currentKey;
+			};
+
+			const first = streamSimple(model(), context, { apiKey, disableProviderRetries: true });
+			for await (const _event of first) {
+				// drain
+			}
+			const firstResult = await first.result();
+			const firstWireKeys = [...wireKeys];
+
+			const second = streamSimple(model(), context, { apiKey, disableProviderRetries: true });
+			for await (const _event of second) {
+				// drain
+			}
+			const secondResult = await second.result();
+			const transition = contexts.find(ctx => ctx.error !== undefined);
+
+			expect(firstResult.stopReason).toBe("error");
+			expect(firstWireKeys).toEqual([failedKey]);
+			expect(transition).toBeDefined();
+			expect(transition!.error).toBeInstanceOf(ProviderHttpError);
+			expect((transition!.error as { status?: number }).status).toBe(failure.status);
+			expect((transition!.error as Error).message).toBe(failure.message);
+			expect(secondResult.content).toEqual([{ type: "text", text: "ok" }]);
+			expect(wireKeys).toEqual([failedKey, healthyKey]);
+		}
+	});
+
+	it("disableProviderRetries fences auth transition after caller abort", async () => {
+		const controller = new AbortController();
+		const keys: unknown[] = [];
+		const contexts: ApiKeyResolveContext[] = [];
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				pushKey(keys, options);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					controller.abort();
+					stream.push({ type: "start", partial: assistant() });
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: assistantError("401 authentication_error", 401),
+					});
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const stream = streamSimple(model(), context, {
+			apiKey: async ctx => {
+				contexts.push(ctx);
+				return ctx.error === undefined ? "old-key" : "new-key";
+			},
+			disableProviderRetries: true,
+			signal: controller.signal,
+		});
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect((await stream.result()).stopReason).toBe("error");
+		expect(keys).toEqual(["old-key"]);
+		expect(contexts).toHaveLength(1);
+		expect(contexts[0]).toMatchObject({ lastChance: false, error: undefined });
 	});
 
 	it("retries when Codex reports an invalidated OAuth token without an HTTP status", async () => {

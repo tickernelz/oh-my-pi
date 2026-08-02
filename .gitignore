@@ -47,7 +47,16 @@ packages/ai/test/.temp-images/
 .opencode/
 .worktrees/
 .worktree/
-compaction-results/
+compaction-results/*
+!compaction-results/lcm-replay/
+compaction-results/lcm-replay/*
+!compaction-results/lcm-replay/baseline-authoritative.json
+!compaction-results/lcm-replay/baseline-authoritative.json.sources.json
+!compaction-results/lcm-replay/baseline-authoritative.json.sqlite
+!compaction-results/lcm-replay/baseline-authoritative.migrated.sqlite
+!compaction-results/lcm-replay/baseline-authoritative.raw-prefix.jsonl
+!compaction-results/lcm-replay/baseline-authoritative.resolved-prefix.jsonl
+!compaction-results/lcm-replay/baseline-authoritative.treatment.sqlite
 changes/
 __pycache__/
 

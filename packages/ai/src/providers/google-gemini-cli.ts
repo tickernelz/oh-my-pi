@@ -278,6 +278,8 @@ export interface GoogleGeminiCliOptions extends StreamOptions {
 
 export interface AntigravityProviderSessionState extends ProviderSessionState {
 	lastGoodEndpoint?: string;
+	/** Endpoint selected for the next durable single-attempt request after a retryable route failure. */
+	nextEndpoint?: string;
 	/**
 	 * Per-conversation request-envelope identity that mirrors the real
 	 * Antigravity client. `sessionId` is the signed-decimal session id;
@@ -557,31 +559,48 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				const mode = options?.antigravityEndpointMode ?? "auto";
 				if (mode === "sandbox") {
 					endpoints = [ANTIGRAVITY_SANDBOX_ENDPOINT];
-					if (providerState) providerState.lastGoodEndpoint = undefined;
+					if (providerState) {
+						providerState.lastGoodEndpoint = undefined;
+						providerState.nextEndpoint = undefined;
+					}
 				} else if (mode === "production") {
 					endpoints = [ANTIGRAVITY_DAILY_ENDPOINT];
-					if (providerState) providerState.lastGoodEndpoint = undefined;
+					if (providerState) {
+						providerState.lastGoodEndpoint = undefined;
+						providerState.nextEndpoint = undefined;
+					}
 				} else {
 					// auto mode
 					if (baseUrl) {
 						const cleanUrl = baseUrl.replace(/\/+$/, "");
 						if (cleanUrl !== ANTIGRAVITY_DAILY_ENDPOINT && cleanUrl !== ANTIGRAVITY_SANDBOX_ENDPOINT) {
 							endpoints = [baseUrl];
-							if (providerState) providerState.lastGoodEndpoint = undefined;
+							if (providerState) {
+								providerState.lastGoodEndpoint = undefined;
+								providerState.nextEndpoint = undefined;
+							}
 						} else {
 							const defaultFallbacks = [...ANTIGRAVITY_ENDPOINT_FALLBACKS] as string[];
-							const lastGood = providerState?.lastGoodEndpoint;
-							if (lastGood && defaultFallbacks.includes(lastGood)) {
-								endpoints = [lastGood, ...defaultFallbacks.filter(e => e !== lastGood)];
+							const nextEndpoint = providerState?.nextEndpoint;
+							const preferredEndpoint =
+								nextEndpoint && defaultFallbacks.includes(nextEndpoint)
+									? nextEndpoint
+									: providerState?.lastGoodEndpoint;
+							if (preferredEndpoint && defaultFallbacks.includes(preferredEndpoint)) {
+								endpoints = [preferredEndpoint, ...defaultFallbacks.filter(e => e !== preferredEndpoint)];
 							} else {
 								endpoints = defaultFallbacks;
 							}
 						}
 					} else {
 						const defaultFallbacks = [...ANTIGRAVITY_ENDPOINT_FALLBACKS] as string[];
-						const lastGood = providerState?.lastGoodEndpoint;
-						if (lastGood && defaultFallbacks.includes(lastGood)) {
-							endpoints = [lastGood, ...defaultFallbacks.filter(e => e !== lastGood)];
+						const nextEndpoint = providerState?.nextEndpoint;
+						const preferredEndpoint =
+							nextEndpoint && defaultFallbacks.includes(nextEndpoint)
+								? nextEndpoint
+								: providerState?.lastGoodEndpoint;
+						if (preferredEndpoint && defaultFallbacks.includes(preferredEndpoint)) {
+							endpoints = [preferredEndpoint, ...defaultFallbacks.filter(e => e !== preferredEndpoint)];
 						} else {
 							endpoints = defaultFallbacks;
 						}
@@ -909,6 +928,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			};
 
 			let receivedContent = false;
+			const maxEmptyStreamRetries = options?.disableProviderRetries ? 0 : MAX_EMPTY_STREAM_RETRIES;
 
 			for (let i = 0; i < endpoints.length; i++) {
 				const endpoint = endpoints[i];
@@ -928,7 +948,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							headers: requestHeaders,
 							body: requestBodyJson,
 							signal: watchdog.signal,
-							maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
+							maxAttempts: options?.disableProviderRetries ? 1 : isLastEndpoint ? MAX_RETRIES + 1 : 1,
 							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
 							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
 							fetch: options?.fetch,
@@ -940,7 +960,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 					if (!response.ok) {
 						if (AIError.isTransientStatus(response.status)) {
-							if (!isLastEndpoint) {
+							if (!isLastEndpoint && !options?.disableProviderRetries) {
 								continue;
 							}
 						}
@@ -963,7 +983,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					const requestUrl = response.url;
 					let currentResponse = response;
 
-					for (let emptyAttempt = 0; emptyAttempt <= MAX_EMPTY_STREAM_RETRIES; emptyAttempt++) {
+					for (let emptyAttempt = 0; emptyAttempt <= maxEmptyStreamRetries; emptyAttempt++) {
 						if (options?.signal?.aborted) {
 							throw new AIError.AbortError("Request was aborted");
 						}
@@ -1003,7 +1023,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							break;
 						}
 
-						if (emptyAttempt < MAX_EMPTY_STREAM_RETRIES) {
+						if (emptyAttempt < maxEmptyStreamRetries) {
 							resetOutput();
 						}
 					}
@@ -1039,6 +1059,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						(options?.antigravityEndpointMode === "auto" || !options?.antigravityEndpointMode)
 					) {
 						providerState.lastGoodEndpoint = endpoint;
+						providerState.nextEndpoint = undefined;
 					}
 					// Commit after a fully successful attempt (content + finish reason);
 					// used as the next request's last_execution_id. Overwrite even when
@@ -1049,15 +1070,16 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					break;
 				} catch (error) {
 					const status = extractHttpStatusFromError(error);
-					if (
+					const canTryNextEndpoint =
 						!isLastEndpoint &&
 						!started &&
 						(AIError.isTransientStatus(status) ||
 							(status === undefined &&
 								!(error instanceof AIError.ProviderResponseError && error.kind === "output") &&
-								AIError.retriable(AIError.classify(error))))
-					) {
-						continue;
+								AIError.retriable(AIError.classify(error))));
+					if (canTryNextEndpoint) {
+						if (!options?.disableProviderRetries) continue;
+						if (providerState) providerState.nextEndpoint = endpoints[i + 1];
 					}
 					throw error;
 				}

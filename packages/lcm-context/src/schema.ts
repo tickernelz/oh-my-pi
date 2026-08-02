@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const LCM_SCHEMA_VERSION = 9;
+export const LCM_SCHEMA_VERSION = 10;
 
 export class UnsupportedLcmSchemaError extends Error {
 	readonly foundVersion: number;
@@ -470,6 +470,66 @@ function migration9(db: Database): void {
 	db.run("ALTER TABLE summary_attempts ADD COLUMN session_id TEXT");
 }
 
+function migration10(db: Database): void {
+	db.run("ALTER TABLE summary_jobs ADD COLUMN retry_epoch INTEGER NOT NULL DEFAULT 0 CHECK (retry_epoch >= 0)");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN lease_policy_token TEXT");
+	db.run("ALTER TABLE summary_jobs ADD COLUMN lease_mutation_nonce TEXT");
+	db.run(`
+		CREATE TABLE summary_retry_policies (
+			project_id TEXT PRIMARY KEY,
+			retry_key TEXT,
+			epoch INTEGER NOT NULL CHECK (epoch >= 0),
+			claim_token TEXT,
+			updated_at INTEGER NOT NULL,
+			CHECK ((retry_key IS NULL AND epoch = 0 AND claim_token IS NULL) OR
+				(retry_key IS NOT NULL AND epoch >= 1 AND claim_token IS NOT NULL))
+		) WITHOUT ROWID, STRICT
+	`);
+	db.run(`
+		INSERT INTO summary_retry_policies(project_id, retry_key, epoch, claim_token, updated_at)
+		SELECT project_id, NULL, 0, NULL, 0 FROM branches
+		UNION
+		SELECT project_id, NULL, 0, NULL, 0 FROM summary_jobs
+	`);
+	db.run(`
+		UPDATE summary_jobs SET status = 'pending', worker_id = NULL, lease_token = NULL,
+			lease_expires_at = NULL, lease_input_tokens = NULL, lease_output_budget = NULL,
+			lease_policy_token = NULL, lease_mutation_nonce = NULL,
+			updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+		WHERE status = 'leased'
+	`);
+	db.run(`
+		CREATE TRIGGER summary_jobs_authorized_insert BEFORE INSERT ON summary_jobs
+		WHEN NEW.status = 'leased' AND NOT EXISTS (
+			SELECT 1 FROM summary_retry_policies p WHERE p.project_id = NEW.project_id
+			AND p.retry_key IS NOT NULL AND NEW.retry_epoch = p.epoch
+			AND NEW.lease_policy_token = p.claim_token AND NEW.lease_mutation_nonce IS NOT NULL
+		) BEGIN SELECT RAISE(ABORT, 'unauthorized lease'); END
+	`);
+	db.run(`
+		CREATE TRIGGER summary_jobs_authorized_update BEFORE UPDATE ON summary_jobs
+		WHEN NEW.status = 'leased' AND (
+			NOT EXISTS (
+				SELECT 1 FROM summary_retry_policies p WHERE p.project_id = NEW.project_id
+				AND p.retry_key IS NOT NULL AND NEW.retry_epoch = p.epoch
+				AND NEW.lease_policy_token = p.claim_token AND NEW.lease_mutation_nonce IS NOT NULL
+			) OR (
+				OLD.status = 'leased' AND (
+					NEW.worker_id IS NOT OLD.worker_id OR NEW.lease_token IS NOT OLD.lease_token OR
+					NEW.lease_expires_at IS NOT OLD.lease_expires_at OR
+					NEW.retry_epoch IS NOT OLD.retry_epoch OR NEW.lease_policy_token IS NOT OLD.lease_policy_token
+				) AND NEW.lease_mutation_nonce IS OLD.lease_mutation_nonce
+			)
+		) BEGIN SELECT RAISE(ABORT, 'unauthorized lease mutation'); END
+	`);
+	db.run(`
+		CREATE TRIGGER summary_jobs_authorization_cleanup BEFORE UPDATE ON summary_jobs
+		WHEN OLD.status = 'leased' AND NEW.status != 'leased'
+			AND (NEW.lease_policy_token IS NOT NULL OR NEW.lease_mutation_nonce IS NOT NULL)
+		BEGIN SELECT RAISE(ABORT, 'uncleared lease authorization'); END
+	`);
+}
+
 const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration1,
 	migration2,
@@ -480,6 +540,7 @@ const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
 	migration7,
 	migration8,
 	migration9,
+	migration10,
 ];
 
 export function initializeLcmSchema(db: Database, busyTimeoutMs: number): void {

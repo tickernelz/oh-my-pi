@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
@@ -9,8 +9,13 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm, createHistoricalContextMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { SessionLcm } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
+import {
+	convertToLlm,
+	createHistoricalContextMessage,
+	wrapSteeringForModel,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
+import { estimateLcmProjectionMessageTokens, SessionLcm } from "@oh-my-pi/pi-coding-agent/session/session-lcm";
+import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -167,6 +172,7 @@ describe("AgentSession context promotion", () => {
 		const marker = "Lossless projection owned this provider request.";
 		const projection: ContextProjection = {
 			revision: 1,
+			activeSourceFingerprint: activeSourceFingerprint(["overflow-source"]),
 			ready: true,
 			historical: [
 				{
@@ -200,9 +206,22 @@ describe("AgentSession context promotion", () => {
 			const projectedMessages: AgentMessage[] = messages[0]
 				? [messages[0], historical, ...messages.slice(1)]
 				: [historical];
-			return { messages: projectedMessages, owned: true, projection };
+			const candidateTokens = wrapSteeringForModel(projectedMessages).reduce(
+				(total, message) => total + estimateLcmProjectionMessageTokens(message),
+				0,
+			);
+			return {
+				messages: projectedMessages,
+				owned: true,
+				projection,
+				candidateTokens,
+				messageTokenBudget: candidateTokens,
+				projectionTokenMeasurements: 1,
+				routeKey: { generation: 0, projectionAttempt: requests.length, sessionId: "test" },
+			};
 		});
-		vi.spyOn(SessionLcm.prototype, "ownsRequest").mockResolvedValue(true);
+		vi.spyOn(SessionLcm.prototype, "commitPrimaryRequestRoute").mockReturnValue(true);
+		vi.spyOn(SessionLcm.prototype, "ownsRequest").mockResolvedValue({ kind: "owned", projection });
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -212,8 +231,9 @@ describe("AgentSession context promotion", () => {
 				if (!liveSession) throw new Error("Expected live session before provider request");
 				return await liveSession.projectLcmContext(messages, signal);
 			},
+			beforeProviderDispatch: (messages, signal) => liveSession?.beginPrimaryProviderRequest(messages, signal),
+			afterProviderResponse: (messages, response) => liveSession?.completePrimaryProviderRequest(messages, response),
 			streamFn: (requestModel, context) => {
-				liveSession?.beginPrimaryProviderRequest();
 				const requestIndex = requests.length;
 				requests.push({
 					model: requestModel.id,
@@ -318,6 +338,94 @@ describe("AgentSession context promotion", () => {
 			{ model: largeModel.id, usedLossless: false },
 		]);
 		expect(lastMessage).toMatchObject({ model: largeModel.id, stopReason: "stop" });
+	});
+
+	it("rekeys an owned overflow intent after a pre-prompt native history rewrite", async () => {
+		const model = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!model) throw new Error("Expected small codex model to exist");
+		const manager = SessionManager.inMemory(tempDir.path());
+		manager.appendMessage(createUserMessage("old request"));
+		const failed = createOverflowMessage(model);
+		manager.appendMessage(failed);
+		const projection: ContextProjection = {
+			revision: 1,
+			activeSourceFingerprint: activeSourceFingerprint(["fresh-source"]),
+			ready: true,
+			historical: [],
+			freshTailSourceIds: ["fresh-source"],
+			uncoveredSourceIds: [],
+			sourceTokens: 1,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: 1,
+			estimatedTokens: 1,
+			pendingJobs: 0,
+		};
+		vi.spyOn(SessionLcm.prototype, "ownsRequest").mockResolvedValue({ kind: "owned", projection });
+		const rearm = vi.spyOn(SessionLcm.prototype, "rearmPrimaryIntent");
+		let projectedInput: AgentMessage[] | undefined;
+		vi.spyOn(SessionLcm.prototype, "project").mockImplementation(async messages => {
+			projectedInput = structuredClone(messages);
+			return { messages, owned: false };
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: manager.buildSessionContext().messages,
+			},
+			convertToLlm,
+			transformContext: (messages, signal) => session.projectLcmContext(messages, signal),
+			streamFn: requestModel => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage(requestModel, "recovered");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"context.engine": "lossless",
+				"contextPromotion.enabled": false,
+				"retry.enabled": false,
+			}),
+			modelRegistry,
+			lcm: { agentDir: tempDir.path() },
+		});
+
+		vi.spyOn(SessionMaintenance.prototype, "runPrePromptCompactionIfNeeded").mockImplementation(async () => {
+			session.agent.replaceMessages([
+				{ role: "user", content: "native compaction rewrite", timestamp: failed.timestamp + 1 },
+			]);
+		});
+
+		await session.prompt("new pending prompt");
+		await session.waitForIdle();
+
+		expect(rearm).toHaveBeenCalledTimes(1);
+		const [rearmedMessages, rearmedFloor] = rearm.mock.calls[0]!;
+		expect(rearmedFloor).toBeUndefined();
+		if (!projectedInput) throw new Error("Expected Lossless projection input");
+		expect(rearmedMessages).toEqual(projectedInput);
+		expect(JSON.stringify(rearmedMessages)).toContain("new pending prompt");
+		expect(
+			manager
+				.buildSessionContext()
+				.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.stopReason === "error" &&
+						message.timestamp === failed.timestamp,
+				),
+		).toBe(false);
 	});
 
 	it("promotes on 413 payload-too-large overflow errors", async () => {

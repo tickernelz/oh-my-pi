@@ -10,6 +10,7 @@
 
 - Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
 - Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
+- Fixed `extractRetryHint` to honor the longest valid delay across retry headers, formatted markers, and prose hints instead of stopping at the first match.
 ## [17.2.1] - 2026-07-30
 
 ### Added

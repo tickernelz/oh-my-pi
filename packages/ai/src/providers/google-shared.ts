@@ -959,12 +959,13 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			if (replacement !== undefined) {
 				params = replacement as GenerateContentParameters;
 			}
+			const requestUrl = options?.disableProviderRetries && plan.fallbackUrl ? plan.fallbackUrl : plan.url;
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,
 				model: model.id,
 				method: "POST",
-				url: plan.url,
+				url: requestUrl,
 				body: params,
 				headers: plan.headers,
 			};
@@ -998,11 +999,15 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			// global endpoint; retry global once so a stale/ambient region never
 			// breaks a request that worked before regional routing existed.
 			const openStream = async (): Promise<ReadableStream<Uint8Array>> => {
-				if (!plan.fallbackUrl) return openStreamAt(plan.url);
+				if (!plan.fallbackUrl || options?.disableProviderRetries) return openStreamAt(requestUrl);
 				try {
 					return await openStreamAt(plan.url);
 				} catch (error) {
-					if (error instanceof AIError.GoogleApiError && error.status === 404) {
+					if (
+						!options?.disableProviderRetries &&
+						error instanceof AIError.GoogleApiError &&
+						error.status === 404
+					) {
 						return openStreamAt(plan.fallbackUrl);
 					}
 					throw error;
@@ -1015,6 +1020,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			// Gemini occasionally finishes with `finishReason: STOP` while emitting only an empty
 			// text part and no tool call. Delivered as-is the agent receives a blank message and
 			// silently halts mid-task, so retry a bounded number of times before giving up.
+			const maxEmptyStreamRetries = options?.disableProviderRetries ? 0 : MAX_EMPTY_STREAM_RETRIES;
 			for (let emptyAttempt = 0; ; emptyAttempt++) {
 				const googleStream = readSseJson<GenerateContentResponse>(body, options?.signal, event =>
 					options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
@@ -1032,9 +1038,9 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				});
 
 				if (output.stopReason !== "stop" || hasMeaningfulGoogleContent(output)) break;
-				if (emptyAttempt >= MAX_EMPTY_STREAM_RETRIES) {
+				if (emptyAttempt >= maxEmptyStreamRetries) {
 					throw new AIError.ProviderResponseError(
-						`Google API returned an empty response (finishReason STOP with no content) after ${MAX_EMPTY_STREAM_RETRIES + 1} attempts`,
+						`Google API returned an empty response (finishReason STOP with no content) after ${maxEmptyStreamRetries + 1} attempts`,
 						{ provider: model.provider, kind: "empty-body" },
 					);
 				}

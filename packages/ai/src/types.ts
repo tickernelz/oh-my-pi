@@ -409,6 +409,8 @@ export interface StreamOptions {
 	frequencyPenalty?: number;
 	maxTokens?: number;
 	signal?: AbortSignal;
+	/** Agent-internal fence called by the StreamFn that owns each transport admission. */
+	beforeTransportDispatch?: () => void | Promise<void>;
 	apiKey?: string;
 	cacheRetention?: CacheRetention;
 	/**
@@ -542,6 +544,8 @@ export interface StreamOptions {
 	 * omission preserves the provider default.
 	 */
 	codexSseMaxAttempts?: number;
+	/** Prevent provider code from issuing a second transport request for this call. */
+	disableProviderRetries?: boolean;
 	/**
 	 * Optional retry delay hook for tests and transports that need custom scheduling.
 	 */

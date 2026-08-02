@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { fetchWithRetry } from "@oh-my-pi/pi-utils/fetch-retry";
+import { extractRetryHint, fetchWithRetry } from "@oh-my-pi/pi-utils/fetch-retry";
 
 describe("fetchWithRetry", () => {
 	it("routes requests through the `fetch` override when provided", async () => {
@@ -77,5 +77,18 @@ describe("fetchWithRetry", () => {
 		expect(response.status).toBe(429);
 		expect(await response.text()).toBe("slow down");
 		expect(attempt).toBe(1);
+	});
+});
+
+describe("extractRetryHint", () => {
+	it("extracts the largest retry-after-ms marker from formatted error text", () => {
+		expect(
+			extractRetryHint(undefined, "provider overloaded retry-after-ms=125.5; outer error retry-after-ms=450"),
+		).toBe(450);
+	});
+
+	it("uses the longest valid delay across headers, structured markers, and prose", () => {
+		const headers = new Headers({ "retry-after": "120", "x-ratelimit-reset-after": "30" });
+		expect(extractRetryHint(headers, "retry-after-ms=1000; try again in 1 hour")).toBe(60 * 60_000);
 	});
 });

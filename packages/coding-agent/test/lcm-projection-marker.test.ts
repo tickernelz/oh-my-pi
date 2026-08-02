@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import {
@@ -16,6 +16,15 @@ import {
 function projection(overrides: Partial<ContextProjection> = {}): ContextProjection {
 	return {
 		revision: 7,
+		activeSourceFingerprint: activeSourceFingerprint([
+			"source-a",
+			"source-b",
+			"source-c",
+			"fresh-1",
+			"fresh-2",
+			"fresh-3",
+			"fresh-4",
+		]),
 		ready: true,
 		historical: [
 			{
@@ -184,6 +193,15 @@ describe("lcmProjectionFingerprint", () => {
 		});
 		const changedFreshTail = projection({
 			freshTailSourceIds: ["fresh-1", "fresh-2", "fresh-3", "fresh-replacement"],
+			activeSourceFingerprint: activeSourceFingerprint([
+				"source-a",
+				"source-b",
+				"source-c",
+				"fresh-1",
+				"fresh-2",
+				"fresh-3",
+				"fresh-replacement",
+			]),
 		});
 		expect(lcmProjectionFingerprint(storageOnly)).toBe(lcmProjectionFingerprint(first));
 		expect(lcmProjectionFingerprint(changedCounts)).not.toBe(lcmProjectionFingerprint(first));

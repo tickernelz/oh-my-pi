@@ -1,4 +1,4 @@
-import type { DoctorReport, PurgeResult, RebuildResult } from "@oh-my-pi/lcm-context";
+import type { DoctorReport, PurgeResult, RebuildResult, SummaryJobAvailability } from "@oh-my-pi/lcm-context";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatBytes } from "@oh-my-pi/pi-utils";
 import type { LcmPublicStatus } from "../session/session-lcm";
@@ -16,7 +16,7 @@ import { resolveLcmProject } from "./project-identity";
 import { discoverLcmProjectJournals } from "./rebuild";
 
 const LCM_USAGE =
-	"Usage: /lcm <status|doctor|rebuild <current|project> --yes|gc|search <query>|describe <handle>|projects>";
+	"Usage: /lcm <status|doctor|rebuild <current|project> --yes|retry [all]|gc|search <query>|describe <handle>|projects>";
 const LCM_REBUILD_USAGE =
 	"Usage: /lcm rebuild <current|project> --yes\nRebuild destructively replaces derived state for only the confirmed scope, can queue summary-model work and incur model cost, and never modifies JSONL.";
 
@@ -28,6 +28,7 @@ export const LCM_SUBCOMMANDS: SubcommandDef[] = [
 		description: "Rebuild from authoritative JSONL with explicit scope",
 		usage: "<current|project> --yes",
 	},
+	{ name: "retry", description: "Retry due summary work, or wake all delayed work", usage: "[all]" },
 	{ name: "gc", description: "Run retention-aware garbage collection on eligible derived data" },
 	{ name: "search", description: "Search current redacted derived history", usage: "<query>" },
 	{ name: "describe", description: "Describe a current LCM handle", usage: "<handle>" },
@@ -77,10 +78,50 @@ function formatBackoff(retryAt: number | undefined): string {
 	return new Date(retryAt).toISOString();
 }
 
+function formatPrimaryRoute(route: LcmPublicStatus["runtime"]["lastRequestRoute"]): string {
+	if (!route) return "none";
+	switch (route.kind) {
+		case "lossless":
+			return "LCM takeover";
+		case "native_passthrough":
+			return `native passthrough (${safeIdentifier(route.reason)})`;
+		case "native_fallback": {
+			const category = safeIdentifier(route.category);
+			const reason = route.reason === undefined ? "" : `/${safeIdentifier(route.reason)}`;
+			return `native fallback (${category}${reason})`;
+		}
+		default:
+			return "[redacted]";
+	}
+}
+
+function formatRouteMetrics(metrics: LcmPublicStatus["runtime"]["lastTakeover"]): string {
+	if (!metrics) return "none";
+	const revision =
+		Number.isSafeInteger(metrics.revision) && (metrics.revision ?? -1) >= 0 ? `; revision ${metrics.revision}` : "";
+	return `${formatBackoff(metrics.observedAt)}${revision}`;
+}
+
+function formatLastFailure(failure: LcmPublicStatus["runtime"]["lastFailure"]): string {
+	if (!failure) return "none";
+	const category = safeIdentifier(failure.category);
+	const reason = failure.reason === undefined ? "" : `/${safeIdentifier(failure.reason)}`;
+	return `${formatBackoff(failure.observedAt)}; ${category}${reason}`;
+}
+
 export function formatLcmStatus(status: LcmPublicStatus): string {
 	const { runtime, store } = status;
+	const health = safeIdentifier(typeof runtime.health === "string" ? runtime.health : undefined).toUpperCase();
+	const readiness =
+		typeof runtime.coverageReadiness === "string"
+			? safeIdentifier(runtime.coverageReadiness).toUpperCase()
+			: "UNAVAILABLE";
 	const lines = [
-		`LCM status: ${runtime.phase.toUpperCase()}`,
+		`LCM health: ${health}`,
+		`Current coverage readiness: ${readiness}`,
+		`Last primary request route: ${formatPrimaryRoute(runtime.lastRequestRoute)}`,
+		`Last LCM takeover: ${formatRouteMetrics(runtime.lastTakeover)}`,
+		`Last LCM failure: ${formatLastFailure(runtime.lastFailure)}`,
 		"Authority: session JSONL is authoritative; LCM SQLite is redacted, derived, and rebuildable.",
 	];
 	if (runtime.summaryModelSelector) {
@@ -149,7 +190,7 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 				const nodes = selectedLevels.reduce((total, [, count]) => total + count, 0);
 				lines.push(`Projection: fitted to the current request; ${projection.pendingJobs} relevant jobs pending`);
 				lines.push(
-					`DAG: depth ${depth}, ${nodes} selected nodes, ${projection.coveredSourceCount} covered sources, ${projection.freshSourceCount} fresh sources`,
+					`DAG: depth ${depth}, ${nodes} selected nodes, ${projection.coveredSourceCount} covered sources, ${projection.uncoveredSourceCount} uncovered sources, ${projection.freshSourceCount} fresh sources`,
 				);
 				lines.push(`Estimated tokens: ${projection.sourceTokens} -> ${projection.estimatedTokens}`);
 			} else {
@@ -157,12 +198,11 @@ export function formatLcmStatus(status: LcmPublicStatus): string {
 			}
 		}
 	}
-	if (runtime.lastFailureCategory) lines.push(`Last fallback: ${runtime.lastFailureCategory}`);
-	if (store?.quarantined || runtime.phase === "quarantined") {
+	if (store?.quarantined || runtime.health === "quarantined") {
 		lines.push("Derived store is quarantined; native compaction remains active.");
-	} else if (runtime.phase === "degraded") {
-		lines.push("Lossless projection is degraded; native compaction remains active.");
-	} else if (runtime.phase === "warming" && branch?.projectionState === "unevaluated") {
+	} else if (runtime.health === "degraded") {
+		lines.push("Lossless runtime is degraded; native compaction remains active.");
+	} else if (runtime.coverageReadiness === "warming" && branch?.projectionState === "unevaluated") {
 		const pressure = runtime.pressure;
 		if (pressure && pressure.requestTokens > pressure.hardThresholdTokens) {
 			lines.push("Lossless projection is evaluating the current revision; native compaction stays ready meanwhile.");
@@ -201,6 +241,10 @@ export function formatLcmRebuild(result: RebuildResult, scope: "current" | "proj
 
 export function formatLcmGc(result: PurgeResult): string {
 	return `LCM retention-aware GC removed ${result.tombstones} eligible tombstones, ${result.jobs} eligible jobs, ${result.summaries} unreferenced summaries, ${result.sourceContents} unreferenced source contents, ${result.files} unreferenced file records, and ${result.quarantineFiles} expired quarantine artifacts (${formatBytes(result.quarantineBytes)}). Active lineage and authoritative session JSONL were not changed.`;
+}
+
+export function formatLcmRetry(result: SummaryJobAvailability, mode: "due" | "all"): string {
+	return `LCM summary retry (${mode}) found ${result.runnable} runnable, ${result.leased} leased, ${result.backoff} in backoff, ${result.exhausted} exhausted, ${result.missing} missing, and ${result.policyMismatch} policy-mismatched relevant jobs.`;
 }
 
 async function formatLcmProjects(agentDir: string): Promise<string> {
@@ -295,6 +339,21 @@ export async function handleLcmCommand(
 				);
 				return commandConsumed();
 			}
+			case "retry": {
+				if (rest && rest !== "all") return usage("Usage: /lcm retry [all]", runtime);
+				if (!runtime.session.lcmEnabled) {
+					await runtime.output("LCM retry unavailable: Lossless context is disabled; native context is active.");
+					return commandConsumed();
+				}
+				const mode = rest === "all" ? "all" : "due";
+				const result = await runtime.session.lcmRetrySummaries(mode);
+				await runtime.output(
+					result
+						? formatLcmRetry(result, mode)
+						: "LCM retry unavailable: derived state is uninitialized; native context remains active.",
+				);
+				return commandConsumed();
+			}
 			case "gc": {
 				if (rest) return usage(LCM_USAGE, runtime);
 				if (!runtime.session.lcmEnabled) {
@@ -321,13 +380,13 @@ export async function handleLcmCommand(
 					return commandConsumed();
 				}
 				const status = await runtime.session.lcmStatus();
-				if (status.runtime.phase === "uninitialized") {
+				if (status.runtime.health === "uninitialized") {
 					await runtime.output(
 						"LCM search unavailable: derived state is uninitialized; session JSONL remains authoritative.",
 					);
-				} else if (status.runtime.phase === "degraded" || status.runtime.phase === "quarantined") {
+				} else if (status.runtime.health === "degraded" || status.runtime.health === "quarantined") {
 					await runtime.output(
-						`LCM search unavailable while runtime is ${status.runtime.phase}; native context remains active.`,
+						`LCM search unavailable while runtime is ${status.runtime.health}; native context remains active.`,
 					);
 				} else {
 					await runtime.output("No LCM matches found in the current project/session/branch derived state.");

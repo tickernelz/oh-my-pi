@@ -554,6 +554,31 @@ describe("Google Gemini CLI alignment", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("Cloud Code Assist API error (503)");
 		});
+
+		it("disables transport retries for a single-attempt caller", async () => {
+			let fetchCalls = 0;
+			const fetchMock: FetchImpl = async () => {
+				fetchCalls += 1;
+				return new Response('{"error":{"message":"busy"}}', {
+					status: 503,
+					headers: { "retry-after-ms": "0" },
+				});
+			};
+			const options = {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				fetch: fetchMock,
+				disableProviderRetries: true,
+			};
+
+			const result = await streamGoogleGeminiCli(
+				createModel("google-gemini-cli"),
+				createContext(),
+				options,
+			).result();
+
+			expect(fetchCalls).toBe(1);
+			expect(result.stopReason).toBe("error");
+		});
 	});
 
 	describe("planning leak interception", () => {

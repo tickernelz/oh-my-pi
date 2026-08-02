@@ -230,6 +230,58 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(agentEndTerminalStates).toEqual([false]);
 	});
 
+	it("keeps an automatic fallback local to its compaction and leaves later manual compaction unannotated", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const previous = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "previous answer" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage(previous);
+		sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() + 1 });
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		vi.spyOn(session, "losslessOwnsRequest").mockResolvedValueOnce({
+			kind: "native",
+			fallback: { category: "provider", reason: "provider_exhausted" },
+		});
+
+		await session.runIdleCompaction(250);
+		const automatic = sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "compaction")
+			.at(-1);
+		expect(automatic).toMatchObject({ type: "compaction", lcmFallback: "provider" });
+
+		sessionManager.appendMessage({ role: "user", content: "after fallback", timestamp: Date.now() + 2 });
+		sessionManager.appendMessage({
+			...previous,
+			content: [{ type: "text", text: "later answer" }],
+			timestamp: Date.now() + 3,
+		});
+		sessionManager.appendMessage({ role: "user", content: "compact manually", timestamp: Date.now() + 4 });
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		await session.compact();
+
+		const manual = sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "compaction")
+			.at(-1);
+		expect(manual).toMatchObject({ type: "compaction" });
+		expect(manual?.lcmFallback).toBeUndefined();
+	});
+
 	it("marks manual compaction active before abort teardown can yield", async () => {
 		session.settings.set("compaction.keepRecentTokens", 1);
 		sessionManager.appendMessage({
@@ -371,7 +423,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			}
 		});
 
-		const autoPromise = session.runIdleCompaction();
+		const autoPromise = session.runIdleCompaction(0);
 		while (!getRuntimeSignals().includes("before_compact:enter")) {
 			await Promise.resolve();
 		}
@@ -390,6 +442,74 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// and double-rewrite session history.
 		expect(autoAborted).toBe(true);
 		expect(appendCompactionSpy).not.toHaveBeenCalled();
+	});
+
+	it("waits for a canceled automatic probe before manual compaction begins", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() + 1 });
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const probeStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const releaseProbe = Promise.withResolvers<void>();
+		vi.spyOn(session, "losslessOwnsRequest").mockImplementation(async (_messages, signal) => {
+			probeStarted.resolve(signal);
+			await releaseProbe.promise;
+			return { kind: "aborted" };
+		});
+
+		const automatic = session.runIdleCompaction(250);
+		const signal = await probeStarted.promise;
+		const manual = session.compact();
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+
+		expect(signal?.aborted).toBe(true);
+		expect(getRuntimeSignals()).not.toContain("before_compact:enter");
+		releaseProbe.resolve();
+		await Promise.all([automatic, manual]);
+		expect(getRuntimeSignals()).toContain("before_compact:enter");
+	});
+
+	it("waits for the canceled automatic probe before resetting the session", async () => {
+		const probeStarted = Promise.withResolvers<AbortSignal | undefined>();
+		const releaseProbe = Promise.withResolvers<void>();
+		vi.spyOn(session, "losslessOwnsRequest").mockImplementation(async (_messages, signal) => {
+			probeStarted.resolve(signal);
+			await releaseProbe.promise;
+			return { kind: "aborted" };
+		});
+		const previousSessionId = session.sessionId;
+		const idle = session.runIdleCompaction(250);
+		const signal = await probeStarted.promise;
+		let resetSettled = false;
+		const reset = session.newSession().then(result => {
+			resetSettled = true;
+			return result;
+		});
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+
+		expect(signal?.aborted).toBe(true);
+		expect(resetSettled).toBe(false);
+		expect(session.sessionId).toBe(previousSessionId);
+
+		releaseProbe.resolve();
+		await Promise.all([idle, reset]);
+		expect(session.sessionId).not.toBe(previousSessionId);
 	});
 
 	it("runs threshold compaction for active goal turns that end with yield", async () => {
@@ -539,22 +659,10 @@ describe("AgentSession auto-compaction queue resume", () => {
 		).toBe(true);
 	});
 
-	it("triggers threshold compaction in active goals even when per-turn pruning shaves the post-prune estimate below threshold", async () => {
-		// Regression for #3174. Goal mode is the most common scenario: the agent
-		// runs many tool-result-heavy turns and the per-turn "useless" /
-		// "supersede" passes shave tokens off every check. Pre-fix
-		// `#checkCompaction` subtracted those savings from the threshold input, so
-		// with the reporter's fixed `compaction.thresholdTokens: 76384`, the
-		// threshold input fell below the trigger even when the provider-billed
-		// prompt (and the visible context anchored to it) sat above 90k tokens —
-		// auto-compaction silently no-op'd indefinitely while the loop kept
-		// running.
-		//
-		// This seeds one large `useless` tool result whose suffix sits inside the
-		// 8k cache-warm window so `#pruneStaleToolResults` actually returns ≥20k
-		// savings (well above the buggy code's mis-subtraction needed to drop
-		// 91000 below 76384). Compaction MUST still fire because the last turn's
-		// billed context tokens (91k) are above the configured threshold.
+	it("skips threshold compaction when pruning drops the retry pressure below hard", async () => {
+		// Seed one large useless result whose removal takes the next request below the
+		// configured hard threshold. The completed turn's stale billed size must not
+		// force LCM, promotion, or native compaction after that rewrite.
 		const now = Date.now();
 
 		// Seed: small user, small toolCall, ONE big useless tool result, then a
@@ -653,10 +761,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.settings.set("compaction.keepRecentTokens", 10000);
 		session.settings.set("compaction.reserveTokens", 16384);
 
-		// Final assistant turn: billed at ~91k context tokens, just over the
-		// reporter's threshold. The pre-fix code would have subtracted ≥20k of
-		// prune savings and dropped the threshold input below 76384, skipping
-		// compaction. Post-fix it must trigger.
+		// The completed turn was billed above hard, but the pruned retry array is not.
 		const finalAssistant = {
 			role: "assistant" as const,
 			content: [{ type: "text" as const, text: "Investigated module-7; continuing." }],
@@ -681,8 +786,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await session.waitForIdle();
 
 		const runtimeSignals = getRuntimeSignals();
-		expect(runtimeSignals).toContain("compaction:start:threshold");
-		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
+		expect(runtimeSignals).not.toContain("compaction:start:threshold");
+		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(false);
 	});
 	it("runs active-goal threshold compaction before unexpected-stop retry continuation", async () => {
 		const now = Date.now();

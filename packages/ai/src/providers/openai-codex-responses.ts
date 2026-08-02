@@ -718,6 +718,7 @@ interface CodexRequestContext {
 	providerSessionState?: CodexProviderSessionState;
 	isolatedTransportState?: CodexProviderSessionState;
 	websocketState?: CodexWebSocketSessionState;
+	sharedWebsocketState?: CodexWebSocketSessionState;
 	responsesLite: boolean;
 	requestMetadata?: CodexRequestMetadata;
 	transformedBody: RequestBody;
@@ -1396,13 +1397,12 @@ async function buildCodexRequestContext(
 	const publicSessionKey = transportSessionId ? `${baseUrl}:${model.id}:${transportSessionId}` : undefined;
 	if (sessionKey && publicSessionKey) {
 		transportProviderSessionState?.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
+		if (providerSessionState !== transportProviderSessionState) {
+			providerSessionState?.webSocketPublicToPrivate.set(publicSessionKey, sessionKey);
+		}
 	}
 	const sharedWebsocketState =
-		sessionKey && providerSessionState
-			? isolatedTransportState
-				? providerSessionState.webSocketSessions.get(sessionKey)
-				: getCodexWebSocketSessionState(sessionKey, providerSessionState)
-			: undefined;
+		sessionKey && providerSessionState ? getCodexWebSocketSessionState(sessionKey, providerSessionState) : undefined;
 	const websocketState =
 		sessionKey && isolatedTransportState
 			? getCodexWebSocketSessionState(sessionKey, isolatedTransportState)
@@ -1450,6 +1450,7 @@ async function buildCodexRequestContext(
 		providerSessionState,
 		isolatedTransportState,
 		websocketState,
+		sharedWebsocketState,
 		responsesLite,
 		requestMetadata,
 		codexClientVersion,
@@ -1521,7 +1522,7 @@ async function openInitialCodexEventStream(
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 }> {
-	const { transformedBody, websocketState } = requestContext;
+	const { transformedBody, websocketState, sharedWebsocketState } = requestContext;
 	if (websocketState && shouldUseCodexWebSocket(model, websocketState, options?.preferWebsockets)) {
 		const websocketRetryBudget = CODEX_WEBSOCKET_RETRY_BUDGET;
 		let websocketRetries = 0;
@@ -1538,12 +1539,24 @@ async function openInitialCodexEventStream(
 				);
 			} catch (error) {
 				if (!(error instanceof CodexWebSocketTransportError)) throw error;
+				if (options?.disableProviderRetries) {
+					if (!options.signal?.aborted) {
+						recordCodexWebSocketFailure(websocketState, true);
+						if (sharedWebsocketState && sharedWebsocketState !== websocketState) {
+							recordCodexWebSocketFailure(sharedWebsocketState, true);
+						}
+					}
+					throw error;
+				}
 				const fatalWebSocketMessage = error.message.toLowerCase();
 				const isFatal = CODEX_WEBSOCKET_FATAL_PATTERNS.some(pattern =>
 					fatalWebSocketMessage.includes(pattern.toLowerCase()),
 				);
 				const activateFallback = isFatal || websocketRetries >= websocketRetryBudget;
 				recordCodexWebSocketFailure(websocketState, activateFallback);
+				if (activateFallback && sharedWebsocketState && sharedWebsocketState !== websocketState) {
+					recordCodexWebSocketFailure(sharedWebsocketState, true);
+				}
 				CODEX_DEBUG &&
 					logger.debug("[codex] codex websocket fallback", {
 						error: error.message,
@@ -1713,6 +1726,7 @@ async function openCodexSseTransport(
 				requestSetup.requestSignal,
 				requestSetup.firstEventTimeoutMs,
 				options?.codexSseMaxAttempts,
+				options?.disableProviderRetries === true,
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
 			),
@@ -2318,6 +2332,17 @@ class CodexStreamProcessor {
 		if (await this.#tryRecoverWhitespaceToolCallLoop(error)) {
 			return true;
 		}
+		if (this.options?.disableProviderRetries) {
+			if (error instanceof CodexWebSocketTransportError && !this.options.signal?.aborted) {
+				const websocketState = this.requestContext.websocketState;
+				if (websocketState) recordCodexWebSocketFailure(websocketState, true);
+				const sharedWebsocketState = this.requestContext.sharedWebsocketState;
+				if (sharedWebsocketState && sharedWebsocketState !== websocketState) {
+					recordCodexWebSocketFailure(sharedWebsocketState, true);
+				}
+			}
+			return false;
+		}
 		if (await this.#tryReconnectWebSocketOnConnectionLimit(error)) {
 			return true;
 		}
@@ -2353,6 +2378,7 @@ class CodexStreamProcessor {
 		// never reaches the caller's message.
 		this.#dropTrailingDegenerateToolCall();
 		if (
+			this.options?.disableProviderRetries ||
 			this.runtime.whitespaceLoopRetries >= CODEX_WHITESPACE_LOOP_RETRY_LIMIT ||
 			!this.runtime.canSafelyReplayWebsocketOverSse ||
 			this.output.content.some(block => block.type !== "thinking") ||
@@ -3972,6 +3998,7 @@ async function openCodexSseEventStream(
 	signal: AbortSignal | undefined,
 	firstEventTimeoutMs: number | undefined,
 	codexSseMaxAttempts: number | undefined,
+	disableProviderRetries: boolean,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
@@ -4025,7 +4052,7 @@ async function openCodexSseEventStream(
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
 			},
-			maxAttempts: resolveCodexSseMaxAttempts(codexSseMaxAttempts),
+			maxAttempts: disableProviderRetries ? 1 : resolveCodexSseMaxAttempts(codexSseMaxAttempts),
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 			fetch: fetchAttempt,
@@ -4034,7 +4061,11 @@ async function openCodexSseEventStream(
 	let response: Response;
 	try {
 		response = await send(compressedBody ?? bodyJson);
-		if (compressedBody !== undefined && (response.status === 400 || response.status === 415)) {
+		if (
+			!disableProviderRetries &&
+			compressedBody !== undefined &&
+			(response.status === 400 || response.status === 415)
+		) {
 			const rejectedStatus = response.status;
 			await response.body?.cancel();
 			headers.delete("content-encoding");

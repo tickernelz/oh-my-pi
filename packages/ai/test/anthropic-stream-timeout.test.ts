@@ -491,6 +491,28 @@ describe("anthropic provider retry delays", () => {
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "after backoff" }]);
 	});
 
+	it("disables provider transport retries for a single-attempt caller", async () => {
+		let attempt = 0;
+		const create = (() => {
+			attempt += 1;
+			return createRejectedAnthropicRequest(
+				new AIError.AnthropicApiError(529, "529 overloaded", new Headers({ "retry-after-ms": "0" })),
+			) as never;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const providerRetryWait = vi.fn(async () => {});
+		const options = {
+			client: { messages: { create } } as AnthropicMessagesClientLike,
+			providerRetryWait,
+			disableProviderRetries: true,
+		};
+
+		const result = await streamAnthropic(model, context, options).result();
+
+		expect(attempt).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("retries transient TLS server errors before surfacing them to the session", async () => {
 		let attempt = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {

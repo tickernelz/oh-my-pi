@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -244,5 +244,31 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		const recovery = new TurnRecovery(createHost(model, modelRegistry));
 		const message = createProviderErrorMessage(model, new Error("fetch failed"));
 		expect(recovery.isRetryableError(message)).toBe(true);
+	});
+
+	it("passes a request-local LCM fallback through recovery compaction", async () => {
+		const host = createHost(model, modelRegistry);
+		const runAutoCompaction = vi.fn(async () => ({
+			deferredHandoff: false,
+			continuationScheduled: false,
+			historyRewritten: true,
+		}));
+		host.runAutoCompaction = runAutoCompaction;
+		host.sessionManager = { getBranch: () => [] } as never;
+		host.agent = { state: { messages: [] }, replaceMessages: () => {} } as never;
+		const message = makeMessage([], model);
+
+		await new TurnRecovery(host).runRecoveryCompactionWithRollback("overflow", message, false, {
+			autoContinue: true,
+			triggerContextTokens: 1_001,
+			lcmFallback: "provider",
+		});
+
+		expect(runAutoCompaction).toHaveBeenCalledWith("overflow", true, false, false, {
+			autoContinue: true,
+			triggerContextTokens: 1_001,
+			phase: "mid_turn",
+			lcmFallback: "provider",
+		});
 	});
 });

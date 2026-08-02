@@ -19,6 +19,7 @@ import {
 	type CompactionResult,
 	type CompactionSettings,
 	calculateContextTokens,
+	calculatePromptTokens,
 	collectShakeRegions,
 	compact,
 	compactionContextTokens,
@@ -76,6 +77,7 @@ import {
 import type { SessionContext } from "./session-context";
 import { getLatestCompactionEntry } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
+import type { LcmOwnershipDecision } from "./session-lcm";
 import type { SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 
@@ -188,10 +190,14 @@ export interface SessionMaintenanceHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	messages(): AgentMessage[];
-	losslessOwnsRequest(messages: AgentMessage[], signal?: AbortSignal): Promise<boolean>;
+	losslessOwnsRequest(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		requestTokensFloor?: number,
+	): Promise<LcmOwnershipDecision | undefined>;
+	rearmLosslessPrimaryIntent(messages: AgentMessage[], requestTokensFloor?: number): void;
 	/** Whether this exact primary response came from a Lossless-owned provider request. */
 	requestUsedLossless(message: AssistantMessage): boolean;
-	takeLosslessFallbackCategory?(): LcmFallbackCategory | undefined;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -252,13 +258,13 @@ export interface SessionMaintenanceHost {
 		reason: "overflow" | "incomplete",
 		message: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: { autoContinue: boolean; triggerContextTokens?: number; lcmFallback?: LcmFallbackCategory },
 	): Promise<CompactionCheckResult>;
 	parseRetryAfterMsFromError(errorMessage: string): number | undefined;
 	setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; onlyIfCurrent?: Model },
 	): Promise<void>;
 	abort(options?: {
 		goalReason?: "interrupted" | "internal";
@@ -272,6 +278,9 @@ export interface SessionMaintenanceHost {
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
 	#autoCompactionAbortController: AbortController | undefined;
+	#automaticProbeAbortController: AbortController | undefined;
+	#automaticOperationSignal: AbortSignal | undefined;
+	#automaticProbeTask: Promise<void> = Promise.resolve();
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
 	readonly #host: SessionMaintenanceHost;
 
@@ -285,6 +294,45 @@ export class SessionMaintenance {
 
 	constructor(host: SessionMaintenanceHost) {
 		this.#host = host;
+	}
+
+	async #withAutomaticProbe<T>(
+		parentSignal: AbortSignal | undefined,
+		operation: (signal: AbortSignal) => Promise<T>,
+		abortedValue: () => T,
+	): Promise<T> {
+		const predecessor = this.#automaticProbeTask;
+		this.#automaticProbeAbortController?.abort();
+		const controller = new AbortController();
+		this.#automaticProbeAbortController = controller;
+		const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal;
+		const task = predecessor.then(async () => {
+			if (signal.aborted) return abortedValue();
+			this.#automaticOperationSignal = signal;
+			try {
+				return await operation(signal);
+			} finally {
+				if (this.#automaticOperationSignal === signal) this.#automaticOperationSignal = undefined;
+			}
+		});
+		const drain = task.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#automaticProbeTask = drain;
+		void drain.then(() => {
+			if (this.#automaticProbeAbortController === controller) this.#automaticProbeAbortController = undefined;
+		});
+
+		if (signal.aborted) return abortedValue();
+		const aborted = Promise.withResolvers<T>();
+		const onAbort = () => aborted.resolve(abortedValue());
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await Promise.race([task, aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
 	}
 
 	/** Whether manual or automatic context maintenance is active. */
@@ -550,6 +598,7 @@ export class SessionMaintenance {
 		try {
 			this.#host.disconnectFromAgent();
 			await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
+			await this.abortAndDrainAutomaticCompaction();
 			if (!this.#model) {
 				throw new Error("No model selected");
 			}
@@ -918,18 +967,41 @@ export class SessionMaintenance {
 	abortCompaction(): void {
 		this.#compactionAbortController?.abort();
 		this.#autoCompactionAbortController?.abort();
+		this.#automaticProbeAbortController?.abort();
 		this.#host.abortHandoff();
 	}
 
 	/** Cancel only automatic maintenance while preserving a manual compaction. */
 	abortAutomaticCompaction(): void {
 		this.#autoCompactionAbortController?.abort();
+		this.#automaticProbeAbortController?.abort();
+	}
+
+	/** Abort and settle the serialized automatic-maintenance tail before replacing session state. */
+	async abortAndDrainAutomaticCompaction(): Promise<void> {
+		for (;;) {
+			this.abortAutomaticCompaction();
+			const task = this.#automaticProbeTask;
+			await task;
+			if (task === this.#automaticProbeTask) return;
+		}
 	}
 
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
-	async runIdleCompaction(): Promise<void> {
-		if (this.#host.isStreaming() || this.isCompacting) return;
-		await this.runAutoCompaction("idle", false, true);
+	async runIdleCompaction(requestTokensFloor: number, parentSignal?: AbortSignal): Promise<void> {
+		return this.#withAutomaticProbe(
+			parentSignal,
+			async signal => {
+				if (this.#host.isStreaming() || this.isCompacting || signal.aborted) return;
+				const decision = await this.#host.losslessOwnsRequest(this.#host.messages(), signal, requestTokensFloor);
+				if (decision?.kind === "owned" || decision?.kind === "aborted" || signal.aborted) return;
+				const lcmFallback = decision?.kind === "native" ? decision.fallback?.category : undefined;
+				await this.runAutoCompaction("idle", false, true, true, {
+					...(lcmFallback ? { lcmFallback } : {}),
+				});
+			},
+			() => undefined,
+		);
 	}
 
 	/**
@@ -965,7 +1037,15 @@ export class SessionMaintenance {
 		return compactionContextTokens(breakdown?.usedTokens ?? 0, localEstimate);
 	}
 
-	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+	async runPrePromptCompactionIfNeeded(messages: AgentMessage[], parentSignal?: AbortSignal): Promise<void> {
+		return this.#withAutomaticProbe(
+			parentSignal,
+			signal => this.#runPrePromptCompactionIfNeeded(messages, signal),
+			() => undefined,
+		);
+	}
+
+	async #runPrePromptCompactionIfNeeded(messages: AgentMessage[], signal: AbortSignal): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -973,13 +1053,20 @@ export class SessionMaintenance {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
-		if (await this.#host.losslessOwnsRequest([...this.#host.messages(), ...messages])) return;
+		const decision = await this.#host.losslessOwnsRequest(
+			[...this.#host.messages(), ...messages],
+			signal,
+			contextTokens,
+		);
+		if (decision?.kind === "owned" || decision?.kind === "aborted" || signal.aborted) return;
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
 		// the history at all. The post-turn threshold path already promotes before
 		// compacting; without this, the pre-prompt path would pre-empt promotion and
 		// compact (snapcompact/summary) a session that should have just been promoted.
-		if (await this.#promoteContextModel()) {
+		const promoted = await this.#promoteContextModel(signal);
+		if (signal.aborted) return;
+		if (promoted) {
 			logger.debug("Pre-prompt context promotion avoided compaction", {
 				contextTokens,
 				contextWindow,
@@ -993,10 +1080,12 @@ export class SessionMaintenance {
 			contextWindow,
 			model: `${model.provider}/${model.id}`,
 		});
+		if (signal.aborted) return;
 		await this.runAutoCompaction("threshold", false, false, false, {
 			autoContinue: false,
 			triggerContextTokens: contextTokens,
 			phase: "pre_turn",
+			...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 		});
 	}
 
@@ -1013,7 +1102,19 @@ export class SessionMaintenance {
 	 */
 	async maintainContextMidRun(
 		activeMessages: AgentMessage[],
-		signal: AbortSignal | undefined,
+		parentSignal: AbortSignal | undefined,
+		context: AgentTurnEndContext | undefined,
+	): Promise<void> {
+		return this.#withAutomaticProbe(
+			parentSignal,
+			signal => this.#maintainContextMidRun(activeMessages, signal, context),
+			() => undefined,
+		);
+	}
+
+	async #maintainContextMidRun(
+		activeMessages: AgentMessage[],
+		signal: AbortSignal,
 		context: AgentTurnEndContext | undefined,
 	): Promise<void> {
 		if (
@@ -1049,7 +1150,8 @@ export class SessionMaintenance {
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
-		if (await this.#host.losslessOwnsRequest(activeMessages, signal)) return;
+		const decision = await this.#host.losslessOwnsRequest(activeMessages, signal, contextTokens);
+		if (decision?.kind === "owned" || decision?.kind === "aborted" || signal.aborted) return;
 
 		// Promote to a larger-context sibling before compacting, mirroring the
 		// pre-prompt (runPrePromptCompactionIfNeeded) and post-turn threshold
@@ -1057,7 +1159,9 @@ export class SessionMaintenance {
 		// crosses the threshold compacts the history (and can hit the no-progress
 		// dead-end on a single oversized turn) on a model that should have just
 		// been promoted to a larger window instead.
-		if (await this.#promoteContextModel()) {
+		const promoted = await this.#promoteContextModel(signal);
+		if (signal.aborted) return;
+		if (promoted) {
 			logger.debug("Mid-run context promotion avoided compaction", {
 				contextTokens,
 				contextWindow,
@@ -1066,6 +1170,7 @@ export class SessionMaintenance {
 			return;
 		}
 
+		if (signal.aborted) return;
 		const messagesBefore = activeMessages.length;
 		await this.runAutoCompaction("threshold", false, false, false, {
 			autoContinue: false,
@@ -1073,6 +1178,7 @@ export class SessionMaintenance {
 			suppressHandoff: true,
 			triggerContextTokens: contextTokens,
 			phase: "mid_turn",
+			...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 		});
 
 		if (signal?.aborted) return;
@@ -1101,6 +1207,7 @@ export class SessionMaintenance {
 	 *    (reasoning-only or truncated). Drop the dead turn, try promotion, otherwise
 	 *    run compaction/handoff and retry.
 	 * 4. Threshold: context over threshold, run context maintenance (no auto-retry).
+	 * Once a persisted failed turn is dropped, recovery rearm/scheduling completes despite later cancellation.
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
@@ -1120,6 +1227,21 @@ export class SessionMaintenance {
 		skipAbortedCheck = true,
 		allowDefer = true,
 		autoContinue = true,
+		parentSignal?: AbortSignal,
+	): Promise<CompactionCheckResult> {
+		return this.#withAutomaticProbe(
+			parentSignal,
+			signal => this.#checkCompaction(assistantMessage, skipAbortedCheck, allowDefer, autoContinue, signal),
+			() => COMPACTION_CHECK_NONE,
+		);
+	}
+
+	async #checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck: boolean,
+		allowDefer: boolean,
+		autoContinue: boolean,
+		signal: AbortSignal,
 	): Promise<CompactionCheckResult> {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
@@ -1139,42 +1261,40 @@ export class SessionMaintenance {
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
 		if (sameModel && !errorIsFromBeforeCompaction && AIError.isContextOverflow(assistantMessage, contextWindow)) {
-			// Clear the failed turn from active context so the retry (or the next
-			// user prompt) does not replay it. The persisted branch entry stays
-			// for now: when no recovery path runs, the user-facing transcript
-			// MUST keep the only assistant message explaining why the turn
-			// stopped. The branch entry is dropped further down, but only on the
-			// paths that actually schedule a retry/compaction.
-			// A native request may use a projection that became ready while the provider was in flight.
-			// Never retry an already projected final payload: extension transforms would reproduce its overflow.
-			const losslessOwnsRequest =
-				!this.#host.requestUsedLossless(assistantMessage) &&
-				(await this.#host.losslessOwnsRequest(this.#host.messages()));
-			if (losslessOwnsRequest) {
+			// A projected request must not repeat the same projection; skip the ownership probe and promote/fallback.
+			const requestUsedLossless = this.#host.requestUsedLossless(assistantMessage);
+			const requestTokensFloor = Math.max(calculateContextTokens(assistantMessage.usage), contextWindow + 1);
+			const retryMessages = this.#host.messages().filter(message => message !== assistantMessage);
+			const decision = requestUsedLossless
+				? undefined
+				: await this.#host.losslessOwnsRequest(retryMessages, signal, requestTokensFloor);
+			if (decision?.kind === "aborted" || signal.aborted) return COMPACTION_CHECK_NONE;
+			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
+			if (decision?.kind === "owned") {
+				await this.#host.dropPersistedAssistantTurn(assistantMessage);
 				if (autoContinue) {
-					this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
-					await this.#host.dropPersistedAssistantTurn(assistantMessage);
 					this.#host.scheduleAgentContinue({ delayMs: 100, generation });
 					return COMPACTION_CHECK_CONTINUATION;
 				}
 				return COMPACTION_CHECK_NONE;
 			}
-			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
 
-			// Try context promotion first - switch to a larger model and retry without compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
+			// Try context promotion first - switching to a larger model drops the local fallback decision.
+			const promoted = await this.#tryContextPromotion(assistantMessage, signal);
+			if (signal.aborted) return COMPACTION_CHECK_NONE;
 			if (promoted) {
 				await this.#host.dropPersistedAssistantTurn(assistantMessage);
-				// Retry on the promoted (larger) model without compacting
 				this.#host.scheduleAgentContinue({ delayMs: 100, generation });
 				return COMPACTION_CHECK_CONTINUATION;
 			}
 
-			// No promotion target available fall through to compaction
+			if (signal.aborted) return COMPACTION_CHECK_NONE;
 			const compactionSettings = this.#host.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
 				return await this.#host.runRecoveryCompactionWithRollback("overflow", assistantMessage, allowDefer, {
 					autoContinue,
+					triggerContextTokens: requestTokensFloor,
+					...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 				});
 			}
 			return COMPACTION_CHECK_NONE;
@@ -1229,12 +1349,27 @@ export class SessionMaintenance {
 		// otherwise compaction/handoff. Unlike overflow, the *input* is fine, so we
 		// allow the handoff strategy to actually run.
 		if (sameModel && !errorIsFromBeforeCompaction && assistantMessage.stopReason === "length") {
-			// Same active-context vs persisted-history split as the overflow path
-			// above: clear the dead turn from agent state so it cannot be replayed,
-			// but keep it on the branch unless promotion or compaction actually runs.
-			this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
+			const requestUsedLossless = this.#host.requestUsedLossless(assistantMessage);
+			const currentMessages = this.#host.messages();
+			const requestTokensFloor = calculatePromptTokens(assistantMessage.usage);
+			const decision = requestUsedLossless
+				? undefined
+				: await this.#host.losslessOwnsRequest(currentMessages, signal, requestTokensFloor);
+			if (decision?.kind === "aborted" || signal.aborted) return COMPACTION_CHECK_NONE;
+			if (decision?.kind === "owned") {
+				this.#host.removeAssistantMessageFromActiveContext(assistantMessage);
+				await this.#host.dropPersistedAssistantTurn(assistantMessage);
+				const retryMessages = this.#host.messages();
+				this.#host.rearmLosslessPrimaryIntent(retryMessages, requestTokensFloor);
+				if (autoContinue) {
+					this.#host.scheduleAgentContinue({ delayMs: 100, generation });
+					return COMPACTION_CHECK_CONTINUATION;
+				}
+				return COMPACTION_CHECK_NONE;
+			}
 
-			const promoted = await this.#tryContextPromotion(assistantMessage);
+			const promoted = await this.#tryContextPromotion(assistantMessage, signal);
+			if (signal.aborted) return COMPACTION_CHECK_NONE;
 			if (promoted) {
 				await this.#host.dropPersistedAssistantTurn(assistantMessage);
 				logger.debug("Context promotion triggered by response.incomplete (length stop)", {
@@ -1244,6 +1379,7 @@ export class SessionMaintenance {
 				return COMPACTION_CHECK_CONTINUATION;
 			}
 
+			if (signal.aborted) return COMPACTION_CHECK_NONE;
 			const incompleteCompactionSettings = this.#host.settings.getGroup("compaction");
 			if (incompleteCompactionSettings.enabled && incompleteCompactionSettings.strategy !== "off") {
 				logger.debug("Compaction triggered by response.incomplete (length stop, no promotion target)", {
@@ -1252,22 +1388,17 @@ export class SessionMaintenance {
 				});
 				return await this.#host.runRecoveryCompactionWithRollback("incomplete", assistantMessage, allowDefer, {
 					autoContinue,
-					triggerContextTokens: calculateContextTokens(assistantMessage.usage),
+					triggerContextTokens: requestTokensFloor,
+					...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 				});
 			}
-			// Neither promotion nor compaction is available — surface the dead-end so
-			// the user understands why the turn yielded with nothing.
 			logger.warn("response.incomplete with no recovery path (promotion + compaction both unavailable)", {
 				model: `${assistantMessage.provider}/${assistantMessage.model}`,
 			});
 			return COMPACTION_CHECK_NONE;
 		}
 
-		// A ready Lossless projection owns successful automatic-maintenance turns.
-		// Check before native pruning so the authoritative journal stays untouched.
-		if (assistantMessage.stopReason !== "error" && (await this.#host.losslessOwnsRequest(this.#host.messages()))) {
-			return COMPACTION_CHECK_NONE;
-		}
+		if (this.#host.requestUsedLossless(assistantMessage)) return COMPACTION_CHECK_NONE;
 
 		// Stale-result pass runs every turn, before any threshold gating: it is
 		// cheap (bails when no candidate) and independent of the compaction
@@ -1297,24 +1428,16 @@ export class SessionMaintenance {
 			? 0
 			: calculateContextTokens(assistantMessage.usage);
 		const storedContextTokens = this.#estimateStoredContextTokens();
-		// Pruning frees bytes for the NEXT prompt; it does not change the size of
-		// the prompt the LLM just billed for. Earlier revisions subtracted the
-		// per-turn supersede/prune `tokensSaved` from the threshold input, which
-		// let a long-running `/goal` session sit above `compaction.thresholdTokens`
-		// indefinitely whenever per-turn pruning saved enough to drop the
-		// post-prune estimate below the user-configured trigger — the visible
-		// context (anchored to the same provider billing) still showed >threshold,
-		// but `shouldCompact` no-op'd (#3174). Anchor the initial trigger on the
-		// last turn's billed context tokens, floored by the post-prune
-		// stored-conversation estimate so a payload-compression hook still can't
-		// deflate the trigger.
+		// Pruning rewrites the next provider request, so maintenance uses that
+		// post-prune pressure. The stored estimate already reflects the rewritten
+		// history; reduce only the prior provider usage by the estimated freed tokens.
 		const contextTokens = compactionContextTokens(assistantUsageContextTokens, storedContextTokens);
 		const postMaintenanceContextTokens = compactionContextTokens(
 			Math.max(0, assistantUsageContextTokens - maintenanceTokensFreed),
 			storedContextTokens,
 		);
 		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-		const shouldThresholdCompact = shouldCompact(contextTokens, contextWindow, compactionSettings);
+		const shouldThresholdCompact = shouldCompact(postMaintenanceContextTokens, contextWindow, compactionSettings);
 		logger.debug("Auto-compaction threshold decision", {
 			phase: "post-agent-end",
 			goalModeEnabled: this.#goalModeState?.enabled === true,
@@ -1332,23 +1455,32 @@ export class SessionMaintenance {
 			shouldCompact: shouldThresholdCompact,
 			contextPromotionEnabled: this.#host.settings.get("contextPromotion.enabled") === true,
 		});
-		if (shouldThresholdCompact) {
-			// Try promotion first — if a larger model is available, switch instead of compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
-			if (!promoted) {
-				return await this.runAutoCompaction("threshold", false, false, allowDefer, {
-					autoContinue,
-					triggerContextTokens: postMaintenanceContextTokens,
-					phase: "pre_turn",
-					terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
-				});
-			}
-			logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
-				contextTokens,
-				contextWindow,
-				model: `${assistantMessage.provider}/${assistantMessage.model}`,
+		if (!shouldThresholdCompact) return COMPACTION_CHECK_NONE;
+		const decision = await this.#host.losslessOwnsRequest(
+			this.#host.messages(),
+			signal,
+			postMaintenanceContextTokens,
+		);
+		if (decision?.kind === "owned" || decision?.kind === "aborted" || signal.aborted) {
+			return COMPACTION_CHECK_NONE;
+		}
+		// Try promotion first — switching models drops the request-local fallback decision.
+		const promoted = await this.#tryContextPromotion(assistantMessage, signal);
+		if (signal.aborted) return COMPACTION_CHECK_NONE;
+		if (!promoted) {
+			return await this.runAutoCompaction("threshold", false, false, allowDefer, {
+				autoContinue,
+				triggerContextTokens: postMaintenanceContextTokens,
+				phase: "pre_turn",
+				terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
+				...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 			});
 		}
+		logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
+			contextTokens,
+			contextWindow,
+			model: `${assistantMessage.provider}/${assistantMessage.model}`,
+		});
 		return COMPACTION_CHECK_NONE;
 	}
 
@@ -1356,14 +1488,14 @@ export class SessionMaintenance {
 	 * Attempt context promotion to a larger model.
 	 * Returns true if promotion succeeded (caller should retry without compacting).
 	 */
-	async #tryContextPromotion(assistantMessage: AssistantMessage): Promise<boolean> {
+	async #tryContextPromotion(assistantMessage: AssistantMessage, signal?: AbortSignal): Promise<boolean> {
 		const currentModel = this.#model;
 		if (!currentModel) return false;
 		// The overflow/length error may have come from a model the user already
 		// switched away from; only promote when the failing turn was this model.
 		if (assistantMessage.provider !== currentModel.provider || assistantMessage.model !== currentModel.id)
 			return false;
-		return this.#promoteContextModel();
+		return this.#promoteContextModel(signal);
 	}
 
 	/**
@@ -1374,24 +1506,41 @@ export class SessionMaintenance {
 	 * ({@link #tryContextPromotion}) and the pre-prompt threshold path
 	 * ({@link runPrePromptCompactionIfNeeded}).
 	 */
-	async #promoteContextModel(): Promise<boolean> {
+	async #promoteContextModel(signal?: AbortSignal): Promise<boolean> {
+		if (signal?.aborted) return false;
 		const promotionSettings = this.#host.settings.getGroup("contextPromotion");
 		if (!promotionSettings.enabled) return false;
 		const currentModel = this.#model;
 		if (!currentModel) return false;
 		const contextWindow = currentModel.contextWindow ?? 0;
 		if (contextWindow <= 0) return false;
-		const targetModel = await this.resolveContextPromotionTarget(currentModel, contextWindow);
-		if (!targetModel) return false;
+		const targetModel = await this.resolveContextPromotionTarget(currentModel, contextWindow, signal);
+		if (signal?.aborted || !targetModel) return false;
 
 		try {
 			await this.#host.setModelTemporary(targetModel, undefined, { ephemeral: true });
+			if (signal?.aborted) {
+				try {
+					await this.#host.setModelTemporary(currentModel, undefined, {
+						ephemeral: true,
+						onlyIfCurrent: targetModel,
+					});
+				} catch (error) {
+					logger.warn("Canceled context promotion rollback failed", {
+						from: `${targetModel.provider}/${targetModel.id}`,
+						to: `${currentModel.provider}/${currentModel.id}`,
+						error: String(error),
+					});
+				}
+				return false;
+			}
 			logger.debug("Context promotion switched model on overflow", {
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
 			});
 			return true;
 		} catch (error) {
+			if (signal?.aborted) return false;
 			logger.warn("Context promotion failed", {
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
@@ -2086,6 +2235,7 @@ export class SessionMaintenance {
 			suppressHandoff?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
+			lcmFallback?: LcmFallbackCategory;
 		} = {},
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
@@ -2165,7 +2315,10 @@ export class SessionMaintenance {
 		this.#autoCompactionAbortController?.abort();
 		const autoCompactionAbortController = new AbortController();
 		this.#autoCompactionAbortController = autoCompactionAbortController;
-		const autoCompactionSignal = autoCompactionAbortController.signal;
+		const automaticOperationSignal = this.#automaticOperationSignal;
+		const autoCompactionSignal = automaticOperationSignal
+			? AbortSignal.any([autoCompactionAbortController.signal, automaticOperationSignal])
+			: autoCompactionAbortController.signal;
 
 		try {
 			// Emit start AFTER the controller is installed so isCompacting is already true
@@ -2689,7 +2842,6 @@ export class SessionMaintenance {
 				return COMPACTION_CHECK_NONE;
 			}
 
-			const lcmFallback = this.#host.takeLosslessFallbackCategory?.();
 			this.#host.sessionManager.appendCompaction(
 				summary,
 				shortSummary,
@@ -2698,7 +2850,7 @@ export class SessionMaintenance {
 				details,
 				fromExtension,
 				preserveData,
-				lcmFallback,
+				options.lcmFallback,
 			);
 			const newEntries = this.#host.sessionManager.getEntries();
 			const sessionContext = this.#host.buildDisplaySessionContext();
@@ -2903,7 +3055,10 @@ export class SessionMaintenance {
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;
-		const signal = controller.signal;
+		const automaticOperationSignal = this.#automaticOperationSignal;
+		const signal = automaticOperationSignal
+			? AbortSignal.any([controller.signal, automaticOperationSignal])
+			: controller.signal;
 		try {
 			await this.#host.emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			const result = await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });

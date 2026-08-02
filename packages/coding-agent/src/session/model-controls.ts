@@ -72,6 +72,7 @@ export class ModelControls {
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
 	#serviceTierByFamily: ServiceTierByFamily;
+	#modelTransitionGeneration = 0;
 
 	constructor(
 		host: ModelControlsHost,
@@ -220,6 +221,7 @@ export class ModelControls {
 		const targetModel = await this.#host.modelRegistry.refreshSelectedModelMetadata(model);
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
+		this.#modelTransitionGeneration += 1;
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(targetModel);
 		this.#host.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`, role);
@@ -255,7 +257,7 @@ export class ModelControls {
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; onlyIfCurrent?: Model },
 	): Promise<void> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		if (!this.#host.modelRegistry.hasConfiguredAuth(model)) {
@@ -263,10 +265,25 @@ export class ModelControls {
 		}
 
 		const targetModel = await this.#host.modelRegistry.refreshSelectedModelMetadata(model);
+		if (options?.onlyIfCurrent) {
+			const activeModel = this.#host.model();
+			if (!activeModel || !modelsAreEqual(activeModel, options.onlyIfCurrent)) return;
+		}
+		this.#modelTransitionGeneration += 1;
+		const transitionGeneration = this.#modelTransitionGeneration;
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(targetModel);
+		if (options?.onlyIfCurrent) {
+			const activeModel = this.#host.model();
+			if (
+				this.#modelTransitionGeneration !== transitionGeneration ||
+				!activeModel ||
+				!modelsAreEqual(activeModel, targetModel)
+			)
+				return;
+		}
 		this.#host.sessionManager.appendModelChange(
 			`${targetModel.provider}/${targetModel.id}`,
 			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
@@ -424,6 +441,7 @@ export class ModelControls {
 		const next = scopedModels[nextIndex];
 
 		// Apply model
+		this.#modelTransitionGeneration += 1;
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(next.model));
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(next.model);
@@ -455,6 +473,7 @@ export class ModelControls {
 			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
 		}
 
+		this.#modelTransitionGeneration += 1;
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(nextModel));
 		this.#host.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(nextModel);
