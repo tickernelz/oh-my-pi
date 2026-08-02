@@ -4,6 +4,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import { createResponseFooterBlock } from "@oh-my-pi/pi-coding-agent/modes/components/usage-row";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
@@ -29,6 +30,23 @@ function buildContext(): InteractiveModeContext {
 		proseOnlyThinking: true,
 		editor: { addToHistory: vi.fn() },
 	} as unknown as InteractiveModeContext;
+}
+
+function projection(): ContextProjection {
+	return {
+		revision: 1,
+		activeSourceFingerprint: activeSourceFingerprint(["source", "fresh"]),
+		ready: true,
+		historical: [],
+		freshTailSourceIds: ["fresh"],
+		uncoveredSourceIds: [],
+		sourceTokens: 20_000,
+		selectedLevelCounts: { 0: 1 },
+		coveredSourceCount: 8,
+		freshSourceCount: 1,
+		estimatedTokens: 4_000,
+		pendingJobs: 0,
+	};
 }
 
 beforeAll(async () => {
@@ -61,58 +79,31 @@ describe("post-compaction transcript reuse", () => {
 			},
 		];
 
-		const projection = {
-			revision: 1,
-			activeSourceFingerprint: activeSourceFingerprint(["source-a", "fresh"]),
-			ready: true,
-			historical: [
-				{
-					kind: "summary",
-					summaryId: "summary-a",
-					summaryHandle: "handle-a",
-					level: 0,
-					redactedText: "summary",
-					tokenCount: 100,
-					sourceIds: ["source-a"],
-					citations: [],
-					files: [],
-				},
-			],
-			freshTailSourceIds: ["fresh"],
-			uncoveredSourceIds: [],
-			sourceTokens: 20_000,
-			selectedLevelCounts: { 0: 1 },
-			coveredSourceCount: 8,
-			freshSourceCount: 1,
-			estimatedTokens: 4_000,
-			pendingJobs: 0,
-		} satisfies ContextProjection;
-
 		for (const message of messages) helpers.addMessageToChat(message);
-		const settledComponents = ctx.chatContainer.children;
+		const settledComponents = [...ctx.chatContainer.children];
 		const assistant = settledComponents.find(
 			(component): component is AssistantMessageComponent => component instanceof AssistantMessageComponent,
 		);
 		if (!assistant) throw new Error("Expected a settled assistant component");
-		assistant.setLcmProjection(projection);
 		assistant.setCacheInvalidation({ reprocessedTokens: 8_000 });
+		ctx.chatContainer.addChild(createResponseFooterBlock({ lcmProjection: projection() }));
 		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("LCM context");
 		ctx.chatContainer.clear();
 		for (const message of messages) {
 			helpers.addMessageToChat(message, { reuseSettledComponent: true });
 		}
 		expect(ctx.chatContainer.children).toEqual(settledComponents);
-		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
 		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("cache miss");
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
 
-		assistant.setLcmProjection(projection);
+		ctx.chatContainer.addChild(createResponseFooterBlock({ lcmProjection: projection() }));
 		ctx.chatContainer.clear();
 		helpers.renderSessionContext(
 			{ messages: [messages[1]!], models: {}, injectedTtsrRules: [], mode: "none" },
 			{ reuseSettledComponents: true },
 		);
 		expect(ctx.chatContainer.children).toEqual([assistant]);
-		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
 		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).toContain("cache miss");
+		expect(Bun.stripANSI(ctx.chatContainer.render(100).join("\n"))).not.toContain("LCM context");
 	});
 });

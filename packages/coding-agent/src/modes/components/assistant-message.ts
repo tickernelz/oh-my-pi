@@ -1,4 +1,3 @@
-import type { ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	Container,
@@ -20,7 +19,6 @@ import { convertImageToPng } from "../../utils/image-loading";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
-import { LcmProjectionMarkerComponent } from "./lcm-projection-marker";
 
 /**
  * Max lines of a turn-ending provider error rendered inline in the transcript.
@@ -184,8 +182,6 @@ export class AssistantMessageComponent extends Container {
 	#contentContainer: Container;
 	#markerSlot: Container;
 	#cacheInvalidation?: CacheInvalidation;
-	#lcmProjectionMarker?: LcmProjectionMarkerComponent;
-	#markersExpanded = false;
 	#lastMessage?: AssistantMessage;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
 	#convertedKittyImages = new Map<string, ImageContent>();
@@ -303,21 +299,8 @@ export class AssistantMessageComponent extends Container {
 		this.#rebuildMarkers();
 	}
 
-	/** Attach a fitted LCM projection to this response without mutating its message. */
-	setLcmProjection(projection: ContextProjection | undefined): void {
-		if (!projection && !this.#lcmProjectionMarker) return;
-		this.#lcmProjectionMarker = projection ? new LcmProjectionMarkerComponent(projection, false) : undefined;
-		if (this.#markersExpanded) this.#lcmProjectionMarker?.setExpanded(true);
-		this.#rebuildMarkers();
-	}
-
-	/** Ctrl+O reveals projection evidence once and toggles long provider errors. */
+	/** Ctrl+O toggles long provider errors. */
 	setExpanded(expanded: boolean): void {
-		if (expanded && !this.#markersExpanded) {
-			this.#markersExpanded = true;
-			this.#lcmProjectionMarker?.setExpanded(true);
-			this.#blockVersion++;
-		}
 		if (this.#errorExpanded === expanded) return;
 		this.#errorExpanded = expanded;
 		if (this.#hasTruncatableError && this.#lastMessage) {
@@ -327,12 +310,11 @@ export class AssistantMessageComponent extends Container {
 
 	#rebuildMarkers(): void {
 		this.#markerSlot.clear();
-		if (!this.#lcmProjectionMarker && !this.#cacheInvalidation) {
+		if (!this.#cacheInvalidation) {
 			this.#blockVersion++;
 			return;
 		}
 		this.#markerSlot.addChild(new Spacer(1));
-		if (this.#lcmProjectionMarker) this.#markerSlot.addChild(this.#lcmProjectionMarker);
 		if (this.#cacheInvalidation) {
 			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(this.#cacheInvalidation, false));
 		}

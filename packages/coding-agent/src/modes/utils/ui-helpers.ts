@@ -33,7 +33,7 @@ import {
 import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
-import { createUsageRowBlock } from "../../modes/components/usage-row";
+import { createResponseFooterBlock } from "../../modes/components/usage-row";
 import { UserMessageComponent } from "../../modes/components/user-message";
 import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
 import { materializeImageReferenceLinksSync } from "../../modes/image-references";
@@ -276,9 +276,6 @@ export class UiHelpers {
 				let assistantComponent: AssistantMessageComponent;
 				if (cached instanceof AssistantMessageComponent) {
 					assistantComponent = cached;
-					// Projection evidence is response-scoped and never persisted. Reusing a
-					// settled component must not make replay fabricate the live-only marker.
-					assistantComponent.setLcmProjection(undefined);
 				} else {
 					assistantComponent = createAssistantMessageComponent(
 						this.ctx,
@@ -347,7 +344,12 @@ export class UiHelpers {
 				readGroup?.seal();
 				readGroup = null;
 				this.ctx.chatContainer.addChild(
-					createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
+					createResponseFooterBlock({
+						usage: pendingUsage,
+						durationMs: pendingUsageDuration,
+						ttftMs: pendingUsageTtft,
+						timestamp: pendingUsageTimestamp,
+					}),
 				);
 			}
 			pendingUsage = undefined;

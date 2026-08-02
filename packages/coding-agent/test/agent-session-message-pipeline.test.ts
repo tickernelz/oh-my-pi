@@ -2394,6 +2394,50 @@ describe("AgentSession message pipeline", () => {
 		expect(projected.some(message => message.role === "developer")).toBe(false);
 	});
 
+	it("emits projection evidence only while Lossless owns the transformed request", async () => {
+		const session = createLcmCompletionSession(() => {
+			throw new Error("primary stream must not run");
+		});
+		session.settings.set("context.lossless.retrievalCues", false);
+		const projection: ContextProjection = {
+			revision: 1,
+			activeSourceFingerprint: activeSourceFingerprint([]),
+			ready: true,
+			historical: [],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: [],
+			sourceTokens: 1,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: 0,
+			estimatedTokens: 1,
+			pendingJobs: 0,
+		};
+		const projected: AgentMessage[] = [{ role: "user", content: "projected", timestamp: 1 }];
+		const validResult: SessionLcmProjectResult = {
+			messages: projected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			projection,
+			routeKey: { generation: 1, projectionAttempt: 1, sessionId: "test" },
+		};
+		vi.spyOn(SessionLcm.prototype, "project")
+			.mockResolvedValueOnce(validResult)
+			.mockResolvedValueOnce({ ...validResult, routeKey: undefined });
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+
+		const ownedInput: AgentMessage[] = [{ role: "user", content: "owned", timestamp: 1 }];
+		expect(await session.projectLcmContext(ownedInput)).toBe(projected);
+		expect(events.filter(event => event.type === "lcm_projection")).toEqual([{ type: "lcm_projection", projection }]);
+
+		const nativeInput: AgentMessage[] = [{ role: "user", content: "native", timestamp: 2 }];
+		expect(await session.projectLcmContext(nativeInput)).toBe(nativeInput);
+		expect(events.filter(event => event.type === "lcm_projection")).toHaveLength(1);
+	});
+
 	it("binds overlapping primary transforms to their own provider dispatch", async () => {
 		const session = createLcmCompletionSession(() => {
 			throw new Error("primary stream must not run");

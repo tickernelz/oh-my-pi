@@ -9,7 +9,7 @@ import { printableEvent } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
 function zeroUsage(): Usage {
@@ -116,11 +116,16 @@ function createFixture() {
 		addMessageToChat,
 		lastAssistantUsage: zeroUsage(),
 	} as unknown as InteractiveModeContext;
-	return { controller: new EventController(ctx), chatContainer, appendMessage, addMessageToChat };
+	return { controller: new EventController(ctx), chatContainer, appendMessage, addMessageToChat, viewSession };
 }
 
 async function send(controller: EventController, event: AgentSessionEvent): Promise<void> {
 	await controller.handleEvent(event);
+}
+
+async function completeResponse(controller: EventController, message: AssistantMessage): Promise<void> {
+	await send(controller, { type: "message_start", message });
+	await send(controller, { type: "message_end", message });
 }
 
 function rendered(container: TranscriptContainer): string {
@@ -133,7 +138,10 @@ beforeAll(async () => {
 
 beforeEach(async () => {
 	resetSettingsForTest();
-	await Settings.init({ inMemory: true, overrides: { "display.smoothStreaming": false } });
+	await Settings.init({
+		inMemory: true,
+		overrides: { "display.smoothStreaming": false },
+	});
 });
 
 afterEach(() => {
@@ -142,46 +150,133 @@ afterEach(() => {
 });
 
 describe("EventController LCM projection evidence", () => {
-	it("renders one marker per meaningful DAG boundary", async () => {
+	it("renders projection evidence only after the response completes", async () => {
+		settings.set("display.showTokenUsage", true);
 		const { controller, chatContainer } = createFixture();
-		const first = projection();
-		await send(controller, { type: "lcm_projection", projection: first });
-		await send(controller, { type: "message_start", message: assistantMessage(1) });
+		const message = {
+			...assistantMessage(1),
+			usage: { ...zeroUsage(), input: 123, output: 7, totalTokens: 130 },
+			duration: 1_000,
+		} satisfies AssistantMessage;
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await send(controller, { type: "message_start", message });
+		expect(rendered(chatContainer)).not.toContain("LCM context");
+
+		await send(controller, { type: "message_end", message });
+		const lines = rendered(chatContainer).split("\n");
+		const usageIndex = lines.findIndex(line => line.includes("123"));
+		const footerRows = lines.filter(line => line.includes("LCM context"));
+		const footerIndex = lines.findIndex(line => line.includes("LCM context"));
+		expect(footerRows).toHaveLength(1);
+		expect(footerIndex).toBe(usageIndex + 1);
+	});
+
+	it("keeps LCM evidence visible when token usage is hidden", async () => {
+		settings.set("display.showTokenUsage", false);
+		const { controller, chatContainer } = createFixture();
+		const message = {
+			...assistantMessage(1),
+			usage: { ...zeroUsage(), input: 321, output: 7, totalTokens: 328 },
+		} satisfies AssistantMessage;
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await completeResponse(controller, message);
+
+		const text = rendered(chatContainer);
+		expect(text).toContain("LCM context");
+		expect(text).not.toContain("321");
+	});
+
+	it("renders one footer per meaningful DAG boundary", async () => {
+		const { controller, chatContainer } = createFixture();
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await completeResponse(controller, assistantMessage(1));
 
 		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
-		await send(controller, { type: "message_start", message: assistantMessage(2) });
+		await completeResponse(controller, assistantMessage(2));
 
 		await send(controller, {
 			type: "lcm_projection",
 			projection: projection({ revision: 3, selectedLevelCounts: { 0: 2, 1: 1 }, coveredSourceCount: 18 }),
 		});
-		await send(controller, { type: "message_start", message: assistantMessage(3) });
+		await completeResponse(controller, assistantMessage(3));
 
 		expect(count(rendered(chatContainer), "LCM context")).toBe(2);
 	});
 
 	it("does not render evidence without a complete fitted projection event", async () => {
 		const { controller, chatContainer } = createFixture();
-		await send(controller, { type: "message_start", message: assistantMessage(1) });
+		await completeResponse(controller, assistantMessage(1));
 		await send(controller, { type: "lcm_projection", projection: projection({ ready: false }) });
-		await send(controller, { type: "message_start", message: assistantMessage(2) });
+		await completeResponse(controller, assistantMessage(2));
 		await send(controller, { type: "lcm_projection", projection: projection({ pendingJobs: 1 }) });
-		await send(controller, { type: "message_start", message: assistantMessage(3) });
+		await completeResponse(controller, assistantMessage(3));
 		await send(controller, {
 			type: "lcm_projection",
 			projection: projection({ uncoveredSourceIds: ["missing"] }),
 		});
-		await send(controller, { type: "message_start", message: assistantMessage(4) });
+		await completeResponse(controller, assistantMessage(4));
 		expect(rendered(chatContainer)).not.toContain("LCM context");
 	});
 
 	it("dedupes the same projection across a failed response and its retry", async () => {
 		const { controller, chatContainer } = createFixture();
-		const fitted = projection();
-		await send(controller, { type: "lcm_projection", projection: fitted });
-		await send(controller, { type: "message_start", message: assistantMessage(1, "error") });
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await completeResponse(controller, assistantMessage(1, "error"));
 		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
-		await send(controller, { type: "message_start", message: assistantMessage(2) });
+		await completeResponse(controller, assistantMessage(2));
+		expect(count(rendered(chatContainer), "LCM context")).toBe(1);
+	});
+
+	it("does not carry evidence from an incomplete response into its replacement", async () => {
+		const { controller, chatContainer } = createFixture();
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await send(controller, { type: "message_start", message: assistantMessage(1, "aborted") });
+		await completeResponse(controller, assistantMessage(2));
+		expect(rendered(chatContainer)).not.toContain("LCM context");
+	});
+
+	it("reattaches the same boundary when an incomplete response is replaced", async () => {
+		const { controller, chatContainer } = createFixture();
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await send(controller, { type: "message_start", message: assistantMessage(1, "aborted") });
+		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
+		await completeResponse(controller, assistantMessage(2));
+		expect(count(rendered(chatContainer), "LCM context")).toBe(1);
+	});
+
+	it("drops an early duplicate after the active response completes", async () => {
+		const { controller, chatContainer } = createFixture();
+		const message = assistantMessage(1);
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await send(controller, { type: "message_start", message });
+		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
+		await send(controller, { type: "message_end", message });
+		await completeResponse(controller, assistantMessage(2));
+		expect(count(rendered(chatContainer), "LCM context")).toBe(1);
+	});
+
+	it("defers evidence from a silently aborted response to its replacement", async () => {
+		const { controller, chatContainer } = createFixture();
+		const aborted = { ...assistantMessage(1, "aborted"), errorMessage: SILENT_ABORT_MARKER };
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await completeResponse(controller, aborted);
+		expect(rendered(chatContainer)).not.toContain("LCM context");
+
+		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
+		await completeResponse(controller, assistantMessage(2));
+		expect(count(rendered(chatContainer), "LCM context")).toBe(1);
+	});
+
+	it("defers evidence from a TTSR-silenced response to its replacement", async () => {
+		const { controller, chatContainer, viewSession } = createFixture();
+		viewSession.isTtsrAbortPending = true;
+		await send(controller, { type: "lcm_projection", projection: projection() });
+		await completeResponse(controller, assistantMessage(1, "aborted"));
+		expect(rendered(chatContainer)).not.toContain("LCM context");
+
+		viewSession.isTtsrAbortPending = false;
+		await send(controller, { type: "lcm_projection", projection: projection({ revision: 2 }) });
+		await completeResponse(controller, assistantMessage(2));
 		expect(count(rendered(chatContainer), "LCM context")).toBe(1);
 	});
 
@@ -190,14 +285,14 @@ describe("EventController LCM projection evidence", () => {
 		const oldBoundary = projection();
 		const newBoundary = projection({ selectedLevelCounts: { 0: 2, 1: 1 }, coveredSourceCount: 18 });
 		await send(controller, { type: "lcm_projection", projection: oldBoundary });
-		await send(controller, { type: "message_start", message: assistantMessage(1) });
+		await completeResponse(controller, assistantMessage(1));
 		await send(controller, { type: "lcm_projection", projection: newBoundary });
 		await send(controller, { type: "lcm_projection", projection: oldBoundary });
-		await send(controller, { type: "message_start", message: assistantMessage(2) });
+		await completeResponse(controller, assistantMessage(2));
 		expect(count(rendered(chatContainer), "LCM context")).toBe(2);
 	});
 
-	it("keeps the marker out of journal messages, provider content, and replay", async () => {
+	it("keeps the footer out of journal messages, provider content, and replay", async () => {
 		const { controller, chatContainer, appendMessage, addMessageToChat } = createFixture();
 		const message = assistantMessage(1);
 		const event = { type: "lcm_projection", projection: projection() } satisfies AgentSessionEvent;
@@ -207,7 +302,7 @@ describe("EventController LCM projection evidence", () => {
 		expect(appendMessage).not.toHaveBeenCalled();
 		expect(addMessageToChat).not.toHaveBeenCalled();
 
-		await send(controller, { type: "message_start", message });
+		await completeResponse(controller, message);
 		expect(rendered(chatContainer)).toContain("LCM context");
 		expect(JSON.stringify(message)).not.toContain("lcm_projection");
 		expect(JSON.stringify(convertToLlm([message]))).not.toContain("LCM context");

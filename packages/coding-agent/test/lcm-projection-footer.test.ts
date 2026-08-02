@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
+import type { Usage } from "@oh-my-pi/pi-ai";
 import {
-	LcmProjectionMarkerComponent,
+	LcmProjectionFooterComponent,
 	lcmProjectionFingerprint,
-} from "@oh-my-pi/pi-coding-agent/modes/components/lcm-projection-marker";
+} from "@oh-my-pi/pi-coding-agent/modes/components/lcm-projection-footer";
+import { createResponseFooterBlock } from "@oh-my-pi/pi-coding-agent/modes/components/usage-row";
 import {
 	getSymbolPresetOverride,
 	initTheme,
@@ -73,23 +73,14 @@ function projection(overrides: Partial<ContextProjection> = {}): ContextProjecti
 	};
 }
 
-function assistantMessage(): AssistantMessage {
+function usage(): Usage {
 	return {
-		role: "assistant",
-		content: [{ type: "text", text: "Projected answer" }],
-		api: "anthropic-messages",
-		provider: "anthropic",
-		model: "test-model",
-		stopReason: "stop",
-		usage: {
-			input: 1,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 2,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		timestamp: 1,
+		input: 12,
+		output: 3,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 15,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
@@ -104,20 +95,20 @@ afterAll(async () => {
 	await setSymbolPreset(previousPreset ?? "unicode");
 });
 
-describe("LcmProjectionMarkerComponent", () => {
-	it("renders compact response evidence with one-based DAG depth and aggregate counts", () => {
-		const lines = new LcmProjectionMarkerComponent(projection()).render(100);
+describe("LcmProjectionFooterComponent", () => {
+	it("renders compact response evidence without a transcript divider", () => {
+		const lines = new LcmProjectionFooterComponent(projection()).render(100);
 		const text = Bun.stripANSI(lines.join("\n"));
-		expect(lines).toHaveLength(3);
-		expect(text).toContain("LCM context");
-		expect(text).toContain("DAG depth 3");
+		expect(lines).toHaveLength(1);
+		expect(text.trimStart().startsWith("LCM context")).toBe(true);
 		expect(text).toContain("3 summaries / 18 covered");
 		expect(text).toContain("ctrl+o");
+		expect(text).not.toContain("DAG depth");
 		expect(text).not.toContain("Journal unchanged");
 	});
 
-	it("expands once into a level tree and keeps the evidence open", () => {
-		const component = new LcmProjectionMarkerComponent(projection());
+	it("expands once into footer details and keeps the evidence open", () => {
+		const component = new LcmProjectionFooterComponent(projection());
 		component.setExpanded(true);
 		const expanded = Bun.stripANSI(component.render(100).join("\n"));
 		expect(expanded).toContain("Depth 3: 1 summary");
@@ -131,50 +122,44 @@ describe("LcmProjectionMarkerComponent", () => {
 		expect(Bun.stripANSI(component.render(100).join("\n"))).toContain("Journal unchanged");
 	});
 
-	it("keeps text-first evidence within a narrow viewport", () => {
-		const component = new LcmProjectionMarkerComponent(projection());
-		const width = 14;
-		const lines = component.render(width);
-		expect(Bun.stripANSI(lines.join("\n"))).toContain("LCM context");
-		for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
-		const concise = Bun.stripANSI(component.render(32).join("\n"));
-		expect(concise).toContain("depth 3");
-		expect(concise).toContain("3/18");
+	it("keeps text-first evidence within narrow viewports", () => {
+		const component = new LcmProjectionFooterComponent(projection());
+		expect(Bun.stripANSI(component.render(14).join("\n"))).toContain("LCM");
+		for (let width = 1; width <= 24; width++) {
+			for (const line of component.render(width)) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
+		}
 
 		component.setExpanded(true);
-		const expanded = component.render(24);
-		expect(Bun.stripANSI(expanded.join("\n"))).toContain("Journal unchanged");
-		for (const line of expanded) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(24);
+		expect(Bun.stripANSI(component.render(24).join("\n"))).toContain("Journal unchanged");
+		for (let width = 1; width <= 24; width++) {
+			for (const line of component.render(width)) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
+		}
 	});
 
 	it("uses only ASCII text and theme symbols under the ASCII preset", async () => {
 		await setSymbolPreset("ascii");
-		const component = new LcmProjectionMarkerComponent(projection());
+		const component = new LcmProjectionFooterComponent(projection());
 		component.setExpanded(true);
 		const text = Bun.stripANSI(component.render(100).join("\n"));
 		expect(text).toMatch(/^[\x00-\x7f]*$/);
 	});
 
-	it("shares the assistant marker slot with cache evidence", () => {
-		const component = new AssistantMessageComponent(assistantMessage());
-		component.setLcmProjection(projection());
-		component.setCacheInvalidation({ reprocessedTokens: 50_999 });
-		const text = Bun.stripANSI(component.render(100).join("\n"));
-		expect(text).toContain("LCM context");
-		expect(text).toContain("cache miss");
-		expect(text.match(/LCM context/g)).toHaveLength(1);
-		expect(text.match(/cache miss/g)).toHaveLength(1);
+	it("shares one response footer with usage metrics", () => {
+		const footer = createResponseFooterBlock({
+			usage: usage(),
+			durationMs: 1_000,
+			timestamp: 1,
+			lcmProjection: projection(),
+		});
+		const lines = footer.render(100).map(line => Bun.stripANSI(line));
+		expect(lines).toHaveLength(3);
+		expect(lines[0]).toBe("");
+		expect(lines[1]).toContain("12");
+		expect(lines[1]).not.toContain("LCM context");
+		expect(lines[2]).toContain("LCM context");
 
-		component.setExpanded(true);
-		component.invalidate();
-		const redrawn = Bun.stripANSI(component.render(100).join("\n"));
-		expect(redrawn).toContain("Journal unchanged");
-		expect(redrawn).toContain("cache miss");
-
-		component.setLcmProjection(undefined);
-		const replayed = Bun.stripANSI(component.render(100).join("\n"));
-		expect(replayed).not.toContain("LCM context");
-		expect(replayed).toContain("cache miss");
+		footer.setExpanded(true);
+		expect(Bun.stripANSI(footer.render(100).join("\n"))).toContain("Journal unchanged");
 	});
 });
 

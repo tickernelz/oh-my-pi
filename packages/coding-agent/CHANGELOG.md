@@ -23,6 +23,7 @@
 ### Fixed
 
 - Fixed Lossless takeover when the active user predates the configured fresh tail by anchoring the complete current turn as raw context; local projection-fit fallbacks remain diagnostic without marking runtime health degraded, while provider and store failures still do.
+- Fixed LCM projection evidence cluttering assistant content by moving it into one dim response footer directly below token usage, with in-place `Ctrl+O` details, persistent visibility when usage is hidden or grouped, and ownership gating so native-fallback requests cannot claim they used LCM.
 
 - Fixed Lossless automatic-maintenance and primary-dispatch races so idle compaction cannot abort itself, canceled probes drain before session replacement, incomplete responses remain atomic, and only the exact projected request and response record LCM ownership.
 ## [17.2.4] - 2026-08-01

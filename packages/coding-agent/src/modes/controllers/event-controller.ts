@@ -10,7 +10,7 @@ import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
-import { lcmProjectionFingerprint } from "../../modes/components/lcm-projection-marker";
+import { lcmProjectionFingerprint } from "../../modes/components/lcm-projection-footer";
 import {
 	groupedReadUsageCallIds,
 	ReadToolGroupComponent,
@@ -20,7 +20,7 @@ import {
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
-import { createUsageRowBlock } from "../../modes/components/usage-row";
+import { createResponseFooterBlock } from "../../modes/components/usage-row";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
@@ -147,6 +147,7 @@ export class EventController {
 	// (never deferred) can tell them apart.
 	#retryPending = false;
 	#pendingLcmProjection?: { fingerprint: string; projection: LcmProjection };
+	#activeLcmProjection?: { fingerprint: string; projection: LcmProjection };
 	#lastRenderedLcmProjectionFingerprint?: string;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleCompactionAbort?: AbortController;
@@ -459,6 +460,7 @@ export class EventController {
 		this.#pinnedErrorComponent = undefined;
 		this.#retryPending = this.ctx.viewSession.isRetrying;
 		this.#pendingLcmProjection = undefined;
+		this.#activeLcmProjection = undefined;
 		this.#lastRenderedLcmProjectionFingerprint = undefined;
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
@@ -553,8 +555,9 @@ export class EventController {
 		this.#lastAssistantComponent = undefined;
 		// A projection belongs only to the response in the turn that produced it.
 		// Keep the last rendered fingerprint across turns for meaningful-boundary
-		// dedupe, but never carry an unconsumed marker into a later turn.
+		// dedupe, but never carry unconsumed footer evidence into a later turn.
 		this.#pendingLcmProjection = undefined;
+		this.#activeLcmProjection = undefined;
 		// Restore the previous turn's inline error in the transcript before dropping
 		// the banner, so the error stays in history once the banner is gone.
 		this.#pinnedErrorComponent?.setErrorPinned(false);
@@ -655,12 +658,8 @@ export class EventController {
 			this.#lastVisibleBlockCount = 0;
 			this.#streamedToolCallIdByIndex.clear();
 			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
-			const lcmProjection = this.#pendingLcmProjection;
-			if (lcmProjection) {
-				this.ctx.streamingComponent.setLcmProjection(lcmProjection.projection);
-				this.#lastRenderedLcmProjectionFingerprint = lcmProjection.fingerprint;
-				this.#pendingLcmProjection = undefined;
-			}
+			this.#activeLcmProjection = this.#pendingLcmProjection;
+			this.#pendingLcmProjection = undefined;
 			this.ctx.streamingMessage = event.message;
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
 			this.#streamingReveal.begin(
@@ -1113,30 +1112,44 @@ export class EventController {
 				if (component) lastPostToolAssistantComponent = component;
 			}
 			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
-			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
+			const lcmProjection = silentlyAborted || ttsrSilenced ? undefined : this.#activeLcmProjection;
+			const displayedUsage =
+				settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)
+					? event.message.usage
+					: undefined;
+			let usageAttached = false;
+			if (displayedUsage) {
 				const readCallIds = groupedReadUsageCallIds(event.message);
-				const usageAttached =
+				usageAttached =
 					readCallIds !== undefined &&
 					(this.#lastReadGroup?.attachUsage(
 						readCallIds,
-						event.message.usage,
+						displayedUsage,
 						event.message.duration,
 						event.message.ttft,
 						event.message.timestamp,
 					) ??
 						false);
-				if (!usageAttached) {
-					this.#resetReadGroup();
-					this.ctx.chatContainer.addChild(
-						createUsageRowBlock(
-							event.message.usage,
-							event.message.duration,
-							event.message.ttft,
-							event.message.timestamp,
-						),
-					);
+			}
+			if (lcmProjection || (displayedUsage && !usageAttached)) {
+				this.#resetReadGroup();
+				const footer = createResponseFooterBlock({
+					usage: usageAttached ? undefined : displayedUsage,
+					durationMs: event.message.duration,
+					ttftMs: event.message.ttft,
+					timestamp: event.message.timestamp,
+					lcmProjection: lcmProjection?.projection,
+				});
+				footer.setExpanded(this.ctx.toolOutputExpanded);
+				this.ctx.chatContainer.addChild(footer);
+			}
+			if (lcmProjection) {
+				this.#lastRenderedLcmProjectionFingerprint = lcmProjection.fingerprint;
+				if (this.#pendingLcmProjection?.fingerprint === lcmProjection.fingerprint) {
+					this.#pendingLcmProjection = undefined;
 				}
 			}
+			this.#activeLcmProjection = undefined;
 			if (displayMessage === event.message) {
 				this.ctx.transcriptMessageComponents.set(event.message, this.ctx.streamingComponent);
 			}

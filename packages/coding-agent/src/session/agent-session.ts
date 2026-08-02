@@ -4645,7 +4645,7 @@ export class AgentSession {
 			}
 		}
 		request.usedLcm = owned;
-		if (result.projection) this.#emit({ type: "lcm_projection", projection: result.projection });
+		if (owned && result.projection) this.#emit({ type: "lcm_projection", projection: result.projection });
 		return this.#bindPrimaryProjectionRequest(request, projected);
 	}
 

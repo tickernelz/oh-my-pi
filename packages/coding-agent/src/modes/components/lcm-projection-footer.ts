@@ -3,8 +3,6 @@ import { type Component, Ellipsis, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
 
-const MARKER_RULE_WIDTH = 10;
-
 type LevelCount = { level: number; count: number };
 
 function selectedLevels(projection: ContextProjection): LevelCount[] {
@@ -51,20 +49,16 @@ export function lcmProjectionFingerprint(projection: ContextProjection): string 
 	]);
 }
 
-/**
- * Renderer-only evidence that the response used a fitted LCM projection. The
- * component is never reconstructed from session messages, so replay cannot
- * fabricate a historical marker. Ctrl+O expands it once; later global collapse
- * toggles leave the evidence visible.
- */
-export class LcmProjectionMarkerComponent implements Component {
+/** Live-only evidence that the completed response used a fitted LCM projection. */
+export class LcmProjectionFooterComponent implements Component {
 	#expanded = false;
 	#cache?: { width: number; expanded: boolean; lines: string[] };
 
-	constructor(
-		private readonly projection: ContextProjection,
-		private readonly padded = true,
-	) {}
+	readonly #projection: ContextProjection;
+
+	constructor(projection: ContextProjection) {
+		this.#projection = projection;
+	}
 
 	setExpanded(expanded: boolean): void {
 		if (!expanded || this.#expanded) return;
@@ -80,22 +74,23 @@ export class LcmProjectionMarkerComponent implements Component {
 		width = Math.max(1, width);
 		if (this.#cache?.width === width && this.#cache.expanded === this.#expanded) return this.#cache.lines;
 
-		const body = [this.#divider(width), ...(this.#expanded ? this.#detailLines(width) : [])];
-		const lines = this.padded ? ["", ...body, ""] : body;
+		const indent = width > 1 ? " " : "";
+		const innerWidth = Math.max(1, width - indent.length);
+		const body = [this.#summary(innerWidth), ...(this.#expanded ? this.#detailLines(innerWidth) : [])];
+		const lines = body.map(line => `${indent}${line}`);
 		this.#cache = { width, expanded: this.#expanded, lines };
 		return lines;
 	}
 
-	#divider(width: number): string {
-		const levels = selectedLevels(this.projection);
-		const depth = levels.length === 0 ? 0 : levels[0]!.level + 1;
+	#summary(width: number): string {
+		const levels = selectedLevels(this.#projection);
 		const summaries = levels.reduce((total, item) => total + item.count, 0);
 		const sep = theme.sep.dot.trim();
-		const coverage = `${plural(summaries, "summary")} / ${this.projection.coveredSourceCount} covered`;
+		const coverage = `${plural(summaries, "summary")} / ${this.#projection.coveredSourceCount} covered`;
 		const hint = this.#expanded ? "" : ` ${sep} ctrl+o`;
-		const full = `LCM context ${sep} DAG depth ${depth} ${sep} ${coverage}${hint}`;
-		const compact = `LCM context ${sep} depth ${depth} ${sep} ${coverage}`;
-		const concise = `LCM context ${sep} depth ${depth} ${sep} ${summaries}/${this.projection.coveredSourceCount}`;
+		const full = `LCM context ${sep} ${coverage}${hint}`;
+		const compact = `LCM ${sep} ${summaries}/${this.#projection.coveredSourceCount}${hint}`;
+		const concise = `LCM ${summaries}/${this.#projection.coveredSourceCount}`;
 		const label =
 			Bun.stringWidth(full, { countAnsiEscapeCodes: false }) <= width
 				? full
@@ -103,19 +98,16 @@ export class LcmProjectionMarkerComponent implements Component {
 					? compact
 					: Bun.stringWidth(concise, { countAnsiEscapeCodes: false }) <= width
 						? concise
-						: truncateToWidth("LCM context", width, Ellipsis.Ascii);
-		const labelWidth = Bun.stringWidth(label, { countAnsiEscapeCodes: false });
-		const ruleWidth = Math.min(MARKER_RULE_WIDTH, width - labelWidth - 1);
-		if (ruleWidth < 1) return theme.fg("muted", label);
-		return `${theme.fg("dim", theme.tree.horizontal.repeat(ruleWidth))} ${theme.fg("muted", label)}`;
+						: truncateToWidth("LCM", width, Ellipsis.Ascii);
+		return theme.fg("dim", label);
 	}
 
 	#detailLines(width: number): string[] {
-		const levels = selectedLevels(this.projection);
+		const levels = selectedLevels(this.#projection);
 		const details = levels.map(({ level, count }) => `Depth ${level + 1}: ${plural(count, "summary")}`);
-		details.push(`Fresh tail: ${plural(this.projection.freshSourceCount, "source")}`);
+		details.push(`Fresh tail: ${plural(this.#projection.freshSourceCount, "source")}`);
 		details.push(
-			`Estimated tokens: ${formatNumber(this.projection.sourceTokens)} -> ${formatNumber(this.projection.estimatedTokens)}`,
+			`Estimated tokens: ${formatNumber(this.#projection.sourceTokens)} -> ${formatNumber(this.#projection.estimatedTokens)}`,
 		);
 		details.push("Journal unchanged");
 

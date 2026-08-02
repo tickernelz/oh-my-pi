@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import type { Usage } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import {
 	CacheInvalidationMarkerComponent,
 	detectCacheInvalidation,
@@ -18,6 +19,19 @@ function usage(parts: { input?: number; cacheRead?: number; cacheWrite?: number;
 		cacheWrite,
 		totalTokens: input + output + cacheRead + cacheWrite,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function assistantMessage(): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "Cached answer" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test-model",
+		stopReason: "stop",
+		usage: usage({ input: 1, output: 1 }),
+		timestamp: 1,
 	};
 }
 
@@ -90,6 +104,17 @@ describe("CacheInvalidationMarkerComponent", () => {
 		const dividerWidth = Bun.stringWidth(lines[1]);
 		expect(dividerWidth).toBeGreaterThan(0);
 		expect(dividerWidth).toBeLessThan(80);
+	});
+
+	it("keeps one blank row around a cache-only assistant marker", () => {
+		const component = new AssistantMessageComponent(assistantMessage());
+		component.setCacheInvalidation({ reprocessedTokens: 50_999 });
+		const lines = component.render(80).map(line => Bun.stripANSI(line));
+		expect(lines).toHaveLength(4);
+		expect(lines[0]).toBe("");
+		expect(lines[1]).toContain("cache miss");
+		expect(lines[2]).toBe("");
+		expect(lines[3]?.trim()).toBe("Cached answer");
 	});
 
 	it("truncates the bare cache label to narrow terminal widths", () => {

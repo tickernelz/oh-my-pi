@@ -55,7 +55,7 @@ import { groupedReadUsageCallIds, ReadToolGroupComponent, readArgsCollapseIntoGr
 import { SkillMessageComponent } from "./skill-message";
 import { ToolExecutionComponent } from "./tool-execution";
 import { TranscriptContainer } from "./transcript-container";
-import { createUsageRowBlock } from "./usage-row";
+import { createResponseFooterBlock } from "./usage-row";
 import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "./user-message";
 
 export interface ChatTranscriptBuilderDeps {
@@ -215,12 +215,12 @@ export class ChatTranscriptBuilder {
 			this.#readGroup?.seal();
 			this.#readGroup = null;
 			this.container.addChild(
-				createUsageRowBlock(
-					this.#pendingUsage,
-					this.#pendingUsageDuration,
-					this.#pendingUsageTtft,
-					this.#pendingUsageTimestamp,
-				),
+				createResponseFooterBlock({
+					usage: this.#pendingUsage,
+					durationMs: this.#pendingUsageDuration,
+					ttftMs: this.#pendingUsageTtft,
+					timestamp: this.#pendingUsageTimestamp,
+				}),
 			);
 		}
 		this.#pendingUsage = undefined;

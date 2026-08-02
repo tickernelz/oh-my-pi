@@ -13,6 +13,7 @@
  * one-entry block).
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
@@ -71,6 +72,35 @@ function assistantMessage(content: Block[]): AssistantMessage {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		timestamp: Date.now(),
+	};
+}
+
+function projection(): ContextProjection {
+	return {
+		revision: 1,
+		activeSourceFingerprint: activeSourceFingerprint(["source", "fresh"]),
+		ready: true,
+		historical: [
+			{
+				kind: "summary",
+				summaryId: "summary-a",
+				summaryHandle: "handle-a",
+				level: 0,
+				redactedText: "summary",
+				tokenCount: 100,
+				sourceIds: ["source"],
+				citations: [],
+				files: [],
+			},
+		],
+		freshTailSourceIds: ["fresh"],
+		uncoveredSourceIds: [],
+		sourceTokens: 20_000,
+		selectedLevelCounts: { 0: 1 },
+		coveredSourceCount: 8,
+		freshSourceCount: 1,
+		estimatedTokens: 4_000,
+		pendingJobs: 0,
 	};
 }
 
@@ -161,6 +191,37 @@ describe("EventController read-group accretion", () => {
 			Bun.stripANSI(component.render(120).join("\n")).includes("2026-01-02 03:04:05"),
 		);
 		expect(usageBlocks).toEqual([group!]);
+	});
+
+	it("keeps an LCM footer after the response when usage nests in the read group", async () => {
+		settings.set("display.showTokenUsage", true);
+		const { controller, chatContainer } = createFixture();
+		const message = assistantMessage([thinking("Reviewing the target"), read("lcm.ts:1-50")]);
+		message.usage = {
+			input: 1234,
+			output: 7,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1241,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		message.timestamp = new Date(2026, 0, 2, 3, 4, 5).getTime();
+
+		await controller.handleEvent({ type: "lcm_projection", projection: projection() } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_start", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_update", message } as AgentSessionEvent);
+		await controller.handleEvent({ type: "message_end", message } as AgentSessionEvent);
+
+		const [group] = readGroups(chatContainer);
+		expect(group).toBeDefined();
+		const groupText = Bun.stripANSI(group!.render(120).join("\n"));
+		expect(groupText).toContain("2026-01-02 03:04:05");
+		expect(groupText).not.toContain("LCM context");
+		const footerBlocks = chatContainer.children.filter(component =>
+			Bun.stripANSI(component.render(120).join("\n")).includes("LCM context"),
+		);
+		expect(footerBlocks).toHaveLength(1);
+		expect(chatContainer.children.indexOf(footerBlocks[0]!)).toBeGreaterThan(chatContainer.children.indexOf(group!));
 	});
 
 	it("keeps usage standalone when visible content follows a read", async () => {
