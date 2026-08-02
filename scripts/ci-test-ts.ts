@@ -84,6 +84,7 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // addon before this bucket: shared utility barrels may load native-backed modules.
 const fastWorkspacePackages = [
 	"packages/hashline",
+	"packages/lcm-context",
 	"packages/wire",
 	"packages/omptype",
 	"packages/utils",

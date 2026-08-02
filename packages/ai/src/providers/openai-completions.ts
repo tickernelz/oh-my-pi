@@ -709,6 +709,7 @@ const streamOpenAICompletionsOnce = (
 						body: params,
 						signal: requestSignal,
 						fetch: options?.fetch,
+						disableProviderRetries: options?.disableProviderRetries,
 						// Transient 408/429/5xx get Retry-After-aware transport retries.
 						// The first-event watchdog above aborts `requestSignal`, which
 						// bounds every attempt and backoff sleep — retries cannot
@@ -728,6 +729,7 @@ const streamOpenAICompletionsOnce = (
 				openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
 					provider: model.provider,
 					signal: requestSignal,
+					disableProviderRetries: options?.disableProviderRetries,
 				});
 			} catch (error) {
 				const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
@@ -737,6 +739,27 @@ const streamOpenAICompletionsOnce = (
 								explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
 							})
 						: undefined;
+				if (options?.disableProviderRetries) {
+					if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
+						rememberOpenAIReasoningEffortFallback(
+							providerSessionState,
+							activeReasoningEffortFallbackKey,
+							reasoningEffortFallback,
+						);
+					} else if (
+						!disableStrictTools &&
+						((isOpenRouterAnthropicModel(model) &&
+							isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)) ||
+							shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
+								model,
+								strictToolsApplied: appliedStrictTools,
+								tools: context.tools,
+							}))
+					) {
+						disableStrictToolsForScope(providerSessionState, strictToolsScope);
+					}
+					throw error;
+				}
 				if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
 					const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;

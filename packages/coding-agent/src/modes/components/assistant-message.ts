@@ -181,6 +181,7 @@ function lerpHex(from: string, to: string, t: number): string {
 export class AssistantMessageComponent extends Container {
 	#contentContainer: Container;
 	#markerSlot: Container;
+	#cacheInvalidation?: CacheInvalidation;
 	#lastMessage?: AssistantMessage;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
 	#convertedKittyImages = new Map<string, ImageContent>();
@@ -279,8 +280,8 @@ export class AssistantMessageComponent extends Container {
 		super();
 		this.#transcriptBlockFinalized = message !== undefined;
 
-		// Slim cache-invalidation divider, populated above the content when this
-		// turn's request lost the prompt cache (see setCacheInvalidation).
+		// Renderer-only response markers are populated by live events. They are
+		// deliberately absent when persisted assistant messages are replayed.
 		this.#markerSlot = new Container();
 		this.addChild(this.#markerSlot);
 
@@ -293,17 +294,28 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	/**
-	 * Show or clear the slim cache-invalidation divider above this turn. Set at
-	 * `message_end` (live) or during rebuild, once the turn's usage is known and
-	 * compared against the previous turn's cache footprint. Bumps the transcript
-	 * block version so the change repaints even after content finalized.
-	 */
+	/** Show or clear the prompt-cache invalidation evidence for this response. */
 	setCacheInvalidation(info: CacheInvalidation | undefined): void {
-		this.#markerSlot.clear();
-		if (info) {
-			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(info));
+		this.#cacheInvalidation = info;
+		this.#rebuildMarkers();
+	}
+
+	/** Ctrl+O toggles long provider errors. */
+	setExpanded(expanded: boolean): void {
+		if (this.#errorExpanded === expanded) return;
+		this.#errorExpanded = expanded;
+		if (this.#hasTruncatableError && this.#lastMessage) {
+			this.updateContent(this.#lastMessage, { transient: this.#lastUpdateTransient });
 		}
+	}
+
+	#rebuildMarkers(): void {
+		this.#markerSlot.clear();
+		if (!this.#cacheInvalidation) {
+			this.#blockVersion++;
+			return;
+		}
+		this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(this.#cacheInvalidation));
 		this.#blockVersion++;
 	}
 
@@ -432,22 +444,6 @@ export class AssistantMessageComponent extends Container {
 		if (this.#errorPinned === pinned) return;
 		this.#errorPinned = pinned;
 		if (this.#lastMessage) {
-			this.updateContent(this.#lastMessage, { transient: this.#lastUpdateTransient });
-		}
-	}
-
-	/**
-	 * Expand or collapse the inline turn-ending error block so Ctrl+O
-	 * (tool-output expansion) can reveal a long provider error's hidden tail.
-	 * Only re-renders when the current message carries a truncatable error, so
-	 * toggling expansion across the transcript skips ordinary turns. Works even
-	 * while the error is pinned in the banner: the inline block is drawn (in full)
-	 * when expanded so the complete body is reachable without sending a message.
-	 */
-	setExpanded(expanded: boolean): void {
-		if (this.#errorExpanded === expanded) return;
-		this.#errorExpanded = expanded;
-		if (this.#hasTruncatableError && this.#lastMessage) {
 			this.updateContent(this.#lastMessage, { transient: this.#lastUpdateTransient });
 		}
 	}

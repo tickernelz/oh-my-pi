@@ -1,23 +1,31 @@
 import { scheduler } from "node:timers/promises";
 
+const FORMATTED_RETRY_AFTER_MS_PATTERN = /\bretry-after-ms=([0-9]+(?:\.[0-9]+)?)\b/gi;
+
 // "reset after 1h2m3s" / "10m15s" / "39s"
-const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i;
+const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/gi;
 // "Please retry in 250ms" / "Please retry in 12s"
-const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/i;
+const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/gi;
 // JSON field: "retryDelay": "34.074824224s"
-const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/i;
+const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/gi;
 // "try again in 250ms" / "try again in 12s" / "try again in 12sec" /
 // "try again in 5 min" / "try again in ~158 min." / "try again in 2h" /
 // "try again in 90 minutes" / "try again in 1 hour"
-const TRY_AGAIN_PATTERN = /try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/i;
+const TRY_AGAIN_PATTERN = /try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/gi;
 // "Your limit will reset in 13 minutes" / "reset in 13 minutes" / "will reset in 2h"
-const WILL_RESET_IN_PATTERN = /(?:will\s+)?reset in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/i;
+const WILL_RESET_IN_PATTERN = /(?:will\s+)?reset in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/gi;
+const BODY_DELAY_PATTERNS = [
+	PLEASE_RETRY_PATTERN,
+	RETRY_DELAY_FIELD_PATTERN,
+	TRY_AGAIN_PATTERN,
+	WILL_RESET_IN_PATTERN,
+] as const;
 
 /**
  * Server-suggested retry delay extraction. Merges the patterns historically used
  * by the OpenAI Codex and Google Gemini retry helpers.
  *
- * Header sources (checked in order):
+ * Header sources (all valid delays are considered):
  *  - `retry-after-ms` (milliseconds)
  *  - `Retry-After` (numeric seconds, or HTTP date)
  *  - `x-ratelimit-reset-ms` (delta ms, or Unix epoch ms/s for large values)
@@ -25,81 +33,87 @@ const WILL_RESET_IN_PATTERN = /(?:will\s+)?reset in\s+~?\s*([0-9.]+)\s*(ms|sec|s
  *  - `x-ratelimit-reset-after` (seconds)
  *
  * Body patterns:
+ *  - `retry-after-ms=1234` appended to formatted provider errors
  *  - `Your quota will reset after 18h31m10s` / `10m15s` / `39s`
+ *  - `Your limit will reset in 13 minutes` / `reset in 2h`
  *  - `Please retry in 250ms` / `Please retry in 12s`
  *  - `"retryDelay": "34.074824224s"` (JSON error detail field)
  *  - `try again in 250ms` / `try again in 12s` / `try again in 5 min` / `try again in ~158 min`
- *
- * Returns `undefined` if no signal is found.
+ * Returns the longest valid delay, or `undefined` if no signal is found.
  */
 export function extractRetryHint(source: Response | Headers | null | undefined, body?: string): number | undefined {
+	let longestMs: number | undefined;
 	const headers = source instanceof Headers ? source : (source?.headers ?? undefined);
 	if (headers) {
 		const retryAfterMs = headers.get("retry-after-ms");
 		if (retryAfterMs) {
 			const ms = Number(retryAfterMs);
-			if (Number.isFinite(ms) && ms >= 0) return ms;
+			if (Number.isFinite(ms) && ms >= 0) longestMs = Math.max(longestMs ?? 0, ms);
 		}
 		const retryAfter = headers.get("retry-after");
 		if (retryAfter) {
 			const seconds = Number(retryAfter);
-			if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-			const parsedDate = Date.parse(retryAfter);
-			if (!Number.isNaN(parsedDate)) return Math.max(0, parsedDate - Date.now());
+			if (Number.isFinite(seconds)) {
+				if (seconds >= 0) longestMs = Math.max(longestMs ?? 0, seconds * 1000);
+			} else {
+				const parsedDate = Date.parse(retryAfter);
+				if (!Number.isNaN(parsedDate)) {
+					const delay = parsedDate - Date.now();
+					if (delay >= 0) longestMs = Math.max(longestMs ?? 0, delay);
+				}
+			}
 		}
 		const rateLimitResetMs = headers.get("x-ratelimit-reset-ms");
 		if (rateLimitResetMs) {
 			const value = Number(rateLimitResetMs);
 			if (Number.isFinite(value) && value > 0) {
-				// > 1e12 → epoch ms; > 1e9 → epoch s; otherwise a delta in ms.
 				const targetMs = value > 1e12 ? value : value > 1e9 ? value * 1000 : undefined;
-				if (targetMs === undefined) return value;
-				const delta = targetMs - Date.now();
-				if (delta > 0) return delta;
+				const delay = targetMs === undefined ? value : targetMs - Date.now();
+				if (delay > 0) longestMs = Math.max(longestMs ?? 0, delay);
 			}
 		}
 		const rateLimitReset = headers.get("x-ratelimit-reset");
 		if (rateLimitReset) {
 			const resetSeconds = Number.parseInt(rateLimitReset, 10);
 			if (!Number.isNaN(resetSeconds)) {
-				const delta = resetSeconds * 1000 - Date.now();
-				if (delta > 0) return delta;
+				const delay = resetSeconds * 1000 - Date.now();
+				if (delay > 0) longestMs = Math.max(longestMs ?? 0, delay);
 			}
 		}
 		const rateLimitResetAfter = headers.get("x-ratelimit-reset-after");
 		if (rateLimitResetAfter) {
 			const seconds = Number(rateLimitResetAfter);
-			if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
-		}
-	}
-
-	if (!body) return undefined;
-
-	const quotaMatch = QUOTA_RESET_PATTERN.exec(body);
-	if (quotaMatch) {
-		const hours = quotaMatch[1] ? Number.parseInt(quotaMatch[1], 10) : 0;
-		const minutes = quotaMatch[2] ? Number.parseInt(quotaMatch[2], 10) : 0;
-		const seconds = Number.parseFloat(quotaMatch[3]!);
-		if (!Number.isNaN(seconds)) {
-			const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
-			if (totalMs > 0) return totalMs;
-		}
-	}
-	// Account-reset hints ("will reset in …") take precedence over short
-	// retry hints ("please retry in 5s"): a body carrying both must honour the
-	// longer account window, not the shorter generic one. QUOTA_RESET_PATTERN
-	// ("reset after …") above already runs first and stays first.
-	for (const pattern of [WILL_RESET_IN_PATTERN, PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TRY_AGAIN_PATTERN]) {
-		const match = pattern.exec(body);
-		if (match?.[1]) {
-			const value = Number.parseFloat(match[1]);
-			if (Number.isFinite(value) && value > 0) {
-				const unitMs = unitToMs(match[2]!);
-				if (unitMs !== undefined) return value * unitMs;
+			if (Number.isFinite(seconds) && seconds > 0) {
+				longestMs = Math.max(longestMs ?? 0, seconds * 1000);
 			}
 		}
 	}
-	return undefined;
+
+	if (!body) return longestMs;
+
+	for (const match of body.matchAll(FORMATTED_RETRY_AFTER_MS_PATTERN)) {
+		const value = Number(match[1]);
+		if (Number.isFinite(value) && value >= 0) longestMs = Math.max(longestMs ?? 0, value);
+	}
+	for (const match of body.matchAll(QUOTA_RESET_PATTERN)) {
+		const hours = match[1] ? Number.parseInt(match[1], 10) : 0;
+		const minutes = match[2] ? Number.parseInt(match[2], 10) : 0;
+		const seconds = Number.parseFloat(match[3]!);
+		if (!Number.isNaN(seconds)) {
+			const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
+			if (totalMs > 0) longestMs = Math.max(longestMs ?? 0, totalMs);
+		}
+	}
+	for (const pattern of BODY_DELAY_PATTERNS) {
+		for (const match of body.matchAll(pattern)) {
+			const value = Number.parseFloat(match[1]!);
+			if (Number.isFinite(value) && value > 0) {
+				const unitMs = unitToMs(match[2]!);
+				if (unitMs !== undefined) longestMs = Math.max(longestMs ?? 0, value * unitMs);
+			}
+		}
+	}
+	return longestMs;
 }
 
 function unitToMs(unit: string): number | undefined {

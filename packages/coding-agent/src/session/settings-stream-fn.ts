@@ -28,7 +28,7 @@ function timeoutSecondsToMs(value: number): number | undefined {
  * Caller-supplied `streamOptions` always win — the helper only fills holes.
  */
 export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn = streamSimple): StreamFn {
-	return (model, context, streamOptions) => {
+	const wrapped: StreamFn = (model, context, streamOptions) => {
 		const openrouterRoutingPreset = settings.get("providers.openrouterVariant");
 		const openrouterVariant =
 			openrouterRoutingPreset && openrouterRoutingPreset !== "default" ? openrouterRoutingPreset : undefined;
@@ -76,4 +76,6 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 		};
 		return base(model, context, merged);
 	};
+	if (base.handlesBeforeTransportDispatch) wrapped.handlesBeforeTransportDispatch = true;
+	return wrapped;
 }

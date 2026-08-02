@@ -34,7 +34,7 @@ import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
-import { createUsageRowBlock } from "../../modes/components/usage-row";
+import { createResponseFooterBlock } from "../../modes/components/usage-row";
 import { UserMessageComponent } from "../../modes/components/user-message";
 import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
 import { materializeImageReferenceLinksSync } from "../../modes/image-references";
@@ -156,6 +156,9 @@ export class UiHelpers {
 				this.ctx.chatContainer.addChild(component);
 				break;
 			}
+			case "historicalContext":
+				// Transform-only transient context has no transcript representation.
+				break;
 			case "hookMessage":
 			case "custom": {
 				if (message.display) {
@@ -271,10 +274,15 @@ export class UiHelpers {
 				const cached = options?.reuseSettledComponent
 					? this.ctx.transcriptMessageComponents.get(message)
 					: undefined;
-				const assistantComponent =
-					cached instanceof AssistantMessageComponent
-						? cached
-						: createAssistantMessageComponent(this.ctx, splitAssistantMessageToolTimeline(message).beforeTools);
+				let assistantComponent: AssistantMessageComponent;
+				if (cached instanceof AssistantMessageComponent) {
+					assistantComponent = cached;
+				} else {
+					assistantComponent = createAssistantMessageComponent(
+						this.ctx,
+						splitAssistantMessageToolTimeline(message).beforeTools,
+					);
+				}
 				if (cached !== assistantComponent) {
 					this.ctx.transcriptMessageComponents.set(message, assistantComponent);
 				}
@@ -337,7 +345,12 @@ export class UiHelpers {
 				readGroup?.seal();
 				readGroup = null;
 				this.ctx.chatContainer.addChild(
-					createUsageRowBlock(pendingUsage, pendingUsageDuration, pendingUsageTtft, pendingUsageTimestamp),
+					createResponseFooterBlock({
+						usage: pendingUsage,
+						durationMs: pendingUsageDuration,
+						ttftMs: pendingUsageTtft,
+						timestamp: pendingUsageTimestamp,
+					}),
 				);
 			}
 			pendingUsage = undefined;

@@ -4,6 +4,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 
 async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 10; i++) {
@@ -37,7 +38,7 @@ function createContext(
 		goalObjective?: string;
 		isCompacting?: boolean;
 		isStreaming?: boolean;
-		runIdleCompaction?: () => void;
+		runIdleCompaction?: (requestTokensFloor: number, signal?: AbortSignal) => void | Promise<void>;
 		runEphemeralTurn?: (args: {
 			promptText: string;
 			signal?: AbortSignal;
@@ -74,9 +75,9 @@ function createContext(
 		pendingTools: new Map<string, unknown>(),
 		flushPendingModelSwitch: async () => {},
 		flushPendingCommandOutput: () => {},
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 		chatContainer: { removeChild: vi.fn() },
-		statusContainer: { clear: vi.fn() },
+		statusContainer: { clear: vi.fn(), disposeChildren: vi.fn(), addChild: vi.fn() },
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		editor: { getText: () => options.editorText ?? "" },
@@ -98,8 +99,31 @@ function createContext(
 			return (this as typeof context).session;
 		},
 		clearTransientSessionUi: () => {},
+		clearPinnedError: vi.fn(),
+		ensureLoadingAnimation: vi.fn(),
+		flushCompactionQueue: async () => {},
 	} as unknown as InteractiveModeContext;
 	return context;
+}
+
+function createPendingIdleCompaction() {
+	const started = Promise.withResolvers<AbortSignal | undefined>();
+	const settled = Promise.withResolvers<void>();
+	let continuedAfterProbe = false;
+	const runIdleCompaction = vi.fn(async (_requestTokensFloor: number, signal?: AbortSignal) => {
+		started.resolve(signal);
+		if (!signal) {
+			settled.resolve();
+			return;
+		}
+		const aborted = Promise.withResolvers<void>();
+		if (signal.aborted) aborted.resolve();
+		else signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		await aborted.promise;
+		if (!signal.aborted) continuedAfterProbe = true;
+		settled.resolve();
+	});
+	return { runIdleCompaction, started, settled, continuedAfterProbe: () => continuedAfterProbe };
 }
 
 describe("EventController idle compaction teardown", () => {
@@ -133,6 +157,88 @@ describe("EventController idle compaction teardown", () => {
 		vi.advanceTimersByTime(60_000);
 
 		expect(runIdleCompaction).not.toHaveBeenCalled();
+	});
+
+	it("passes the exact firing pressure into idle maintenance", async () => {
+		const runIdleCompaction = vi.fn((_requestTokensFloor: number, _signal?: AbortSignal) => {});
+		const context = createContext({ runIdleCompaction });
+
+		const controller = new EventController(context);
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+		await flushMicrotasks();
+
+		expect(runIdleCompaction).toHaveBeenCalledWith(210, expect.any(AbortSignal));
+		controller.dispose();
+	});
+
+	it("keeps a fired idle compaction alive through its own lifecycle events", async () => {
+		const started = Promise.withResolvers<AbortSignal | undefined>();
+		const release = Promise.withResolvers<void>();
+		const settled = Promise.withResolvers<void>();
+		const runIdleCompaction = vi.fn(async (_requestTokensFloor: number, signal?: AbortSignal) => {
+			started.resolve(signal);
+			await release.promise;
+			settled.resolve();
+		});
+		const controller = new EventController(createContext({ runIdleCompaction }));
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+		const signal = await started.promise;
+
+		try {
+			await controller.handleEvent({ type: "auto_compaction_start", reason: "idle", action: "context-full" });
+			expect(signal?.aborted).toBe(false);
+			await controller.handleEvent({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				skipped: true,
+			});
+			expect(signal?.aborted).toBe(false);
+			expect(runIdleCompaction).toHaveBeenCalledTimes(1);
+		} finally {
+			release.resolve();
+			await settled.promise;
+			controller.dispose();
+		}
+	});
+
+	it("aborts a fired idle ownership probe when a new agent turn starts", async () => {
+		const probe = createPendingIdleCompaction();
+		const controller = new EventController(createContext({ runIdleCompaction: probe.runIdleCompaction }));
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+		const signal = await probe.started.promise;
+
+		expect(signal).toBeInstanceOf(AbortSignal);
+		expect(signal?.aborted).toBe(false);
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
+		await probe.settled.promise;
+
+		expect(signal?.aborted).toBe(true);
+		expect(probe.continuedAfterProbe()).toBe(false);
+		expect(probe.runIdleCompaction).toHaveBeenCalledTimes(1);
+		controller.dispose();
+	});
+
+	it("aborts a fired idle ownership probe when the controller is disposed", async () => {
+		const probe = createPendingIdleCompaction();
+		const controller = new EventController(createContext({ runIdleCompaction: probe.runIdleCompaction }));
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+		const signal = await probe.started.promise;
+
+		expect(signal).toBeInstanceOf(AbortSignal);
+		expect(signal?.aborted).toBe(false);
+		controller.dispose();
+		await probe.settled.promise;
+
+		expect(signal?.aborted).toBe(true);
+		expect(probe.continuedAfterProbe()).toBe(false);
+		expect(probe.runIdleCompaction).toHaveBeenCalledTimes(1);
 	});
 
 	it("emits an LLM-generated recap after the default four-minute delay", async () => {

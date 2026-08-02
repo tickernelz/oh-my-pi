@@ -199,6 +199,41 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(result.disabledFeatures).toContain("unsigned-thinking-replay");
 	});
 
+	it("pins a signing proxy without retrying a single-attempt request", async () => {
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const capturedPayloads: unknown[] = [];
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			capturedPayloads.push(params);
+			if (attempt === 1) {
+				return {
+					async withResponse() {
+						throw createSignatureRejection();
+					},
+				} as never;
+			}
+			return successRequest() as never;
+		});
+		const request = () =>
+			streamAnthropic(model, priorTurnContext, {
+				apiKey: "sk-ant-test",
+				disableProviderRetries: true,
+				providerSessionState,
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = attempt;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(readReplayUnsignedThinkingDisabled(providerSessionState)).toBe(true);
+		expect(extractPriorAssistantBlocks(capturedPayloads[0]).find(block => block.type === "thinking")).toBeDefined();
+		expect(extractPriorAssistantBlocks(capturedPayloads[1]).find(block => block.type === "thinking")).toBeUndefined();
+	});
+
 	it("pre-demotes unsigned thinking on subsequent turns once the session is pinned", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];

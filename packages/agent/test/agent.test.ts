@@ -585,8 +585,12 @@ describe("Agent", () => {
 	it("prompt() emits assistant error lifecycle for Anthropic output-blocked stream errors before assistant start", async () => {
 		const mock = createMockModel({ responses: [] });
 		const errorText = "Output blocked by content filtering policy";
+		const providerDispatches: unknown[] = [];
+		const providerResponses: Array<{ messages: unknown; response: unknown }> = [];
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			beforeProviderDispatch: messages => providerDispatches.push(messages),
+			afterProviderResponse: (messages, response) => providerResponses.push({ messages, response }),
 			streamFn: () => {
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => stream.fail(new Error(errorText)));
@@ -618,6 +622,9 @@ describe("Agent", () => {
 		}
 		expect(assistantEnd.message.stopReason).toBe("error");
 		expect(assistantEnd.message.errorMessage).toBe(errorText);
+		expect(providerResponses).toHaveLength(1);
+		expect(providerResponses[0]?.messages).toBe(providerDispatches[0]);
+		expect(providerResponses[0]?.response).toBe(assistantEnd.message);
 
 		const lastMessage = agent.state.messages.at(-1);
 		if (lastMessage?.role !== "assistant") {
@@ -625,6 +632,37 @@ describe("Agent", () => {
 		}
 		expect(lastMessage.stopReason).toBe("error");
 		expect(lastMessage.errorMessage).toBe(errorText);
+	});
+
+	it("attributes terminal Harmony escalation to the emitted assistant error", async () => {
+		const leak = "Some prose. analysis to=functions.edit code 大发实网";
+		const mock = createMockModel({
+			provider: "openai-codex",
+			responses: [{ content: [leak] }, { content: [leak] }, { content: [leak] }],
+		});
+		const providerResponses: Array<{ messages: unknown; response: unknown }> = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+			afterProviderResponse: (messages, response) => providerResponses.push({ messages, response }),
+		});
+		const events: AgentEvent[] = [];
+		const unsubscribe = agent.subscribe(event => events.push(event));
+
+		await agent.prompt("trigger repeated Harmony leakage");
+		unsubscribe();
+
+		const assistantEnd = events
+			.filter(event => event.type === "message_end" && event.message.role === "assistant")
+			.at(-1);
+		if (assistantEnd?.type !== "message_end" || assistantEnd.message.role !== "assistant") {
+			throw new Error("terminal assistant error was not emitted");
+		}
+		expect(mock.calls).toHaveLength(3);
+		expect(providerResponses).toHaveLength(3);
+		expect(providerResponses.at(-1)?.response).toBe(assistantEnd.message);
+		expect(assistantEnd.message.stopReason).toBe("error");
+		expect(assistantEnd.message.errorMessage).toContain("Harmony leak persisted");
 	});
 
 	it("prompt() emits assistant error lifecycle for provider stream failures", async () => {

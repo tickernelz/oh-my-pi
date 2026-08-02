@@ -100,6 +100,8 @@ const GITLAB_DUO_WORKFLOW_MAX_STALL_RESTARTS = 2;
  */
 const GITLAB_DUO_WORKFLOW_STALL_ERROR_MESSAGE =
 	"GitLab Duo Agent stopped making progress (the workflow's visible history did not advance after multiple restarts).";
+const GITLAB_DUO_WORKFLOW_TIMEOUT_ERROR_MESSAGE =
+	"GitLab Duo Workflow WebSocket timed out before the workflow completed.";
 /**
  * Two rendered-`goal` byte thresholds bounding three reliability zones. Empirically
  * the DWS/Workhorse transport accepts no fixed token wall (it has tokenized
@@ -1014,7 +1016,15 @@ async function runGitLabDuoWorkflow(
 		);
 		pendingSession.pendingActions = undefined;
 		const resumeResult = await resumeGitLabDuoWorkflowSocket(
-			{ fetchImpl, baseUrl, apiKey, workflowId: pendingSession.workflowId, state, providerSessionState },
+			{
+				fetchImpl,
+				baseUrl,
+				apiKey,
+				workflowId: pendingSession.workflowId,
+				state,
+				providerSessionState,
+				failOnTimeout: options.disableProviderRetries === true,
+			},
 			() => runGitLabDuoWorkflowSocket(pendingSession.ws, pendingSession.startPayload, state, options, responses),
 		);
 		// A stall on the resumed socket means the server-side turn stopped advancing even
@@ -1030,7 +1040,15 @@ async function runGitLabDuoWorkflow(
 		session.pauseBuffer = [];
 		const sessionWorkflowId = session.workflowId;
 		const resumeResult = await resumeGitLabDuoWorkflowSocket(
-			{ fetchImpl, baseUrl, apiKey, workflowId: sessionWorkflowId, state, providerSessionState },
+			{
+				fetchImpl,
+				baseUrl,
+				apiKey,
+				workflowId: sessionWorkflowId,
+				state,
+				providerSessionState,
+				failOnTimeout: options.disableProviderRetries === true,
+			},
 			() => runGitLabDuoWorkflowSocket(session.ws, session.startPayload, state, options, undefined, replay),
 		);
 		// As with the action resume, a stall falls through to a fresh-workflow seed
@@ -1221,6 +1239,7 @@ async function runGitLabDuoWorkflow(
 				error: gitLabDuoWorkflowErrorText(cachedError),
 			});
 			clearGitLabDuoWorkflowCachedNamespace(apiKey, baseUrl, options.cwd);
+			if (options.disableProviderRetries) throw cachedError;
 			const rediscovered = await resolveGitLabDuoWorkflowNamespaceSelection(
 				model,
 				options,
@@ -1330,6 +1349,12 @@ async function runGitLabDuoWorkflow(
 			}
 			lastSocketResult = await runGitLabDuoWorkflowSocket(ws, startPayload, state, options);
 			if (lastSocketResult === "approval") {
+				if (options.disableProviderRetries) {
+					throw new AIError.ProviderResponseError(
+						`GitLab Duo Workflow requires approval: ${state.lastApprovalStatus ?? "PLAN_APPROVAL_REQUIRED"}`,
+						{ provider: "gitlab-duo-agent", kind: "runtime" },
+					);
+				}
 				startPayload = buildGitLabDuoWorkflowApprovalStartRequest(startPayload);
 				state.lastApprovalStatus = undefined;
 				continue;
@@ -1343,7 +1368,7 @@ async function runGitLabDuoWorkflow(
 			// (status CREATED → START branch, no checkpoint replay), then reopen the
 			// socket. The accumulated conversation replays through the goal transcript.
 			// Bounded to a single retry so a persistently dead endpoint can't loop on quota.
-			if (lastSocketResult === "timeout" && !timeoutReconnected) {
+			if (lastSocketResult === "timeout" && !options.disableProviderRetries && !timeoutReconnected) {
 				timeoutReconnected = true;
 				traceGitLabDuoWorkflow("websocket.idle_restart", { workflowId });
 				await stopGitLabDuoWorkflow(fetchImpl, baseUrl, apiKey, workflowId);
@@ -1360,6 +1385,12 @@ async function runGitLabDuoWorkflow(
 				startPayload = { ...startPayload, workflowID: workflowId };
 				continue;
 			}
+			if (lastSocketResult === "timeout" && options.disableProviderRetries) {
+				throw new AIError.ProviderResponseError(GITLAB_DUO_WORKFLOW_TIMEOUT_ERROR_MESSAGE, {
+					provider: "gitlab-duo-agent",
+					kind: "runtime",
+				});
+			}
 			// The server caps each workflow at a fixed step (graph-recursion) limit.
 			// A long but healthy OMP tool-call loop legitimately overruns it; that is
 			// not a real failure. Stop the exhausted run and create a FRESH workflow
@@ -1370,7 +1401,11 @@ async function runGitLabDuoWorkflow(
 			// checkpoint dedupe drops any re-sent ui_chat_log entries. Bounded so a
 			// task that perpetually overruns degrades to a graceful stop, not a quota
 			// sink.
-			if (lastSocketResult === "step_limit" && stepLimitRestarts < GITLAB_DUO_WORKFLOW_MAX_STEP_LIMIT_RESTARTS) {
+			if (
+				lastSocketResult === "step_limit" &&
+				!options.disableProviderRetries &&
+				stepLimitRestarts < GITLAB_DUO_WORKFLOW_MAX_STEP_LIMIT_RESTARTS
+			) {
 				stepLimitRestarts++;
 				state.stepLimitRequested = false;
 				traceGitLabDuoWorkflow("websocket.step_limit_restart", { workflowId, restart: stepLimitRestarts });
@@ -1397,7 +1432,11 @@ async function runGitLabDuoWorkflow(
 			// rebuilt from the agent loop's intact `context.messages`, so no in-flight
 			// tool result is lost. Bounded so a persistently stalling endpoint degrades to
 			// a surfaced result instead of looping on quota.
-			if (lastSocketResult === "stalled" && stallRestarts < GITLAB_DUO_WORKFLOW_MAX_STALL_RESTARTS) {
+			if (
+				lastSocketResult === "stalled" &&
+				!options.disableProviderRetries &&
+				stallRestarts < GITLAB_DUO_WORKFLOW_MAX_STALL_RESTARTS
+			) {
 				stallRestarts++;
 				state.stalledRequested = false;
 				traceGitLabDuoWorkflow("websocket.stall_restart", { workflowId, restart: stallRestarts });
@@ -1422,6 +1461,7 @@ async function runGitLabDuoWorkflow(
 			// so a deterministic failure surfaces instead of looping on quota.
 			if (
 				lastSocketResult === "retryable_error" &&
+				!options.disableProviderRetries &&
 				genericErrorRetries < GITLAB_DUO_WORKFLOW_MAX_GENERIC_ERROR_RETRIES
 			) {
 				genericErrorRetries++;
@@ -2492,6 +2532,7 @@ async function resumeGitLabDuoWorkflowSocket(
 		workflowId: string;
 		state: GitLabDuoWorkflowStreamState;
 		providerSessionState: GitLabDuoWorkflowProviderSessionState | undefined;
+		failOnTimeout: boolean;
 	},
 	run: () => Promise<GitLabDuoWorkflowSocketResult>,
 ): Promise<GitLabDuoWorkflowSocketResult> {
@@ -2504,6 +2545,14 @@ async function resumeGitLabDuoWorkflowSocket(
 		}
 		await stopGitLabDuoWorkflow(args.fetchImpl, args.baseUrl, args.apiKey, args.workflowId);
 		throw error;
+	}
+	if (socketResult === "timeout" && args.failOnTimeout) {
+		if (args.providerSessionState) args.providerSessionState.active = undefined;
+		await stopGitLabDuoWorkflow(args.fetchImpl, args.baseUrl, args.apiKey, args.workflowId);
+		throw new AIError.ProviderResponseError(GITLAB_DUO_WORKFLOW_TIMEOUT_ERROR_MESSAGE, {
+			provider: "gitlab-duo-agent",
+			kind: "runtime",
+		});
 	}
 	// A stall on the resumed socket must NOT finalize the stream: the caller re-seeds a
 	// fresh workflow (rebuilt goal includes the just-returned tool result) to break the

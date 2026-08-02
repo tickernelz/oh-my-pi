@@ -7,7 +7,7 @@
  * that were queued on the same cap. The fix moves the bracket to each
  * LLM HTTP request; this file exercises the new contract.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -124,20 +124,64 @@ describe("issue #3749: provider semaphore deadlock", () => {
 
 		// Parent's first LLM stream completes → slot frees → child acquires.
 		gates[0]!.resolve();
-		await parentTurn1;
+		const parentStream1 = await parentTurn1;
+		await parentStream1.result();
 		await waitFor(() => invocations() === 2, "child admitted after parent turn");
 		expect(inFlight()).toBe(1);
 
 		// Child completes. Parent's second turn can now start.
 		gates[1]!.resolve();
-		await childTurn;
+		const childStream = await childTurn;
+		await childStream.result();
 
 		const parentTurn2 = wrapped(model, { messages: [] }, {});
 		await waitFor(() => invocations() === 3, "parent turn 2 invoked");
 		gates[2]!.resolve();
-		await parentTurn2;
+		const parentStream2 = await parentTurn2;
+		await parentStream2.result();
 
 		expect(peakInFlight()).toBe(1);
+	});
+
+	it("runs the request fence after admission and never sends a queued stale payload", async () => {
+		const model = requireModel("ollama-cloud", "gpt-oss:120b");
+		const settings = Settings.isolated({ "providers.ollama-cloud.maxConcurrency": 1 });
+		const { stream, gates, invocations } = makeGatedStream();
+		const wrapped = wrapStreamFnWithProviderConcurrency(settings, stream);
+		const holder = wrapped(model, { messages: [] }, {});
+		await waitFor(() => invocations() === 1, "holder invoked");
+
+		let routeCurrent = true;
+		const fenceEntered = deferred();
+		const releaseFence = deferred();
+		const beforeTransportDispatch = vi.fn(async () => {
+			fenceEntered.resolve();
+			await releaseFence.promise;
+			if (!routeCurrent) throw new Error("projection route changed before provider dispatch");
+		});
+		const queued = Promise.resolve(wrapped(model, { messages: [] }, { beforeTransportDispatch }));
+		const staleRejected = queued.catch(error => error);
+		await Promise.resolve();
+		expect(beforeTransportDispatch).not.toHaveBeenCalled();
+		expect(invocations()).toBe(1);
+
+		gates[0]!.resolve();
+		await (await holder).result();
+		await fenceEntered.promise;
+		expect(invocations()).toBe(1);
+		routeCurrent = false;
+		releaseFence.resolve();
+		const staleError = await staleRejected;
+		expect(staleError).toBeInstanceOf(Error);
+		expect((staleError as Error).message).toContain("projection route changed before provider dispatch");
+		expect(beforeTransportDispatch).toHaveBeenCalledTimes(1);
+		expect(invocations()).toBe(1);
+
+		const admittedAfterStale = wrapped(model, { messages: [] }, {});
+		await waitFor(() => invocations() === 2, "request after stale fence invoked");
+		gates[1]!.resolve();
+		const admittedStream = await admittedAfterStale;
+		await admittedStream.result();
 	});
 
 	it("admits a deeper spawn tree than maxConcurrency without deadlocking", async () => {
@@ -149,7 +193,7 @@ describe("issue #3749: provider semaphore deadlock", () => {
 		// 3 "parents" + 6 "children" all sharing a cap of 2. The old bracket
 		// would freeze after the first two parents acquired both slots.
 		const parents = [0, 1, 2].map(async () => wrapped(model, { messages: [] }, {}));
-		const children: Promise<unknown>[] = [];
+		const children: Array<Promise<AssistantMessageEventStream>> = [];
 		for (let i = 0; i < 3; i++) {
 			children.push(Promise.resolve(wrapped(model, { messages: [] }, {})));
 			children.push(Promise.resolve(wrapped(model, { messages: [] }, {})));
@@ -161,7 +205,8 @@ describe("issue #3749: provider semaphore deadlock", () => {
 			gates[i]!.resolve();
 		}
 
-		await Promise.all([...parents, ...children]);
+		const streams = await Promise.all([...parents, ...children]);
+		await Promise.all(streams.map(stream => stream.result()));
 		expect(invocations()).toBe(9);
 		expect(peakInFlight()).toBe(2);
 	});

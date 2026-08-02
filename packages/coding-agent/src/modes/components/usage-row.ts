@@ -1,7 +1,9 @@
+import type { ContextProjection } from "@oh-my-pi/lcm-context";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
+import { LcmProjectionFooterComponent } from "./lcm-projection-footer";
 
 /** Below this the rate is nonsense (cached/instant responses yield absurd tok/s). */
 const MIN_DURATION_MS = 100;
@@ -41,12 +43,43 @@ export function formatUsageRow(usage: Usage, durationMs?: number, ttftMs?: numbe
 	return parts.join("  ");
 }
 
-// `timestamp` is optional and trails the throughput args to preserve the existing
-// (usage, durationMs, ttftMs) call contract — this function is part of the package's
-// public export surface (./modes/components/*).
+export interface ResponseFooterOptions {
+	usage?: Usage;
+	durationMs?: number;
+	ttftMs?: number;
+	timestamp?: number;
+	lcmProjection?: ContextProjection;
+}
+
+export class ResponseFooterComponent extends Container {
+	readonly #lcmFooter: LcmProjectionFooterComponent | undefined;
+
+	constructor(options: ResponseFooterOptions) {
+		super();
+		this.addChild(new Spacer(1));
+		if (options.usage) {
+			this.addChild(
+				new Text(
+					theme.fg("dim", formatUsageRow(options.usage, options.durationMs, options.ttftMs, options.timestamp)),
+					1,
+					0,
+				),
+			);
+		}
+		this.#lcmFooter = options.lcmProjection ? new LcmProjectionFooterComponent(options.lcmProjection) : undefined;
+		if (this.#lcmFooter) this.addChild(this.#lcmFooter);
+	}
+
+	setExpanded(expanded: boolean): void {
+		this.#lcmFooter?.setExpanded(expanded);
+	}
+}
+
+export function createResponseFooterBlock(options: ResponseFooterOptions): ResponseFooterComponent {
+	return new ResponseFooterComponent(options);
+}
+
+/** Stable public factory for a usage-only response footer. */
 export function createUsageRowBlock(usage: Usage, durationMs?: number, ttftMs?: number, timestamp?: number): Container {
-	const block = new Container();
-	block.addChild(new Spacer(1));
-	block.addChild(new Text(theme.fg("dim", formatUsageRow(usage, durationMs, ttftMs, timestamp)), 1, 0));
-	return block;
+	return createResponseFooterBlock({ usage, durationMs, ttftMs, timestamp });
 }

@@ -87,6 +87,16 @@ function getDefaultSessionDirName(cwd: string): {
 	return { encodedDirName, hashedDirName: encodeHashedSessionDirName(canonicalCwd, scope), resolvedCwd };
 }
 
+/** Resolve canonical and legacy session directories without touching them. */
+export function getSessionDirCandidatesReadOnly(cwd: string, sessionsRoot: string = getSessionsDir()): string[] {
+	const { encodedDirName, hashedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	const candidates = new Set<string>();
+	for (const name of [encodedDirName, hashedDirName, encodeLegacyAbsoluteSessionDirName(resolvedCwd)]) {
+		candidates.add(path.join(sessionsRoot, name));
+	}
+	return [...candidates];
+}
+
 /**
  * Migrate old `--<home-encoded>-*--` session dirs to the new `-*` format.
  * Runs once per sessions root on first access, best-effort.

@@ -1,10 +1,11 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { isFastModeUnsupported } from "@oh-my-pi/pi-ai/error";
 import {
 	clearAnthropicFastModeFallback,
 	isAnthropicFastModeFallbackDisabled,
 	streamAnthropic,
 } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { AnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type { Context, Model, ProviderSessionState, ServiceTier } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -133,6 +134,47 @@ describe("Anthropic priority service tier → speed='fast'", () => {
 			expect(matching.speed).toBeUndefined();
 			expect(differentModel.speed).toBe("fast");
 			expect(differentEndpoint.speed).toBe("fast");
+		});
+
+		it("learns unsupported fast mode without retrying a single-attempt request", async () => {
+			const model = makeAnthropicModel("claude-opus-4-7");
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const speeds: unknown[] = [];
+			let wireCalls = 0;
+			const rejection = Object.assign(
+				new Error(
+					'429 {"type":"error","error":{"type":"rate_limit_error","message":"Extra usage is required for fast mode."}}',
+				),
+				{ status: 429 },
+			);
+			const spy = vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+				wireCalls += 1;
+				speeds.push(params && typeof params === "object" && "speed" in params ? params.speed : undefined);
+				return {
+					async withResponse() {
+						throw rejection;
+					},
+				} as never;
+			});
+			const request = () =>
+				streamAnthropic(model, CONTEXT, {
+					apiKey: "sk-ant-test",
+					disableProviderRetries: true,
+					providerSessionState,
+					serviceTier: "priority",
+				}).result();
+
+			const first = await request();
+			const firstWireCalls = wireCalls;
+			const second = await request();
+			spy.mockRestore();
+
+			expect(first.stopReason).toBe("error");
+			expect(second.stopReason).toBe("error");
+			expect(firstWireCalls).toBe(1);
+			expect(wireCalls).toBe(2);
+			expect(speeds).toEqual(["fast", undefined]);
+			expect(isAnthropicFastModeFallbackDisabled(providerSessionState, model)).toBe(true);
 		});
 	});
 });

@@ -310,6 +310,7 @@ export function streamGitLabDuo(
 									: undefined,
 								reasoning: reasoningEffort,
 								toolChoice: mapAnthropicToolChoice(options.toolChoice),
+								disableProviderRetries: options.disableProviderRetries,
 							},
 						)
 					: mapping.openaiApiType === "responses"
@@ -346,6 +347,7 @@ export function streamGitLabDuo(
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
+									disableProviderRetries: options.disableProviderRetries,
 								} satisfies OpenAIResponsesOptions,
 							)
 						: streamOpenAICompletions(
@@ -380,6 +382,7 @@ export function streamGitLabDuo(
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
+									disableProviderRetries: options.disableProviderRetries,
 								} satisfies OpenAICompletionsOptions,
 							);
 

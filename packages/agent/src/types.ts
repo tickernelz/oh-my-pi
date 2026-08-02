@@ -26,10 +26,13 @@ import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
 
-/** Stream function - can return sync or Promise for async config lookup */
-export type StreamFn = (
+/** Stream function - can return sync or Promise for async config lookup. */
+export type StreamFn = ((
 	...args: Parameters<typeof streamSimple>
-) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>) & {
+	/** This wrapper invokes `beforeTransportDispatch` at its transport admission boundary. */
+	handlesBeforeTransportDispatch?: true;
+};
 
 /** Called once an aside has been inserted into the agent's live context. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
@@ -223,6 +226,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * and provider send.
 	 */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+
+	/**
+	 * Synchronous request-local hook after API-key resolution and immediately before
+	 * provider dispatch. Receives the exact post-transform AgentMessage array used
+	 * to build this call's provider context.
+	 */
+	beforeProviderDispatch?: (messages: AgentMessage[], signal?: AbortSignal) => void;
+	/** Called once with the final AssistantMessage produced by this provider dispatch. */
+	afterProviderResponse?: (messages: AgentMessage[], response: AssistantMessage) => void;
 
 	/**
 	 * Resolves the API key or resolver for the current model before each LLM call.

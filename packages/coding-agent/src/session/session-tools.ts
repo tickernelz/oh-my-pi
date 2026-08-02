@@ -70,6 +70,7 @@ interface SessionToolsOptions {
 	/** Creates the built-in `inspect_image` tool for session-scoped runtime enablement (see {@link SessionTools.setInspectImageMode}). */
 	createInspectImageTool?: () => Promise<AgentTool | null>;
 	builtInToolNames?: Iterable<string>;
+	ambientLcmToolNames?: Iterable<string>;
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	ensureWriteRegistered?: () => Promise<boolean>;
 	rebuildSystemPrompt?: (
@@ -184,6 +185,7 @@ export class SessionTools {
 	#createInspectImageTool: SessionToolsOptions["createInspectImageTool"];
 	#installedVibeToolNames = new Set<string>();
 	#builtInToolNames: Set<string>;
+	#ambientLcmToolNames: Set<string>;
 	#rpcHostToolNames = new Set<string>();
 	#xdev: XdevState | undefined;
 	#pendingXdevMountDelta: { added: Set<string>; removed: Set<string> } | undefined;
@@ -228,6 +230,7 @@ export class SessionTools {
 		this.#createComputerTool = options.createComputerTool;
 		this.#createInspectImageTool = options.createInspectImageTool;
 		this.#builtInToolNames = new Set(options.builtInToolNames ?? []);
+		this.#ambientLcmToolNames = new Set(options.ambientLcmToolNames ?? []);
 		this.#presentationPinnedToolNames = options.presentationPinnedToolNames;
 		this.#ensureWriteRegistered = options.ensureWriteRegistered;
 		this.#rebuildSystemPrompt = options.rebuildSystemPrompt;
@@ -306,6 +309,18 @@ export class SessionTools {
 		const mountedNames = this.#xdev?.mountedNames;
 		if (!mountedNames || mountedNames.size === 0) return this.getActiveToolNames();
 		return [...this.getActiveToolNames(), ...mountedNames];
+	}
+
+	/** Activates or removes own-session LCM tools while preserving explicit selections. */
+	async setAmbientLcmToolsEnabled(enabled: boolean): Promise<void> {
+		if (this.#ambientLcmToolNames.size === 0) return;
+		const next = this.getEnabledToolNames().filter(name => !this.#ambientLcmToolNames.has(name));
+		if (enabled) {
+			for (const name of this.#ambientLcmToolNames) {
+				if (this.#toolRegistry.has(name)) next.push(name);
+			}
+		}
+		await this.applyActiveToolsByName(next);
 	}
 
 	/** Names currently presented as `xd://` devices. */

@@ -24,6 +24,7 @@
       "@huggingface/transformers": "^4.2.0",
       "@napi-rs/cli": "3.7.2",
       "@oh-my-pi/hashline": "17.2.10",
+      "@oh-my-pi/lcm-context": "17.2.10",
       "@oh-my-pi/omp-stats": "17.2.10",
       "@oh-my-pi/omptype": "17.2.10",
       "@oh-my-pi/pi-agent-core": "17.2.10",

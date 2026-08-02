@@ -17,6 +17,7 @@ import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import type { LcmRetrievalRuntime } from "../lcm/operations";
 import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import type { MnemopiSessionState } from "../mnemopi/state";
@@ -52,6 +53,7 @@ import { GlobTool } from "./glob";
 import { GrepTool } from "./grep";
 import { HubTool, isIrcEnabled } from "./hub";
 import { InspectImageTool } from "./inspect-image";
+import { LcmCrossProjectSearchTool, LcmDescribeTool, LcmExpandTool, LcmRecallTool, LcmSearchTool } from "./lcm";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
 import { MemoryEditTool } from "./memory-edit";
@@ -66,6 +68,21 @@ import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { isMountableUnderXdev, type XdevState } from "./xdev";
 import { YieldTool } from "./yield";
+
+export const TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES = [
+	"lcm_search",
+	"lcm_describe",
+	"lcm_recall",
+	"lcm_cross_project_search",
+] as const;
+
+const LCM_RETRIEVAL_TOOL_NAMES: Readonly<Record<string, true>> = {
+	lcm_search: true,
+	lcm_describe: true,
+	lcm_recall: true,
+	lcm_expand: true,
+	lcm_cross_project_search: true,
+};
 
 export * from "../edit";
 export * from "../goals";
@@ -91,6 +108,7 @@ export * from "./grep";
 export * from "./hub";
 export * from "./image-gen";
 export * from "./inspect-image";
+export * from "./lcm";
 export * from "./learn";
 export * from "./manage-skill";
 export * from "./memory-edit";
@@ -245,6 +263,10 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** This session's own project/session/branch-scoped LCM retrieval port. */
+	getLcmRuntime?: () => LcmRetrievalRuntime | undefined;
+	/** Concrete parent capability forwarded only across a Task child boundary. */
+	getForwardedLcmRuntime?: () => LcmRetrievalRuntime | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -441,6 +463,11 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	lcm_search: LcmSearchTool.createIf,
+	lcm_describe: LcmDescribeTool.createIf,
+	lcm_expand: LcmExpandTool.createIf,
+	lcm_recall: LcmRecallTool.createIf,
+	lcm_cross_project_search: s => new LcmCrossProjectSearchTool(s),
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
@@ -589,6 +616,17 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			if (!goalEnabled || restrictToolNames) return false;
 			const goalState = session.getGoalModeState?.();
 			return goalState === undefined || goalState.enabled === true || goalState.goal.status === "dropped";
+		}
+		if (name === "lcm_expand") {
+			return (session.taskDepth ?? 0) > 0 && session.getForwardedLcmRuntime?.() !== undefined;
+		}
+		if (LCM_RETRIEVAL_TOOL_NAMES[name]) {
+			const explicitlyRequested = requestedTools?.includes(name) === true;
+			const defaultTopLevelLossless =
+				!restrictToolNames &&
+				(session.taskDepth ?? 0) === 0 &&
+				session.settings.get("context.engine") === "lossless";
+			return explicitlyRequested || defaultTopLevelLossless;
 		}
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return session.settings.get("bash.enabled");

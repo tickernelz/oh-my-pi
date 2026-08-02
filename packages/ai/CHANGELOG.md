@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added request-scoped `disableProviderRetries` stream control for callers that own a durable retry budget, propagated through built-in provider adapters while leaving normal completion and recall retries unchanged.
+
+### Fixed
+
+- Fixed healthy broker-sourced Codex usage leaving a remote gateway credential blocked until expiry: reconciliation now awaits a scoped broker delete fenced by the exact expiry and monotonic row version it inspected, so a concurrent newer 429 block is preserved.
+- Fixed durable single-attempt provider calls to retain auth and capability learning without extra wire requests, surface GitLab timeouts instead of publishing partial output, and prevent caller-aborted Codex requests from disabling shared WebSocket transport.
+
 ## [17.2.10] - 2026-08-06
 
 ### Breaking Changes

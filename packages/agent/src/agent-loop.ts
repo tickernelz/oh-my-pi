@@ -5,6 +5,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
 	type ComputerAction,
 	type ComputerSafetyCheck,
 	type Context,
@@ -158,7 +159,9 @@ class HarmonyLeakInterruption extends Error {
 	constructor(
 		readonly detection: HarmonyDetection,
 		readonly removed: string,
-		readonly recovered?: HarmonyRecoveredToolCall,
+		readonly recovered: HarmonyRecoveredToolCall | undefined,
+		readonly requestMessages: AgentMessage[],
+		readonly response: AssistantMessage,
 	) {
 		super(`Detected GPT-5 Harmony protocol leakage (${signalListLabel(detection.signals)})`);
 		this.name = "HarmonyLeakInterruption";
@@ -1163,6 +1166,7 @@ async function runLoopBody(
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
+				let recoveredProviderMessages: AgentMessage[] | undefined;
 				let message: AssistantMessage;
 				try {
 					message = await streamAssistantResponse(
@@ -1193,6 +1197,7 @@ async function runLoopBody(
 						harmonyTruncateResumeCount++;
 						recovered = err.recovered;
 						message = recovered.message;
+						recoveredProviderMessages = err.requestMessages;
 						await emitHarmonyAudit(config, err, "truncate_resume", harmonyRetryAttempt);
 						// A recovered message completes the turn, so the abort-retry counter
 						// resets like the normal success path (the truncate-resume counter
@@ -1206,6 +1211,7 @@ async function runLoopBody(
 							);
 						}
 						await emitHarmonyAudit(config, err, "abort_retry", harmonyRetryAttempt);
+						config.afterProviderResponse?.(err.requestMessages, err.response);
 						harmonyRetryAttempt++;
 						continue;
 					}
@@ -1214,7 +1220,11 @@ async function runLoopBody(
 					message = snapshotAssistantMessage(message);
 					currentContext.messages.push(message);
 					stream.push({ type: "message_start", message: snapshotAssistantMessage(message) });
-					stream.push({ type: "message_end", message: snapshotAssistantMessage(message) });
+					const finalEventMessage = snapshotAssistantMessage(message);
+					stream.push({ type: "message_end", message: finalEventMessage });
+					if (recoveredProviderMessages) {
+						config.afterProviderResponse?.(recoveredProviderMessages, finalEventMessage);
+					}
 				}
 				newMessages.push(message);
 
@@ -1496,6 +1506,7 @@ async function emitHarmonyAudit(
 
 interface PreparedProviderCall {
 	model: Model;
+	messages: AgentMessage[];
 	context: Context;
 	promptToolWireTools: Context["tools"];
 	ownedDialect: Dialect | undefined;
@@ -1547,7 +1558,7 @@ async function prepareProviderCall(
 			tools: undefined,
 		};
 	}
-	return { model, context: llmContext, promptToolWireTools, ownedDialect };
+	return { model, messages, context: llmContext, promptToolWireTools, ownedDialect };
 }
 
 /**
@@ -1569,9 +1580,9 @@ async function streamAssistantResponse(
 	prepared?: PreparedProviderCall,
 ): Promise<AssistantMessage> {
 	const providerCall = prepared ?? (await prepareProviderCall(context, config, signal));
-	const { model, context: llmContext, promptToolWireTools, ownedDialect } = providerCall;
+	const { model, messages, context: llmContext, promptToolWireTools, ownedDialect } = providerCall;
 
-	const streamFunction = streamFn || streamSimple;
+	const streamFunction: StreamFn = streamFn || streamSimple;
 
 	const dynamicReasoning = config.getReasoning?.();
 	const dynamicDisableReasoning = config.getDisableReasoning?.();
@@ -1659,19 +1670,48 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
-			let response = await streamFunction(model, llmContext, {
-				...config,
-				apiKey,
-				metadata: resolvedMetadata,
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				disableReasoning: effectiveDisableReasoning,
-				temperature: effectiveTemperature,
-				serviceTier: effectiveServiceTier,
-				cwd: effectiveCwd,
-				signal: finalRequestSignal,
-				onResponse: captureOnResponse,
-			});
+			const finishAbortedRequest = async (
+				partialMessage: AssistantMessage | null = null,
+				addedPartial = false,
+				completedToolCallIds: ReadonlySet<string> = new Set(),
+			): Promise<AssistantMessage> => {
+				const { message: aborted, eventMessage } = emitAbortedAssistantMessage(
+					partialMessage,
+					addedPartial,
+					completedToolCallIds,
+					context,
+					config,
+					stream,
+					requestSignal,
+				);
+				await finishChat(aborted);
+				config.afterProviderResponse?.(messages, eventMessage);
+				return aborted;
+			};
+			const beforeTransportDispatch = () => {
+				config.beforeProviderDispatch?.(messages, finalRequestSignal);
+			};
+			let response: AssistantMessageEventStream;
+			try {
+				if (!streamFunction.handlesBeforeTransportDispatch) beforeTransportDispatch();
+				response = await streamFunction(model, llmContext, {
+					...config,
+					apiKey,
+					metadata: resolvedMetadata,
+					toolChoice: effectiveToolChoice,
+					reasoning: effectiveReasoning,
+					disableReasoning: effectiveDisableReasoning,
+					temperature: effectiveTemperature,
+					serviceTier: effectiveServiceTier,
+					cwd: effectiveCwd,
+					signal: finalRequestSignal,
+					beforeTransportDispatch,
+					onResponse: captureOnResponse,
+				});
+			} catch (error) {
+				if (requestSignal?.aborted) return await finishAbortedRequest();
+				throw error;
+			}
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks
 				// so the rest of the loop executes them unchanged. When the model starts
@@ -1699,17 +1739,7 @@ async function streamAssistantResponse(
 				} catch {
 					// Provider cancellation failures cannot change the committed aborted message.
 				}
-				const aborted = emitAbortedAssistantMessage(
-					partialMessage,
-					addedPartial,
-					completedToolCallIds,
-					context,
-					config,
-					stream,
-					requestSignal,
-				);
-				await finishChat(aborted);
-				return aborted;
+				return finishAbortedRequest(partialMessage, addedPartial, completedToolCallIds);
 			};
 
 			// Set up a single abort race: register the abort listener once for the whole
@@ -1762,7 +1792,7 @@ async function streamAssistantResponse(
 									context.messages.pop();
 									addedPartial = false;
 								}
-								throw new HarmonyLeakInterruption(detection, removed, recovered);
+								throw new HarmonyLeakInterruption(detection, removed, recovered, messages, finalMessage);
 							}
 						}
 						finalMessage = snapshotAssistantMessage(finalMessage);
@@ -1791,8 +1821,10 @@ async function streamAssistantResponse(
 						if (!addedPartial) {
 							stream.push({ type: "message_start", message: snapshotAssistantMessage(finalMessage) });
 						}
-						stream.push({ type: "message_end", message: snapshotAssistantMessage(finalMessage) });
+						const finalEventMessage = snapshotAssistantMessage(finalMessage);
+						stream.push({ type: "message_end", message: finalEventMessage });
 						await finishChat(finalMessage);
+						config.afterProviderResponse?.(messages, finalEventMessage);
 						return finalMessage;
 					}
 					if (requestSignal?.aborted) {
@@ -1876,15 +1908,18 @@ async function streamAssistantResponse(
 						context.messages.pop();
 						addedPartial = false;
 					}
-					throw new HarmonyLeakInterruption(detection, removed, recovered);
+					throw new HarmonyLeakInterruption(detection, removed, recovered, messages, trailing);
 				}
 			}
 			trailing = snapshotAssistantMessage(trailing);
+			let finalEventMessage = trailing;
 			if (addedPartial) {
 				context.messages[context.messages.length - 1] = trailing;
-				stream.push({ type: "message_end", message: snapshotAssistantMessage(trailing) });
+				finalEventMessage = snapshotAssistantMessage(trailing);
+				stream.push({ type: "message_end", message: finalEventMessage });
 			}
 			await finishChat(trailing);
+			config.afterProviderResponse?.(messages, finalEventMessage);
 			return trailing;
 		});
 	} catch (err) {
@@ -2036,7 +2071,7 @@ function emitAbortedAssistantMessage(
 	config: AgentLoopConfig,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	requestSignal: AbortSignal | undefined,
-): AssistantMessage {
+): { message: AssistantMessage; eventMessage: AssistantMessage } {
 	const model = config.getModel?.() ?? config.model;
 	const errorMessage = abortReasonText(requestSignal);
 	const errorId =
@@ -2080,8 +2115,9 @@ function emitAbortedAssistantMessage(
 		context.messages.push(abortedMessage);
 		stream.push({ type: "message_start", message: snapshotAssistantMessage(abortedMessage) });
 	}
-	stream.push({ type: "message_end", message: snapshotAssistantMessage(abortedMessage) });
-	return abortedMessage;
+	const eventMessage = snapshotAssistantMessage(abortedMessage);
+	stream.push({ type: "message_end", message: eventMessage });
+	return { message: abortedMessage, eventMessage };
 }
 
 /** Per-call outcome of the pre-dispatch prepare phase (validation + `beforeToolCall`). */

@@ -64,6 +64,27 @@ const context: Context = {
 	messages: [{ role: "user", content: "Help me update the code.", timestamp: Date.now() }],
 };
 
+function gitLabApprovalFlowFetch(): FetchImpl {
+	return async (input: string | URL | Request) => {
+		const url = String(input);
+		if (url.includes("/api/graphql")) {
+			return new Response(
+				JSON.stringify({
+					data: {
+						aiChatAvailableModels: {
+							defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+							selectableModels: [],
+							pinnedModel: null,
+						},
+					},
+				}),
+				{ status: 200 },
+			);
+		}
+		return new Response("{}", { status: 200 });
+	};
+}
+
 const editTool: Tool = {
 	name: "edit",
 	description: "Apply a hashline patch.",
@@ -774,6 +795,88 @@ describe("GitLab Duo Workflow per-account namespace cache", () => {
 		expect(groupHits.count).toBe(2);
 	});
 
+	it("does not rediscover a failed cached namespace within a single-attempt request", async () => {
+		const apiKey = "acct-single-attempt-cache-key";
+		const baseUrl = "https://gitlab.single-attempt-cache.example.com";
+		let groupHits = 0;
+		let directAccessHits = 0;
+		let failCachedSetup = false;
+		const fetchImpl: FetchImpl = async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.includes("/api/v4/groups") && url.includes("top_level_only")) {
+				groupHits += 1;
+				return new Response(
+					JSON.stringify([{ id: "gid://gitlab/Group/single-attempt-root", full_path: "acct-group" }]),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/groups")) {
+				return new Response(JSON.stringify([{ id: 42, path_with_namespace: "acct-group/proj" }]), { status: 200 });
+			}
+			if (url.includes("/direct_access")) {
+				directAccessHits += 1;
+				if (failCachedSetup) {
+					failCachedSetup = false;
+					return new Response(JSON.stringify({ message: "cached namespace unavailable" }), { status: 404 });
+				}
+				return new Response(
+					JSON.stringify({
+						duo_workflow_service: { base_url: "https://workflow.example.com", token: "wf-token", headers: {} },
+						gitlab_rails: { token: "rails-token" },
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/projects")) {
+				return new Response(JSON.stringify([{ id: 42, path_with_namespace: "acct-group/proj" }]), { status: 200 });
+			}
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows")) {
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 200 });
+		};
+
+		await driveOneTurn(apiKey, baseUrl, fetchImpl, new Map<string, ProviderSessionState>());
+		expect(groupHits).toBe(1);
+		failCachedSetup = true;
+		let socketCount = 0;
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketCount += 1;
+			const socket = makeSocket();
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+			});
+			return socket;
+		};
+		const result = await streamGitLabDuoWorkflow({ ...model, baseUrl } as Model<"gitlab-duo-agent">, context, {
+			apiKey,
+			disableProviderRetries: true,
+			fetch: fetchImpl,
+			providerSessionState: new Map<string, ProviderSessionState>(),
+			webSocketFactory,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(groupHits).toBe(1);
+		expect(directAccessHits).toBe(2);
+		expect(socketCount).toBe(0);
+	});
+
 	it("ensures Duo settings once per account rather than once per provider session", async () => {
 		const apiKey = "acct-settings-key";
 		const baseUrl = "https://gitlab.settings-cache.example.com";
@@ -1006,6 +1109,173 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(result.stopReason).not.toBe("error");
 	});
 
+	it("surfaces a partial idle timeout as an error for a single-attempt request", async () => {
+		let createCount = 0;
+		const stoppedWorkflowIds: string[] = [];
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/")) {
+				const match = /\/workflows\/([^/?]+)/.exec(url);
+				if (init?.method === "PATCH" && match?.[1]) stoppedWorkflowIds.push(match[1]);
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				createCount += 1;
+				return new Response(JSON.stringify({ id: `workflow-${createCount}` }), { status: 200 });
+			}
+			return new Response("{}", { status: 200 });
+		};
+		let socketCount = 0;
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketCount += 1;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				socket.onmessage?.(
+					new MessageEvent("message", {
+						data: JSON.stringify({
+							newCheckpoint: {
+								status: "CREATED",
+								checkpoint: JSON.stringify({
+									channel_values: { ui_chat_log: [{ message_type: "agent", content: "Partial answer" }] },
+								}),
+							},
+						}),
+					}),
+				);
+			});
+			return socket;
+		};
+		const stream = streamGitLabDuoWorkflow(model, context, {
+			apiKey: "single-attempt-timeout-key",
+			disableProviderRetries: true,
+			fetch: fetchImpl,
+			idleTimeoutMs: 10,
+			rootNamespaceId: "gid://gitlab/Group/1",
+			webSocketFactory,
+			workflowDefinition: "chat",
+			workflowToken: "workflow-token",
+		});
+		const eventTypesPromise = (async () => {
+			const eventTypes: string[] = [];
+			for await (const event of stream) eventTypes.push(event.type);
+			return eventTypes;
+		})();
+		const result = await stream.result();
+		const eventTypes = await eventTypesPromise;
+
+		expect(createCount).toBe(1);
+		expect(socketCount).toBe(1);
+		expect(stoppedWorkflowIds).toEqual(["workflow-1"]);
+		expect(result.content).toEqual([{ type: "text", text: "Partial answer" }]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("timed out");
+		expect(eventTypes.at(-1)).toBe("error");
+		expect(eventTypes).not.toContain("done");
+	});
+
+	it("surfaces PLAN_APPROVAL_REQUIRED after one single-attempt WebSocket", async () => {
+		let socketCount = 0;
+		const sent: string[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketCount += 1;
+			const currentSocket = socketCount;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+				},
+				close() {},
+			};
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				const status = currentSocket === 1 ? "PLAN_APPROVAL_REQUIRED" : "INPUT_REQUIRED";
+				socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status }) }));
+			});
+			return socket;
+		};
+		const result = await streamGitLabDuoWorkflow(model, context, {
+			apiKey: "single-attempt-approval-key",
+			disableProviderRetries: true,
+			fetch: gitLabApprovalFlowFetch(),
+			rootNamespaceId: "gid://gitlab/Group/1",
+			webSocketFactory,
+			workflowDefinition: "chat",
+			workflowId: "workflow-single-approval",
+			workflowToken: "workflow-token",
+		}).result();
+
+		expect(socketCount).toBe(1);
+		expect(sent).toHaveLength(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("GitLab Duo Workflow requires approval: PLAN_APPROVAL_REQUIRED");
+	});
+
+	it("continues PLAN_APPROVAL_REQUIRED on a second WebSocket when retries are enabled", async () => {
+		let socketCount = 0;
+		const sent: string[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketCount += 1;
+			const currentSocket = socketCount;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+				},
+				close() {},
+			};
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				const status = currentSocket === 1 ? "PLAN_APPROVAL_REQUIRED" : "INPUT_REQUIRED";
+				socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status }) }));
+			});
+			return socket;
+		};
+		const result = await streamGitLabDuoWorkflow(model, context, {
+			apiKey: "normal-approval-key",
+			fetch: gitLabApprovalFlowFetch(),
+			rootNamespaceId: "gid://gitlab/Group/1",
+			webSocketFactory,
+			workflowDefinition: "chat",
+			workflowId: "workflow-normal-approval",
+			workflowToken: "workflow-token",
+		}).result();
+
+		expect(socketCount).toBe(2);
+		expect(sent).toHaveLength(2);
+		expect(JSON.parse(sent[1]!)).toMatchObject({
+			startRequest: { additional_context: [], approval: { approval: {} }, goal: "" },
+		});
+		expect(result.stopReason).toBe("stop");
+	});
+
 	it("restarts on a fresh workflow when the server reports the max step limit", async () => {
 		const createdWorkflowIds: string[] = [];
 		let createCount = 0;
@@ -1170,7 +1440,10 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(result.errorMessage).toBeUndefined();
 	});
 
-	it("surfaces the generic processing error after the bounded retry is exhausted", async () => {
+	it.each([
+		{ label: "after its bounded retry", disableProviderRetries: undefined, expectedCalls: 2 },
+		{ label: "without retry for a single-attempt caller", disableProviderRetries: true, expectedCalls: 1 },
+	] as const)("surfaces the generic processing error %s", async ({ disableProviderRetries, expectedCalls }) => {
 		let createCount = 0;
 		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
 			const url = String(input);
@@ -1232,12 +1505,12 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			rootNamespaceId: "gid://gitlab/Group/1",
 			fetch: fetchImpl,
 			webSocketFactory,
+			...(disableProviderRetries === undefined ? {} : { disableProviderRetries }),
 		});
 		const result = await stream.result();
 
-		// One original attempt + one bounded retry, then surface the error.
-		expect(createCount).toBe(2);
-		expect(sockets).toHaveLength(2);
+		expect(createCount).toBe(expectedCalls);
+		expect(sockets).toHaveLength(expectedCalls);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Duo Agent Platform");
 	});

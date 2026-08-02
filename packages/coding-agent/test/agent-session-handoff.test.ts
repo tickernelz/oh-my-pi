@@ -608,7 +608,7 @@ describe("AgentSession handoff", () => {
 			details: {},
 		});
 
-		await session.runIdleCompaction();
+		await session.runIdleCompaction(0);
 
 		const endEvent = events.find(
 			(event): event is Extract<AgentSessionEvent, { type: "auto_compaction_end" }> =>
@@ -762,7 +762,7 @@ describe("AgentSession handoff", () => {
 		});
 
 		try {
-			await localSession.runIdleCompaction();
+			await localSession.runIdleCompaction(0);
 			expect(compactSpy).toHaveBeenCalledTimes(1);
 			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");

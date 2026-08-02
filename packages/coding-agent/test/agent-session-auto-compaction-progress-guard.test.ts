@@ -1102,15 +1102,8 @@ describe("AgentSession auto-compaction progress guard", () => {
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 	}
 
-	it("auto-continues when residual sits at the recovery band but the trigger was already sub-band", async () => {
+	it("skips maintenance when pruning already leaves the retry inside the recovery band", async () => {
 		activateOngoingGoal("recovery-band");
-		// Regression for the #3412 review: when stale/tool-output pruning already
-		// dropped context under the recovery band BEFORE this pass, the trigger
-		// (postMaintenanceContextTokens) is itself sub-band. The old guard returned
-		// `residual < trigger`, so a residual that merely held the line at/under the
-		// band — not strictly smaller than the already-safe trigger — was reported
-		// as no-progress and the auto-continue was suppressed with a false warning,
-		// even though the next turn could no longer re-trip threshold compaction.
 		const now = Date.now();
 		// Pin the threshold so the recovery band is exact: floor(76384 * 0.8) = 61107.
 		session.settings.set("compaction.thresholdTokens", 76384);
@@ -1124,19 +1117,12 @@ describe("AgentSession auto-compaction progress guard", () => {
 
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
-		// Residual lands AT the band (61000 <= 61107). Maintenance pruning already
-		// drove the trigger below this, so the old strict-less guard would have
-		// suppressed; the band check proves headroom and continues.
+		// The post-prune retry already sits inside the recovery band.
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 61000, contextWindow: 200000, percent: 30.5 });
 
 		const notices = collectNotices();
 
-		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
-		session.subscribe(event => {
-			if (event.type === "auto_compaction_end") onCompactionDone();
-		});
-
-		// Final turn billed above the 76384 threshold so threshold compaction fires.
+		// The completed turn was billed above the threshold; only the post-prune retry governs maintenance.
 		const finalAssistant = {
 			role: "assistant" as const,
 			content: [{ type: "text" as const, text: "continuing." }],
@@ -1157,10 +1143,9 @@ describe("AgentSession auto-compaction progress guard", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
 
-		await compactionDone;
 		await session.waitForIdle();
 
-		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy).not.toHaveBeenCalled();
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});

@@ -2609,6 +2609,34 @@ const streamAnthropicOnce = (
 					break;
 				} catch (streamError) {
 					const streamFailure = activeAbortTracker.getLocalAbortReason() ?? streamError;
+					if (options?.disableProviderRetries) {
+						if (
+							!disableStrictTools &&
+							firstTokenTime === undefined &&
+							hasStrictAnthropicTools(params) &&
+							AIError.isGrammarError(streamFailure)
+						) {
+							if (providerSessionState) providerSessionState.strictToolsDisabled = true;
+						} else if (
+							!forceDemoteUnsignedThinking &&
+							firstTokenTime === undefined &&
+							!streamedReplayUnsafeContent &&
+							isInvalidThinkingSignatureError(
+								streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+							)
+						) {
+							if (providerSessionState) providerSessionState.replayUnsignedThinkingDisabled = true;
+						} else if (
+							!dropFastMode &&
+							model.provider === "anthropic" &&
+							options.serviceTier === "priority" &&
+							firstTokenTime === undefined &&
+							AIError.isFastModeUnsupported(streamFailure)
+						) {
+							if (providerSessionState) providerSessionState.fastModeDisabled = true;
+						}
+						throw streamFailure;
+					}
 					if (
 						!disableStrictTools &&
 						firstTokenTime === undefined &&

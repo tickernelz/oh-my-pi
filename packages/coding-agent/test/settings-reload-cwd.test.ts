@@ -94,6 +94,66 @@ it("reports overlay provenance for a null tombstone that blocks the global fallb
 	}
 });
 
+it("reports generic setting-leaf provenance across merge precedence", async () => {
+	const root = path.join(os.tmpdir(), `setting-provenance-${Snowflake.next()}`);
+	const agentDir = path.join(root, "agent");
+	const projectDir = path.join(root, "project");
+	const globalOnlyDir = path.join(root, "global-only");
+	const overlayPath = path.join(root, "overlay.yml");
+	const summaryPath = "context.lossless.summaryModel" as const;
+	const concurrencyPath = "context.lossless.maxConcurrentSummaries" as const;
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.mkdirSync(path.join(projectDir, ".omp"), { recursive: true });
+	fs.mkdirSync(globalOnlyDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(agentDir, "config.yml"),
+		YAML.stringify({ context: { lossless: { summaryModel: "global/model", maxConcurrentSummaries: 1 } } }, null, 2),
+	);
+	fs.writeFileSync(
+		path.join(projectDir, ".omp", "config.yml"),
+		YAML.stringify({ context: { lossless: { summaryModel: "project/model", maxConcurrentSummaries: 2 } } }, null, 2),
+	);
+	fs.writeFileSync(
+		overlayPath,
+		YAML.stringify({ context: { lossless: { summaryModel: "overlay/model", maxConcurrentSummaries: 3 } } }, null, 2),
+	);
+
+	try {
+		const runtime = await Settings.loadReadOnly({
+			cwd: projectDir,
+			agentDir,
+			configFiles: [overlayPath],
+			overrides: { [summaryPath]: "runtime/model", [concurrencyPath]: 4 },
+		});
+		expect(runtime.get(summaryPath)).toBe("runtime/model");
+		expect(runtime.get(concurrencyPath)).toBe(4);
+		expect(runtime.getSettingProvenance(summaryPath)).toBe("runtime");
+		expect(runtime.getSettingProvenance(concurrencyPath)).toBe("runtime");
+
+		runtime.clearOverride(summaryPath);
+		runtime.clearOverride(concurrencyPath);
+		expect(runtime.get(summaryPath)).toBe("overlay/model");
+		expect(runtime.get(concurrencyPath)).toBe(3);
+		expect(runtime.getSettingProvenance(summaryPath)).toBe("overlay");
+		expect(runtime.getSettingProvenance(concurrencyPath)).toBe("overlay");
+
+		const project = await Settings.loadReadOnly({ cwd: projectDir, agentDir });
+		expect(project.get(summaryPath)).toBe("project/model");
+		expect(project.get(concurrencyPath)).toBe(2);
+		expect(project.getSettingProvenance(summaryPath)).toBe("project");
+		expect(project.getSettingProvenance(concurrencyPath)).toBe("project");
+
+		const global = await Settings.loadReadOnly({ cwd: globalOnlyDir, agentDir });
+		expect(global.get(summaryPath)).toBe("global/model");
+		expect(global.get(concurrencyPath)).toBe(1);
+		expect(global.getSettingProvenance(summaryPath)).toBe("global");
+		expect(global.getSettingProvenance(concurrencyPath)).toBe("global");
+		expect(Settings.isolated().getSettingProvenance(summaryPath)).toBe("default");
+		expect(Settings.isolated().getSettingProvenance(concurrencyPath)).toBe("default");
+	} finally {
+		if (fs.existsSync(root)) removeSyncWithRetries(root);
+	}
+});
 describe("Settings.reloadForCwd", () => {
 	let settingsState: SettingsTestState | undefined;
 
@@ -314,6 +374,60 @@ describe("Settings.reloadForCwd", () => {
 
 			expect(settings.getModelRole("default")).toBe("anthropic/native");
 			expect(settings.getProjectModelRole("default")).toBe("anthropic/native");
+			expect(settings.get("compaction.enabled")).toBe(true);
+		});
+
+		it("merges every native LCM override over global settings", async () => {
+			await Bun.write(
+				path.join(agentDir, "config.yml"),
+				YAML.stringify(
+					{
+						context: {
+							engine: "native",
+							lossless: { summaryModel: "global-summary", maxConcurrentSummaries: 1 },
+						},
+					},
+					null,
+					2,
+				),
+			);
+			fs.mkdirSync(path.join(startDir, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(startDir, ".omp", "config.yml"),
+				YAML.stringify(
+					{
+						context: { engine: "lossless", lossless: { maxConcurrentSummaries: 2 } },
+						compaction: { enabled: false },
+					},
+					null,
+					2,
+				),
+			);
+			fs.mkdirSync(path.join(bareProject, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(bareProject, ".omp", "config.yml"),
+				YAML.stringify(
+					{
+						context: {
+							lossless: { summaryModel: "project-summary", maxConcurrentSummaries: 4 },
+						},
+						compaction: { enabled: false },
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: startDir, agentDir });
+			expect(settings.get("context.engine")).toBe("lossless");
+			expect(settings.get("context.lossless.summaryModel")).toBe("global-summary");
+			expect(settings.get("context.lossless.maxConcurrentSummaries")).toBe(2);
+			expect(settings.get("compaction.enabled")).toBe(true);
+
+			await settings.reloadForCwd(bareProject);
+			expect(settings.get("context.engine")).toBe("native");
+			expect(settings.get("context.lossless.summaryModel")).toBe("project-summary");
+			expect(settings.get("context.lossless.maxConcurrentSummaries")).toBe(4);
 			expect(settings.get("compaction.enabled")).toBe(true);
 		});
 

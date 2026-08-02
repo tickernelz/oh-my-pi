@@ -191,14 +191,15 @@ export class SelectorController {
 				this.focusActiveEditorArea();
 				this.ctx.ui.requestRender();
 			};
+			const availableModels = this.ctx.session.getAvailableModels();
 			const selector = new SettingsSelectorComponent(
 				{
 					availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 					thinkingLevel: this.ctx.session.thinkingLevel,
 					availableThemes,
-					providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
-						(a, b) => a.localeCompare(b),
-					),
+					models: availableModels,
+					summaryModels: this.ctx.session.modelRegistry.getAvailable(),
+					providers: [...new Set(availableModels.map(model => model.provider))].sort((a, b) => a.localeCompare(b)),
 					cwd: getProjectDir(),
 					model: this.ctx.session.model,
 					imageBudget: this.ctx.ui.imageBudget,
@@ -430,6 +431,11 @@ export class SelectorController {
 			} else {
 				disableProvider(providerId);
 			}
+			return;
+		}
+
+		if (id.startsWith("context.lossless.")) {
+			this.ctx.session.refreshLcmSettings();
 			return;
 		}
 

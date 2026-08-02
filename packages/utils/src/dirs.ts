@@ -22,11 +22,11 @@ export const APP_NAME: string = "omp";
 /** Config directory name (e.g. ".omp") */
 export const CONFIG_DIR_NAME: string = ".omp";
 
-/** Ordered main settings filenames: canonical write target first, legacy-compatible YAML fallback second. */
-export const MAIN_CONFIG_FILENAMES = ["config.yml", "config.yaml"] as const;
-
 /** Version (e.g. "1.0.0") */
 export const VERSION: string = version;
+
+/** Ordered main settings filenames: canonical write target first, legacy-compatible YAML fallback second. */
+export const MAIN_CONFIG_FILENAMES = ["config.yml", "config.yaml"] as const;
 
 /** Minimum Bun version */
 export const MIN_BUN_VERSION: string = engines.bun.replace(/[^0-9.]/g, "");
@@ -164,7 +164,7 @@ export function pathIsWithin(root: string, candidate: string): boolean {
 	const normalizedRoot = normalizePathForComparison(root);
 	const normalizedCandidate = normalizePathForComparison(candidate);
 	const relative = path.relative(normalizedRoot, normalizedCandidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 export function relativePathWithinRoot(root: string, candidate: string): string | null {
@@ -778,6 +778,11 @@ export function getSessionsDir(agentDir?: string): string {
 /** Get the content-addressed blob store directory (~/.omp/agent/blobs). */
 export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
+}
+
+/** Get the Lossless Context Management data directory (~/.omp/agent/lcm). */
+export function getLcmDir(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "lcm", "data");
 }
 
 /** Get the custom themes directory (~/.omp/agent/themes). */

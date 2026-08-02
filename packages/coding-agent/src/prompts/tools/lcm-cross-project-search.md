@@ -1,0 +1,1 @@
+Search exactly one explicitly selected, catalog-authorized LCM project with bounded pagination. Returns redacted derived matches and project-qualified opaque summary/source handles; it never unions projects or opens an arbitrary store.

@@ -48,6 +48,7 @@ import {
 	hsvToRgb,
 	isEnoent,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	setProjectDir,
@@ -1301,21 +1302,27 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Re-point the process and every cwd-derived cache at `newCwd` after the
 	 * active session's working directory changed (`/move` relocation or resuming
 	 * a session from another project). The SessionManager's cwd MUST already
-	 * reflect `newCwd` before this is called.
+	 * reflect `newCwd` before this is called. A cross-project `switchSession()`
+	 * atomically updates Settings and LCM first, so matching scopes skip only that
+	 * duplicate work while still refreshing every other cwd-derived cache.
 	 */
 	async applyCwdChange(newCwd: string): Promise<void> {
 		setProjectDir(newCwd);
-		// Re-scope project settings (`.claude/settings.yml` etc.) to the new
-		// directory in place so the active session and every settings reader pick
-		// up the destination project's configuration.
-		if (isSettingsInitialized()) {
-			await settings.reloadForCwd(newCwd);
-			// Reapply provider preferences from the newly-loaded settings so the
-			// module-level search/image provider state reflects the destination
-			// project's configuration. Without this, the previous project's
-			// exclusions leak and newly-excluded providers are still used.
-			applyProviderGlobalsFromSettings(settings);
+		const settingsAndLcmCurrent =
+			normalizePathForComparison(this.settings.getCwd()) === normalizePathForComparison(newCwd);
+		if (!settingsAndLcmCurrent) {
+			// Re-scope project settings (`.claude/settings.yml` etc.) before LCM
+			// binds or schedules so it never observes the source project's config.
+			await this.settings.reloadForCwd(newCwd);
+			await this.session.refreshLcmSettingsAndRebind();
 		}
+
+		// Reapply provider preferences from the newly-loaded settings so the
+		// module-level search/image provider state reflects the destination
+		// project's configuration. Without this, the previous project's
+		// exclusions leak and newly-excluded providers are still used.
+		applyProviderGlobalsFromSettings(this.settings);
+
 		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 		// the next prompt sees everything scoped to the new project directory.
 		clearClaudePluginRootsCache();
@@ -1533,7 +1540,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		// after enabling loop mode.
 		return parsed.prompt;
 	}
-
 	recordLocalSubmission(text: string, imageCount = 0): () => void {
 		if (this.isKnownSlashCommand(text)) {
 			return () => {};

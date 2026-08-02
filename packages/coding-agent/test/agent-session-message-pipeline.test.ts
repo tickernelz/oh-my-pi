@@ -1,4 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
+import {
+	activeSourceFingerprint,
+	type ContextProjection,
+	type LcmContext,
+	openLcmContext,
+	type SourceSnapshot,
+} from "@oh-my-pi/lcm-context";
 import {
 	Agent,
 	type AgentMessage,
@@ -16,8 +24,10 @@ import {
 	type ModelSpec,
 	registerCustomApi,
 	type SimpleStreamOptions,
+	streamSimple,
 	type TextContent,
 } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -27,10 +37,23 @@ import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/typ
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { createAgentSession, type ExtensionContext, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
-import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent, lcmCueTerms } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	convertToLlm,
+	createHistoricalContextMessage,
+	wrapSteeringForModel,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	estimateLcmProjectionMessageTokens,
+	LcmCompletionError,
+	type LcmPrimaryRouteKey,
+	MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS,
+	SessionLcm,
+	type SessionLcmProjectResult,
+} from "@oh-my-pi/pi-coding-agent/session/session-lcm";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -82,6 +105,50 @@ async function withNativeDialectEnv<T>(fn: () => Promise<T>): Promise<T> {
 describe("AgentSession message pipeline", () => {
 	const sessions: AgentSession[] = [];
 
+	function createLcmCompletionSession(
+		sideStreamFn: StreamFn,
+		obfuscator?: SecretObfuscator,
+		modelOverride?: Model<Api>,
+	): AgentSession {
+		const model =
+			modelOverride ??
+			(buildModel({
+				id: "lcm-completion-model",
+				name: "LCM Completion Model",
+				api: "anthropic",
+				provider: "test-lcm-provider",
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 4096,
+				maxTokens: 1024,
+			} as ModelSpec<Api>) as Model<Api>);
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory("/lcm-completion-test"),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"context.engine": "lossless",
+				modelRoles: { smol: "lcm-completion-model" },
+			}),
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: {
+					recordObservedUsage: vi.fn(),
+					recordUsageCost: vi.fn(),
+					ingestUsageHeaders: vi.fn(),
+				},
+			} as never,
+			sideStreamFn,
+			obfuscator,
+			lcm: { agentDir: "/lcm-completion-test" },
+		});
+		sessions.push(session);
+		return session;
+	}
+
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		clearCustomApis();
@@ -117,7 +184,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {} as never,
-			transformContext,
+			sideTransformContext: transformContext,
 			convertToLlm,
 		});
 		sessions.push(session);
@@ -187,7 +254,7 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {} as never,
-			transformContext: wrapSteeringForModel,
+			sideTransformContext: wrapSteeringForModel,
 			convertToLlm,
 		});
 		sessions.push(session);
@@ -1465,5 +1532,1159 @@ describe("AgentSession message pipeline", () => {
 		expect(result.replyText).toBe("Here is text");
 		expect(result.assistantMessage.content.some(block => block.type === "toolCall")).toBe(false);
 		expect(result.assistantMessage.content.every(block => block.type !== "toolCall")).toBe(true);
+	});
+
+	it("resolves LCM role fallback chains with configured provider preference and accounts usage off-journal", async () => {
+		const other = buildModel({
+			id: "summary-model",
+			name: "Other Summary",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://other.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const preferred = buildModel({
+			...other,
+			name: "Preferred Summary",
+			provider: "opencode-go",
+			baseUrl: "https://preferred.invalid",
+		} as ModelSpec<Api>) as Model<Api>;
+		const recordObservedUsage = vi.fn();
+		const recordUsageCost = vi.fn();
+		const resolver = vi.fn(() => async () => "key");
+		const selected: Model<Api>[] = [];
+		let capturedContext: Context | undefined;
+		let capturedOptions: SimpleStreamOptions | undefined;
+		const sideStreamFn: StreamFn = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
+			selected.push(model);
+			capturedContext = context;
+			capturedOptions = options;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const base = createAssistantMessage("summary text");
+				const message = {
+					...base,
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					timestamp: 123,
+					usage: {
+						...base.usage,
+						input: 11,
+						output: 7,
+						cacheRead: 3,
+						cacheWrite: 2,
+						cost: { ...base.usage.cost, total: 1.25 },
+					},
+				};
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const manager = SessionManager.inMemory("/lcm-role-test");
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: manager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"context.engine": "lossless",
+				modelProviderOrder: ["opencode-go", "openai"],
+				modelRoles: { smol: "missing-summary-model,summary-model" },
+			}),
+			modelRegistry: {
+				getAvailable: () => [other, preferred],
+				resolver,
+				authStorage: { recordObservedUsage, recordUsageCost },
+				getProviderBaseUrl: () => preferred.baseUrl,
+			} as never,
+			sideStreamFn,
+			lcm: { agentDir: "/lcm-role-test" },
+		});
+		sessions.push(session);
+		const affinitySessionId = session.sessionId;
+
+		const text = await session.lcmComplete({
+			systemPrompt: "system",
+			prompt: "prompt",
+			oneshotKind: "lcm_summary",
+			maxOutputTokens: 128,
+			modelSelector: "@smol",
+		});
+
+		expect(text).toBe("summary text");
+		expect(selected).toEqual([preferred]);
+		expect(resolver).toHaveBeenCalledWith(preferred, affinitySessionId);
+		expect(capturedContext?.systemPrompt).toEqual(["system"]);
+		expect(capturedContext?.tools).toEqual([]);
+		expect(capturedContext?.messages).toEqual([
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "prompt" }] }),
+		]);
+		expect(capturedOptions?.statefulResponses).toBe(false);
+		expect(capturedOptions?.providerSessionState).toBeInstanceOf(Map);
+		expect(capturedOptions?.sessionId).toStartWith(`${affinitySessionId}:lcm:lcm_summary:`);
+		expect(recordUsageCost).toHaveBeenCalledWith("opencode-go", 1.25, {
+			sessionId: affinitySessionId,
+			recordedAt: 123,
+			baseUrl: preferred.baseUrl,
+		});
+		expect(recordObservedUsage).toHaveBeenCalledWith({
+			provider: "opencode-go",
+			model: "summary-model",
+			at: 123,
+			usage: { input: 11, output: 7, cacheRead: 3, cacheWrite: 2 },
+			costUsd: 1.25,
+		});
+		// The status line reads this: a dispatched LCM request must move the session's LCM cost.
+		expect(session.getLcmCost()).toBeCloseTo(1.25, 8);
+		expect(manager.getBranch()).toHaveLength(0);
+	});
+
+	it("reuses durable summary transport state and retires superseded epoch, credential, and model state", async () => {
+		const firstModel = buildModel({
+			id: "summary-model-a",
+			name: "Summary Model A",
+			api: "anthropic",
+			provider: "test-lcm-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const secondModel = buildModel({
+			...firstModel,
+			id: "summary-model-b",
+			name: "Summary Model B",
+		} as ModelSpec<Api>) as Model<Api>;
+		const capturedOptions: SimpleStreamOptions[] = [];
+		const closeProviderState = vi.fn();
+		const closeCountsAtDispatch: number[] = [];
+		let resolvedApiKey = "key-a";
+		const sideStreamFn: StreamFn = (model, _context, options) => {
+			if (!options?.providerSessionState || !options.sessionId) throw new Error("Missing provider session options");
+			capturedOptions.push(options);
+			const invocation = capturedOptions.length;
+			closeCountsAtDispatch.push(closeProviderState.mock.calls.length);
+			if (!options.providerSessionState.has("learned-capability")) {
+				options.providerSessionState.set("learned-capability", { close: closeProviderState });
+			}
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (invocation === 1 || invocation === 3 || invocation === 5 || invocation === 7) {
+					stream.fail(new Error("retryable summary transport failure"));
+					return;
+				}
+				const response = createAssistantMessage("summary text");
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: { ...response, api: model.api, provider: model.provider, model: model.id },
+				});
+			});
+			return stream;
+		};
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory("/lcm-provider-state-test"),
+			settings: Settings.isolated({ "compaction.enabled": false, "context.engine": "lossless" }),
+			modelRegistry: {
+				getAvailable: () => [firstModel, secondModel],
+				resolver: () => async () => resolvedApiKey,
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn,
+			lcm: { agentDir: "/lcm-provider-state-test" },
+		});
+		sessions.push(session);
+		const request = {
+			systemPrompt: "system",
+			prompt: "prompt",
+			oneshotKind: "lcm_summary",
+			maxOutputTokens: 128,
+			modelSelector: firstModel.id,
+			providerSessionKey: "summary-job-a:1",
+			providerSessionFamilyKey: "summary-job-a",
+			retainProviderStateOnFailure: true,
+		} as const;
+
+		await expect(session.lcmComplete(request)).rejects.toThrow("LCM completion failed");
+		await session.lcmComplete(request);
+		await expect(session.lcmComplete(request)).rejects.toThrow("LCM completion failed");
+		await session.lcmComplete({ ...request, providerSessionKey: "summary-job-a:2" });
+		await expect(session.lcmComplete({ ...request, providerSessionKey: "summary-job-a:3" })).rejects.toThrow(
+			"LCM completion failed",
+		);
+		resolvedApiKey = "key-b";
+		await session.lcmComplete({ ...request, providerSessionKey: "summary-job-a:3" });
+		await expect(session.lcmComplete({ ...request, providerSessionKey: "summary-job-a:3" })).rejects.toThrow(
+			"LCM completion failed",
+		);
+		session.settings.set("context.lossless.summaryModel", secondModel.id);
+		session.refreshLcmSettings();
+		await session.lcmComplete({
+			...request,
+			modelSelector: secondModel.id,
+			providerSessionKey: "summary-job-a:3",
+		});
+
+		expect(capturedOptions).toHaveLength(8);
+		expect(capturedOptions[1]?.providerSessionState).toBe(capturedOptions[0]?.providerSessionState);
+		expect(capturedOptions[1]?.sessionId).toBe(capturedOptions[0]?.sessionId);
+		expect(capturedOptions[3]?.providerSessionState).not.toBe(capturedOptions[2]?.providerSessionState);
+		expect(capturedOptions[3]?.sessionId).not.toBe(capturedOptions[2]?.sessionId);
+		expect(capturedOptions[5]?.providerSessionState).not.toBe(capturedOptions[4]?.providerSessionState);
+		expect(capturedOptions[5]?.sessionId).not.toBe(capturedOptions[4]?.sessionId);
+		expect(capturedOptions[7]?.providerSessionState).not.toBe(capturedOptions[6]?.providerSessionState);
+		expect(capturedOptions[7]?.sessionId).not.toBe(capturedOptions[6]?.sessionId);
+		expect(capturedOptions[0]?.providerSessionState).not.toBe(session.providerSessionState);
+		expect(closeCountsAtDispatch).toEqual([0, 0, 1, 2, 3, 4, 5, 6]);
+		expect(closeProviderState).toHaveBeenCalledTimes(7);
+		await session.dispose();
+		expect(closeProviderState).toHaveBeenCalledTimes(7);
+	});
+
+	it("retires aborted summary state before a timeout-ignoring completion settles", async () => {
+		const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const finish = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const closeProviderState = [vi.fn(), vi.fn()];
+		const providerStates: Array<NonNullable<SimpleStreamOptions["providerSessionState"]>> = [];
+		let invocation = 0;
+		const sideStreamFn: StreamFn = (model, _context, options) => {
+			const index = invocation++;
+			if (!options?.providerSessionState) throw new Error("Missing provider session state");
+			providerStates.push(options.providerSessionState);
+			options.providerSessionState.set("transport", { close: closeProviderState[index]! });
+			started[index]!.resolve();
+			const stream = new AssistantMessageEventStream();
+			void finish[index]!.promise.then(() => {
+				const response = createAssistantMessage("summary text");
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: { ...response, api: model.api, provider: model.provider, model: model.id },
+				});
+			});
+			return stream;
+		};
+		const session = createLcmCompletionSession(sideStreamFn);
+		const request = {
+			systemPrompt: "system",
+			prompt: "prompt",
+			oneshotKind: "lcm_summary",
+			maxOutputTokens: 128,
+			providerSessionKey: "summary-overlap:1",
+			providerSessionFamilyKey: "summary-overlap",
+			retainProviderStateOnFailure: true,
+		} as const;
+		const firstController = new AbortController();
+		const first = session.lcmComplete({ ...request, signal: firstController.signal }).catch(error => error);
+		await started[0]!.promise;
+
+		firstController.abort("provider deadline elapsed");
+		expect(closeProviderState[0]).toHaveBeenCalledTimes(1);
+		const second = session.lcmComplete(request);
+		await started[1]!.promise;
+		expect(providerStates[1]).not.toBe(providerStates[0]);
+
+		finish[0]!.resolve();
+		await first;
+		expect(closeProviderState[1]).not.toHaveBeenCalled();
+		expect(providerStates[1]?.has("transport")).toBe(true);
+
+		finish[1]!.resolve();
+		await second;
+		expect(closeProviderState[1]).toHaveBeenCalledTimes(1);
+	});
+
+	it("wraps rejected LCM provider errors with bounded scheduling metadata and no raw error object", async () => {
+		const providerError = Object.assign(new Error("upstream body says try again in 45s; credential=raw-secret"), {
+			headers: new Headers({ "retry-after-ms": "60000" }),
+		});
+		const sideStreamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.fail(providerError));
+			return stream;
+		};
+		const session = createLcmCompletionSession(sideStreamFn);
+
+		const caught = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+
+		expect(caught).toBeInstanceOf(LcmCompletionError);
+		const error = caught as LcmCompletionError & { cause?: unknown; headers?: unknown };
+		expect(error.provider).toBe("test-lcm-provider");
+		expect(error.retryAfterMs).toBe(60_000);
+		expect(error.message).toBe("LCM completion failed");
+		expect(error.cause).toBeUndefined();
+		expect(error.headers).toBeUndefined();
+	});
+
+	it("dispatches one provider transport call per durable LCM attempt", async () => {
+		const model = buildModel({
+			id: "lcm-completion-model",
+			name: "LCM OpenAI Completion Model",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://example.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<"openai-responses">) as Model<Api>;
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ error: { message: "busy", type: "server_error" } }), {
+					status: 503,
+					headers: { "content-type": "application/json", "retry-after-ms": "0" },
+				}),
+		);
+		const session = createLcmCompletionSession(
+			(requestModel, requestContext, options) =>
+				streamSimple(requestModel, requestContext, {
+					...options,
+					fetch: fetchMock,
+				}),
+			undefined,
+			model,
+		);
+
+		const caught = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+
+		expect(caught).toBeInstanceOf(LcmCompletionError);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps normal provider retries for transient LCM recall failures", async () => {
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const model = buildModel({
+			id: "lcm-completion-model",
+			name: "LCM Recall Model",
+			api: "openai-completions",
+			provider: "openai",
+			baseUrl: "https://example.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<"openai-completions">) as Model<Api>;
+		let wireCalls = 0;
+		const fetchMock = vi.fn(async () => {
+			wireCalls++;
+			if (wireCalls === 1) {
+				return new Response(JSON.stringify({ error: { message: "busy", type: "server_error" } }), {
+					status: 503,
+					headers: { "content-type": "application/json", "retry-after-ms": "0" },
+				});
+			}
+			return new Response(
+				`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "recalled answer" }, finish_reason: null }] })}\n\n` +
+					`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
+					"data: [DONE]\n\n",
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		});
+		const session = createLcmCompletionSession(
+			(requestModel, requestContext, options) => {
+				expect(options?.disableProviderRetries).toBeUndefined();
+				return streamSimple(requestModel, requestContext, {
+					...options,
+					fetch: fetchMock,
+				});
+			},
+			undefined,
+			model,
+		);
+
+		const outcome = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "recall this",
+				oneshotKind: "lcm_recall",
+				maxOutputTokens: 128,
+			})
+			.then(
+				text => ({ text }),
+				error => ({ error }),
+			);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		if ("error" in outcome) throw outcome.error;
+		expect(outcome.text).toBe("recalled answer");
+	});
+
+	it("obfuscates returned LCM provider errors and preserves parsed retry metadata", async () => {
+		const secret = "LCM_PROVIDER_SECRET_123456";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const sideStreamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const error = createAssistantMessage("");
+				error.content = [];
+				error.stopReason = "error";
+				error.errorMessage = `Rate limited; wrapped retry-after-ms=45000; token=${secret}`;
+				stream.push({ type: "error", reason: "error", error });
+			});
+			return stream;
+		};
+		const session = createLcmCompletionSession(sideStreamFn, obfuscator);
+
+		const caught = await session
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+
+		expect(caught).toBeInstanceOf(LcmCompletionError);
+		const error = caught as LcmCompletionError;
+		expect(error.provider).toBe("test-lcm-provider");
+		expect(error.retryAfterMs).toBe(45_000);
+		expect(error.message).toContain(obfuscator.obfuscate(secret));
+		expect(error.message).not.toContain(secret);
+	});
+
+	it("preserves structural aborts from rejected and returned LCM streams", async () => {
+		const rejectedAbort = new Error("wrapped provider cancellation", {
+			cause: new AIError.AbortError("provider-local abort"),
+		});
+		const rejectedSession = createLcmCompletionSession(() => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.fail(rejectedAbort));
+			return stream;
+		});
+		const rejected = await rejectedSession
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+			})
+			.catch(error => error);
+		expect(rejected).toBe(rejectedAbort);
+
+		const controller = new AbortController();
+		const returnedAbort = new AIError.AbortError("caller cancelled summary");
+		const returnedSession = createLcmCompletionSession(() => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const aborted = createAssistantMessage("");
+				aborted.content = [];
+				aborted.stopReason = "aborted";
+				controller.abort(returnedAbort);
+				stream.push({ type: "error", reason: "aborted", error: aborted });
+			});
+			return stream;
+		});
+		const returned = await returnedSession
+			.lcmComplete({
+				systemPrompt: "system",
+				prompt: "prompt",
+				oneshotKind: "lcm_summary",
+				maxOutputTokens: 128,
+				signal: controller.signal,
+			})
+			.catch(error => error);
+		expect(returned).toBe(returnedAbort);
+		expect(AIError.is(AIError.classify(returned), AIError.Flag.Abort)).toBe(true);
+	});
+
+	it("routes concurrent LCM completions through the shared provider in-flight limiter", async () => {
+		const suffix = crypto.randomUUID();
+		const api = `test-lcm-provider-limiter-${suffix}`;
+		const provider = `test-lcm-provider-limiter-${suffix}`;
+		let starts = 0;
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		registerCustomApi(api, () => {
+			starts++;
+			const stream = new AssistantMessageEventStream();
+			if (starts === 1) {
+				firstStarted.resolve();
+				void releaseFirst.promise.then(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("summary") });
+				});
+			} else {
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("unexpected") });
+				});
+			}
+			return stream;
+		});
+		const model = buildModel({
+			id: "limited-lcm-model",
+			name: "Limited LCM Model",
+			api,
+			provider,
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"context.engine": "lossless",
+			"providers.maxInFlightRequests": { [provider]: 1 },
+			modelRoles: { smol: "limited-lcm-model" },
+		});
+		const settingsAwareStreamFn = createSettingsAwareStreamFn(settings);
+		const secondEnteredLimiter = Promise.withResolvers<void>();
+		let sideCalls = 0;
+		const sideStreamFn: StreamFn = (streamModel, context, options) => {
+			const stream = settingsAwareStreamFn(streamModel, context, options);
+			sideCalls++;
+			if (sideCalls === 2) secondEnteredLimiter.resolve();
+			return stream;
+		};
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory("/lcm-limiter-test"),
+			settings,
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn,
+			lcm: { agentDir: "/lcm-limiter-test" },
+		});
+		sessions.push(session);
+		const request = {
+			systemPrompt: "system",
+			prompt: "prompt",
+			oneshotKind: "lcm_summary" as const,
+			maxOutputTokens: 128,
+		};
+		const first = session.lcmComplete(request);
+		await firstStarted.promise;
+		const controller = new AbortController();
+		const queuedAbort = new AIError.AbortError("cancel queued LCM completion");
+		const second = session.lcmComplete({ ...request, signal: controller.signal });
+		try {
+			await secondEnteredLimiter.promise;
+			controller.abort(queuedAbort);
+			expect(await second.catch(error => error)).toBe(queuedAbort);
+			expect(starts).toBe(1);
+			releaseFirst.resolve();
+			expect(await first).toBe("summary");
+		} finally {
+			releaseFirst.resolve();
+			controller.abort(queuedAbort);
+			await Promise.allSettled([first, second]);
+		}
+	});
+
+	it("injects a cue into an owned projection and suppresses it when the setting is off", async () => {
+		using tempDir = TempDir.createSync("@pi-lcm-cue-owned-");
+		const model = buildModel({
+			id: "lcm-cue-model",
+			name: "LCM Cue Model",
+			api: "anthropic",
+			provider: "test-lcm-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const manager = SessionManager.inMemory(tempDir.path());
+		// The first user entry is always kept raw, so the token mass must live in a middle entry
+		// that the summary covers — otherwise the projection cannot fit under the threshold.
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "opening question" }],
+			steering: true,
+			timestamp: 1,
+		});
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: `bulk ${"detail ".repeat(2000)}` }],
+			timestamp: 2,
+		});
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "which deployment rollback checklist did we approve" }],
+			timestamp: 3,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": true,
+			// The threshold must leave a positive provider-message budget after system/tool inputs.
+			"compaction.thresholdTokens": 2_000,
+			"context.engine": "lossless",
+			modelRoles: { smol: "lcm-cue-model" },
+		});
+		let openedContext: LcmContext | undefined;
+		const projectionTokenMeasurements = vi.fn();
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: manager,
+			settings,
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn: () => {
+				throw new Error("primary stream must not run");
+			},
+			lcm: {
+				agentDir: tempDir.path(),
+				dependencies: {
+					onProjectionTokenMeasurement: projectionTokenMeasurements,
+					openContext: async options => {
+						const context = await openLcmContext(options);
+						openedContext = context;
+						let captured: SourceSnapshot | undefined;
+						const reconcile = context.reconcile.bind(context);
+						vi.spyOn(context, "reconcile").mockImplementation((snapshot, reconcileOptions) => {
+							captured = snapshot;
+							return reconcile(snapshot, reconcileOptions);
+						});
+						vi.spyOn(context, "project").mockImplementation(() => {
+							const snapshot = captured;
+							const entries = snapshot?.entries ?? [];
+							const historicalSources = entries.slice(0, -1);
+							const fresh = entries.at(-1);
+							const projection: ContextProjection = {
+								revision: 1,
+								activeSourceFingerprint: activeSourceFingerprint(entries.map(entry => entry.entryId)),
+								ready: true,
+								historical:
+									historicalSources.length > 0 && snapshot
+										? [
+												{
+													kind: "summary" as const,
+													summaryId: "seen-summary",
+													summaryHandle: "seen-handle",
+													level: 0,
+													redactedText: `FIRST\n${"historical detail ".repeat(2_000)}\nLAST`,
+													tokenCount: 3,
+													sourceIds: historicalSources.map(entry => entry.entryId),
+													citations: historicalSources.map((entry, position) => ({
+														...snapshot.scope,
+														sourceId: entry.entryId,
+														sourceKey: `covered-key-${position}`,
+														contentHash: entry.contentHash,
+														position,
+													})),
+													files: [],
+												},
+											]
+										: [],
+								freshTailSourceIds: fresh ? [fresh.entryId] : [],
+								uncoveredSourceIds: [],
+								sourceTokens: 5_000,
+								selectedLevelCounts: historicalSources.length > 0 ? { 0: 1 } : {},
+								coveredSourceCount: historicalSources.length,
+								freshSourceCount: fresh ? 1 : 0,
+								estimatedTokens: 20,
+								pendingJobs: 0,
+							};
+							return projection;
+						});
+						vi.spyOn(context, "search").mockReturnValue([
+							{
+								kind: "summary",
+								id: "unseen-summary",
+								summaryHandle: "unseen-handle",
+								redactedText: "earlier decision: roll back with the staged checklist",
+								rank: 1,
+								citations: [
+									{
+										projectId: "p",
+										sessionId: "s",
+										branchId: "b",
+										sourceId: "src",
+										sourceKey: "key",
+										contentHash: "hash",
+										position: 0,
+									},
+								],
+							},
+						]);
+						return context;
+					},
+				},
+			},
+		});
+		sessions.push(session);
+		// Direct assignment to agent.state.model does not stick; this is the supported setter.
+		session.agent.setModel(model);
+		expect(session.model?.contextWindow).toBe(200_000);
+		expect(session.settings.getGroup("compaction").enabled).toBe(true);
+		expect(session.settings.getGroup("compaction").strategy).not.toBe("off");
+		const input = manager.buildSessionContext().messages;
+		const projected = await session.projectLcmContext(input);
+		expect(projected).not.toBe(input);
+		const rowsChangedAfterFirst = openedContext?.status().performance?.reconcileRowsChanged;
+		expect(rowsChangedAfterFirst).toBeDefined();
+
+		const cueIndex = projected.findIndex(
+			message =>
+				message.role === "developer" &&
+				Array.isArray(message.content) &&
+				message.content.some(part => part.type === "text" && part.text.includes("<lcm-cues>")),
+		);
+		expect(cueIndex).toBeGreaterThanOrEqual(0);
+		expect(cueIndex).toBe(projected.findLastIndex(message => message.role === "user") - 1);
+		const cueText = JSON.stringify(projected[cueIndex]);
+		expect(cueText).toContain("lcm-handle:v1:");
+		expect(cueText).not.toContain("older facts");
+
+		expect((await session.lcmStatus()).runtime.lastRequestRoute).toBeUndefined();
+		const rawTokens = projected.reduce((total, message) => total + estimateLcmProjectionMessageTokens(message), 0);
+		const providerTokens = wrapSteeringForModel(projected).reduce(
+			(total, message) => total + estimateLcmProjectionMessageTokens(message),
+			0,
+		);
+		expect(providerTokens).toBeGreaterThan(rawTokens);
+		session.beginPrimaryProviderRequest(projected);
+		const committedRoute = (await session.lcmStatus()).runtime.lastRequestRoute;
+		const measurementCount = projectionTokenMeasurements.mock.calls.length;
+		expect(committedRoute).toMatchObject({
+			kind: "lossless",
+			metrics: { candidateTokens: providerTokens, projectionTokenMeasurements: measurementCount },
+		});
+		expect(measurementCount).toBeGreaterThan(0);
+		expect(measurementCount).toBeLessThanOrEqual(MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS);
+
+		settings.set("context.lossless.retrievalCues", false);
+		const withoutCues = await session.projectLcmContext(input);
+		expect(openedContext?.status().performance?.reconcileRowsChanged).toBe(rowsChangedAfterFirst);
+		expect(withoutCues.some(message => message.role === "developer")).toBe(false);
+		const abortedDispatch = new AbortController();
+		abortedDispatch.abort();
+		session.beginPrimaryProviderRequest(withoutCues, abortedDispatch.signal);
+		expect((await session.lcmStatus()).runtime.lastRequestRoute).toEqual(committedRoute);
+	}, 30_000);
+
+	it("drops a retrieval cue when the exact steering-aware final render exceeds its budget", async () => {
+		const model = buildModel({
+			id: "lcm-cue-fit-model",
+			name: "LCM Cue Fit Model",
+			api: "anthropic",
+			provider: "test-lcm-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4_096,
+			maxTokens: 256,
+		} as ModelSpec<Api>) as Model<Api>;
+		const projected: AgentMessage[] = [
+			{
+				role: "user",
+				content: [{ type: "text", text: `near budget ${"x".repeat(1_200)}` }],
+				steering: true,
+				timestamp: 1,
+			},
+		];
+		const projectedTokens = wrapSteeringForModel(projected).reduce(
+			(total, message) => total + estimateLcmProjectionMessageTokens(message),
+			0,
+		);
+		const manager = SessionManager.inMemory("/lcm-cue-fit");
+		const settings = Settings.isolated({
+			"compaction.enabled": true,
+			"compaction.thresholdTokens": projectedTokens + 12,
+			"context.engine": "lossless",
+		});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: manager,
+			settings,
+			modelRegistry: {
+				getAvailable: () => [model],
+				resolver: () => async () => "key",
+				authStorage: { recordObservedUsage: vi.fn(), recordUsageCost: vi.fn() },
+			} as never,
+			sideStreamFn: () => {
+				throw new Error("primary stream must not run");
+			},
+			lcm: { agentDir: "/lcm-cue-fit" },
+		});
+		sessions.push(session);
+		session.agent.setModel(model);
+		const routeKey = { generation: 1, projectionAttempt: 1, sessionId: manager.getSessionId() } as LcmPrimaryRouteKey;
+		vi.spyOn(SessionLcm.prototype, "project").mockResolvedValue({
+			messages: projected,
+			owned: true,
+			candidateTokens: projectedTokens,
+			messageTokenBudget: projectedTokens + 12,
+			projectionTokenMeasurements: 8,
+			projection: {
+				revision: 1,
+				activeSourceFingerprint: activeSourceFingerprint([]),
+				ready: true,
+				historical: [],
+				freshTailSourceIds: [],
+				uncoveredSourceIds: [],
+				sourceTokens: projectedTokens,
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: 0,
+				estimatedTokens: projectedTokens,
+				pendingJobs: 0,
+			},
+			routeKey,
+		});
+		vi.spyOn(SessionLcm.prototype, "searchProjected").mockResolvedValue([
+			{
+				kind: "summary",
+				id: "cue-summary",
+				summaryHandle: "cue-handle",
+				redactedText: "deployment rollback checklist ".repeat(20),
+				rank: 1,
+				citations: [
+					{
+						projectId: "project",
+						sessionId: "session",
+						branchId: "branch",
+						sourceId: "source",
+						sourceKey: "source-key",
+						contentHash: "content-hash",
+						position: 0,
+					},
+				],
+			},
+		]);
+
+		const result = await session.projectLcmContext([
+			{ role: "user", content: "which deployment rollback checklist", timestamp: 1 },
+		]);
+
+		expect(result).toBe(projected);
+		expect(result.some(message => message.role === "developer")).toBe(false);
+	});
+
+	it("adds no cue when no lossless projection owns the request", async () => {
+		const session = createLcmCompletionSession(() => {
+			throw new Error("primary stream must not run");
+		});
+		const input: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "deployment rollback checklist question" }], timestamp: 1 },
+		];
+		// Cues are gated on ownership: compaction is disabled here, so LCM returns the native array
+		// untouched and no `developer` block may appear even though the setting defaults to on.
+		expect(session.settings.get("context.lossless.retrievalCues")).toBe(true);
+		const projected = await session.projectLcmContext(input);
+		expect(projected).toBe(input);
+		expect(projected.some(message => message.role === "developer")).toBe(false);
+	});
+
+	it("emits projection evidence only while Lossless owns the transformed request", async () => {
+		const session = createLcmCompletionSession(() => {
+			throw new Error("primary stream must not run");
+		});
+		session.settings.set("context.lossless.retrievalCues", false);
+		const projection: ContextProjection = {
+			revision: 1,
+			activeSourceFingerprint: activeSourceFingerprint([]),
+			ready: true,
+			historical: [],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: [],
+			sourceTokens: 1,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: 0,
+			estimatedTokens: 1,
+			pendingJobs: 0,
+		};
+		const projected: AgentMessage[] = [{ role: "user", content: "projected", timestamp: 1 }];
+		const validResult: SessionLcmProjectResult = {
+			messages: projected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			projection,
+			routeKey: { generation: 1, projectionAttempt: 1, sessionId: "test" },
+		};
+		vi.spyOn(SessionLcm.prototype, "project")
+			.mockResolvedValueOnce(validResult)
+			.mockResolvedValueOnce({ ...validResult, routeKey: undefined });
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+
+		const ownedInput: AgentMessage[] = [{ role: "user", content: "owned", timestamp: 1 }];
+		expect(await session.projectLcmContext(ownedInput)).toBe(projected);
+		expect(events.filter(event => event.type === "lcm_projection")).toEqual([{ type: "lcm_projection", projection }]);
+
+		const nativeInput: AgentMessage[] = [{ role: "user", content: "native", timestamp: 2 }];
+		expect(await session.projectLcmContext(nativeInput)).toBe(nativeInput);
+		expect(events.filter(event => event.type === "lcm_projection")).toHaveLength(1);
+	});
+
+	it("binds overlapping primary transforms to their own provider dispatch", async () => {
+		const session = createLcmCompletionSession(() => {
+			throw new Error("primary stream must not run");
+		});
+		await session.lcmStatus();
+		const olderInput: AgentMessage[] = [{ role: "user", content: "older input", timestamp: 1 }];
+		const olderProjected: AgentMessage[] = [{ role: "user", content: "older projected", timestamp: 1 }];
+		const newerInput: AgentMessage[] = [{ role: "user", content: "newer input", timestamp: 2 }];
+		const newerProjected: AgentMessage[] = [{ role: "user", content: "newer projected", timestamp: 2 }];
+		const olderKey = {
+			generation: 1,
+			projectionAttempt: 1,
+			sessionId: "older",
+		} as LcmPrimaryRouteKey;
+		const newerKey = {
+			generation: 1,
+			projectionAttempt: 2,
+			sessionId: "newer",
+		} as LcmPrimaryRouteKey;
+		const olderResult = Promise.withResolvers<SessionLcmProjectResult>();
+		const newerReady = Promise.withResolvers<AgentMessage[]>();
+		const releaseNewerDispatch = Promise.withResolvers<void>();
+		const project = vi
+			.spyOn(SessionLcm.prototype, "project")
+			.mockImplementationOnce(async () => olderResult.promise)
+			.mockResolvedValueOnce({
+				messages: newerProjected,
+				owned: true,
+				candidateTokens: 1,
+				messageTokenBudget: 10,
+				projectionTokenMeasurements: 1,
+				routeKey: newerKey,
+			});
+		const commit = vi.spyOn(SessionLcm.prototype, "commitPrimaryRequestRoute").mockReturnValue(true);
+		const recordTokens = vi.spyOn(SessionLcm.prototype, "recordPendingPrimaryProviderTokens");
+
+		const olderDispatch = (async () => {
+			const messages = await session.projectLcmContext(olderInput);
+			session.beginPrimaryProviderRequest(messages);
+			return messages;
+		})();
+		expect(project).toHaveBeenCalledTimes(1);
+		const newerDispatch = (async () => {
+			const messages = await session.projectLcmContext(newerInput);
+			newerReady.resolve(messages);
+			await releaseNewerDispatch.promise;
+			session.beginPrimaryProviderRequest(messages);
+			return messages;
+		})();
+		expect(await newerReady.promise).toBe(newerProjected);
+
+		olderResult.resolve({
+			messages: olderProjected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			routeKey: olderKey,
+		});
+		expect(await olderDispatch).toBe(olderInput);
+		expect(commit).not.toHaveBeenCalled();
+
+		releaseNewerDispatch.resolve();
+		expect(await newerDispatch).toBe(newerProjected);
+		expect(commit).toHaveBeenCalledTimes(1);
+		expect(commit).toHaveBeenCalledWith(newerKey);
+		expect(recordTokens).toHaveBeenCalledTimes(1);
+		expect(recordTokens).toHaveBeenCalledWith(newerKey, 1, 1);
+
+		const staleOwnedKey = { ...olderKey, projectionAttempt: 3, sessionId: "stale-owned" };
+		const currentOwnedKey = { ...newerKey, projectionAttempt: 4, sessionId: "current-owned" };
+		const sharedProjected: AgentMessage[] = [{ role: "user", content: "shared projected", timestamp: 3 }];
+		project.mockResolvedValueOnce({
+			messages: sharedProjected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			routeKey: staleOwnedKey,
+		});
+		const staleOwned = await session.projectLcmContext(olderInput);
+		project.mockResolvedValueOnce({
+			messages: sharedProjected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			routeKey: currentOwnedKey,
+		});
+		const currentOwned = await session.projectLcmContext(newerInput);
+		expect(currentOwned).not.toBe(staleOwned);
+
+		expect(() => session.beginPrimaryProviderRequest(staleOwned)).toThrow(AIError.AbortError);
+		expect(commit).toHaveBeenCalledTimes(1);
+		session.beginPrimaryProviderRequest(currentOwned);
+		expect(commit).toHaveBeenCalledTimes(2);
+		expect(commit).toHaveBeenLastCalledWith(currentOwnedKey);
+
+		const supersedingKey = { ...newerKey, projectionAttempt: 5, sessionId: "superseding" };
+		project.mockResolvedValueOnce({
+			messages: newerProjected,
+			owned: true,
+			candidateTokens: 1,
+			messageTokenBudget: 10,
+			projectionTokenMeasurements: 1,
+			routeKey: supersedingKey,
+		});
+		await session.projectLcmContext([{ role: "user", content: "superseding input", timestamp: 4 }]);
+		expect(() => session.beginPrimaryProviderRequest(currentOwned)).toThrow(AIError.AbortError);
+		expect(commit).toHaveBeenCalledTimes(2);
+	});
+
+	it("builds cue terms from user text only, across scripts, ignoring image parts", () => {
+		// Image parts must never reach the query; stringifying one would send base64 to FTS.
+		expect(
+			lcmCueTerms([
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "which deployment rollback checklist did we approve" },
+						{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+					],
+					timestamp: 1,
+				},
+			]),
+		).toEqual(["deployment", "checklist", "rollback"]);
+
+		// A Unicode-aware split is required: an ASCII-only one returns nothing for non-Latin text.
+		expect(
+			lcmCueTerms([
+				{ role: "user", content: [{ type: "text", text: "kenapa proyeksi belum dievaluasi" }], timestamp: 1 },
+			]),
+		).toEqual(["dievaluasi", "proyeksi", "kenapa"]);
+		expect(
+			lcmCueTerms([{ role: "user", content: [{ type: "text", text: "配置文件 已经 更新" }], timestamp: 1 }]),
+		).toEqual(["配置文件"]);
+
+		// Only the newest user message matters; stopwords and short tokens are dropped.
+		expect(
+			lcmCueTerms([
+				{ role: "user", content: [{ type: "text", text: "stale earlier question" }], timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "that with them" }], timestamp: 2 },
+			]),
+		).toEqual([]);
+		expect(lcmCueTerms([{ ...createAssistantMessage("no user here"), timestamp: 1 }])).toEqual([]);
+		expect(lcmCueTerms([{ role: "user", content: "plain string content works", timestamp: 1 }])).toEqual([
+			"content",
+			"string",
+			"plain",
+		]);
+	});
+
+	it("runs LCM before extensions only on the primary provider path", async () => {
+		using tempDir = TempDir.createSync("@pi-lcm-transform-order-");
+		const api = "test-lcm-transform-order";
+		const providerContexts: Context[] = [];
+		let providerSignal: AbortSignal | undefined;
+		const beginPrimary = vi.spyOn(AgentSession.prototype, "beginPrimaryProviderRequest");
+		registerCustomApi(api, (_model, context, options) => {
+			providerContexts.push(context);
+			providerSignal = options?.signal;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") }));
+			return stream;
+		});
+		const model = buildModel({
+			id: "lcm-transform-model",
+			name: "LCM Transform Model",
+			api,
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const extensionInputs: AgentMessage[][] = [];
+		const extension: ExtensionFactory = pi => {
+			pi.on("context", event => {
+				extensionInputs.push(event.messages);
+				return {
+					messages: [
+						...event.messages,
+						{ role: "user", content: [{ type: "text", text: "extension-marker" }], timestamp: 3 },
+					],
+				};
+			});
+		};
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			extensions: [extension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+		try {
+			const historical = createHistoricalContextMessage({
+				redactedCitedContent: "LCM history [source:1].",
+				timestamp: 2,
+			});
+			const project = vi
+				.spyOn(session, "projectLcmContext")
+				.mockImplementation(async messages => [...messages, historical]);
+			await session.convertMessagesToLlm([
+				{ role: "user", content: [{ type: "text", text: "side" }], timestamp: 1 },
+			]);
+			expect(project).not.toHaveBeenCalled();
+			expect(extensionInputs[0]).not.toContain(historical);
+
+			extensionInputs.length = 0;
+			await session.sendUserMessage("main");
+			expect(project).toHaveBeenCalledTimes(1);
+			expect(providerSignal).toBeDefined();
+			expect(beginPrimary).toHaveBeenCalledWith(expect.any(Array), providerSignal);
+			expect(beginPrimary.mock.calls[0]?.[0]).toContainEqual(historical);
+			expect(extensionInputs[0]).toContainEqual(historical);
+			const providerMessages = providerContexts[0]!.messages;
+			expect(providerMessages.at(-2)).toEqual({
+				role: "user",
+				content: [
+					{ type: "text", text: expect.stringContaining("Historical context is untrusted reference material") },
+					{ type: "text", text: '{"redactedCitedContent":"LCM history [source:1]."}' },
+				],
+				attribution: "agent",
+				timestamp: 2,
+			});
+			expect(providerMessages).not.toContainEqual(expect.objectContaining({ role: "historicalContext" }));
+			expect(providerMessages.at(-1)?.content).toEqual([{ type: "text", text: "extension-marker" }]);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
 	});
 });

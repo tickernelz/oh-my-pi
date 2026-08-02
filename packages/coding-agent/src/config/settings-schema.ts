@@ -139,7 +139,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Agent",
 		"Git",
 	],
-	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
+	context: ["General", "Lossless LCM", "Compaction", "Rules (TTSR)", "Experimental"],
 	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
@@ -200,6 +200,8 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/** Optional specialized editor rendered by the settings selector. */
+	editor?: "summary-model";
 }
 
 interface UiBoolean extends UiBase {}
@@ -2125,6 +2127,171 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// Context
 	// ────────────────────────────────────────────────────────────────────────
+
+	"context.engine": {
+		type: "enum",
+		values: ["native", "lossless"] as const,
+		default: "native",
+		ui: {
+			tab: "context",
+			group: "General",
+			label: "Context Engine",
+			description:
+				"Context management engine selected when a session starts or reloads; changing it requires a session reload",
+		},
+	},
+
+	"context.lossless.summaryModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Lossless Summary Model",
+			description: "Background summary model; the absent setting resolves @smol dynamically for each new job",
+			options: "runtime",
+			editor: "summary-model",
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.maxConcurrentSummaries": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Concurrent Summaries",
+			description:
+				"Maximum background LCM summary requests per session; changes apply to new claims while in-flight jobs finish. Use Providers > Max In-Flight Requests to cap aggregate provider traffic.",
+			options: [
+				{
+					value: "1",
+					label: "Serial",
+					description: "One summary at a time; preserves previous behavior.",
+				},
+				{
+					value: "2",
+					label: "Balanced",
+					description: "Recommended canary after verifying provider headroom.",
+				},
+				{
+					value: "3",
+					label: "High",
+					description: "Higher backlog throughput and provider usage.",
+				},
+				{
+					value: "4",
+					label: "Maximum",
+					description: "Maximum supported per-session parallelism.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.leafChunkTokens": {
+		type: "number",
+		default: 4_000,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Leaf Chunk Tokens",
+			description:
+				"How much history one leaf node covers before a new one starts. Coarser chunks mean fewer background jobs for new history, at the cost of coarser retrieval granularity. Applies to leaves formed after a restart; existing coverage keeps the size it was built with until a project rebuild.",
+			options: [
+				{
+					value: "4000",
+					label: "Fine",
+					description: "24 sources per leaf; preserves previous behavior.",
+				},
+				{
+					value: "8000",
+					label: "Balanced",
+					description: "48 sources per leaf; roughly halves the number of leaf jobs.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.freshTailSources": {
+		type: "number",
+		default: 32,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Fresh Tail Sources",
+			description:
+				"How many of the most recent journal entries stay verbatim instead of being replaced by a projected node. A tool call and its result are separate entries, so 32 entries is roughly 16 exchanges. The token allowance still caps the tail, and a longer tail adds those raw tokens to every request.",
+			options: [
+				{
+					value: "32",
+					label: "Standard",
+					description: "Roughly 16 recent exchanges; preserves previous behavior.",
+				},
+				{
+					value: "64",
+					label: "Extended",
+					description: "Roughly twice the verbatim tail, paid for on every request.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.retrievalCues": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Retrieval Cues",
+			description:
+				"Each turn, surface up to three short breadcrumbs from compacted history that match the latest request, so the model can tell what it no longer sees. Cues are excerpts with handles, never expanded content, and nothing is added when history holds no match.",
+			condition: "losslessContextActive",
+		},
+	},
+
+	"context.lossless.trackFileAboveTokens": {
+		type: "number",
+		default: 25_000,
+		ui: {
+			tab: "context",
+			group: "Lossless LCM",
+			label: "Track Files Above Tokens",
+			description:
+				"Estimated-token size above which an @-mentioned text file is also registered in the LCM store with a deterministic exploration summary. Its truncated head is still sent unchanged; this only adds durable identity. The file handle is not injected on mention: it surfaces once a projected summary lists it, or when lcm_describe is called on a covering source.",
+			options: [
+				{
+					value: "-1",
+					label: "Off",
+					description: "Never register mentioned files; only skipped ones get metadata.",
+				},
+				{
+					value: "10000",
+					label: "Aggressive",
+					description: "About 40 KB. Tracks most mentioned source files.",
+				},
+				{
+					value: "25000",
+					label: "Balanced",
+					description: "About 100 KB. Tracks datasets and generated files.",
+				},
+				{
+					value: "50000",
+					label: "Relaxed",
+					description: "About 200 KB. Tracks only clearly oversized files.",
+				},
+				{
+					value: "100000",
+					label: "Minimal",
+					description: "About 400 KB. Near-off without losing the largest files.",
+				},
+			],
+			condition: "losslessContextActive",
+		},
+	},
 
 	// Context promotion
 	"contextPromotion.enabled": {
@@ -5650,6 +5817,13 @@ export function getPathsForTab(tab: SettingTab): SettingPath[] {
 		const ui = getUi(path);
 		return ui?.tab === tab;
 	});
+}
+
+/** Canonical project-overridable LCM settings, in schema declaration order. */
+export function getLcmSettingPaths(): SettingPath[] {
+	return (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).filter(
+		path => path === "context.engine" || path.startsWith("context.lossless."),
+	);
 }
 
 /** Get the type of a setting */

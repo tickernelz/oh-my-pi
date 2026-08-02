@@ -28,6 +28,10 @@ export * from "./extensibility/extensions";
 export * from "./extensibility/skills";
 // Slash commands
 export { type FileSlashCommand, loadSlashCommands as discoverSlashCommands } from "./extensibility/slash-commands";
+export * from "./lcm/operations";
+export * from "./lcm/project-catalog";
+export * from "./lcm/project-identity";
+export * from "./lcm/rebuild";
 export type * from "./lsp";
 // Main entry point
 export * from "./main";
@@ -47,6 +51,7 @@ export * from "./session/redis-session-storage";
 export * from "./session/session-context";
 export * from "./session/session-dump-format";
 export * from "./session/session-entries";
+export * from "./session/session-lcm";
 export * from "./session/session-listing";
 export * from "./session/session-loader";
 export * from "./session/session-manager";

@@ -81,6 +81,17 @@ describe("fetchWithRetry", () => {
 });
 
 describe("extractRetryHint", () => {
+	it("extracts the largest retry-after-ms marker from formatted error text", () => {
+		expect(
+			extractRetryHint(undefined, "provider overloaded retry-after-ms=125.5; outer error retry-after-ms=450"),
+		).toBe(450);
+	});
+
+	it("uses the longest valid delay across headers, structured markers, and prose", () => {
+		const headers = new Headers({ "retry-after": "120", "x-ratelimit-reset-after": "30" });
+		expect(extractRetryHint(headers, "retry-after-ms=1000; try again in 1 hour")).toBe(60 * 60_000);
+	});
+
 	// Devin returns HTTP 403 with "Your limit will reset in 13 minutes" for an
 	// account-scoped message rate cap. Without recognizing "will reset in", the
 	// credential is blocked for the 1-minute default instead of 13 minutes and

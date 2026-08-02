@@ -184,7 +184,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		};
 	}
 
-	listFilesSync(dir: string, pattern: string): string[] {
+	listFilesSync(dir: string, pattern: string, _options?: { strict?: boolean }): string[] {
 		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
 		const out: string[] = [];
 		for (const path of this.#index.keys()) {
@@ -509,15 +509,6 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 		});
 		this.#pendingChain = next.catch(() => {});
 		return next;
-	}
-
-	appendSync(line: string): void {
-		if (this.#closed) throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
-		// Local index is updated immediately; remote publish stays ordered on the
-		// path queue. Callers that need remote durability still await append()/flush().
-		const mtimeMs = this.#storage._appendForWriter(this.#path, line);
-		void this.#trackPromise(this.#storage._queueAppend(this.#path, line, mtimeMs, () => this.#error));
 	}
 
 	async append(line: string): Promise<void> {

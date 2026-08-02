@@ -26,11 +26,8 @@ export interface SessionStorageWriter {
 	 */
 	append(line: string): Promise<void>;
 	/**
-	 * Synchronous append when the backend can apply the line before return.
-	 * File and memory implement this so {@link SessionManager} can latch the
-	 * first write failure before the appending call returns (surfaced by a later
-	 * flushSync/close/next append — the turn loop does not throw from append).
-	 * Indexed backends update the local index immediately and queue remote I/O.
+	 * Synchronous append only when the backend durably applies the line before return.
+	 * Backends with queued remote I/O must omit this method.
 	 */
 	appendSync?(line: string): void;
 	/** Resolve once all queued appends complete. No fsync. */
@@ -68,7 +65,8 @@ export interface SessionStorage {
 	 */
 	updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void>;
 	statSync(path: string): SessionStorageStat;
-	listFilesSync(dir: string, pattern: string): string[];
+	/** Strict callers receive real directory-enumeration failures instead of an empty result. */
+	listFilesSync(dir: string, pattern: string, options?: { strict?: boolean }): string[];
 
 	exists(path: string): Promise<boolean>;
 	readText(path: string): Promise<string>;
@@ -249,10 +247,14 @@ export class FileSessionStorage implements SessionStorage {
 		return { size: stats.size, mtimeMs: stats.mtimeMs, mtime: stats.mtime };
 	}
 
-	listFilesSync(dir: string, pattern: string): string[] {
+	listFilesSync(dir: string, pattern: string, options?: { strict?: boolean }): string[] {
 		try {
+			// Bun.Glob treats some inaccessible roots as an empty scan. A real
+			// enumeration makes strict callers distinguish those roots from empty dirs.
+			if (options?.strict) fs.readdirSync(dir);
 			return Array.from(new Bun.Glob(pattern).scanSync(dir)).map(name => path.join(dir, name));
-		} catch {
+		} catch (error) {
+			if (options?.strict) throw error;
 			return [];
 		}
 	}
@@ -708,7 +710,7 @@ export class MemorySessionStorage implements SessionStorage {
 		};
 	}
 
-	listFilesSync(dir: string, pattern: string): string[] {
+	listFilesSync(dir: string, pattern: string, _options?: { strict?: boolean }): string[] {
 		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
 		const files: string[] = [];
 		for (const path of this.#files.keys()) {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { activeSourceFingerprint, type ContextProjection } from "@oh-my-pi/lcm-context";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import {
@@ -316,6 +317,43 @@ describe("RPC subagent registry", () => {
 
 		expect(frames).toHaveLength(1);
 		expect(frames[0]).toEqual({ type: "subagent_event", payload: eventPayload });
+		registry.dispose();
+	});
+
+	test("filters renderer-only child LCM projection events before RPC framing", () => {
+		const eventBus = new EventBus();
+		const frames: RpcSubagentFrame[] = [];
+		const registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
+		registry.setSubscriptionLevel("events");
+		const projectionPayload: SubagentEventPayload = {
+			id: "SubagentA",
+			event: {
+				type: "lcm_projection",
+				projection: {
+					revision: 0,
+					activeSourceFingerprint: activeSourceFingerprint([]),
+					ready: true,
+					historical: [],
+					freshTailSourceIds: [],
+					uncoveredSourceIds: [],
+					sourceTokens: 0,
+					selectedLevelCounts: {},
+					coveredSourceCount: 0,
+					freshSourceCount: 0,
+					estimatedTokens: 0,
+					pendingJobs: 0,
+				} satisfies ContextProjection,
+			},
+		};
+		const ordinaryPayload: SubagentEventPayload = {
+			id: "SubagentA",
+			event: { type: "agent_start" },
+		};
+
+		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, projectionPayload);
+		eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, ordinaryPayload);
+
+		expect(frames).toEqual([{ type: "subagent_event", payload: ordinaryPayload }]);
 		registry.dispose();
 	});
 });

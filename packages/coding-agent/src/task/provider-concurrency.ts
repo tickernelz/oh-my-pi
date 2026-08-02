@@ -74,9 +74,17 @@ export function getProviderSemaphore(settings: Settings, provider: string): Sema
  * see the module-level comment for the failure mode this fixes.
  */
 export function wrapStreamFnWithProviderConcurrency(settings: Settings, base: StreamFn): StreamFn {
-	return async (model, context, options) => {
+	const baseHandlesTransportFence = base.handlesBeforeTransportDispatch === true;
+	const wrapped: StreamFn = async (model, context, options) => {
+		const dispatch = async () => {
+			if (baseHandlesTransportFence) return base(model, context, options);
+			options?.signal?.throwIfAborted();
+			await options?.beforeTransportDispatch?.();
+			options?.signal?.throwIfAborted();
+			return base(model, context, options ? { ...options, beforeTransportDispatch: undefined } : undefined);
+		};
 		const semaphore = getProviderSemaphore(settings, model.provider);
-		if (!semaphore) return base(model, context, options);
+		if (!semaphore) return dispatch();
 		await semaphore.acquire(options?.signal);
 		let released = false;
 		const release = () => {
@@ -85,11 +93,8 @@ export function wrapStreamFnWithProviderConcurrency(settings: Settings, base: St
 			semaphore.release();
 		};
 		try {
-			const stream = await base(model, context, options);
-			// EventStream.result() settles when the producer pushes 'done'/'error'
-			// or calls fail() — i.e. once the provider has finished producing.
-			// Releasing here keeps the slot held for the network request and
-			// nothing else.
+			options?.signal?.throwIfAborted();
+			const stream = await dispatch();
 			stream.result().then(release, release);
 			return stream;
 		} catch (err) {
@@ -97,4 +102,6 @@ export function wrapStreamFnWithProviderConcurrency(settings: Settings, base: St
 			throw err;
 		}
 	};
+	wrapped.handlesBeforeTransportDispatch = true;
+	return wrapped;
 }

@@ -6,7 +6,7 @@ import {
 	isBlobRef,
 	isImageDataUrl,
 } from "./blob-store";
-import type { FileEntry } from "./session-entries";
+import { assertJournalableEntry, type FileEntry } from "./session-entries";
 
 const MAX_PERSIST_CHARS = 500_000;
 const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
@@ -289,5 +289,6 @@ function stripReplayedReasoningSignatures(entry: FileEntry): FileEntry {
 }
 
 export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore): FileEntry {
+	assertJournalableEntry(entry);
 	return truncateForPersistence(stripReplayedReasoningSignatures(entry), blobStore) as FileEntry;
 }

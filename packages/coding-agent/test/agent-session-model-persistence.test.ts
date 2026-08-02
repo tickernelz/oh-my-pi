@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, Effort, type Model } from "@oh-my-pi/pi-ai";
@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionTools } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -196,6 +197,52 @@ describe("AgentSession model persistence", () => {
 
 		expect(created.session.model?.id).toBe(nextModel.id);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(nextModel));
+	});
+
+	it("keeps a newer model switch authoritative when an onlyIfCurrent transition resumes", async () => {
+		const expectedCurrent = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const staleTarget = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const winningModel = getAnthropicModelOrThrow("claude-opus-4-5");
+		const created = await createSession({ initialModel: expectedCurrent, persist: true });
+		const reconciliationStarted = Promise.withResolvers<void>();
+		const releaseReconciliation = Promise.withResolvers<void>();
+		let reconciliationCalls = 0;
+		const reconciliationSpy = spyOn(
+			SessionTools.prototype,
+			"reconcileInspectImageAfterModelChange",
+		).mockImplementation(async () => {
+			if (reconciliationCalls++ !== 0) return;
+			reconciliationStarted.resolve();
+			await releaseReconciliation.promise;
+		});
+
+		const staleTransition = created.session.setModelTemporary(staleTarget, Effort.High, {
+			onlyIfCurrent: expectedCurrent,
+		});
+		await reconciliationStarted.promise;
+
+		try {
+			await created.session.setModelTemporary(winningModel, Effort.Low);
+			releaseReconciliation.resolve();
+			await staleTransition;
+			await created.session.sessionManager.flush();
+
+			const journalModels = created.session.sessionManager
+				.getBranch()
+				.flatMap(entry => (entry.type === "model_change" ? [entry.model] : []));
+			const durableModel = created.session.sessionManager.buildSessionContext().models.temporary;
+
+			expect(journalModels).toEqual([modelValue(winningModel)]);
+			expect(durableModel).toBe(modelValue(winningModel));
+			expect(created.session.model?.provider).toBe(winningModel.provider);
+			expect(created.session.model?.id).toBe(winningModel.id);
+			expect(created.session.thinkingLevel).toBe(Effort.Low);
+			expect(created.session.agent.state.thinkingLevel).toBe(Effort.Low);
+		} finally {
+			releaseReconciliation.resolve();
+			await staleTransition.catch(() => undefined);
+			reconciliationSpy.mockRestore();
+		}
 	});
 
 	it("switches the active model even when the live context is over the target window", async () => {

@@ -33,6 +33,7 @@ import {
 } from "./messages";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
+	assertJournalableEntry,
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type CredentialPinEntry,
@@ -460,6 +461,7 @@ export class SessionManager {
 	 * in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
 	onEntryAppended?: (entry: SessionEntry) => void;
+	#durableEntryObservers = new Set<(entry: SessionEntry) => void>();
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -476,6 +478,7 @@ export class SessionManager {
 	#atomicPersistenceTail: Promise<void> = Promise.resolve();
 	/** Observer notifications withheld until their entries are proven durable. */
 	#pendingDurabilityNotifications: SessionEntry[] = [];
+	#pendingDurableObserverNotifications: SessionEntry[] = [];
 	/** Bumped on every sync rewrite / chain reset so stale queued tasks become no-ops. */
 	#diskEpoch = 0;
 	/**
@@ -523,6 +526,14 @@ export class SessionManager {
 		this.#blobs = new BlobStore(getBlobsDir());
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
+	}
+
+	/** Subscribe to durable-entry notifications; observers run synchronously and failures are isolated. */
+	subscribeToDurableEntries(observer: (entry: SessionEntry) => void): () => void {
+		this.#durableEntryObservers.add(observer);
+		return () => {
+			this.#durableEntryObservers.delete(observer);
+		};
 	}
 
 	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
@@ -629,15 +640,39 @@ export class SessionManager {
 		return error;
 	}
 
+	#emitDurableEntryObservers(entries: readonly SessionEntry[]): void {
+		const seen = new Set<string>();
+		for (const entry of entries) {
+			if (seen.has(entry.id)) continue;
+			seen.add(entry.id);
+			for (const observer of [...this.#durableEntryObservers]) {
+				try {
+					observer(entry);
+				} catch (err) {
+					logger.warn("Durable session entry observer failed.", { error: String(err) });
+				}
+			}
+		}
+	}
+
+	#notifyDurableEntryObservers(entries: readonly SessionEntry[] = []): void {
+		const notifications = [...this.#pendingDurableObserverNotifications, ...entries];
+		this.#pendingDurableObserverNotifications = [];
+		this.#emitDurableEntryObservers(notifications);
+	}
+
 	#notifyDurableEntries(entries: readonly SessionEntry[] = []): void {
 		const notifications = [...this.#pendingDurabilityNotifications, ...entries];
 		this.#pendingDurabilityNotifications = [];
 		const seen = new Set<string>();
+		const durableEntries: SessionEntry[] = [];
 		for (const entry of notifications) {
 			if (seen.has(entry.id)) continue;
 			seen.add(entry.id);
+			durableEntries.push(entry);
 			this.#notifyEntryAppended(entry);
 		}
+		this.#notifyDurableEntryObservers(durableEntries);
 	}
 
 	async #authoritativelyRewriteCurrentStateLocked(operationError: Error): Promise<void> {
@@ -816,6 +851,7 @@ export class SessionManager {
 				this.#rewriteRequired = true;
 				this.#hasTitleSlot = true;
 			}
+			if (this.#fileIsCurrent && !this.#rewriteRequired) this.#notifyDurableEntryObservers();
 		} catch (err) {
 			this.#noteDiskFailure(err);
 		}
@@ -846,6 +882,7 @@ export class SessionManager {
 			},
 			{ epoch: startEpoch },
 		);
+		if (this.#fileIsCurrent && !this.#rewriteRequired) this.#notifyDurableEntryObservers();
 	}
 
 	/**
@@ -883,13 +920,13 @@ export class SessionManager {
 		}
 	}
 
-	#appendToSessionFile(entry: SessionEntry): void {
-		if (!this.#persist || !this.#sessionFile) return;
+	#appendToSessionFile(entry: SessionEntry): boolean {
+		if (!this.#persist || !this.#sessionFile) return false;
 		if (this.#atomicEntryBatch) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
 			this.#atomicRewriteDirty = true;
-			return;
+			return false;
 		}
 		if (this.#diskFailure) throw this.#diskFailure;
 
@@ -898,7 +935,7 @@ export class SessionManager {
 		// output never create a file.
 		if (!this.#shouldHaveSessionFile()) {
 			this.#fileIsCurrent = false;
-			return;
+			return false;
 		}
 
 		// Atomic replacement / move window: do not open a fresh append writer that
@@ -911,18 +948,18 @@ export class SessionManager {
 		//   in-flight atomic via its `commitGuard`.
 		if (this.#sessionFileRelocating) {
 			this.#rewriteSynchronously();
-			return;
+			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 		if (this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch) {
 			this.#atomicRewriteDirty = true;
 			this.#rewriteSynchronously();
-			return;
+			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 		// Cold/divergent: not on disk yet, or in-memory entries diverged from the
 		// file → rewrite the whole file synchronously and keep going.
 		if (!this.#fileIsCurrent || this.#rewriteRequired) {
 			this.#rewriteSynchronously();
-			return;
+			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 
 		// Hot path: write the entry directly on the writer, outside the async disk
@@ -939,11 +976,25 @@ export class SessionManager {
 			const line = this.#lineFor(entry);
 			if (writer.appendSync) {
 				writer.appendSync(line);
-			} else {
-				void writer.append(line).catch(err => this.#noteDiskFailure(err));
+				return writer.getError() === undefined;
 			}
+			void writer.append(line).then(
+				() => {
+					if (!this.#fileIsCurrent || this.#rewriteRequired || this.#diskFailure) return;
+					const index = this.#pendingDurableObserverNotifications.findIndex(
+						candidate => candidate.id === entry.id,
+					);
+					if (index === -1) return;
+					this.#emitDurableEntryObservers(this.#pendingDurableObserverNotifications.splice(0, index + 1));
+				},
+				err => {
+					this.#noteDiskFailure(err);
+				},
+			);
+			return false;
 		} catch (err) {
 			this.#noteDiskFailure(err);
+			return false;
 		}
 	}
 
@@ -1039,6 +1090,7 @@ export class SessionManager {
 
 		this.#entries = [];
 		this.#index.clear();
+		this.#pendingDurableObserverNotifications = [];
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#forceFileCreation = false;
@@ -1066,6 +1118,7 @@ export class SessionManager {
 	}
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
+		for (const entry of entries) assertJournalableEntry(entry);
 		this.#header = header;
 		this.#entries = entries;
 		this.#sessionId = header.id;
@@ -1093,6 +1146,7 @@ export class SessionManager {
 	}
 
 	#recordEntry(entry: SessionEntry): void {
+		assertJournalableEntry(entry);
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
@@ -1101,9 +1155,13 @@ export class SessionManager {
 			batch.externalLeafChanged = true;
 			batch.externalLeafId = entry.id;
 		}
-		this.#appendToSessionFile(entry);
+		const durable = this.#appendToSessionFile(entry);
 		if (batch) batch.deferredNotifications.push(entry);
-		else this.#notifyEntryAppended(entry);
+		else {
+			this.#notifyEntryAppended(entry);
+			if (durable) this.#notifyDurableEntryObservers([entry]);
+			else if (this.#persist && this.#sessionFile) this.#pendingDurableObserverNotifications.push(entry);
+		}
 	}
 
 	#rollbackAtomicEntryBatch(batch: AtomicEntryBatch): void {
@@ -1812,6 +1870,11 @@ export class SessionManager {
 		return this.#sessionDir;
 	}
 
+	/** Storage backend used by read-only session discovery and loading. */
+	getSessionStorage(): SessionStorage {
+		return this.#storage;
+	}
+
 	getSessionId(): string {
 		return this.#sessionId;
 	}
@@ -1950,6 +2013,10 @@ export class SessionManager {
 		this.#index.insert(entry);
 		this.#notifyEntryAppended(entry);
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
+		if (this.#persist && this.#sessionFile) {
+			if (this.#fileIsCurrent && !this.#rewriteRequired) this.#notifyDurableEntryObservers([entry]);
+			else this.#pendingDurableObserverNotifications.push(entry);
+		}
 
 		this.#notifySessionNameListeners();
 		return true;
@@ -1969,6 +2036,7 @@ export class SessionManager {
 	 * guests must not share references).
 	 */
 	snapshotForReplication(): { header: SessionHeader; entries: SessionEntry[] } {
+		for (const entry of this.#entries) assertJournalableEntry(entry);
 		return { header: structuredClone(this.#header), entries: structuredClone(this.#entries) as SessionEntry[] };
 	}
 
@@ -2088,6 +2156,7 @@ export class SessionManager {
 		details?: T,
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
+		lcmFallback?: CompactionEntry["lcmFallback"],
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -2099,6 +2168,7 @@ export class SessionManager {
 			details,
 			fromExtension,
 			preserveData,
+			lcmFallback,
 		};
 		this.#recordEntry(entry);
 		return entry.id;

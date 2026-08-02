@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { LcmFallbackCategory } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { ImageContent, MessageAttribution, ServiceTierByFamily, TextContent } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
 
@@ -62,9 +63,23 @@ export interface SessionEntryBase {
 	timestamp: string;
 }
 
+/**
+ * Shared session-entry consumers operate on the agent's complete in-memory message union.
+ * Journal write/load boundaries reject transient-only roles before they can become durable.
+ */
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+}
+
+/** Reject transform-only messages at every session journal boundary. */
+export function assertJournalableEntry(entry: unknown): void {
+	if (entry === null || typeof entry !== "object" || !("type" in entry) || entry.type !== "message") return;
+	if (!("message" in entry)) return;
+	const message = entry.message;
+	if (message !== null && typeof message === "object" && "role" in message && message.role === "historicalContext") {
+		throw new TypeError("Historical context messages are transient and cannot be persisted");
+	}
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -111,6 +126,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	 * compaction divider.
 	 */
 	warning?: string;
+	/** Sanitized display-only reason native compaction replaced bounded LCM work. */
+	lcmFallback?: LcmFallbackCategory;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {

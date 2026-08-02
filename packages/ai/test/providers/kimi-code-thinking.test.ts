@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { getBundledModel } from "@oh-my-pi/pi-catalog";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -171,6 +172,42 @@ describe("OpenAI/Anthropic compatibility shim cache affinity", () => {
 
 		expect(requestHeaders?.get("x-grok-conv-id")).toBe(cacheKey);
 	});
+});
+
+describe("OpenAI/Anthropic compatibility shim retry boundaries", () => {
+	it.each(["openai", "anthropic"] as const)(
+		"forwards single-attempt requests through its %s transport",
+		async format => {
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			let wireCalls = 0;
+			const stream = streamOpenAIAnthropicShim(
+				K3_MODEL,
+				TITLE_CONTEXT,
+				{
+					apiKey: "test-key",
+					format,
+					disableProviderRetries: true,
+					fetch: async () => {
+						wireCalls++;
+						return new Response(JSON.stringify({ error: { type: "server_error", message: "busy" } }), {
+							status: 503,
+							headers: { "content-type": "application/json", "retry-after-ms": "0" },
+						});
+					},
+				},
+				{
+					anthropicBaseUrl: "https://shim-retry.example/v1",
+					openaiBaseUrl: "https://shim-retry.example/v1",
+					defaultFormat: format,
+				},
+			);
+
+			const result = await stream.result();
+
+			expect(wireCalls).toBe(1);
+			expect(result.stopReason).toBe("error");
+		},
+	);
 });
 
 describe("Kimi Code prompt cache affinity", () => {

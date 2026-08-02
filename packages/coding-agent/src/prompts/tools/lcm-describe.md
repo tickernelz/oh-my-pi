@@ -1,0 +1,1 @@
+Describe one opaque LCM source, summary, or file handle within the current session/branch scope. Returns bounded redacted metadata and text. Large files remain reference-only; artifact and filesystem availability is explicit and unavailable content is never reconstructed from SQLite.

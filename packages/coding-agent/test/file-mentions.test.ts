@@ -103,9 +103,11 @@ describe("generateFileMentionMessages path resolution", () => {
 		const cwd = await createTempDir();
 		// TTF header begins with a NUL run; auto-reading it as text would leak
 		// control bytes into the conversation (the reported bug).
-		await Bun.write(path.join(cwd, "Silver.ttf"), Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x4f, 0x53]));
+		const fontBytes = Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x4f, 0x53]);
+		const blobBytes = Buffer.from([0x4d, 0x5a, 0xff, 0xfe, 0xc0, 0xc0]);
+		await Bun.write(path.join(cwd, "Silver.ttf"), fontBytes);
 		// A non-NUL invalid-UTF8 blob must be refused too, not just NUL-bearing files.
-		await Bun.write(path.join(cwd, "blob.bin"), Buffer.from([0x4d, 0x5a, 0xff, 0xfe, 0xc0, 0xc0]));
+		await Bun.write(path.join(cwd, "blob.bin"), blobBytes);
 
 		const messages = await generateFileMentionMessages(["Silver.ttf", "blob.bin"], cwd);
 		expect(messages).toHaveLength(1);
@@ -116,8 +118,80 @@ describe("generateFileMentionMessages path resolution", () => {
 		expect(message.files).toHaveLength(2);
 		for (const file of message.files) {
 			expect(file.skippedReason).toBe("binary");
+			expect(file.contentHash).toBeUndefined();
 			expect(file.content).toContain("binary file");
 			expect(file.content).not.toContain("\u0000");
 		}
+	});
+
+	test("hashes skipped oversized files only when LCM identity is requested", async () => {
+		const cwd = await createTempDir();
+		const filePath = path.join(cwd, "oversized.txt");
+		const byteSize = 6 * 1024 * 1024;
+		await Bun.write(filePath, "x");
+		await fs.truncate(filePath, byteSize);
+
+		const nativeMessages = await generateFileMentionMessages(["oversized.txt"], cwd);
+		const nativeMessage = nativeMessages[0];
+		if (nativeMessage?.role !== "fileMention") throw new Error("expected file mention message");
+		expect(nativeMessage.files[0]).toMatchObject({ byteSize, skippedReason: "tooLarge" });
+		expect(nativeMessage.files[0]?.contentHash).toBeUndefined();
+
+		const lcmMessages = await generateFileMentionMessages(["oversized.txt"], cwd, {
+			hashSkippedFiles: true,
+		});
+		const lcmMessage = lcmMessages[0];
+		if (lcmMessage?.role !== "fileMention") throw new Error("expected file mention message");
+		expect(lcmMessage.files[0]).toMatchObject({ byteSize, skippedReason: "tooLarge" });
+		expect(lcmMessage.files[0]?.content).toBe(nativeMessage.files[0]?.content);
+		expect(lcmMessage.files[0]?.contentHash).toMatch(/^[a-f0-9]{64}$/);
+	});
+
+	test("tracks a large auto-read file without replacing its truncated head", async () => {
+		const cwd = await createTempDir();
+		const header = "id,name,email\n";
+		const rows = Array.from({ length: 40_000 }, (_, index) => `${index},name${index},u${index}@example.com\n`);
+		const csv = header + rows.join("");
+		await Bun.write(path.join(cwd, "big.csv"), csv);
+		const byteSize = Buffer.byteLength(csv, "utf8");
+		// Comfortably under the 5 MiB auto-read cap, comfortably over a 25k-token budget.
+		expect(byteSize).toBeLessThan(5 * 1024 * 1024);
+		expect(Math.ceil(byteSize / 4)).toBeGreaterThan(25_000);
+
+		const untracked = await generateFileMentionMessages(["big.csv"], cwd);
+		const untrackedFile = untracked[0]?.role === "fileMention" ? untracked[0].files[0] : undefined;
+		expect(untrackedFile?.explorationSummary).toBeUndefined();
+		expect(untrackedFile?.contentHash).toBeUndefined();
+
+		const tracked = await generateFileMentionMessages(["big.csv"], cwd, {
+			hashSkippedFiles: true,
+			trackFileAboveTokens: 25_000,
+		});
+		const trackedFile = tracked[0]?.role === "fileMention" ? tracked[0].files[0] : undefined;
+
+		// The head is the point: tracking adds identity, it does not replace content.
+		expect(trackedFile?.content).toBe(untrackedFile?.content);
+		expect(trackedFile?.content).toContain("id,name,email");
+		expect(trackedFile?.skippedReason).toBeUndefined();
+
+		expect(trackedFile?.byteSize).toBe(byteSize);
+		expect(trackedFile?.contentHash).toMatch(/^[a-f0-9]{64}$/);
+		expect(trackedFile?.explorationSummary).toContain("Columns (3): id, name, email");
+		expect(trackedFile?.explorationSummary).toContain("a truncated head was inlined");
+	});
+
+	test("leaves a file under the tracking threshold untouched", async () => {
+		const cwd = await createTempDir();
+		await Bun.write(path.join(cwd, "small.csv"), "id,name\n1,a\n");
+
+		const messages = await generateFileMentionMessages(["small.csv"], cwd, {
+			hashSkippedFiles: true,
+			trackFileAboveTokens: 25_000,
+		});
+		const file = messages[0]?.role === "fileMention" ? messages[0].files[0] : undefined;
+
+		expect(file?.content).toContain("1,a");
+		expect(file?.explorationSummary).toBeUndefined();
+		expect(file?.contentHash).toBeUndefined();
 	});
 });

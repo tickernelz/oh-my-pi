@@ -81,6 +81,35 @@ describe("buildSessionContext snapcompact archives", () => {
 		expect(summary.images?.map(image => image.data)).toEqual(["base64-frame"]);
 		expect(summary.blocks?.map(block => block.type)).toEqual(["text", "image", "text"]);
 	});
+
+	it("restores persisted LCM fallback metadata for the native compaction divider", () => {
+		const entries = [
+			{
+				type: "message",
+				id: "fallback-source",
+				parentId: null,
+				timestamp,
+				message: { role: "user", content: "before fallback", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "fallback-compaction",
+				parentId: "fallback-source",
+				timestamp,
+				summary: "native fallback summary",
+				firstKeptEntryId: "fallback-source",
+				tokensBefore: 456,
+				lcmFallback: "deadline",
+			},
+		] satisfies SessionEntry[];
+		const context = buildSessionContext(entries, undefined, undefined, { transcript: true });
+		const summary = compactionSummary(context.messages);
+		expect(summary.lcmFallback).toBe("deadline");
+		expect(summary.summary).toBe("native fallback summary");
+		const providerSummary = compactionSummary(buildSessionContext(entries).messages);
+		expect(providerSummary.lcmFallback).toBeUndefined();
+		expect("lcmFallback" in providerSummary).toBe(false);
+	});
 });
 
 // A turn whose tool is still executing at rebuild time: the assistant message

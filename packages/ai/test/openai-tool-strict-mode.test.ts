@@ -789,6 +789,131 @@ describe("OpenAI tool strict mode", () => {
 		expect(strictFlags).toEqual([[true], [undefined], [undefined]]);
 	});
 
+	it("learns a strict-tools rejection without retrying a single-attempt request", async () => {
+		const model = getBundledModel("openrouter", "deepseek/deepseek-v4-flash") as Model<"openai-completions">;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const strictFlags: boolean[][] = [];
+		let wireCalls = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				wireCalls += 1;
+				const bodyText = typeof init?.body === "string" ? init.body : "";
+				const payload = JSON.parse(bodyText) as {
+					tools?: Array<{ function?: { strict?: boolean } }>;
+				};
+				strictFlags.push((payload.tools ?? []).map(tool => tool.function?.strict === true));
+				if (wireCalls === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message: "Invalid tool parameters schema : field `anyOf`: missing field `type`",
+								type: "invalid_request_error",
+							},
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				return createSseResponse([
+					{
+						id: "chatcmpl-durable-strict-learning",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: { content: "Recovered" } }],
+					},
+					{
+						id: "chatcmpl-durable-strict-learning",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					},
+					"[DONE]",
+				]);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = () =>
+			streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = wireCalls;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(wireCalls).toBe(2);
+		expect(strictFlags).toEqual([[true], [false]]);
+	});
+
+	it("learns a Responses strict-tools rejection without retrying a single-attempt request", async () => {
+		const model = {
+			...(getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">),
+			baseUrl: "https://strict-responses.example.test/v1",
+		} as Model<"openai-responses">;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const strictFlags: Array<Array<boolean | undefined>> = [];
+		let wireCalls = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				wireCalls += 1;
+				const bodyText = typeof init?.body === "string" ? init.body : "";
+				const payload = JSON.parse(bodyText) as { tools?: Array<{ strict?: boolean }> };
+				strictFlags.push((payload.tools ?? []).map(tool => tool.strict));
+				if (wireCalls === 1) {
+					return new Response(
+						JSON.stringify({
+							error: {
+								message: "Invalid tool parameters schema : field `anyOf`: missing field `type`",
+								type: "invalid_request_error",
+							},
+						}),
+						{ status: 400, headers: { "content-type": "application/json" } },
+					);
+				}
+				return createSseResponse([
+					{
+						type: "response.completed",
+						response: {
+							id: "resp_durable_strict_learning",
+							status: "completed",
+							usage: {
+								input_tokens: 1,
+								output_tokens: 1,
+								total_tokens: 2,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				]);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const request = () =>
+			streamOpenAIResponses(model, testContext, {
+				apiKey: "test-key",
+				disableProviderRetries: true,
+				fetch: fetchMock,
+				providerSessionState,
+			}).result();
+
+		const first = await request();
+		const firstWireCalls = wireCalls;
+		const second = await request();
+
+		expect(first.stopReason).toBe("error");
+		expect(firstWireCalls).toBe(1);
+		expect(second.stopReason).toBe("stop");
+		expect(wireCalls).toBe(2);
+		expect(strictFlags).toEqual([[true], [undefined]]);
+	});
+
 	it("sends strict=true for openai-responses tool schemas on OpenAI", async () => {
 		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 

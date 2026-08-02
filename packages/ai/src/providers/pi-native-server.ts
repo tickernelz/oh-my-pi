@@ -60,6 +60,7 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"headers",
 	"initiatorOverride",
 	"maxRetryDelayMs",
+	"disableProviderRetries",
 	"metadata",
 	"sessionId",
 	"promptCacheKey",

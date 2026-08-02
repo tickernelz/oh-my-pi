@@ -20,6 +20,17 @@ import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
 
 import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
+import type {
+	ContextProjection,
+	DoctorReport,
+	PurgeResult,
+	RebuildResult,
+	SearchHit,
+	SummaryJobAvailability,
+	SummaryProviderAttempt,
+	SummaryProviderAttemptStart,
+	SummaryProviderUsage,
+} from "@oh-my-pi/lcm-context";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -37,6 +48,7 @@ import {
 	type AsideMessage,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	instrumentedCompleteSimple,
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
@@ -50,9 +62,11 @@ import {
 	collectEntriesForBranchSummary,
 	estimateTokens,
 	generateBranchSummary,
+	resolveThresholdTokens,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
+	Api,
 	AssistantMessage,
 	CodexCompactionContext,
 	ImageContent,
@@ -74,9 +88,14 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
+import { type ApiKeyResolver, type Effort, resolveApiKeyOnce, seedApiKeyResolver, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	getHeadersFromError,
+	getRetryAfterMsFromErrorMessage,
+	getRetryAfterMsFromHeaders,
+} from "@oh-my-pi/pi-ai/utils/retry-after";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
@@ -84,6 +103,7 @@ import {
 	$env,
 	APP_NAME,
 	escapeXmlText,
+	extractRetryHint,
 	formatDuration,
 	getAgentDbPath,
 	isBunTestRuntime,
@@ -99,9 +119,10 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCosts } from "../advisor";
 import { type AsyncJob, AsyncJobManager } from "../async";
+import { extractTextContent } from "../commit/utils";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { getModelMatchPreferences, type ResolvedModelRoleValue, resolveModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -146,6 +167,14 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import type {
+	LcmDescription,
+	LcmExpandOptions,
+	LcmHandle,
+	LcmResolvedExpansion,
+	LcmSearchOptions,
+} from "../lcm/operations";
+import { insertLcmCueMessage, LCM_SEARCH_DEFAULT_LIMIT, renderLcmRetrievalCues } from "../lcm/operations";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
@@ -302,6 +331,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	sanitizeAssistantForReparentedHistory,
 	USER_INTERRUPT_LABEL,
+	wrapSteeringForModel,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
@@ -319,6 +349,23 @@ import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
 import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
+import {
+	estimateLcmProjectionMessageTokens,
+	estimateLcmProjectionMessageTokenUpperBound,
+	LcmCompletionError,
+	type LcmCompletionRequest,
+	type LcmCompletionResult,
+	type LcmOwnershipDecision,
+	type LcmPrimaryRouteKey,
+	type LcmProjectionLimits,
+	type LcmPublicStatus,
+	MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS,
+	MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS,
+	normalizeLcmBranch,
+	normalizeLcmMaxConcurrentSummaries,
+	SessionLcm,
+	type SessionLcmJournal,
+} from "./session-lcm";
 import {
 	COMPACTION_CHECK_NONE,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
@@ -349,6 +396,18 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+
+function isStructuralLcmAbortError(error: unknown): boolean {
+	const seen = new Set<object>();
+	let current = error;
+	while (current && typeof current === "object" && !seen.has(current)) {
+		seen.add(current);
+		const errorId = "errorId" in current && typeof current.errorId === "number" ? current.errorId : undefined;
+		if (current instanceof AIError.AbortError || AIError.is(errorId, AIError.Flag.Abort)) return true;
+		current = "cause" in current ? current.cause : undefined;
+	}
+	return false;
+}
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -421,6 +480,92 @@ type SetSessionNameWithTrigger = (
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
 
+interface PrimaryProjectionRequest {
+	readonly attempt: number;
+	readonly lcm: SessionLcm | undefined;
+	readonly model: Model | undefined;
+	routeKey: LcmPrimaryRouteKey | undefined;
+	usedLcm: boolean;
+	dispatchStarted: boolean;
+	dispatchedWithLcm: boolean;
+}
+
+/**
+ * Additive filter only: `lcm_search` text mode ANDs the tokens, so a whole sentence matches nothing.
+ * These are the English function words most likely to survive the length filter and over-constrain.
+ */
+const LCM_CUE_STOPWORDS = new Set([
+	"about",
+	"after",
+	"again",
+	"also",
+	"been",
+	"could",
+	"does",
+	"from",
+	"have",
+	"into",
+	"just",
+	"like",
+	"make",
+	"more",
+	"must",
+	"only",
+	"over",
+	"said",
+	"same",
+	"should",
+	"some",
+	"than",
+	"that",
+	"them",
+	"then",
+	"there",
+	"these",
+	"they",
+	"those",
+	"very",
+	"were",
+	"what",
+	"when",
+	"which",
+	"while",
+	"will",
+	"with",
+	"would",
+	"your",
+]);
+const LCM_CUE_MIN_TOKEN_CHARS = 4;
+const LCM_CUE_QUERY_TOKENS = 3;
+
+/**
+ * Reduces the newest user message to a few distinctive terms. Splits on Unicode non-alphanumerics so
+ * non-Latin scripts survive; an ASCII-only split would silently return nothing for them.
+ */
+export function lcmCueTerms(messages: readonly AgentMessage[]): string[] {
+	const latest = messages.findLast(message => message.role === "user");
+	if (!latest) return [];
+	const content = latest.content;
+	const text =
+		typeof content === "string"
+			? content
+			: content
+					.filter(part => part.type === "text")
+					.map(part => part.text)
+					.join(" ");
+	if (text.trim().length === 0) return [];
+	const seen = new Set<string>();
+	const tokens: string[] = [];
+	for (const raw of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+		if (raw.length < LCM_CUE_MIN_TOKEN_CHARS || LCM_CUE_STOPWORDS.has(raw) || seen.has(raw)) continue;
+		seen.add(raw);
+		tokens.push(raw);
+	}
+	// Longest-first is a cheap proxy for distinctiveness; ties keep first-occurrence order.
+	tokens.sort((left, right) => right.length - left.length);
+	return tokens.slice(0, LCM_CUE_QUERY_TOKENS);
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -441,6 +586,14 @@ export class AgentSession {
 	readonly #prewalk: PrewalkCoordinator;
 
 	readonly #providerBoundary: SessionProviderBoundary;
+	readonly #lcmOptions: AgentSessionConfig["lcm"];
+	#lcm: SessionLcm | undefined;
+	#lcmLifecycleTail: Promise<void> = Promise.resolve();
+	readonly #primaryProjectionRequests = new WeakMap<AgentMessage[], PrimaryProjectionRequest>();
+	#primaryProjectionAttempt = 0;
+	readonly #lcmProjectedPrimaryResponses = new WeakSet<AssistantMessage>();
+	/** Live LCM provider spend for this process; the durable remainder lives in the LCM ledger. */
+	#lcmSpendUsd = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -568,7 +721,7 @@ export class AgentSession {
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
 
-	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+	#sideTransformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
@@ -625,6 +778,12 @@ export class AgentSession {
 	#yieldTerminationPending = false;
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	#lcmSummaryProviderStates = new Map<
+		string,
+		{ stateKey: string; providerStates: Map<string, ProviderSessionState> }
+	>();
+	#lcmSummaryModelSelector: string | undefined;
+	#lcmSummaryModelSelectorInitialized = false;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
@@ -1123,7 +1282,7 @@ export class AgentSession {
 		this.agent.serviceTierResolver = model => this.#models.effectiveServiceTier(model);
 		this.#titleSystemPrompt = config.titleSystemPrompt;
 		this.#pruneToolDescriptions = config.pruneToolDescriptions === true;
-		this.#transformContext = config.transformContext ?? (messages => messages);
+		this.#sideTransformContext = config.sideTransformContext ?? (messages => messages);
 		this.#sideStreamFn = config.sideStreamFn ?? streamSimple;
 		this.#preferWebsockets = config.preferWebsockets;
 		this.#onPayload = config.onPayload;
@@ -1242,6 +1401,7 @@ export class AgentSession {
 			createComputerTool: config.createComputerTool,
 			createInspectImageTool: config.createInspectImageTool,
 			builtInToolNames: config.builtInToolNames,
+			ambientLcmToolNames: config.ambientLcmToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
 			ensureWriteRegistered: config.ensureWriteRegistered,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
@@ -1275,7 +1435,7 @@ export class AgentSession {
 			model: () => this.model,
 			sessionId: () => this.sessionId,
 			localProtocolOptions: () => this.#localProtocolOptions(),
-			transformContext: (messages, signal) => this.#transformContext(messages, signal),
+			transformContext: (messages, signal) => this.#sideTransformContext(messages, signal),
 			convertToLlm: messages => this.#convertToLlm(messages),
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
@@ -1283,6 +1443,13 @@ export class AgentSession {
 			obfuscator: this.#obfuscator,
 		};
 		this.#providerBoundary = new SessionProviderBoundary(providerBoundaryHost);
+		this.#lcmOptions = config.lcm ? { ...config.lcm } : undefined;
+		this.#lcm =
+			this.#lcmOptions && this.settings.get("context.engine") === "lossless" ? this.#createLcm() : undefined;
+		if (this.#lcm) {
+			this.#lcmSummaryModelSelector = this.settings.get("context.lossless.summaryModel");
+			this.#lcmSummaryModelSelectorInitialized = true;
+		}
 		const streamGuardsHost: StreamGuardsHost = {
 			agent: this.agent,
 			settings: this.settings,
@@ -1463,6 +1630,11 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			sessionId: () => this.sessionId,
 			messages: () => this.messages,
+			losslessOwnsRequest: (messages, signal, requestTokensFloor) =>
+				this.losslessOwnsRequest(messages, signal, requestTokensFloor),
+			rearmLosslessPrimaryIntent: (messages, requestTokensFloor) =>
+				this.#lcm?.rearmPrimaryIntent(messages, requestTokensFloor),
+			requestUsedLossless: message => this.#lcmProjectedPrimaryResponses.has(message),
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			goalModeState: () => this.#goalModeState,
 			planReferencePath: () => this.#planReferencePath,
@@ -3662,6 +3834,8 @@ export class AgentSession {
 		this.#detachUsageBeforeModelCall?.();
 		this.#detachUsageBeforeModelCall = undefined;
 		this.#memory.cancelLocalMemoryStartup();
+		this.#lcm?.beginDispose();
+		this.#maintenance.abortAutomaticCompaction();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
 		this.#irc.flushPending();
@@ -3792,6 +3966,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
 		}
+		await this.#maintenance.abortAndDrainAutomaticCompaction();
 		await this.#drainAutolearnCapture();
 		await this.#memory.transition;
 
@@ -3800,6 +3975,7 @@ export class AgentSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
+			this.#enqueueLcmLifecycle(() => this.#closeCurrentLcm()),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
@@ -3852,6 +4028,38 @@ export class AgentSession {
 		}
 
 		this.#providerSessionState.clear();
+		this.#closeLcmSummaryProviderSessions(reason);
+	}
+
+	#closeLcmSummaryProviderState(
+		familyKey: string,
+		stateKey: string,
+		providerStates: Map<string, ProviderSessionState>,
+		reason: string,
+	): void {
+		const retained = this.#lcmSummaryProviderStates.get(familyKey);
+		if (!retained || retained.stateKey !== stateKey || retained.providerStates !== providerStates) return;
+		for (const [providerKey, state] of retained.providerStates) {
+			try {
+				state.close();
+			} catch (error) {
+				logger.warn("Failed to close LCM summary provider session state", {
+					familyKey,
+					stateKey,
+					providerKey,
+					reason,
+					error: String(error),
+				});
+			}
+		}
+		retained.providerStates.clear();
+		this.#lcmSummaryProviderStates.delete(familyKey);
+	}
+
+	#closeLcmSummaryProviderSessions(reason: string): void {
+		for (const [familyKey, retained] of this.#lcmSummaryProviderStates) {
+			this.#closeLcmSummaryProviderState(familyKey, retained.stateKey, retained.providerStates, reason);
+		}
 	}
 
 	freshSession(): FreshSessionResult | undefined {
@@ -4340,9 +4548,18 @@ export class AgentSession {
 		this.#maintenance.abortCompaction();
 	}
 
+	/** Decide whether Lossless owns one automatic maintenance request. */
+	losslessOwnsRequest(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		requestTokensFloor?: number,
+	): Promise<LcmOwnershipDecision | undefined> {
+		return this.#lcm?.ownsRequest(messages, signal, requestTokensFloor) ?? Promise.resolve(undefined);
+	}
+
 	/** Trigger idle compaction through the automatic maintenance flow. */
-	async runIdleCompaction(): Promise<void> {
-		await this.#maintenance.runIdleCompaction();
+	async runIdleCompaction(requestTokensFloor: number, signal?: AbortSignal): Promise<void> {
+		await this.#maintenance.runIdleCompaction(requestTokensFloor, signal);
 	}
 
 	/** Toggle automatic compaction. */
@@ -4376,6 +4593,710 @@ export class AgentSession {
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
 		return this.agent.state.messages;
+	}
+
+	#lcmProjectionLimits(messages: readonly AgentMessage[]): LcmProjectionLimits | undefined {
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return undefined;
+		const compaction = this.settings.getGroup("compaction");
+		if (!compaction.enabled || compaction.strategy === "off") return undefined;
+		const hardThresholdTokens = resolveThresholdTokens(contextWindow, compaction);
+		const nonMessageTokens = computeNonMessageTokens(this);
+		const sourceTokens =
+			nonMessageTokens + messages.reduce((total, message) => total + estimateLcmProjectionMessageTokens(message), 0);
+		const tokenBudget = Math.floor(hardThresholdTokens - nonMessageTokens);
+		return {
+			sourceTokens,
+			// 20% of the window cannot cover a large branch before the hard deadline, and
+			// one oversized entry can consume that band in a single step.
+			prewarmThresholdTokens: Math.floor(hardThresholdTokens * 0.4),
+			hardThresholdTokens,
+			tokenBudget,
+			freshTail: {
+				maxSources: this.settings.get("context.lossless.freshTailSources"),
+				maxTokens: Math.max(1, Math.min(16_000, Math.floor(tokenBudget / 2))),
+			},
+		};
+	}
+
+	#measureLcmProjection(messages: readonly AgentMessage[]): { tokens: number; upperBound: number } {
+		this.#lcmOptions?.dependencies?.onProjectionTokenMeasurement?.();
+		const providerMessages = wrapSteeringForModel(messages as AgentMessage[]);
+		let tokens = 0;
+		let upperBound = 0;
+		for (const message of providerMessages) {
+			tokens += estimateLcmProjectionMessageTokens(message);
+			upperBound += estimateLcmProjectionMessageTokenUpperBound(message);
+		}
+		return { tokens, upperBound };
+	}
+
+	#createLcm(): SessionLcm | undefined {
+		const options = this.#lcmOptions;
+		if (!options || this.#isDisposed) return undefined;
+		try {
+			return new SessionLcm(
+				{
+					sessionManager: this.sessionManager,
+					obfuscator: this.#obfuscator,
+					projectionLimits: messages => this.#lcmProjectionLimits(messages),
+					projectionTokenMeasurements: messages => this.#measureLcmProjection(messages),
+					complete: request => this.#lcmCompleteWithAttempt(request),
+					resolveSummaryModel: selector => {
+						const model = this.#resolveLcmSummaryModel(selector);
+						return `${model.provider}/${model.id}`;
+					},
+				},
+				options,
+			);
+		} catch (error) {
+			logger.warn("LCM session creation failed; native context remains available", { error: String(error) });
+			return undefined;
+		}
+	}
+
+	#enqueueLcmLifecycle(operation: () => Promise<void>): Promise<void> {
+		const task = this.#lcmLifecycleTail.then(operation);
+		this.#lcmLifecycleTail = task.catch(() => {});
+		return task;
+	}
+
+	async #closeCurrentLcm(): Promise<void> {
+		this.#primaryProjectionAttempt++;
+		const lcm = this.#lcm;
+		if (!lcm) return;
+		this.#lcm = undefined;
+		lcm.beginDispose();
+		await lcm.close();
+	}
+
+	#primaryProjectionIsCurrent(request: PrimaryProjectionRequest): boolean {
+		const currentModel = this.model;
+		const modelMatches =
+			request.model === currentModel ||
+			(request.model !== undefined && currentModel !== undefined && modelsAreEqual(request.model, currentModel));
+		return request.attempt === this.#primaryProjectionAttempt && request.lcm === this.#lcm && modelMatches;
+	}
+
+	#bindPrimaryProjectionRequest(request: PrimaryProjectionRequest, messages: AgentMessage[]): AgentMessage[] {
+		const boundMessages = this.#primaryProjectionRequests.has(messages) ? [...messages] : messages;
+		this.#primaryProjectionRequests.set(boundMessages, request);
+		return boundMessages;
+	}
+
+	/** Apply Lossless projection to a primary request. */
+	async projectLcmContext(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
+		const request: PrimaryProjectionRequest = {
+			attempt: ++this.#primaryProjectionAttempt,
+			lcm: this.#lcm,
+			model: this.model,
+			routeKey: undefined,
+			usedLcm: false,
+			dispatchStarted: false,
+			dispatchedWithLcm: false,
+		};
+		const lcm = request.lcm;
+		if (!lcm) return this.#bindPrimaryProjectionRequest(request, messages);
+		const result = await lcm.project(messages, signal);
+		if (!this.#primaryProjectionIsCurrent(request) || signal?.aborted) {
+			return this.#bindPrimaryProjectionRequest(request, messages);
+		}
+		let projected = result.messages;
+		let owned = result.owned;
+		let candidateTokens = result.candidateTokens ?? Number.NaN;
+		let projectionTokenMeasurements = result.projectionTokenMeasurements ?? 0;
+		const tokenBudget = result.messageTokenBudget ?? Number.NaN;
+		const validFitMetadata =
+			!owned ||
+			(Number.isSafeInteger(candidateTokens) &&
+				candidateTokens >= 0 &&
+				Number.isSafeInteger(tokenBudget) &&
+				tokenBudget >= 0 &&
+				candidateTokens <= tokenBudget &&
+				Number.isSafeInteger(result.projectionTokenMeasurements) &&
+				projectionTokenMeasurements >= 0 &&
+				projectionTokenMeasurements <= MAX_LCM_PROJECTION_TOKEN_MEASUREMENTS);
+		if (owned && (!validFitMetadata || !result.routeKey)) {
+			if (!validFitMetadata) {
+				const invariantTokens =
+					Number.isSafeInteger(candidateTokens) &&
+					candidateTokens >= 0 &&
+					Number.isSafeInteger(tokenBudget) &&
+					candidateTokens > tokenBudget
+						? candidateTokens
+						: Number.MAX_SAFE_INTEGER;
+				lcm.recordPendingPrimaryProviderTokens(result.routeKey, invariantTokens, projectionTokenMeasurements);
+			}
+			projected = messages;
+			owned = false;
+		}
+		if (owned && result.projection && this.settings.get("context.lossless.retrievalCues")) {
+			const cue = await this.#withLcmRetrievalCues(
+				lcm,
+				messages,
+				projected,
+				result.projection,
+				tokenBudget,
+				candidateTokens,
+			);
+			projected = cue.messages;
+			candidateTokens = cue.candidateTokens;
+			projectionTokenMeasurements += cue.projectionTokenMeasurements;
+		}
+		if (!this.#primaryProjectionIsCurrent(request) || signal?.aborted) {
+			return this.#bindPrimaryProjectionRequest(request, messages);
+		}
+		request.routeKey = result.routeKey;
+		if (result.routeKey && owned) {
+			lcm.recordPendingPrimaryProviderTokens(result.routeKey, candidateTokens, projectionTokenMeasurements);
+			if (candidateTokens > tokenBudget || projectionTokenMeasurements > MAX_LCM_PRIMARY_TOKEN_MEASUREMENTS) {
+				projected = messages;
+				owned = false;
+			}
+		}
+		request.usedLcm = owned;
+		if (owned && result.projection) this.#emit({ type: "lcm_projection", projection: result.projection });
+		return this.#bindPrimaryProjectionRequest(request, projected);
+	}
+
+	/** Carry request ownership through later AgentMessage transforms before provider preparation. */
+	bindPrimaryProviderRequestMessages(source: AgentMessage[], target: AgentMessage[]): AgentMessage[] {
+		const request = this.#primaryProjectionRequests.get(source);
+		if (!request) return this.#primaryProjectionRequests.has(target) ? [...target] : target;
+		this.#primaryProjectionRequests.delete(source);
+		return this.#bindPrimaryProjectionRequest(request, target);
+	}
+
+	/**
+	 * Appends one ephemeral cue block pointing at compacted history the request no longer contains.
+	 * The query comes from the ORIGINAL messages — the projected array holds summaries, not the ask —
+	 * and insertion targets the projected array, which the transform never journals.
+	 */
+	async #withLcmRetrievalCues(
+		lcm: SessionLcm,
+		original: readonly AgentMessage[],
+		projected: AgentMessage[],
+		projection: ContextProjection,
+		tokenBudget: number,
+		candidateTokens: number,
+	): Promise<{ messages: AgentMessage[]; candidateTokens: number; projectionTokenMeasurements: number }> {
+		const base = { messages: projected, candidateTokens, projectionTokenMeasurements: 0 };
+		try {
+			const terms = lcmCueTerms(original);
+			if (terms.length === 0) return base;
+			// Text mode ANDs the terms, so a three-term query often matches nothing even when the
+			// topic is present. Retry once with the most distinctive term alone before giving up.
+			let hits = await lcm.searchProjected(terms.join(" "), LCM_SEARCH_DEFAULT_LIMIT, projection.revision);
+			if (hits.length === 0 && terms.length > 1) {
+				hits = await lcm.searchProjected(terms[0]!, LCM_SEARCH_DEFAULT_LIMIT, projection.revision);
+			}
+			if (hits.length === 0) return base;
+			const inContext = new Set(projection.historical.map(item => item.summaryHandle));
+			const rendered = renderLcmRetrievalCues(hits, inContext);
+			if (!rendered) return base;
+			const withCue = insertLcmCueMessage(projected, {
+				role: "developer",
+				content: [{ type: "text", text: rendered }],
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+			const measurement = this.#measureLcmProjection(withCue);
+			return measurement.tokens <= tokenBudget
+				? { messages: withCue, candidateTokens: measurement.tokens, projectionTokenMeasurements: 1 }
+				: { ...base, projectionTokenMeasurements: 1 };
+		} catch (error) {
+			logger.debug("LCM retrieval cues skipped", {
+				operation: "searchProjected",
+				error: error instanceof Error ? error.name : typeof error,
+			});
+			return base;
+		}
+	}
+
+	/** Pin the completed primary transform to the provider request about to start. */
+	beginPrimaryProviderRequest(messages: AgentMessage[], signal?: AbortSignal): void {
+		const request = this.#primaryProjectionRequests.get(messages);
+		if (!request) return;
+		if (signal?.aborted) {
+			request.dispatchStarted = true;
+			request.dispatchedWithLcm = false;
+			return;
+		}
+		const current = this.#primaryProjectionIsCurrent(request);
+		if (request.dispatchStarted) {
+			if (request.usedLcm && (!request.dispatchedWithLcm || !current)) {
+				throw new AIError.AbortError("Lossless projection was superseded before provider dispatch");
+			}
+			return;
+		}
+		request.dispatchStarted = true;
+		if (!current) {
+			request.dispatchedWithLcm = false;
+			if (request.usedLcm)
+				throw new AIError.AbortError("Lossless projection was superseded before provider dispatch");
+			return;
+		}
+		const committed = request.lcm?.commitPrimaryRequestRoute(request.routeKey) === true;
+		request.dispatchedWithLcm = committed && request.usedLcm;
+		if (request.usedLcm && !committed) {
+			throw new AIError.AbortError("Lossless projection route changed before provider dispatch");
+		}
+	}
+
+	completePrimaryProviderRequest(messages: AgentMessage[], response: AssistantMessage): void {
+		const request = this.#primaryProjectionRequests.get(messages);
+		if (!request) return;
+		this.#primaryProjectionRequests.delete(messages);
+		if (request.dispatchedWithLcm) this.#lcmProjectedPrimaryResponses.add(response);
+		request.dispatchedWithLcm = false;
+	}
+
+	async #rebindLcm(): Promise<void> {
+		this.#primaryProjectionAttempt++;
+		this.#maintenance.abortAutomaticCompaction();
+		await this.#enqueueLcmLifecycle(async () => {
+			const shouldEnable =
+				!this.#isDisposed && this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless";
+			if (!shouldEnable) {
+				try {
+					await this.#closeCurrentLcm();
+				} catch (error) {
+					logger.warn("LCM session close failed; native context remains available", { error: String(error) });
+				}
+				this.#closeLcmSummaryProviderSessions("LCM disabled");
+				await this.#tools.setAmbientLcmToolsEnabled(false);
+				return;
+			}
+
+			let lcm = this.#lcm;
+			if (!lcm) {
+				lcm = this.#createLcm();
+				if (!lcm) {
+					await this.#tools.setAmbientLcmToolsEnabled(false);
+					return;
+				}
+				this.#lcm = lcm;
+			}
+
+			this.refreshLcmSettings();
+			try {
+				await lcm.rebind();
+			} catch (error) {
+				logger.warn("LCM session rebind failed; native context remains available", { error: String(error) });
+			} finally {
+				this.#closeLcmSummaryProviderSessions("LCM rebind");
+			}
+			await this.#tools.setAmbientLcmToolsEnabled(this.#lcm?.enabled === true);
+		});
+	}
+
+	get lcmEnabled(): boolean {
+		return this.#lcm?.enabled === true;
+	}
+
+	refreshLcmSettings(): void {
+		const summaryModel = this.settings.get("context.lossless.summaryModel");
+		const summaryModelChanged =
+			this.#lcmSummaryModelSelectorInitialized && this.#lcmSummaryModelSelector !== summaryModel;
+		this.#lcm?.configure({
+			summaryModel,
+			maxConcurrentSummaries: this.settings.get("context.lossless.maxConcurrentSummaries"),
+		});
+		this.#lcmSummaryModelSelector = summaryModel;
+		this.#lcmSummaryModelSelectorInitialized = true;
+		if (summaryModelChanged) this.#closeLcmSummaryProviderSessions("LCM summary model changed");
+	}
+
+	async refreshLcmSettingsAndRebind(): Promise<void> {
+		await this.#rebindLcm();
+	}
+
+	async lcmStatus(): Promise<LcmPublicStatus> {
+		const status: LcmPublicStatus = this.#lcm
+			? await this.#lcm.status()
+			: {
+					runtime: {
+						health: "disabled",
+						summaryWorkers: {
+							active: 0,
+							limit: normalizeLcmMaxConcurrentSummaries(
+								this.settings.get("context.lossless.maxConcurrentSummaries"),
+							),
+						},
+					},
+				};
+		const selector = status.runtime.summaryModelSelector;
+		if (!selector || status.runtime.resolvedSummaryModel) return status;
+		const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+			settings: this.settings,
+			matchPreferences: getModelMatchPreferences(this.settings),
+		}).model;
+		if (!resolved) return status;
+		return {
+			...status,
+			runtime: { ...status.runtime, resolvedSummaryModel: `${resolved.provider}/${resolved.id}` },
+		};
+	}
+
+	lcmDoctor(): Promise<DoctorReport | null> {
+		return this.#lcm?.doctor() ?? Promise.resolve(null);
+	}
+
+	lcmRebuildCurrent(): Promise<RebuildResult | null> {
+		return this.#lcm?.rebuild() ?? Promise.resolve(null);
+	}
+
+	lcmRebuildProject(projectId: string, journals: readonly SessionLcmJournal[]): Promise<RebuildResult | null> {
+		if (!this.#lcm) return Promise.resolve(null);
+		const obfuscator = this.#obfuscator;
+		const redact = obfuscator?.hasSecrets() ? (text: string) => obfuscator.obfuscate(text) : String;
+		return this.#lcm.rebuildProject(journals.map(journal => normalizeLcmBranch(journal, projectId, redact)));
+	}
+
+	lcmGc(): Promise<PurgeResult | null> {
+		return this.#lcm?.purge() ?? Promise.resolve(null);
+	}
+
+	lcmRetrySummaries(mode: "due" | "all" = "due"): Promise<SummaryJobAvailability | null> {
+		return this.#lcm?.retrySummaries(mode) ?? Promise.resolve(null);
+	}
+
+	lcmSearch(query: string, options?: LcmSearchOptions): Promise<SearchHit[]> {
+		return this.#lcm?.search(query, options) ?? Promise.resolve([]);
+	}
+
+	lcmDescribe(handle: LcmHandle): Promise<LcmDescription | null> {
+		return this.#lcm?.describe(handle) ?? Promise.resolve(null);
+	}
+
+	lcmExpand(options: LcmExpandOptions): Promise<LcmResolvedExpansion | null> {
+		return this.#lcm?.expand(options) ?? Promise.resolve(null);
+	}
+
+	#resolveLcmSummaryModel(selector = "@smol"): Model<Api> {
+		const model = resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+			settings: this.settings,
+			matchPreferences: getModelMatchPreferences(this.settings),
+		}).model;
+		if (!model) throw new Error(`LCM completion could not resolve ${selector}`);
+		return model;
+	}
+
+	/**
+	 * Provider-safe, history-free one-shot used by LCM summary and recall. Retrieval
+	 * callers keep the text-only contract; the summary host uses the attempt-bearing
+	 * form so billed usage stays attributable.
+	 */
+	async lcmComplete(request: LcmCompletionRequest): Promise<string> {
+		try {
+			return (await this.#lcmCompleteWithAttempt(request)).text;
+		} catch (error) {
+			if (error instanceof LcmCompletionError && error.category === "aborted") {
+				if (error.cause instanceof Error) throw error.cause;
+				throw request.signal?.reason instanceof Error
+					? request.signal.reason
+					: new AIError.AbortError(error.message);
+			}
+			throw error;
+		}
+	}
+
+	async #lcmCompleteWithAttempt(request: LcmCompletionRequest): Promise<LcmCompletionResult> {
+		if (!this.#lcm || this.#isDisposed) throw new Error("Lossless context is not enabled for this session");
+		if (!Number.isSafeInteger(request.maxOutputTokens) || request.maxOutputTokens < 1) {
+			throw new RangeError("LCM completion maxOutputTokens must be a positive safe integer");
+		}
+		request.signal?.throwIfAborted();
+		let model: Model<Api>;
+		let affinitySessionId: string;
+		let resolver: ApiKeyResolver;
+		let resolvedApiKey: string;
+		try {
+			model = this.#resolveLcmSummaryModel(request.modelSelector);
+			affinitySessionId = this.#activeProviderSessionId();
+			request.onResolvedModel?.(`${model.provider}/${model.id}`);
+			resolver = this.#modelRegistry.resolver(model, affinitySessionId);
+			const key = await resolveApiKeyOnce(resolver, request.signal);
+			if (!key) {
+				throw new LcmCompletionError("LCM completion provider credential is unavailable", {
+					provider: model.provider,
+					category: "provider_key_mismatch",
+				});
+			}
+			resolvedApiKey = key;
+		} catch (error) {
+			if (error instanceof LcmCompletionError) throw error;
+			if (isStructuralLcmAbortError(error)) {
+				throw new LcmCompletionError("LCM completion aborted before dispatch", {
+					category: "aborted",
+					cause: error,
+				});
+			}
+			throw new LcmCompletionError("LCM completion provider configuration is unavailable", {
+				category: "provider_key_mismatch",
+			});
+		}
+		let attemptStart: SummaryProviderAttemptStart | undefined;
+		const finishedAttempt = (usage?: SummaryProviderUsage): SummaryProviderAttempt => {
+			const started = attemptStart;
+			if (!started) throw new Error("LCM completion finished before provider dispatch");
+			if (usage) this.#lcmSpendUsd += usage.cost.total;
+			return {
+				...started,
+				completedAt: Math.max(started.startedAt, Date.now()),
+				...(usage ? { usage } : {}),
+			};
+		};
+		const persistProviderState = request.oneshotKind === "lcm_summary";
+		const providerSessionKey = request.providerSessionKey ?? Snowflake.next();
+		const credentialFingerprint = new Bun.CryptoHasher("sha256")
+			.update("omp:lcm-summary-provider-state:v1\0")
+			.update(resolvedApiKey)
+			.digest("hex");
+		const summaryProviderStateKey = JSON.stringify([
+			model.api,
+			model.provider,
+			model.baseUrl ?? "",
+			model.id,
+			credentialFingerprint,
+			providerSessionKey,
+		]);
+		const providerSessionFamilyKey = request.providerSessionFamilyKey ?? providerSessionKey;
+		let retainedProviderState = persistProviderState
+			? this.#lcmSummaryProviderStates.get(providerSessionFamilyKey)
+			: undefined;
+		if (retainedProviderState && retainedProviderState.stateKey !== summaryProviderStateKey) {
+			this.#closeLcmSummaryProviderState(
+				providerSessionFamilyKey,
+				retainedProviderState.stateKey,
+				retainedProviderState.providerStates,
+				"LCM summary provider identity changed",
+			);
+			retainedProviderState = undefined;
+		}
+		const isolatedProviderState = retainedProviderState?.providerStates ?? new Map<string, ProviderSessionState>();
+		if (persistProviderState && !retainedProviderState) {
+			this.#lcmSummaryProviderStates.set(providerSessionFamilyKey, {
+				stateKey: summaryProviderStateKey,
+				providerStates: isolatedProviderState,
+			});
+		}
+		const retireProviderStateOnAbort = (): void => {
+			if (!persistProviderState) return;
+			this.#closeLcmSummaryProviderState(
+				providerSessionFamilyKey,
+				summaryProviderStateKey,
+				isolatedProviderState,
+				"LCM summary request aborted",
+			);
+		};
+		if (request.signal?.aborted) retireProviderStateOnAbort();
+		else request.signal?.addEventListener("abort", retireProviderStateOnAbort, { once: true });
+		let retainProviderState = false;
+		try {
+			let systemPrompt: string;
+			let userPrompt: string;
+			let options: SimpleStreamOptions;
+			let dispatchFence: Promise<void> | undefined;
+			const beforeTransportDispatch = (): Promise<void> => {
+				dispatchFence ??= (async () => {
+					request.signal?.throwIfAborted();
+					const start: SummaryProviderAttemptStart = {
+						attemptId: Snowflake.next(),
+						startedAt: Date.now(),
+						provider: model.provider,
+						model: model.id,
+					};
+					if (request.onAttemptStart && !(await request.onAttemptStart(start))) {
+						throw new LcmCompletionError("LCM completion was superseded before dispatch", {
+							provider: model.provider,
+							category: "aborted",
+						});
+					}
+					attemptStart = start;
+					request.signal?.throwIfAborted();
+				})();
+				return dispatchFence;
+			};
+			try {
+				systemPrompt = this.#obfuscateTextForProvider(request.systemPrompt) ?? request.systemPrompt;
+				userPrompt = this.#obfuscateTextForProvider(request.prompt) ?? request.prompt;
+				options = this.prepareSimpleStreamOptions(
+					{
+						apiKey: seedApiKeyResolver(resolvedApiKey, resolver),
+						maxTokens: request.maxOutputTokens,
+						signal: request.signal,
+						beforeTransportDispatch,
+						sessionId: [
+							affinitySessionId,
+							"lcm",
+							request.oneshotKind,
+							`${model.provider}/${model.id}`,
+							credentialFingerprint,
+							providerSessionKey,
+						].join(":"),
+						preferWebsockets: this.#preferWebsockets,
+						providerSessionState: isolatedProviderState,
+						statefulResponses: false,
+						initiatorOverride: "agent",
+						...(request.oneshotKind === "lcm_summary" ? { disableProviderRetries: true } : {}),
+					},
+					model.provider,
+				);
+			} catch (error) {
+				if (error instanceof LcmCompletionError) throw error;
+				if (isStructuralLcmAbortError(error)) {
+					throw new LcmCompletionError("LCM completion aborted before dispatch", {
+						provider: model.provider,
+						category: "aborted",
+						cause: error,
+					});
+				}
+				throw new LcmCompletionError("LCM completion provider configuration is unavailable", {
+					provider: model.provider,
+					category: "provider_key_mismatch",
+				});
+			}
+			let response: AssistantMessage;
+			try {
+				response = await instrumentedCompleteSimple(
+					model,
+					{
+						systemPrompt: [systemPrompt],
+						messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+						tools: [],
+					},
+					options,
+					{
+						telemetry: resolveTelemetry(this.agent.telemetry, affinitySessionId),
+						oneshotKind: request.oneshotKind,
+						completeImpl: async (requestModel, requestContext, requestOptions) => {
+							if (!this.#sideStreamFn.handlesBeforeTransportDispatch) {
+								await requestOptions.beforeTransportDispatch?.();
+								requestOptions.signal?.throwIfAborted();
+							}
+							const stream = await this.#sideStreamFn(requestModel, requestContext, requestOptions);
+							return stream.result();
+						},
+					},
+				);
+			} catch (error) {
+				if (error instanceof LcmCompletionError) throw error;
+				if (isStructuralLcmAbortError(error)) {
+					throw new LcmCompletionError(
+						attemptStart ? "LCM completion aborted" : "LCM completion aborted before dispatch",
+						{
+							provider: model.provider,
+							category: "aborted",
+							cause: error,
+							...(attemptStart ? { attempt: finishedAttempt() } : {}),
+						},
+					);
+				}
+				if (!attemptStart) {
+					throw new LcmCompletionError("LCM completion provider configuration is unavailable", {
+						provider: model.provider,
+						category: "provider_key_mismatch",
+					});
+				}
+				retainProviderState = request.retainProviderStateOnFailure === true;
+				const label = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				const headerHint = getRetryAfterMsFromHeaders(getHeadersFromError(error));
+				const textHint = getRetryAfterMsFromErrorMessage(label) ?? extractRetryHint(undefined, label);
+				const retryAfterMs =
+					headerHint === undefined
+						? textHint
+						: textHint === undefined
+							? headerHint
+							: Math.max(headerHint, textHint);
+				const safeLabel = this.#obfuscator?.hasSecrets()
+					? (this.#obfuscateTextForProvider(label) ?? "LCM completion failed")
+					: "LCM completion failed";
+				throw new LcmCompletionError(safeLabel, {
+					provider: model.provider,
+					retryAfterMs,
+					category: "transport_error",
+					attempt: finishedAttempt(),
+				});
+			}
+			if (response.provider === "opencode-go") {
+				this.#modelRegistry.authStorage.recordUsageCost(response.provider, response.usage.cost.total, {
+					sessionId: affinitySessionId,
+					recordedAt: response.timestamp,
+					baseUrl: this.#modelRegistry.getProviderBaseUrl?.(response.provider),
+				});
+			}
+			this.#modelRegistry.authStorage.recordObservedUsage({
+				provider: response.provider,
+				model: response.model,
+				at: response.timestamp,
+				usage: {
+					input: response.usage.input,
+					output: response.usage.output,
+					cacheRead: response.usage.cacheRead,
+					cacheWrite: response.usage.cacheWrite,
+				},
+				costUsd: response.usage.cost.total,
+			});
+			if (response.stopReason === "aborted" || AIError.is(response.errorId, AIError.Flag.Abort)) {
+				throw new LcmCompletionError("LCM completion aborted", {
+					provider: model.provider,
+					category: "aborted",
+					attempt: finishedAttempt(response.usage),
+				});
+			}
+			if (response.stopReason === "error") {
+				retainProviderState = request.retainProviderStateOnFailure === true;
+				const message = response.errorMessage ?? "LCM completion failed";
+				const safeMessage = this.#obfuscator?.hasSecrets()
+					? (this.#obfuscateTextForProvider(message) ?? "LCM completion failed")
+					: "LCM completion failed";
+				throw new LcmCompletionError(safeMessage, {
+					provider: model.provider,
+					retryAfterMs: getRetryAfterMsFromErrorMessage(message) ?? extractRetryHint(undefined, message),
+					category: "provider_error",
+					attempt: finishedAttempt(response.usage),
+				});
+			}
+			const text = extractTextContent(response).trim();
+			if (!text) {
+				retainProviderState = request.retainProviderStateOnFailure === true;
+				throw new LcmCompletionError("LCM completion returned no text", {
+					provider: model.provider,
+					category: "empty_output",
+					attempt: finishedAttempt(response.usage),
+				});
+			}
+			// Never deobfuscate derived output: re-apply the boundary so summary and
+			// recall cannot reveal or persist secrets absent from their redacted input.
+			return {
+				text: (this.#obfuscateTextForProvider(text) ?? text).trim(),
+				attempt: finishedAttempt(response.usage),
+			};
+		} finally {
+			request.signal?.removeEventListener("abort", retireProviderStateOnAbort);
+			const retainedProviderStateIsCurrent =
+				this.#lcmSummaryProviderStates.get(providerSessionFamilyKey)?.providerStates === isolatedProviderState;
+			if (!persistProviderState || !retainProviderState || !retainedProviderStateIsCurrent) {
+				if (persistProviderState && retainedProviderStateIsCurrent) {
+					this.#closeLcmSummaryProviderState(
+						providerSessionFamilyKey,
+						summaryProviderStateKey,
+						isolatedProviderState,
+						"LCM summary request completed",
+					);
+				} else {
+					for (const state of isolatedProviderState.values()) {
+						try {
+							state.close();
+						} catch (error) {
+							logger.debug("Failed to close isolated LCM provider state", { error: String(error) });
+						}
+					}
+					isolatedProviderState.clear();
+				}
+			}
+		}
 	}
 
 	/** Latest image attachments addressable by tools as `Image #N` or `attachment://N`. */
@@ -5217,10 +6138,19 @@ export class AgentSession {
 			// Auto-read @filepath mentions
 			const fileMentions = extractFileMentions(expandedText);
 			if (fileMentions.length > 0) {
+				// Same signal as hashSkippedFiles: LCM file identity is only worth computing
+				// when the derived store will actually index it.
+				const losslessFileTracking =
+					this.lcmEnabled ||
+					(this.#lcmOptions !== undefined && this.settings.get("context.engine") === "lossless");
 				const fileMentionMessages = await generateFileMentionMessages(fileMentions, this.sessionManager.getCwd(), {
 					autoResizeImages: this.settings.get("images.autoResize"),
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
+					hashSkippedFiles: losslessFileTracking,
+					...(losslessFileTracking
+						? { trackFileAboveTokens: this.settings.get("context.lossless.trackFileAboveTokens") }
+						: {}),
 				});
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
@@ -5307,6 +6237,7 @@ export class AgentSession {
 			if (this.#promptGeneration !== generation) {
 				return;
 			}
+			this.#lcm?.rearmPrimaryIntent([...this.messages, ...messages]);
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this);
@@ -6278,6 +7209,7 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
+		await this.#maintenance.abortAndDrainAutomaticCompaction();
 		this.#cancelOwnAsyncJobs();
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
@@ -6326,6 +7258,7 @@ export class AgentSession {
 
 			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 			this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
+			await this.#rebindLcm();
 
 			this.#todo.resetCycle();
 			this.#planReferenceSent = false;
@@ -6438,6 +7371,7 @@ export class AgentSession {
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
 			await this.#memory.resetContextForNewTranscript();
+			await this.#rebindLcm();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -6489,7 +7423,7 @@ export class AgentSession {
 	setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; onlyIfCurrent?: Model },
 	): Promise<void> {
 		return this.#models.setModelTemporary(model, thinkingLevel, options);
 	}
@@ -6826,6 +7760,7 @@ export class AgentSession {
 	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
+		if (isChanging) this.#primaryProjectionAttempt++;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
 			if (isChanging) {
@@ -7306,6 +8241,7 @@ export class AgentSession {
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
+		const previousCwd = this.sessionManager.getCwd();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
@@ -7324,6 +8260,7 @@ export class AgentSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		await this.#maintenance.abortAndDrainAutomaticCompaction();
 		await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#bash.flushPending();
@@ -7394,6 +8331,8 @@ export class AgentSession {
 			}
 			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
+			await this.settings.reloadForCwd(this.sessionManager.getCwd());
+			await this.#rebindLcm();
 
 			let sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
@@ -7582,6 +8521,15 @@ export class AgentSession {
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
 			try {
+				await this.settings.reloadForCwd(previousCwd);
+			} catch (reloadError) {
+				logger.warn("Failed to restore settings after session switch rollback", {
+					cwd: previousCwd,
+					error: String(reloadError),
+				});
+			}
+			await this.#rebindLcm();
+			try {
 				await this.#sessionSwitchReconciler?.();
 			} catch (reconcileError) {
 				logger.warn("Failed to reconcile session mode after switch rollback", {
@@ -7676,6 +8624,7 @@ export class AgentSession {
 			this.#syncAgentSessionId();
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
+			await this.#rebindLcm();
 
 			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
@@ -7752,6 +8701,7 @@ export class AgentSession {
 			POST_PROMPT_DRAIN_TIMEOUT_MS,
 			"Timed out draining post-prompt tasks before /btw branch",
 		);
+		await this.#maintenance.abortAndDrainAutomaticCompaction();
 		if (
 			this.isStreaming ||
 			this.isBashRunning ||
@@ -7801,6 +8751,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 			this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
+			await this.#rebindLcm();
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
@@ -8122,6 +9073,7 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, branchTransitioned);
 		}
+		await this.#rebindLcm();
 
 		// Update agent state — build display context to populate agent messages.
 		const stateContext = this.sessionManager.buildSessionContext();
@@ -8955,6 +9907,10 @@ export class AgentSession {
 	/** Return cumulative cost recorded for the current session's advisor activity. */
 	getAdvisorCost(): number {
 		return this.#advisors.getAdvisorCost();
+	}
+	/** Return cumulative cost recorded for this session's LCM summary and recall activity. */
+	getLcmCost(): number {
+		return (this.#lcm?.priorSpendUsd() ?? 0) + this.#lcmSpendUsd;
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.

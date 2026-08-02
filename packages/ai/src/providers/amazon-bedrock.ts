@@ -408,6 +408,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					headers: requestHeaders,
 					body,
 					signal: watchdog.signal,
+					maxAttempts: options.disableProviderRetries ? 1 : undefined,
 					fetch: options.fetch,
 					timeout: false,
 				});

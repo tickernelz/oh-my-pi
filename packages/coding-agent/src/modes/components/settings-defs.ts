@@ -45,6 +45,8 @@ interface BaseSettingDef {
 	 * enums, submenus, and text inputs.
 	 */
 	condition?: () => boolean;
+	/** Optional specialized editor selected declaratively by schema metadata. */
+	editor?: AnyUiMetadata["editor"];
 }
 
 export interface BooleanSettingDef extends BaseSettingDef {
@@ -98,6 +100,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 	advisorEnabled: () => {
 		try {
 			return Settings.instance.get("advisor.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	losslessContextActive: () => {
+		try {
+			return Settings.instance.get("context.engine") === "lossless";
 		} catch {
 			return false;
 		}
@@ -162,7 +171,15 @@ function pathToSettingDef(path: SettingPath): SettingDef | null {
 
 	const schemaType = getType(path);
 	const condition = ui.condition ? CONDITIONS[ui.condition] : undefined;
-	const base = { path, label: ui.label, description: ui.description, tab: ui.tab, group: ui.group, condition };
+	const base = {
+		path,
+		label: ui.label,
+		description: ui.description,
+		tab: ui.tab,
+		group: ui.group,
+		condition,
+		editor: ui.editor,
+	};
 
 	if (schemaType === "boolean") {
 		return { ...base, type: "boolean" };

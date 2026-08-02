@@ -1,18 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
+	getLcmSettingPaths,
+	getUi,
 	SETTING_TABS,
 	SETTINGS_SCHEMA,
 	type SettingPath,
-	type SettingTab,
 	TAB_GROUPS,
 } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
-import { getSettingsForTab } from "@oh-my-pi/pi-coding-agent/modes/components/settings-defs";
-
-interface UiShape {
-	tab: SettingTab;
-	group?: string;
-}
+import { getSettingDef, getSettingsForTab } from "@oh-my-pi/pi-coding-agent/modes/components/settings-defs";
 
 describe("settings layout", () => {
 	beforeEach(async () => {
@@ -27,7 +23,7 @@ describe("settings layout", () => {
 	it("every UI setting declares a group registered in TAB_GROUPS for its tab", () => {
 		const violations: string[] = [];
 		for (const path in SETTINGS_SCHEMA) {
-			const ui = (SETTINGS_SCHEMA[path as keyof typeof SETTINGS_SCHEMA] as { ui?: UiShape }).ui;
+			const ui = getUi(path as SettingPath);
 			if (!ui) continue;
 			if (!ui.group) {
 				violations.push(`${path}: missing ui.group`);
@@ -36,6 +32,24 @@ describe("settings layout", () => {
 			}
 		}
 		expect(violations).toEqual([]);
+	});
+
+	it("exposes every canonical LCM setting exactly once through schema UI", () => {
+		const paths = getLcmSettingPaths();
+		const contextDefs = getSettingsForTab("context");
+
+		expect(new Set(paths).size).toBe(paths.length);
+		for (const path of paths) {
+			const ui = getUi(path);
+			expect(ui).toMatchObject({ tab: "context" });
+			if (path.startsWith("context.lossless.")) {
+				expect(ui).toMatchObject({ group: "Lossless LCM", condition: "losslessContextActive" });
+			}
+			expect(contextDefs.filter(def => def.path === path)).toHaveLength(1);
+			expect(getSettingDef(path)).toBeDefined();
+		}
+
+		expect(getSettingDef("context.lossless.summaryModel")).toMatchObject({ editor: "summary-model" });
 	});
 
 	it("getSettingsForTab returns contiguous groups in TAB_GROUPS order", () => {
@@ -139,6 +153,46 @@ describe("settings layout", () => {
 		Settings.instance.set("retry.usageAwareFallback", true);
 		expect(defs[1]?.condition?.()).toBe(true);
 		expect(defs[2]?.condition?.()).toBe(true);
+	});
+
+	it("exposes lossless context settings from the schema", () => {
+		const defs = getSettingsForTab("context");
+		const engine = defs.find(def => def.path === "context.engine");
+		const summaryModel = defs.find(def => def.path === "context.lossless.summaryModel");
+		const maxConcurrent = defs.find(def => def.path === "context.lossless.maxConcurrentSummaries");
+
+		expect(engine).toMatchObject({
+			type: "enum",
+			label: "Context Engine",
+			group: "General",
+			values: ["native", "lossless"],
+		});
+		expect(engine?.description.toLowerCase()).toContain("reload");
+		expect(summaryModel).toMatchObject({
+			type: "submenu",
+			label: "Lossless Summary Model",
+			group: "Lossless LCM",
+			options: [],
+			editor: "summary-model",
+		});
+		expect(summaryModel?.description).toContain("@smol");
+		expect(maxConcurrent).toMatchObject({
+			type: "submenu",
+			label: "Concurrent Summaries",
+			group: "Lossless LCM",
+			options: [
+				{ value: "1", label: "Serial", description: "One summary at a time; preserves previous behavior." },
+				{ value: "2", label: "Balanced", description: "Recommended canary after verifying provider headroom." },
+				{ value: "3", label: "High", description: "Higher backlog throughput and provider usage." },
+				{ value: "4", label: "Maximum", description: "Maximum supported per-session parallelism." },
+			],
+		});
+		expect(summaryModel?.condition?.()).toBe(false);
+		expect(maxConcurrent?.condition?.()).toBe(false);
+
+		Settings.instance.set("context.engine", "lossless");
+		expect(summaryModel?.condition?.()).toBe(true);
+		expect(maxConcurrent?.condition?.()).toBe(true);
 	});
 
 	it("exposes ask.enabled as a boolean under Available Tools", () => {

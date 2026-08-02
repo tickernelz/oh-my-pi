@@ -31,6 +31,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
+import { handleLcmCommand, LCM_SUBCOMMANDS } from "../lcm/slash-command";
 import { readMCPConfigFile } from "../mcp/config-writer";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
@@ -1905,6 +1906,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "lcm",
+		description: "Inspect and operate Lossless Context Management",
+		acpDescription: "Inspect and maintain LCM derived state",
+		acpInputHint: "<subcommand>",
+		subcommands: LCM_SUBCOMMANDS,
+		allowArgs: true,
+		handle: handleLcmCommand,
+	},
+	{
 		name: "memory",
 		description: "Inspect and operate memory maintenance",
 		acpDescription: "Manage memory",
@@ -2033,6 +2043,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			setProjectDir(resolvedPath);
 			await runtime.settings.reloadForCwd(resolvedPath);
+			await runtime.session.refreshLcmSettingsAndRebind();
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.

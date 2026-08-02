@@ -103,6 +103,8 @@ import {
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
+import type { LcmRetrievalRuntime } from "./lcm/operations";
+import { registerLcmProject } from "./lcm/project-catalog";
 import { setSharedLspEnabled } from "./lsp/client";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "./lsp/startup-events";
 import {
@@ -204,6 +206,7 @@ import {
 	ReadTool,
 	releaseComputerSessionsForOwner,
 	resolveMountedXdevExecutable,
+	TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES,
 	type Tool,
 	type ToolSession,
 	WebSearchTool,
@@ -513,6 +516,8 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/** Concrete parent capability required to expose this child's own scoped LCM runtime. */
+	parentLcmRuntime?: LcmRetrievalRuntime;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Parent Mnemopi state to alias for subagent memory tools. */
@@ -1628,6 +1633,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	const hasExplicitToolNames = (options.toolNames?.length ?? 0) > 0;
+	const configuredToolNames = hasExplicitToolNames ? normalizeToolNames(options.toolNames ?? []) : undefined;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
@@ -1712,7 +1719,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			enableIrc: restrictToolNames ? false : options.enableIrc,
 			restrictToolNames,
 			get hasEditTool() {
-				const requestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+				const requestedToolNames = configuredToolNames;
 				return restrictToolNames
 					? requestedToolNames?.includes("edit") === true
 					: !requestedToolNames || requestedToolNames.includes("edit");
@@ -1743,6 +1750,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isDisposed: () => session?.isDisposed ?? false,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
+			getLcmRuntime: () => (session?.lcmEnabled ? session : undefined),
+			getForwardedLcmRuntime: options.parentLcmRuntime ? () => options.parentLcmRuntime : undefined,
 			getAgentId: () => resolvedAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
@@ -1859,6 +1868,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		const ambientLcmToolNames =
+			!restrictToolNames && taskDepth === 0 && !hasExplicitToolNames ? TOP_LEVEL_LCM_RETRIEVAL_TOOL_NAMES : [];
+		for (const name of ambientLcmToolNames) {
+			if (toolRegistry.has(name)) {
+				toolSession.xdev?.builtInNames.add(name);
+				continue;
+			}
+			const created = await BUILTIN_TOOLS[name](toolSession);
+			if (!created) continue;
+			const wrapped = wrapToolWithMetaNotice(created);
+			toolRegistry.set(wrapped.name, wrapped);
+			toolSession.xdev?.builtInNames.add(wrapped.name);
+		}
 
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
@@ -1959,7 +1981,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// (filtered in `createTools`), custom tools are force-activated via
 			// `alwaysInclude` below, so an explicit `--no-tools`/whitelist must be
 			// honored here or image-gen would leak past every filter (issue #5305).
-			const imageGenRequested = !options.toolNames || options.toolNames.includes("generate_image");
+			const imageGenRequested = !hasExplicitToolNames || configuredToolNames?.includes("generate_image") === true;
 			if (settings.get("generate_image.enabled") && imageGenRequested) {
 				const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
 				if (imageGenTools.length > 0) {
@@ -2962,7 +2984,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
-		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+		const explicitlyRequestedToolNames = configuredToolNames ? [...configuredToolNames] : undefined;
 		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
 		// `yield` call to terminate. The tool registry already includes `yield` (see
 		// `createTools`), but an explicit `toolNames` list would otherwise drop it from the
@@ -3017,9 +3039,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const xdevWriteAvailable =
 			builtInRegistryToolNames.has("write") &&
 			(explicitlyRequestedToolNameSet === undefined || explicitlyRequestedToolNameSet.has("write"));
-		const initialRequestedActiveToolNames = options.toolNames
-			? requestedActiveToolNames
-			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
+		const ambientLcmToolNameSet = new Set<string>(ambientLcmToolNames);
+		const initialRequestedActiveToolNames = (
+			options.toolNames
+				? requestedActiveToolNames
+				: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name))
+		).filter(name => settings.get("context.engine") === "lossless" || !ambientLcmToolNameSet.has(name));
 		let initialToolNames = [...initialRequestedActiveToolNames];
 
 		// Custom tools and extension-registered tools are always included regardless of toolNames filter.
@@ -3123,9 +3148,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return obfuscateMessages(obfuscator, converted);
 		};
 
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
+		const sideTransformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
 			const withContext = await extensionRunner.emitContext(messages);
 			return wrapSteeringForModel(withContext);
+		};
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal) => {
+			const projected = session ? await session.projectLcmContext(messages, signal) : messages;
+			const transformed = await sideTransformContext(projected, signal);
+			return session ? session.bindPrimaryProviderRequestMessages(projected, transformed) : transformed;
 		};
 		// Per-request provider-context transforms. Obfuscate FIRST so secrets are
 		// redacted from text before snapcompact rasterizes it into PNG frames, then
@@ -3231,6 +3261,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			deadline: options.deadline,
 			transformContext,
 			transformProviderContext,
+			beforeProviderDispatch: (messages, signal) => {
+				session?.beginPrimaryProviderRequest(messages, signal);
+				if (!notifyFirstChatDispatch) return;
+				const cb = notifyFirstChatDispatch;
+				notifyFirstChatDispatch = undefined;
+				try {
+					cb();
+				} catch (err) {
+					logger.warn("onFirstChatDispatch hook threw", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			},
+			afterProviderResponse: (messages, response) => session?.completePrimaryProviderRequest(messages, response),
 			steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
 			followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
 			interruptMode: settings.get("interruptMode") ?? "immediate",
@@ -3246,20 +3290,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId)),
-			streamFn: (streamModel, context, streamOptions) => {
-				if (notifyFirstChatDispatch) {
-					const cb = notifyFirstChatDispatch;
-					notifyFirstChatDispatch = undefined;
-					try {
-						cb();
-					} catch (err) {
-						logger.warn("onFirstChatDispatch hook threw", {
-							error: err instanceof Error ? err.message : String(err),
-						});
-					}
-				}
-				return settingsAwareStreamFn(streamModel, context, streamOptions);
-			},
+			streamFn: settingsAwareStreamFn,
 			cursorExecHandlers,
 			getCursorTools: () => (toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
 			transformToolCallArguments,
@@ -3319,6 +3350,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			hasEditTool: true,
 			requireYieldTool: false,
+			getLcmRuntime: undefined,
 			getSessionId: () => {
 				const id = sessionManager.getSessionId?.();
 				return id ? `${id}-advisor` : null;
@@ -3422,7 +3454,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? () => createVibeTools(toolSession)
 					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
-			transformContext,
+			ambientLcmToolNames,
+			sideTransformContext,
+			lcm: {
+				agentDir,
+				summaryModel: settings.get("context.lossless.summaryModel") ?? "@smol",
+				maxConcurrentSummaries: settings.get("context.lossless.maxConcurrentSummaries"),
+				leafChunkTokens: settings.get("context.lossless.leafChunkTokens"),
+				registerProject: async (project, journal) => {
+					await registerLcmProject(project, agentDir, Date.now(), journal.sessionDir);
+				},
+			},
 			transformProviderContext,
 			onPayload,
 			onResponse,

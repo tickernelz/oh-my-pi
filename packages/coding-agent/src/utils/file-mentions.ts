@@ -21,6 +21,8 @@ import {
 	truncateHeadBytes,
 } from "../session/streaming-output";
 import { resolveReadPath } from "../tools/path-utils";
+import { fileContentHash } from "./file-content-hash";
+import { buildExplorationSummary } from "./file-exploration";
 import { formatDimensionNote, resizeImage } from "./image-resize";
 
 /** Regex to match @filepath patterns in text */
@@ -187,7 +189,22 @@ export function extractFileMentions(text: string): string[] {
 export async function generateFileMentionMessages(
 	filePaths: string[],
 	cwd: string,
-	options?: { autoResizeImages?: boolean; useHashLines?: boolean; snapshotStore?: SnapshotStore },
+	options?: {
+		autoResizeImages?: boolean;
+		useHashLines?: boolean;
+		snapshotStore?: SnapshotStore;
+		hashSkippedFiles?: boolean;
+		/**
+		 * Estimated-token ceiling above which an auto-read text file is additionally
+		 * registered as an LCM file reference: the truncated head still reaches the model,
+		 * but the file also gains a content hash and a deterministic exploration summary so
+		 * its identity survives compaction. Absent or non-positive disables tracking.
+		 *
+		 * Text path only. Images carry their own byte cap and a bytes-per-token estimate is
+		 * meaningless for them; skipped files are already registered by `skippedReason`.
+		 */
+		trackFileAboveTokens?: number;
+	},
 ): Promise<AgentMessage[]> {
 	if (filePaths.length === 0) return [];
 
@@ -217,7 +234,13 @@ export async function generateFileMentionMessages(
 						path: resolvedPath,
 						content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 						byteSize: stat.size,
+						contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 						skippedReason: "tooLarge",
+						explorationSummary: await buildExplorationSummary(absolutePath, {
+							byteSize: stat.size,
+							fileType: mimeType,
+							kind: "skippedLarge",
+						}),
 					});
 					continue;
 				}
@@ -253,7 +276,13 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: too large, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
+					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "tooLarge",
+					explorationSummary: await buildExplorationSummary(absolutePath, {
+						byteSize: stat.size,
+						fileType: path.extname(resolvedPath).slice(1).toLowerCase() || "binary",
+						kind: "skippedLarge",
+					}),
 				});
 				continue;
 			}
@@ -262,7 +291,13 @@ export async function generateFileMentionMessages(
 					path: resolvedPath,
 					content: `(skipped auto-read: binary file, ${formatBytes(stat.size)})`,
 					byteSize: stat.size,
+					contentHash: options?.hashSkippedFiles ? await fileContentHash(absolutePath) : undefined,
 					skippedReason: "binary",
+					explorationSummary: await buildExplorationSummary(absolutePath, {
+						byteSize: stat.size,
+						fileType: path.extname(resolvedPath).slice(1).toLowerCase() || "binary",
+						kind: "skippedBinary",
+					}),
 				});
 				continue;
 			}
@@ -274,6 +309,26 @@ export async function generateFileMentionMessages(
 			if (snapshotStore) {
 				const tag = snapshotStore.record(canonicalSnapshotKey(absolutePath), normalized);
 				output = `${formatHashlineHeader(resolvedPath, tag)}\n${formatNumberedLines(output)}`;
+			}
+			// The head stays: a bounded excerpt of real content beats a stub. Above the
+			// threshold we ALSO register identity + exploration metadata, because otherwise a
+			// large-but-readable file leaves no trace once its message is compacted.
+			const trackAboveTokens = options?.trackFileAboveTokens ?? 0;
+			const estimatedTokens = Math.ceil(Buffer.byteLength(content, "utf8") / 4);
+			if (trackAboveTokens > 0 && estimatedTokens > trackAboveTokens) {
+				files.push({
+					path: resolvedPath,
+					content: output,
+					lineCount,
+					byteSize: Buffer.byteLength(content, "utf8"),
+					contentHash: await fileContentHash(absolutePath),
+					explorationSummary: await buildExplorationSummary(absolutePath, {
+						byteSize: Buffer.byteLength(content, "utf8"),
+						fileType: path.extname(resolvedPath).slice(1).toLowerCase() || "binary",
+						kind: "truncatedHead",
+					}),
+				});
+				continue;
 			}
 			files.push({ path: resolvedPath, content: output, lineCount });
 		} catch {
