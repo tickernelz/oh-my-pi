@@ -23,6 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -410,12 +411,14 @@ describe("vibe session registry", () => {
 
 	async function simulateProcessBoundary(): Promise<void> {
 		await AgentLifecycleManager.global().dispose();
+		IrcBus.resetGlobalForTests();
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
 	}
 
 	beforeEach(() => {
+		IrcBus.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		VibeSessionRegistry.resetGlobalForTests();
@@ -432,6 +435,7 @@ describe("vibe session registry", () => {
 		for (const root of tempRoots.splice(0)) {
 			await fs.rm(root, { recursive: true, force: true });
 		}
+		IrcBus.resetGlobalForTests();
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
