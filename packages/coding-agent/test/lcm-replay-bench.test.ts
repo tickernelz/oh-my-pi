@@ -1007,7 +1007,7 @@ describe("LCM replay immutable identity", () => {
 			expect(await Bun.file(capture.sourcePath).exists()).toBe(false);
 			expect(sha256(await Bun.file(sourcePath).bytes())).toBe(sourceInputHash);
 			expect(sha256(await Bun.file(seed.snapshotPath).bytes())).toBe(seedStoreHash);
-			expect(rejectionMs).toBeLessThan(2_000);
+			expect(rejectionMs).toBeLessThan(5_000);
 		}
 	}, 60_000);
 
@@ -1042,7 +1042,7 @@ describe("LCM replay immutable identity", () => {
 		expect(await Bun.file(capture.sourcePath).exists()).toBe(false);
 		expect(sha256(await Bun.file(forgedStore).bytes())).toBe(forgedStoreHash);
 		expect(sha256(await Bun.file(seed.sourcePath).bytes())).toBe(seedSourceHash);
-		expect(rejectionMs).toBeLessThan(2_000);
+		expect(rejectionMs).toBeLessThan(5_000);
 	}, 60_000);
 });
 

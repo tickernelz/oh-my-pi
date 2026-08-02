@@ -195,9 +195,16 @@ describe("AgentSession shake", () => {
 		});
 
 		it("keeps a successful overflow shake recovery committed before retrying", async () => {
+			const contextWindow = session.model?.contextWindow ?? 0;
+			expect(contextWindow).toBeGreaterThan(0);
 			session.settings.set("compaction.strategy", "shake");
+			session.settings.set("compaction.thresholdTokens", contextWindow - 1);
+			session.settings.set("compaction.thresholdPercent", -1);
 			session.settings.set("contextPromotion.enabled", false);
-			seedHeavyToolResult("X ".repeat(20000));
+			// The provider-reported overflow remains the post-shake pressure anchor.
+			// Seed enough eligible context that this shake genuinely restores the
+			// recovery band instead of correctly falling through to context-full.
+			seedHeavyToolResult("X ".repeat(Math.ceil(contextWindow * 0.6)));
 			branchToolResults()[0].useless = true;
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -461,7 +468,7 @@ describe("AgentSession shake", () => {
 			expect(fullStart).toBeDefined();
 		});
 
-		it("counts pre-shake prune savings when deciding whether to fall back to context-full", async () => {
+		it("skips shake when pre-shake pruning restores headroom", async () => {
 			session.settings.set("compaction.strategy", "shake");
 			session.settings.set("compaction.thresholdTokens", 76384);
 			session.settings.set("compaction.thresholdPercent", -1);
@@ -518,7 +525,11 @@ describe("AgentSession shake", () => {
 			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
 			await Bun.sleep(50);
 
-			expect(shakeSpy).toHaveBeenCalledTimes(1);
+			expect(shakeSpy).not.toHaveBeenCalled();
+			const shakeStart = events.find(
+				event => event.type === "auto_compaction_start" && (event as { action?: string }).action === "shake",
+			);
+			expect(shakeStart).toBeUndefined();
 			const fullStart = events.find(
 				event => event.type === "auto_compaction_start" && (event as { action?: string }).action === "context-full",
 			);
