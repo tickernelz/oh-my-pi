@@ -756,13 +756,13 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		}
 	});
 
-	test("RemoteAuthCredentialStore applies version-fenced scoped block mutations", async () => {
+	test("applies version-fenced scoped block mutations and retains rejected optimistic upserts", async () => {
 		const futureBlock = Date.now() + 60_000;
 		const laterBlock = futureBlock + 60_000;
 		const newestBlock = laterBlock + 60_000;
 		const brokerClient = new AuthBrokerClient({ url: "http://127.0.0.1:9", token: "unused" });
 		const fetchSnapshotPending = Promise.withResolvers<FetchSnapshotResult>();
-		vi.spyOn(brokerClient, "fetchSnapshot").mockReturnValue(fetchSnapshotPending.promise);
+		const fetchSnapshotSpy = vi.spyOn(brokerClient, "fetchSnapshot").mockReturnValue(fetchSnapshotPending.promise);
 		const upsertPending = Promise.withResolvers<CredentialBlockResponse>();
 		const upsertSpy = vi.spyOn(brokerClient, "upsertCredentialBlock").mockReturnValue(upsertPending.promise);
 		const deleteSpy = vi
@@ -814,6 +814,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		try {
 			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(futureBlock);
 
+			fetchSnapshotSpy.mockClear();
 			remoteStore.upsertCredentialBlock({
 				credentialId: 7,
 				providerKey: "anthropic:oauth",
@@ -867,9 +868,14 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			expect(deleteSpy).toHaveBeenCalledTimes(3);
 			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(newestBlock);
 			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "shared")).toBeUndefined();
+			upsertPending.reject(new Error("500 persistent credential block store unavailable"));
+			await upsertPending.promise.catch(() => {});
+			await Promise.resolve();
+			expect(fetchSnapshotSpy).not.toHaveBeenCalled();
+			expect(remoteStore.getCredentialBlock(7, "anthropic:oauth", "tier:fable")).toBe(newestBlock);
 		} finally {
 			upsertPending.resolve({ ok: true });
-			await upsertPending.promise;
+			await upsertPending.promise.catch(() => {});
 			remoteStore.close();
 		}
 	});

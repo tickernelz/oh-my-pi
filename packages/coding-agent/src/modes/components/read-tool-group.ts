@@ -397,6 +397,32 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		this.#updateDisplay();
 	}
 
+	/**
+	 * Re-key an entry whose streamed tool-call id changed mid-stream (a provider
+	 * rewriting the id across deltas; see EventController's
+	 * `#streamedToolCallIdByIndex`). Preserves row order so a sibling read run is
+	 * not visibly reshuffled, and no-ops when the rename would collide.
+	 */
+	renameEntry(oldId: string, newId: string): void {
+		if (oldId === newId || !newId) return;
+		const entry = this.#entries.get(oldId);
+		if (!entry || this.#entries.has(newId)) return;
+		entry.toolCallId = newId;
+		const reordered = [...this.#entries].map(([key, value]): [string, ReadEntry] => [
+			key === oldId ? newId : key,
+			value,
+		]);
+		this.#entries.clear();
+		for (const [key, value] of reordered) this.#entries.set(key, value);
+		this.#updateDisplay();
+	}
+	/** Remove one call without discarding successful siblings in the shared group. */
+	removeEntry(toolCallId: string): boolean {
+		if (!this.#entries.delete(toolCallId)) return this.#entries.size === 0;
+		this.#updateDisplay();
+		return this.#entries.size === 0;
+	}
+
 	updateResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
 		isPartial = false,

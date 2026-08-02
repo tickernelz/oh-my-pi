@@ -406,11 +406,17 @@ export class SessionPersistenceIndeterminateError extends AggregateError {
  * tree by `(id, parentId)`, and the mutable leaf pointer selects which path is
  * active for future appends and for LLM context construction.
  *
- * Durability is software-crash safe but not power-loss safe: appends are handed
- * to the OS synchronously in-body (so an entry survives an OOM/SIGKILL the
- * instant `appendMessage` returns) but never `fsync`'d. Full-file rewrites go
- * through the storage layer's atomic temp-write+rename so a crash mid-rewrite
- * cannot truncate the prior good file.
+ * Durability is software-crash safe but not power-loss safe: appends are normally
+ * handed to the OS synchronously in-body but never `fsync`'d. While an in-place
+ * atomic rewrite publishes, a synchronous `flushSync` still persists fenced
+ * appends by superseding the pending publish against the same (stable) path.
+ * A {@link moveTo} relocation is the one exception: the session file is being
+ * renamed to a new path, so appends landing in the rename window are held in
+ * memory and persisted only by the move's trailing rewrite. A `flushSync` in
+ * that narrow window cannot durably place them — writing the vacated source
+ * would recreate the orphan the move eliminates, and a queued backend publish
+ * (fire-and-forget on `IndexedSessionStorage`) could land after the rename all
+ * the same. This gap is inherent to closing the writer for a Windows-safe rename.
  */
 export class SessionManager {
 	#cwd: string;
@@ -480,6 +486,16 @@ export class SessionManager {
 	#atomicRewriteFenceEpoch: number | null = null;
 	/** Set by synchronous appends that land while an atomic replacement is active. */
 	#atomicRewriteDirty = false;
+	/**
+	 * True while {@link moveTo} is renaming the session file but has not yet
+	 * repointed `#sessionFile`. Both the synchronous append hot path
+	 * ({@link #appendToSessionFile}) and synchronous rewrites
+	 * ({@link #rewriteSynchronously}, reached via `flushSync` on Ctrl+C) would
+	 * otherwise touch the pre-rename path — opening a fresh writer or writing the
+	 * full body — recreating the very orphan the move eliminates. Both defer
+	 * while this is set; the move's trailing atomic rewrite persists them.
+	 */
+	#sessionFileRelocating = false;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
@@ -785,6 +801,12 @@ export class SessionManager {
 	 */
 	#rewriteSynchronously(): void {
 		if (!this.#persist || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
+		// A move is renaming the file out from under `#sessionFile`. Writing the
+		// full body now would target either the vacated source (recreating the
+		// orphan the move eliminates) or a path a queued backend publish may clobber
+		// post-rename, so defer to moveTo's trailing atomic rewrite. This narrows
+		// flushSync durability for entries in the rename window (see class doc).
+		if (this.#sessionFileRelocating) return;
 
 		try {
 			const body = this.#fileBody();
@@ -884,13 +906,18 @@ export class SessionManager {
 		}
 
 		// Atomic replacement window: the old path may be moved aside underneath
-		// any newly-opened append handle (Windows EPERM fallback). Do not open a
-		// writer here; the active rewrite loops and serializes a fresh full body.
+		// any newly-opened append handle (Windows EPERM fallback), or a `moveTo`
+		// may be renaming the session file to a new directory. Do not open a
+		// writer here; the active rewrite loops and serializes a fresh full body,
+		// and the move's trailing atomic rewrite folds in these deferred entries.
 		// A superseding synchronous rewrite bumps `#diskEpoch`, at which point
 		// the pending atomic publish is guaranteed to abandon via its
 		// `commitGuard`, so appends can (and must) take the hot path so they
 		// don't strand in memory while `close()` returns without a rewrite.
-		if (this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch) {
+		if (
+			this.#sessionFileRelocating ||
+			(this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch)
+		) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
 			this.#atomicRewriteDirty = true;
@@ -903,9 +930,9 @@ export class SessionManager {
 			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 
-		// Hot path: append synchronously so the entry is durable the instant this
-		// returns (file/memory writers perform the write in-body). Never routed
-		// through the async disk chain — durability must hold without a flush().
+		// Hot path: queue the entry directly on the writer, outside the async disk
+		// chain. File writers batch same-turn appends until their microtask
+		// boundary; flush(), flushSync(), and close() drain that batch explicitly.
 		// A mid-close writer leaves `#writer` undefined, so `#appendWriter` simply
 		// opens a fresh append handle and the entry still lands.
 		try {
@@ -924,6 +951,16 @@ export class SessionManager {
 
 		if (!this.#shouldHaveSessionFile()) {
 			this.#fileIsCurrent = false;
+			return;
+		}
+
+		// Title changes use their own asynchronous append path rather than
+		// #appendToSessionFile. Defer them under the same move fence so they cannot
+		// recreate the vacated source path before #sessionFile is repointed.
+		if (this.#sessionFileRelocating) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			this.#atomicRewriteDirty = true;
 			return;
 		}
 
@@ -1366,90 +1403,105 @@ export class SessionManager {
 				: computeDefaultSessionDir(resolvedCwd, this.#storage));
 
 		let sessionFileExisted = false;
-
+		// Fence synchronous appends and rewrites away from the session file for the
+		// duration of the relocation (see `#sessionFileRelocating`). This flag —
+		// not a `#diskEpoch` bump — is used deliberately: bumping the epoch here
+		// would cancel any disk task already queued at the current epoch (e.g. a
+		// header-only `ensureOnDisk()` materializing rewrite) before the drain
+		// below runs it, silently dropping an explicitly materialized session.
 		if (this.#persist && this.#sessionFile) {
-			this.#storage.ensureDirSync(nextSessionDir);
-			await this.#drainAndCloseWriter();
-			this.#clearDiskError();
+			this.#sessionFileRelocating = true;
+		}
 
-			const oldSessionFile = this.#sessionFile;
-			const newSessionFile = path.join(nextSessionDir, path.basename(oldSessionFile));
-			const oldArtifactsDir = artifactsDirectoryFor(oldSessionFile)!;
-			const newArtifactsDir = artifactsDirectoryFor(newSessionFile)!;
-			const sessionPathChanged = path.resolve(oldSessionFile) !== path.resolve(newSessionFile);
-			const artifactPathChanged = path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
-			sessionFileExisted = this.#storage.existsSync(oldSessionFile);
+		try {
+			if (this.#persist && this.#sessionFile) {
+				this.#storage.ensureDirSync(nextSessionDir);
+				await this.#drainAndCloseWriter();
+				this.#clearDiskError();
 
-			let sessionMoved = false;
-			let artifactsMoved = false;
+				const oldSessionFile = this.#sessionFile;
+				const newSessionFile = path.join(nextSessionDir, path.basename(oldSessionFile));
+				const oldArtifactsDir = artifactsDirectoryFor(oldSessionFile)!;
+				const newArtifactsDir = artifactsDirectoryFor(newSessionFile)!;
+				const sessionPathChanged = path.resolve(oldSessionFile) !== path.resolve(newSessionFile);
+				const artifactPathChanged = path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
+				sessionFileExisted = this.#storage.existsSync(oldSessionFile);
 
-			try {
-				if (sessionFileExisted && sessionPathChanged) {
-					await fs.promises.rename(oldSessionFile, newSessionFile);
-					sessionMoved = true;
-				}
+				let sessionMoved = false;
+				let artifactsMoved = false;
 
-				if (artifactPathChanged) {
-					try {
-						const artifactStat = await fs.promises.stat(oldArtifactsDir);
-						if (artifactStat.isDirectory()) {
-							await fs.promises.rename(oldArtifactsDir, newArtifactsDir);
-							artifactsMoved = true;
+				try {
+					if (sessionFileExisted && sessionPathChanged) {
+						await fs.promises.rename(oldSessionFile, newSessionFile);
+						sessionMoved = true;
+					}
+
+					if (artifactPathChanged) {
+						try {
+							const artifactStat = await fs.promises.stat(oldArtifactsDir);
+							if (artifactStat.isDirectory()) {
+								await fs.promises.rename(oldArtifactsDir, newArtifactsDir);
+								artifactsMoved = true;
+							}
+						} catch (err) {
+							if (!isEnoent(err)) throw err;
 						}
-					} catch (err) {
-						if (!isEnoent(err)) throw err;
 					}
-				}
-			} catch (err) {
-				if (artifactsMoved) {
-					try {
-						await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
-					} catch (rollbackErr) {
-						throw new Error(
-							`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-						);
+				} catch (err) {
+					if (artifactsMoved) {
+						try {
+							await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
+						} catch (rollbackErr) {
+							throw new Error(
+								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+							);
+						}
 					}
+
+					if (sessionMoved) {
+						try {
+							await fs.promises.rename(newSessionFile, oldSessionFile);
+						} catch (rollbackErr) {
+							throw new Error(
+								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+							);
+						}
+					}
+
+					throw err;
 				}
 
-				if (sessionMoved) {
-					try {
-						await fs.promises.rename(newSessionFile, oldSessionFile);
-					} catch (rollbackErr) {
-						throw new Error(
-							`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-						);
-					}
-				}
-
-				throw err;
+				this.#sessionFile = newSessionFile;
+				this.#artifactManager = null;
+				this.#artifactManagerSessionFile = null;
+				// Path is repointed; a sync rewrite may now safely target the new file.
+				this.#sessionFileRelocating = false;
 			}
 
-			this.#sessionFile = newSessionFile;
-			this.#artifactManager = null;
-			this.#artifactManagerSessionFile = null;
-		}
+			this.#cwd = resolvedCwd;
+			this.#sessionDir = nextSessionDir;
+			this.#header.cwd = resolvedCwd;
+			// Re-filter additional roots: the new cwd may have been an additional root,
+			// or it may now contain/subsume one. Re-normalize to keep the invariant
+			// that cwd is never also listed as an additional directory.
+			if (this.#additionalDirectories.length > 0) {
+				this.#additionalDirectories = this.#additionalDirectories.filter(d => d !== resolvedCwd);
+				this.#header.additionalDirectories =
+					this.#additionalDirectories.length > 0 ? this.#additionalDirectories : undefined;
+			}
 
-		this.#cwd = resolvedCwd;
-		this.#sessionDir = nextSessionDir;
-		this.#header.cwd = resolvedCwd;
-		// Re-filter additional roots: the new cwd may have been an additional root,
-		// or it may now contain/subsume one. Re-normalize to keep the invariant
-		// that cwd is never also listed as an additional directory.
-		if (this.#additionalDirectories.length > 0) {
-			this.#additionalDirectories = this.#additionalDirectories.filter(d => d !== resolvedCwd);
-			this.#header.additionalDirectories =
-				this.#additionalDirectories.length > 0 ? this.#additionalDirectories : undefined;
-		}
+			// Rewrite at the new location when the file already existed (update cwd) or
+			// there is in-memory output worth materializing; otherwise stay lazy.
+			const hasAssistant = this.#historyContainsAssistantMessage();
+			if (this.#persist && this.#sessionFile && (sessionFileExisted || hasAssistant)) {
+				this.#forceFileCreation = true;
+				await this.#rewriteAtomically();
+			}
 
-		// Rewrite at the new location when the file already existed (update cwd) or
-		// there is in-memory output worth materializing; otherwise stay lazy.
-		const hasAssistant = this.#historyContainsAssistantMessage();
-		if (this.#persist && this.#sessionFile && (sessionFileExisted || hasAssistant)) {
-			this.#forceFileCreation = true;
-			await this.#rewriteAtomically();
+			if (this.#sessionFile) this.#rememberBreadcrumb(resolvedCwd, this.#sessionFile);
+		} finally {
+			this.#sessionFileRelocating = false;
 		}
-
-		if (this.#sessionFile) this.#rememberBreadcrumb(resolvedCwd, this.#sessionFile);
 	}
 
 	/**
@@ -1596,6 +1648,7 @@ export class SessionManager {
 		if (this.#atomicEntryBatch) throw new Error("Cannot synchronously flush during an atomic session batch.");
 		if (this.#diskFailure) throw this.#diskFailure;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) {
+			this.#writer?.flushSync?.();
 			const writerError = this.#writer?.getError();
 			if (writerError) throw writerError;
 			return;

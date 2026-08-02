@@ -182,6 +182,7 @@ export interface SessionMaintenanceHost {
 	extensionRunner: ExtensionRunner | undefined;
 	sideStreamFn: StreamFn;
 	providerSessionState: Map<string, ProviderSessionState>;
+	preferWebsockets: boolean | undefined;
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
 	isDisposed(): boolean;
@@ -278,6 +279,19 @@ export interface SessionMaintenanceHost {
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
 	#autoCompactionAbortController: AbortController | undefined;
+	/**
+	 * Live tool-loop contexts parked after mid-turn maintenance hit a no-progress
+	 * dead end. Membership suppresses the repeated rescue + warning while no cut
+	 * point exists; {@link maintainContextMidRun} re-arms the entry once a later
+	 * tool result makes `prepareCompaction` viable again.
+	 */
+	readonly #midTurnCompactionDeadEnds = new WeakSet<AgentMessage[]>();
+	/**
+	 * Carries a mid-turn dead end across the loop's final answer to the next
+	 * pre-prompt check. That check must not warn again for the same oversized
+	 * persisted turn, but a new agent loop still gets its own live-array guard.
+	 */
+	#midTurnDeadEndPendingPrePrompt = false;
 	#automaticProbeAbortController: AbortController | undefined;
 	#automaticOperationSignal: AbortSignal | undefined;
 	#automaticProbeTask: Promise<void> = Promise.resolve();
@@ -1052,6 +1066,8 @@ export class SessionMaintenance {
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#host.settings.getGroup("compaction");
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
+		const pendingMidTurnDeadEnd = this.#midTurnDeadEndPendingPrePrompt;
+		this.#midTurnDeadEndPendingPrePrompt = false;
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
 		const decision = await this.#host.losslessOwnsRequest(
 			[...this.#host.messages(), ...messages],
@@ -1059,6 +1075,15 @@ export class SessionMaintenance {
 			contextTokens,
 		);
 		if (decision?.kind === "owned" || decision?.kind === "aborted" || signal.aborted) return;
+		if (
+			pendingMidTurnDeadEnd &&
+			prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model) === undefined
+		) {
+			// The prior tool loop already attempted the rescue and warned for this
+			// persisted oversized turn. Only a later persisted cut point makes a
+			// pre-prompt retry useful; the new agent loop may warn for its own turn.
+			return;
+		}
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
 		// the history at all. The post-turn threshold path already promotes before
@@ -1145,6 +1170,25 @@ export class SessionMaintenance {
 		if (!lastAssistant || lastAssistant.stopReason === "aborted" || lastAssistant.stopReason === "error") return;
 
 		if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
+		if (this.#midTurnCompactionDeadEnds.has(activeMessages)) {
+			// A prior boundary already ran the dead-end rescue and could not reduce
+			// this turn. Re-running the rescue and re-emitting its warning on every
+			// following tool boundary is wasted work while nothing summarizable
+			// exists. But the tool loop keeps appending turns: once a later
+			// (smaller) tool result gives prepareCompaction a cut point before the
+			// now-older oversized turn, compaction can finally make progress and
+			// MUST run rather than stay suppressed until provider overflow (#7153
+			// review). Stay parked only while no cut point is available; re-arm as
+			// soon as one appears.
+			if (
+				!model ||
+				prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model) === undefined
+			) {
+				return;
+			}
+			this.#midTurnCompactionDeadEnds.delete(activeMessages);
+			this.#midTurnDeadEndPendingPrePrompt = false;
+		}
 
 		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
 		const storedContextTokens = this.#estimateStoredContextTokens();
@@ -1172,7 +1216,7 @@ export class SessionMaintenance {
 
 		if (signal.aborted) return;
 		const messagesBefore = activeMessages.length;
-		await this.runAutoCompaction("threshold", false, false, false, {
+		const result = await this.runAutoCompaction("threshold", false, false, false, {
 			autoContinue: false,
 			suppressContinuation: true,
 			suppressHandoff: true,
@@ -1180,6 +1224,10 @@ export class SessionMaintenance {
 			phase: "mid_turn",
 			...(decision?.kind === "native" && decision.fallback ? { lcmFallback: decision.fallback.category } : {}),
 		});
+		if (result.automaticContinuationBlocked) {
+			this.#midTurnCompactionDeadEnds.add(activeMessages);
+			this.#midTurnDeadEndPendingPrePrompt = true;
+		}
 
 		if (signal?.aborted) return;
 		const compactedMessages = this.#host.agent.state.messages;
@@ -1667,8 +1715,9 @@ export class SessionMaintenance {
 						thinkingLevel: this.#host.thinkingLevel(),
 						tools: this.#host.agent.state.tools,
 						sessionId: this.#host.sessionId(),
-						promptCacheKey: this.#host.sessionId(),
+						promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
 						providerSessionState: this.#host.providerSessionState,
+						preferWebsockets: this.#host.preferWebsockets,
 						// Route every summarization HTTP request through the
 						// session's side-stream transport so the provider
 						// concurrency cap (e.g. providers.ollama-cloud.maxConcurrency)
@@ -2718,8 +2767,9 @@ export class SessionMaintenance {
 									thinkingLevel: this.#host.thinkingLevel(),
 									tools: this.#host.agent.state.tools,
 									sessionId: this.#host.sessionId(),
-									promptCacheKey: this.#host.sessionId(),
+									promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
 									providerSessionState: this.#host.providerSessionState,
+									preferWebsockets: this.#host.preferWebsockets,
 									codexCompaction,
 								},
 							);

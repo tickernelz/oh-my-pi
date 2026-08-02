@@ -234,7 +234,11 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(hiddenUtility.defaultHeaders["anthropic-beta"]).not.toContain("redact-thinking-2026-02-12");
 	});
 
-	it("adds Cowork's context-1m beta for million-token models", () => {
+	it("never advertises context-1m on OAuth requests for million-token models (#7238)", () => {
+		// OAuth subscription credentials have no long-context credit balance, so
+		// advertising `context-1m-2025-08-07` hard-429s beta-gated 1M models
+		// ("Usage credits are required for long context requests") regardless of
+		// prompt size, breaking every subagent on Claude Pro/Max.
 		const longContextModel = buildModel({
 			...ANTHROPIC_MODEL_SPEC,
 			id: "claude-opus-5",
@@ -250,8 +254,9 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 
 		expect(options.defaultHeaders["anthropic-beta"]).toBe(
-			"claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01",
+			"claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01",
 		);
+		expect(options.defaultHeaders["anthropic-beta"]).not.toContain("context-1m-2025-08-07");
 	});
 
 	it("matches Cowork's system-block layout: billing and instruction uncached, single breakpoint on the last context block", () => {

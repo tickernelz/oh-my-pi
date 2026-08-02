@@ -824,6 +824,50 @@ export function getDebugLogPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, `${APP_NAME}-debug.log`, "state");
 }
 
+/**
+ * Best-effort one-time copy of a legacy config-root file to its redirected XDG
+ * location. Existing installs that enable XDG after the file was created keep
+ * their data (e.g. a placeholder key whose loss would break deobfuscation of
+ * persisted transcripts). The legacy file is left in place for older omp
+ * versions sharing the profile.
+ */
+function adoptLegacyFile(legacyPath: string, targetPath: string): void {
+	if (targetPath === legacyPath) return;
+	try {
+		if (fs.existsSync(targetPath) || !fs.existsSync(legacyPath)) return;
+		fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+		fs.copyFileSync(legacyPath, targetPath, fs.constants.COPYFILE_EXCL);
+	} catch {
+		// Opportunistic: a copy race or unwritable XDG dir falls back to a fresh
+		// file at the new path — the pre-adoption behavior.
+	}
+}
+
+/** Get the secret placeholder key path (~/.omp/agent/secret-placeholder.key; XDG default: $XDG_STATE_HOME/omp/secret-placeholder.key). Adopts a legacy key on first XDG resolution. */
+export function getSecretPlaceholderKeyPath(): string {
+	const keyPath = dirs.agentSubdir(undefined, "secret-placeholder.key", "state");
+	adoptLegacyFile(path.join(dirs.agentDir, "secret-placeholder.key"), keyPath);
+	return keyPath;
+}
+
+/** Get the daemon runtime directory for a project (~/.omp/run/daemons/<hash>; XDG default: $XDG_STATE_HOME/omp/run/daemons/<hash>). */
+export function getDaemonRuntimeDir(projectDir: string): string {
+	const key = Bun.hash.wyhash(path.resolve(projectDir)).toString(16).padStart(16, "0");
+	return dirs.rootSubdir(path.join("run", "daemons", key), "state");
+}
+
+/** Get the provider in-flight root directory (~/.omp/run/provider-inflight; XDG default: $XDG_STATE_HOME/omp/run/provider-inflight). */
+export function getProviderInFlightRoot(): string {
+	return dirs.rootSubdir(path.join("run", "provider-inflight"), "state");
+}
+
+/** Get the marketplaces registry path (~/.omp/marketplaces.json; XDG default: $XDG_DATA_HOME/omp/marketplaces.json). Adopts a legacy registry on first XDG resolution. */
+export function getMarketplacesRegistryPath(): string {
+	const registryPath = dirs.rootSubdir("marketplaces.json", "data");
+	adoptLegacyFile(path.join(dirs.configRoot, "marketplaces.json"), registryPath);
+	return registryPath;
+}
+
 // =============================================================================
 // Project subdirectories (.omp/*)
 // =============================================================================

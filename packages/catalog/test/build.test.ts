@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { buildOpenAICompat, buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog/compat/openai";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -608,6 +609,34 @@ describe("OpenRouter model discovery", () => {
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("maps OpenRouter's advertised reasoning effort ladder and default", async () => {
+		const options = openrouterModelManagerOptions({
+			fetch: async () =>
+				Response.json({
+					data: [
+						{
+							id: "deepseek/deepseek-v4-flash-0731",
+							name: "DeepSeek V4 Flash 0731",
+							supported_parameters: ["tools", "reasoning", "reasoning_effort"],
+							reasoning: {
+								supported_efforts: ["max", "high", "low"],
+								default_effort: "high",
+							},
+						},
+					],
+				}),
+		});
+		const specs = await options.fetchDynamicModels?.();
+		const spec = specs?.find(model => model.id === "deepseek/deepseek-v4-flash-0731");
+		if (!spec) throw new Error("Expected discovered DeepSeek V4 Flash 0731 model");
+
+		expect(buildModel(spec).thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.Max],
+			defaultLevel: Effort.High,
+		});
 	});
 
 	it("ignores legacy OpenRouter chat-completions cache rows", async () => {

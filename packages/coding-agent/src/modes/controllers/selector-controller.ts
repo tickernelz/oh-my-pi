@@ -1,4 +1,5 @@
 import { type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
@@ -702,15 +703,38 @@ export class SelectorController {
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
-				onPick: async (model, selector) => {
-					try {
-						// Session-only: update agent state but don't persist the model to settings.
+				onPick: async (model, selector, { overContext }) => {
+					// Session-only: update agent state but don't persist the model to settings.
+					const applySessionModel = async () => {
 						const roleThinkingLevel = this.ctx.session.resolveTemporaryModelThinkingLevel(model);
 						await this.ctx.session.setModelTemporary(model, roleThinkingLevel);
 						this.ctx.statusLine.invalidate();
 						this.ctx.updateEditorBorderColor();
 						const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
 						this.ctx.showStatus(`Session-only model: ${selector}. Use ${roleSelectorHint} or /model for roles.`);
+					};
+					try {
+						if (overContext) {
+							// Over-context pick: close the picker so the compaction loader is
+							// visible, compact with the current model, then switch. The switch
+							// runs in the before-flush hook so any prompt queued during
+							// compaction executes on the target model, not the old one; the
+							// early "nothing to compact" return skips the hook, so the
+							// idempotent post-return call covers it. A cancelled or failed
+							// compaction keeps the current model — the target still cannot
+							// fit the transcript.
+							done();
+							let switched = false;
+							const switchAfterCompaction = async (outcome: CompactionOutcome) => {
+								if (switched || outcome !== "ok") return;
+								switched = true;
+								await applySessionModel();
+							};
+							const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction);
+							await switchAfterCompaction(outcome);
+							return;
+						}
+						await applySessionModel();
 						done();
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -759,7 +783,6 @@ export class SelectorController {
 	 * entry — used when reopening the hub after a /login round-trip.
 	 */
 	#showModelHub(hubOptions: { initialProviderId?: string }): void {
-		const currentContextTokens = this.ctx.session.getContextUsage()?.tokens ?? 0;
 		let overlayHandle: OverlayHandle | undefined;
 		let hub: ModelHubComponent | undefined;
 		let closed = false;
@@ -827,7 +850,6 @@ export class SelectorController {
 									selector,
 									thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
 									persist: targetScope === "global",
-									currentContextTokens,
 								});
 								if (!switched) return;
 								if (targetScope === "project") {
@@ -928,7 +950,6 @@ export class SelectorController {
 										thinkingLevel: effectiveIsAuto
 											? ThinkingLevel.Inherit
 											: (concreteThinking ?? ThinkingLevel.Inherit),
-										currentContextTokens,
 									});
 									if (!switched) return;
 									if (effectiveIsAuto) {

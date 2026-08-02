@@ -69,8 +69,12 @@ function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<
 			pendingProviderId: undefined,
 			tryClaimInput: vi.fn(),
 		},
+		settings: {
+			get: vi.fn((_key: string): unknown => undefined),
+		},
 		session: {
 			refreshMCPTools: vi.fn(),
+			setMCPPromptCommands: vi.fn(),
 			modelRegistry: { authStorage },
 		},
 		mcpManager,

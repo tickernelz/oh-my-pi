@@ -752,4 +752,44 @@ describe("searchCodex model selection", () => {
 		expect(result.model).toBe("gpt-5.6-terra");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
 	});
+
+	it("preserves a nested type:error code and message instead of Unknown error (#7200)", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const sse = [
+			`data: ${JSON.stringify({
+				type: "error",
+				error: {
+					code: "unsupported_region",
+					message: "web_search is not available for this workspace's data residency region.",
+				},
+			})}`,
+			"",
+		].join("\n");
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+		await expect(searchCodex(makeSearchParams("nested error envelope", fetchMock))).rejects.toThrow(
+			"Codex error (unsupported_region): web_search is not available for this workspace's data residency region.",
+		);
+	});
+
+	it("preserves a structured response.failed error code and message (#7200)", async () => {
+		delete process.env.PI_CODEX_WEB_SEARCH_MODEL;
+		const sse = [
+			`data: ${JSON.stringify({
+				type: "response.failed",
+				response: {
+					id: "resp_failed",
+					error: { code: "model_snapshot_unavailable", message: "The requested model snapshot is unavailable." },
+				},
+			})}`,
+			"",
+		].join("\n");
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+		await expect(searchCodex(makeSearchParams("structured failure", fetchMock))).rejects.toThrow(
+			"Codex request failed (model_snapshot_unavailable): The requested model snapshot is unavailable.",
+		);
+	});
 });

@@ -246,7 +246,7 @@ describe("executeHashlineSingle multi-section aggregate cap", () => {
 		}
 
 		const sections = tags.map((tag, i) =>
-			[formatHashlineHeader(`f${i}.ts`, tag), "SWAP 1.=1:", `+HEADER${i}`].join("\n"),
+			[formatHashlineHeader(`f${i}.ts`, tag), "PUT 1-1:", `+HEADER${i}`].join("\n"),
 		);
 		const input = sections.join("\n");
 

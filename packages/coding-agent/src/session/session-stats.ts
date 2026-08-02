@@ -1,5 +1,10 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { calculatePromptTokens, estimateTokens, type SessionMessageEntry } from "@oh-my-pi/pi-agent-core/compaction";
+import {
+	calculatePromptTokens,
+	estimateTokens,
+	hasContextTokenUsage,
+	type SessionMessageEntry,
+} from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -127,7 +132,12 @@ export class SessionStatsTracker {
 			const entry = branchEntries[index];
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const assistant = entry.message;
-			if (assistant.stopReason !== "aborted" && assistant.stopReason !== "error" && assistant.usage) {
+			if (
+				assistant.stopReason !== "aborted" &&
+				assistant.stopReason !== "error" &&
+				assistant.usage &&
+				hasContextTokenUsage(assistant.usage)
+			) {
 				anchorEntry = entry;
 				break;
 			}
@@ -184,7 +194,8 @@ export class SessionStatsTracker {
 					message.role !== "assistant" ||
 					message.stopReason === "aborted" ||
 					message.stopReason === "error" ||
-					!message.usage
+					!message.usage ||
+					!hasContextTokenUsage(message.usage)
 				) {
 					continue;
 				}

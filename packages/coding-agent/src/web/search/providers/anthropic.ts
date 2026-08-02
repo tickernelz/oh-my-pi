@@ -19,6 +19,7 @@ import {
 	withAuth,
 	wrapFetchForCch,
 } from "@oh-my-pi/pi-ai";
+import { hasOpus47ApiRestrictions } from "@oh-my-pi/pi-catalog/identity/family";
 import { $env } from "@oh-my-pi/pi-utils";
 import type {
 	AnthropicApiResponse,
@@ -176,7 +177,8 @@ async function callSearch(
 		body.metadata = { user_id: metadataUserId };
 	}
 
-	if (temperature !== undefined) {
+	// Opus 4.7+, Sonnet 5+, and Fable/Mythos 5 reject sampling parameters with a 400.
+	if (temperature !== undefined && !hasOpus47ApiRestrictions(model)) {
 		body.temperature = temperature;
 	}
 

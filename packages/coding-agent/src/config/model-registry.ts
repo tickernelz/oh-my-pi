@@ -580,7 +580,13 @@ function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: ModelTr
 		result.headers = patch.headers;
 		compat = patch.compat;
 	}
-	return buildModel({ ...result, compat } as ModelSpec<Api>);
+	const built = buildModel({ ...result, compat } as ModelSpec<Api>);
+	if (patch.thinking !== undefined && built.thinking !== undefined) {
+		// Config-authored capability metadata owns the explicit surface; build
+		// first so non-reasoning and wire-disabled models still suppress it.
+		built.thinking = patch.thinking;
+	}
+	return built;
 }
 
 function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<Api> {

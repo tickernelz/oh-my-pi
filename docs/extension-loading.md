@@ -98,8 +98,19 @@ extensions:
 
 Behavior split:
 
-- SDK: when `disableExtensionDiscovery=true`, it still loads `additionalExtensionPaths` via `loadExtensions()`.
-- CLI path building (`main.ts`) currently clears CLI extension paths when `--no-extensions` is set, so explicit `-e/--hook` are not forwarded in that mode.
+- SDK: when `disableExtensionDiscovery=true`, ambient extension factories are
+  excluded, while `additionalExtensionPaths` are still resolved normally
+  (including package directories with `package.json#omp.extensions`).
+- CLI: `--no-extensions` follows the same explicit-only contract. Explicit
+  `-e/--extension` and `--hook` paths still load, and only sibling capability
+  roots from explicitly named extension packages remain eligible. Project/user
+  `extensions:` settings and installed OMP extension packages are excluded from
+  that sibling surface.
+
+This flag governs extension factories and OMP extension-package sibling roots;
+it is not a whole-process capability-isolation switch. Skills, MCP servers,
+tools, prompts, and rules owned by other discovery subsystems retain their own
+enable/disable controls.
 
 ### Disable specific extension modules
 

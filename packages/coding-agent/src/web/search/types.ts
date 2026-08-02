@@ -30,7 +30,12 @@ export const SEARCH_PROVIDER_OPTIONS = [
 		label: "OpenAI",
 		description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
 	},
-	{ value: "xai", label: "xAI", description: "Grok web search via xAI Responses API (requires XAI_API_KEY)" },
+	{
+		value: "xai",
+		label: "xAI",
+		description:
+			"Grok web search via xAI Responses API (uses SuperGrok/X Premium+ OAuth via /login xai-oauth, or XAI_API_KEY)",
+	},
 	{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
 	{ value: "exa", label: "Exa", description: "API via /login exa or EXA_API_KEY; explicit keyless fallback via MCP" },
 	{ value: "tinyfish", label: "TinyFish", description: "Requires TINYFISH_API_KEY" },

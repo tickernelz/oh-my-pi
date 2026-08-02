@@ -1,4 +1,5 @@
 import type { KnownProvider } from "@oh-my-pi/pi-catalog";
+import { aiandProvider } from "./aiand";
 import { aimlApiProvider } from "./aimlapi";
 import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { alibabaTokenPlanProvider } from "./alibaba-token-plan";
@@ -18,6 +19,7 @@ import { fireworksProvider } from "./fireworks";
 import { githubCopilotProvider } from "./github-copilot";
 import { gitlabDuoProvider } from "./gitlab-duo";
 import { gitLabDuoWorkflowProvider } from "./gitlab-duo-workflow";
+import { gmiCloudProvider } from "./gmi-cloud";
 import { googleProvider } from "./google";
 import { googleAntigravityProvider } from "./google-antigravity";
 import { googleGeminiCliProvider } from "./google-gemini-cli";
@@ -100,6 +102,7 @@ const ALL = [
 	gitLabDuoWorkflowProvider,
 	alibabaCodingPlanProvider,
 	alibabaTokenPlanProvider,
+	aiandProvider,
 	aimlApiProvider,
 	zhipuCodingPlanProvider,
 	umansProvider,
@@ -154,6 +157,7 @@ const ALL = [
 	mistralProvider,
 	minimaxProvider,
 	amazonBedrockProvider,
+	gmiCloudProvider,
 ];
 
 export type RegistryDef = (typeof ALL)[number];

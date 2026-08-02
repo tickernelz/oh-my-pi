@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/lcm-context",
-	"version": "17.2.1",
+	"version": "17.2.4",
 	"description": "Rebuildable lossless-context projection and summary storage for Oh My Pi",
 	"homepage": "https://github.com/tickernelz/oh-my-pi#readme",
 	"author": "Can Boluk",

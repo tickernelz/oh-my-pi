@@ -154,7 +154,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const endpointPrefix = "https://api.anthropic.com/";
 		return async (input, init) => {
 			const url = String(input);
-			if (url === "https://models.dev/api.json") {
+			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
 			}
 			if (url.startsWith(endpointPrefix) && url.endsWith("/models")) {
@@ -1870,6 +1870,9 @@ describe("ModelRegistry runtime discovery", () => {
 
 	test("llama.cpp selected model refresh does not resolve command api keys", async () => {
 		const commandLogPath = path.join(tempDir, "llama-cpp-key-command.log");
+		// Pre-create so the before/after comparison works whether or not
+		// registry construction happens to invoke the key command itself.
+		fs.writeFileSync(commandLogPath, "");
 		writeRawModelsJson({
 			"llama.cpp": {
 				baseUrl: "http://127.0.0.1:8080",

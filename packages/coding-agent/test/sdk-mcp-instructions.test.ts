@@ -248,7 +248,7 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		}
 	}, 20_000);
 
-	it("keeps MCP tools active after deferred discovery when CLI tool filtering names only built-ins", async () => {
+	it("keeps deferred MCP tools top-level when CLI tool filtering grants read but not write", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -270,26 +270,24 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		try {
 			expect(session.getActiveToolNames()).toContain("read");
 
-			// Deferred discovery mounts MCP under xd:// and activates write as its
-			// transport. The xd registry reconciles before the async prompt rebuild
-			// while the active tool swap lands after it, so poll the complete
-			// post-condition — exiting on the mount alone races the swap.
+			// The xd:// transport rides BOTH halves: `read xd://` discovers and
+			// `write xd://<tool>` executes. A session granted read but not write
+			// never allocates xdev state, so deferred discovery must surface MCP
+			// tools top-level instead of auto-granting the denied write transport.
 			const deadline = Date.now() + 12_000;
-			const settled = () =>
-				session.getXdevToolEntries().some(entry => entry.name === MCP_TOOL_NAME) &&
-				session.getActiveToolNames().includes("write");
-			while (!settled() && Date.now() < deadline) {
+			let activeNames = session.getActiveToolNames();
+			while (!activeNames.includes(MCP_TOOL_NAME) && Date.now() < deadline) {
 				await Bun.sleep(50);
+				activeNames = session.getActiveToolNames();
 			}
-			const deviceNames = session.getXdevToolEntries().map(entry => entry.name);
 
-			expect(session.getActiveToolNames()).toContain("read");
-			expect(session.getActiveToolNames()).toContain("write");
-			expect(session.getActiveToolNames()).not.toContain(MCP_TOOL_NAME);
-			expect(deviceNames).toContain(MCP_TOOL_NAME);
-			const write = session.getToolByName("write");
-			expect(write).toBeDefined();
-			const result = await write!.execute("deferred-mcp-call", { path: `xd://${MCP_TOOL_NAME}`, content: "{}" });
+			expect(activeNames).toContain("read");
+			expect(activeNames).toContain(MCP_TOOL_NAME);
+			expect(activeNames).not.toContain("write");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain(MCP_TOOL_NAME);
+			const mcpTool = session.getToolByName(MCP_TOOL_NAME);
+			expect(mcpTool).toBeDefined();
+			const result = await mcpTool!.execute("deferred-mcp-call", {});
 			expect(result.content.find(part => part.type === "text")?.text).toBe(TOOL_RESULT);
 		} finally {
 			await session.dispose();

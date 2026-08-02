@@ -62,8 +62,8 @@ function messageContent(entry: Record<string, unknown>): unknown {
 	return (message as { content?: unknown }).content;
 }
 
-describe("SessionManager immediate JSONL persistence", () => {
-	it("writes the first assistant turn and later entries before appendMessage returns", () => {
+describe("SessionManager batched JSONL persistence", () => {
+	it("writes later entries at the microtask or synchronous flush boundary", async () => {
 		const cwd = makeTempDir("@pi-immediate-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
 		const manager = SessionManager.create(cwd, sessionDir);
@@ -84,9 +84,21 @@ describe("SessionManager immediate JSONL persistence", () => {
 		manager.appendMessage({ role: "user", content: "written immediately", timestamp: Date.now() });
 
 		entries = readJsonl(sessionFile);
+		expect(entries).toHaveLength(3);
+
+		await Promise.resolve();
+		entries = readJsonl(sessionFile);
 		expect(entries).toHaveLength(4);
 		expect(messageRole(entries[3] ?? {})).toBe("user");
 		expect(messageContent(entries[3] ?? {})).toBe("written immediately");
+
+		manager.appendMessage({ role: "user", content: "flushed synchronously", timestamp: Date.now() });
+		manager.flushSync();
+
+		entries = readJsonl(sessionFile);
+		expect(entries).toHaveLength(5);
+		expect(messageRole(entries[4] ?? {})).toBe("user");
+		expect(messageContent(entries[4] ?? {})).toBe("flushed synchronously");
 	});
 
 	it("keeps pre-assistant sessions out of history during shutdown", async () => {

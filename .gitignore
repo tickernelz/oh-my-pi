@@ -73,6 +73,7 @@ packages/natives/npm/
 packages/coding-agent/src/utils/mupdf-wasm.wasm
 /runs/
 python/omp-rpc/src/omp_rpc.egg-info/
+python/omp-rpc/build/
 # parallel-agent worktrees
 .wt/
 CPU*.md

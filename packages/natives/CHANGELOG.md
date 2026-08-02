@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [17.2.2] - 2026-07-31
+
+### Changed
+
+- Updated native HTML-to-Markdown rendering to html-to-markdown-rs 3.9.2 defaults, which may result in formatting differences (such as fenced code blocks and cycling nested-list bullets) compared to version 2.30.0.
+
+### Fixed
+
+- Fixed a heap corruption crash when opening PulseAudio on Linux ARM64 by shipping target-specific miniaudio Rust layouts for GNU and musl native addons.
+- Fixed local Bazel addon builds on NixOS by exposing system CMake tools to sandboxed build scripts and correctly bundling Opus.
+- Fixed workspace native addon loading to correctly prefer the workspace build over an installed leaf package.
+- Fixed process crashes caused by pathological HTML inputs; conversions that exceed the native-stack DOM depth limit now reject instead of returning silently truncated Markdown.
+
 ## [17.2.1] - 2026-07-30
 
 ### Fixed

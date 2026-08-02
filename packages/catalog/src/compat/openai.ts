@@ -322,10 +322,14 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	const isGrok = modelMatchesHost(hostModel, "xai");
 	const isMistral = modelMatchesHost(hostModel, "mistral");
 	const isOpenCodeHost = modelMatchesHost(hostModel, "opencode");
+	// Google AI Studio's OpenAI-compat shim (`generativelanguage.googleapis.com/v1beta/openai`)
+	// implements a subset of chat-completions and 400s on `store` ("Unknown name \"store\"").
+	const isGoogleAistudioOpenAI = hostMatchesUrl(baseUrl, "googleAistudio");
 	const isNonStandard =
 		isCerebras ||
 		isGrok ||
 		isMistral ||
+		isGoogleAistudioOpenAI ||
 		hostMatchesUrl(baseUrl, "chutes") ||
 		hostMatchesUrl(baseUrl, "deepseekFamily") ||
 		hostMatchesUrl(baseUrl, "fireworks") ||

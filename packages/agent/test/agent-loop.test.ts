@@ -1500,6 +1500,11 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolEnds.length).toBe(2);
 		expect(toolEnds[0].isError).toBe(false);
 		expect(toolEnds[1].isError).toBe(true);
+		expect(toolEnds[1].result.details).toEqual({
+			__synthetic: true,
+			source: "interrupt_skipped",
+			executed: false,
+		});
 		const skippedContent = toolEnds[1].result.content[0];
 		expect(skippedContent?.type).toBe("text");
 		if (skippedContent?.type !== "text") throw new Error("skipped tool result must be text");
@@ -1690,6 +1695,66 @@ describe("agentLoop with AgentMessage", () => {
 		expect(
 			events.some(e => e.type === "message_start" && e.message.role === "user" && e.message.content === "interrupt"),
 		).toBe(true);
+	});
+
+	it("distinguishes an in-flight abort from a never-executed steering skip", async () => {
+		const toolSchema = type({});
+		let steerReady = false;
+		let drained = false;
+
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "wait",
+			label: "Wait",
+			description: "Starts work, then throws when steering aborts it",
+			parameters: toolSchema,
+			interruptible: true,
+			async execute(_toolCallId, _params, signal) {
+				steerReady = true;
+				if (!signal) throw new Error("missing tool abort signal");
+				const aborted = Promise.withResolvers<void>();
+				if (signal.aborted) {
+					aborted.resolve();
+				} else {
+					signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				}
+				await aborted.promise;
+				throw new Error("aborted after partial work");
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "wait", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "immediate",
+			hasSteeringMessages: () => steerReady && !drained,
+			getSteeringMessages: async () => {
+				if (!steerReady || drained) return [];
+				drained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+
+		const toolEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnd?.result.details).toEqual({
+			__interrupted: true,
+			source: "interrupt_skipped",
+			execution: "started",
+		});
+		expect(toolEnd?.result.details).not.toHaveProperty("executed");
 	});
 
 	it("keeps a completed error result instead of clobbering it into skipped when a steer aborts the signal (#4752)", async () => {

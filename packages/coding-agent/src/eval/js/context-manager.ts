@@ -8,6 +8,7 @@ import {
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
+import { attachSessionOwner, resolveOwnerScopedSessionKey, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
 import { WorkerCore } from "./worker-core";
@@ -57,10 +58,16 @@ interface JsSession {
 	worker: WorkerHandle;
 	state: "alive" | "dead";
 	pending: Map<string, PendingRun>;
+	ownerIds: Set<string>;
+	hasFallbackOwner: boolean;
+}
+
+interface StartingJsSession extends SessionOwners {
+	promise: Promise<JsSession>;
 }
 
 const sessions = new Map<string, JsSession>();
-const startingSessions = new Map<string, Promise<JsSession>>();
+const startingSessions = new Map<string, StartingJsSession>();
 const resettingSessions = new Map<string, Promise<void>>();
 // Worker startup (module-graph import + WorkerCore construction) is infrastructure
 // cost, not user compute. Floor it independently of Bun's 5s default per-test timeout
@@ -99,6 +106,8 @@ export function setJsEvalWorkerThreadForTests(enabled: boolean): boolean {
 export async function executeInVmContext(options: {
 	sessionKey: string;
 	sessionId: string;
+	/** Logical owner identifier; scopes `reset` on shared contexts and retained-worker cleanup. */
+	ownerId?: string;
 	cwd: string;
 	session: ToolSession;
 	localRoots?: Record<string, string>;
@@ -108,47 +117,55 @@ export async function executeInVmContext(options: {
 	timeoutMs?: number;
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
+	const sessionKey = resolveOwnerScopedSessionKey({
+		baseKey: options.sessionKey,
+		ownerId: options.ownerId,
+		reset: options.reset === true,
+		hasSession: key => sessions.has(key) || startingSessions.has(key),
+		getOwners: key => sessions.get(key) ?? startingSessions.get(key),
+	});
 	if (options.reset) {
 		// Coalesce concurrent resets: an existing in-flight reset already
 		// produces a fresh context, so a follow-up `reset: true` cell should
 		// just wait for it rather than failing the user-visible call.
-		const inFlight = resettingSessions.get(options.sessionKey);
+		const inFlight = resettingSessions.get(sessionKey);
 		if (inFlight) await inFlight.catch(() => undefined);
 		else {
-			const resetPromise = resetVmContext(options.sessionKey);
+			const resetPromise = resetVmContext(sessionKey);
 			resettingSessions.set(
-				options.sessionKey,
+				sessionKey,
 				resetPromise.then(() => undefined),
 			);
 			try {
 				await resetPromise;
 			} finally {
-				resettingSessions.delete(options.sessionKey);
+				resettingSessions.delete(sessionKey);
 			}
 		}
 	} else {
 		// Internal coordination: wait for any in-flight reset to settle and
 		// then run on the freshly-rebuilt context.
-		const inFlight = resettingSessions.get(options.sessionKey);
+		const inFlight = resettingSessions.get(sessionKey);
 		if (inFlight) await inFlight.catch(() => undefined);
 	}
 	const session = await acquireSession(
-		options.sessionKey,
+		sessionKey,
 		{ cwd: options.cwd, sessionId: options.sessionId, localRoots: options.localRoots },
 		options.timeoutMs,
+		options.ownerId,
 	);
 	return await runOnce(session, options);
 }
 
 export async function resetVmContext(sessionKey: string): Promise<void> {
-	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.catch(() => undefined));
+	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
 	if (!session) return;
 	sessions.delete(sessionKey);
 	await killSession(session, new ToolError("JS context reset"), { force: false });
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
-	const pending = [...startingSessions.values()];
+	const pending = [...startingSessions.values()].map(starting => starting.promise);
 	startingSessions.clear();
 	const started = await Promise.allSettled(pending);
 	const all = [...sessions.values()];
@@ -158,6 +175,45 @@ export async function disposeAllVmContexts(): Promise<void> {
 	}
 	sessions.clear();
 	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
+}
+
+/**
+ * Shut down retained JS contexts owned solely by `ownerId` (e.g. a subagent's
+ * private fork); shared contexts just drop the owner registration.
+ */
+export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
+	const toKill: JsSession[] = [];
+	for (const session of [...sessions.values()]) {
+		if (!session.ownerIds.has(ownerId)) continue;
+		if (session.ownerIds.size === 1) {
+			toKill.push(session);
+			continue;
+		}
+		session.ownerIds.delete(ownerId);
+	}
+	const startingToKill: StartingJsSession[] = [];
+	for (const [sessionKey, starting] of [...startingSessions.entries()]) {
+		if (sessions.has(sessionKey) || !starting.ownerIds.has(ownerId)) continue;
+		if (starting.ownerIds.size === 1) {
+			startingSessions.delete(sessionKey);
+			startingToKill.push(starting);
+			continue;
+		}
+		starting.ownerIds.delete(ownerId);
+	}
+	for (const session of toKill) {
+		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
+	}
+	const started = await Promise.allSettled(startingToKill.map(starting => starting.promise));
+	for (const result of started) {
+		if (result.status !== "fulfilled") continue;
+		const session = result.value;
+		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
+		toKill.push(session);
+	}
+	await Promise.all(
+		toKill.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })),
+	);
 }
 
 /**
@@ -177,6 +233,8 @@ export async function smokeTestJsEvalWorker(): Promise<void> {
 		worker,
 		state: "alive",
 		pending: new Map(),
+		ownerIds: new Set(),
+		hasFallbackOwner: false,
 	};
 	try {
 		await initWorker(session, { cwd: process.cwd(), sessionId: "smoke" }, WORKER_INIT_TIMEOUT_MS);
@@ -243,15 +301,25 @@ async function runOnce(
 	}
 }
 
-async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, timeoutMs?: number): Promise<JsSession> {
+async function acquireSession(
+	sessionKey: string,
+	snapshot: SessionSnapshot,
+	timeoutMs?: number,
+	ownerId?: string,
+): Promise<JsSession> {
 	const existing = sessions.get(sessionKey);
 	if (existing && existing.state === "alive") {
 		existing.sessionId = snapshot.sessionId;
 		existing.cwd = snapshot.cwd;
+		attachSessionOwner(existing, snapshot.sessionId, ownerId);
 		return existing;
 	}
 	const starting = startingSessions.get(sessionKey);
-	if (starting) return await starting;
+	if (starting) {
+		attachSessionOwner(starting, snapshot.sessionId, ownerId);
+		return await starting.promise;
+	}
+	let startingSession!: StartingJsSession;
 
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
@@ -264,6 +332,8 @@ async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, tim
 			worker,
 			state: "alive",
 			pending: new Map(),
+			ownerIds: new Set(),
+			hasFallbackOwner: false,
 		};
 		// Init headroom is the fixed infrastructure floor; the caller's per-cell timeout
 		// dominates when larger so users can grant more by raising `timeout` on a cell.
@@ -293,14 +363,27 @@ async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, tim
 				session.state = "alive";
 			}
 		}
-		sessions.set(sessionKey, session);
+		session.ownerIds = new Set(startingSession.ownerIds);
+		session.hasFallbackOwner = startingSession.hasFallbackOwner;
+		// Publish only while this startup still owns the key: owner disposal or
+		// a concurrent dispose-all may have already reaped the starting record,
+		// and publishing here would resurrect a context that was just torn down.
+		if (startingSessions.get(sessionKey) === startingSession) {
+			sessions.set(sessionKey, session);
+		}
 		return session;
 	})();
-	startingSessions.set(sessionKey, startup);
+	startingSession = {
+		ownerIds: new Set(),
+		hasFallbackOwner: false,
+		promise: startup,
+	};
+	attachSessionOwner(startingSession, snapshot.sessionId, ownerId);
+	startingSessions.set(sessionKey, startingSession);
 	try {
 		return await startup;
 	} finally {
-		if (startingSessions.get(sessionKey) === startup) startingSessions.delete(sessionKey);
+		if (startingSessions.get(sessionKey) === startingSession) startingSessions.delete(sessionKey);
 	}
 }
 

@@ -1181,21 +1181,46 @@ export function isCompiledGrammarTooLargeStrictError(
 	);
 }
 
+interface StrictToolsRetryContext {
+	model: OpenAIModelIdentity;
+	strictToolsApplied: boolean;
+	tools: Tool[] | undefined;
+}
+
+/** Decide whether an OpenAI-family request should retry once with non-strict tools. */
 export function shouldRetryWithoutStrictTools(
 	error: unknown,
 	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
-	strictToolsApplied: boolean,
-	tools: Tool[] | undefined,
+	context: StrictToolsRetryContext,
 ): boolean {
+	const { model, strictToolsApplied, tools } = context;
 	if (!tools || tools.length === 0 || !strictToolsApplied) return false;
 	const status = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
 	if (status !== 400 && status !== 422) return false;
+	const errorMessage = error instanceof Error ? error.message.trim() : "";
 	const messageParts = [error instanceof Error ? error.message : undefined, capturedErrorResponse?.bodyText]
 		.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
 		.join("\n");
-	return /wrong_api_format|mixed values for 'strict'|tool[s]?\b.*strict|\bstrict\b.*tool|tool parameters? schema|invalid schema for function|structured[_ -]?outputs?\b[^\n]*(?:not (?:supported|available|enabled)|unsupported)|(?:not support|unsupported)[^\n]*structured[_ -]?outputs?\b/i.test(
-		messageParts,
-	);
+	if (
+		/wrong_api_format|mixed values for 'strict'|tool[s]?\b.*strict|\bstrict\b.*tool|tool parameters? schema|invalid schema for function|structured[_ -]?outputs?\b[^\n]*(?:not (?:supported|available|enabled)|unsupported)|(?:not support|unsupported)[^\n]*structured[_ -]?outputs?\b/i.test(
+			messageParts,
+		)
+	) {
+		return true;
+	}
+	if (model.provider !== "openrouter" || !/^(?:400\s+)?Provider returned error$/i.test(errorMessage)) return false;
+	const body = capturedErrorResponse?.bodyJson;
+	if (body && typeof body === "object" && "error" in body) {
+		const errorBody = body.error;
+		if (errorBody && typeof errorBody === "object" && "metadata" in errorBody) {
+			const metadata = errorBody.metadata;
+			if (metadata && typeof metadata === "object" && "raw" in metadata) {
+				const raw = metadata.raw;
+				if (typeof raw === "string" ? raw.trim().length > 0 : raw != null) return false;
+			}
+		}
+	}
+	return true;
 }
 
 function normalizeOpenAIStableId(value: string | undefined, maxLength: number, hashPrefix: string): string | undefined {

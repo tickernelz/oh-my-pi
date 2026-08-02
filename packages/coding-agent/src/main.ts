@@ -491,6 +491,7 @@ async function runInteractiveMode(
 	}
 
 	if (initialMessage !== undefined) {
+		session.maybeStartTitleGeneration(initialMessage);
 		try {
 			using _keepalive = new EventLoopKeepalive();
 			await session.prompt(initialMessage, { images: initialImages });
@@ -501,6 +502,7 @@ async function runInteractiveMode(
 	}
 
 	for (const message of initialMessages) {
+		session.maybeStartTitleGeneration(message);
 		try {
 			using _keepalive = new EventLoopKeepalive();
 			await session.prompt(message);
@@ -1095,14 +1097,13 @@ export async function buildSessionOptions(
 	}
 
 	// Additional extension paths from CLI
-	const cliExtensionPaths = parsed.noExtensions ? [] : [...(parsed.extensions ?? []), ...(parsed.hooks ?? [])];
+	const cliExtensionPaths = [...(parsed.extensions ?? []), ...(parsed.hooks ?? [])];
 	if (cliExtensionPaths.length > 0) {
 		options.additionalExtensionPaths = cliExtensionPaths;
 	}
 
 	if (parsed.noExtensions) {
 		options.disableExtensionDiscovery = true;
-		options.additionalExtensionPaths = [];
 	}
 
 	return options;
@@ -1135,10 +1136,6 @@ export async function runRootCommand(
 	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
-
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
 	if (parsedArgs.version) {
 		writeStartupNotice(parsedArgs, `${VERSION}\n`);
@@ -1182,15 +1179,31 @@ export async function runRootCommand(
 	// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 	// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
 	// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
-	// `--no-extensions` short-circuits both the factory load and the sub-discovery.
-	if (!parsedArgs.noExtensions) {
-		const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
-		if (cliExtensions.length > 0) {
-			injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir());
-		}
-	}
+	// Explicit roots remain authorized under `--no-extensions`; only ambient
+	// extension discovery is disabled.
+	const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
+	injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir(), {
+		mode: parsedArgs.noExtensions ? "explicit-only" : "merge",
+		replace: true,
+	});
 
 	let cwd = getProjectDir();
+	// Classify the host before opening auth or settings storage so every
+	// session-critical database connection picks the right busy timeout.
+	// See getDbBusyTimeoutMs().
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
+	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	// Only the interactive host renders a focusable Agent Hub / subagent session
+	// tree; declare it so headless subagent optimizations (e.g. skipping replan
+	// title refresh) can tell a focusable process from a print/RPC/eval one.
+	setInteractiveHost(isInteractive);
+	// Create AuthStorage and ModelRegistry upfront
+	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
+	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
+
 	const settingsInstance =
 		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
 	if (parsedArgs.approvalMode) {
@@ -1213,15 +1226,6 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
-	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
-	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
-	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
-	// Only the interactive host renders a focusable Agent Hub / subagent session
-	// tree; declare it so headless subagent optimizations (e.g. skipping replan
-	// title refresh) can tell a focusable process from a print/RPC/eval one.
-	setInteractiveHost(isInteractive);
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
@@ -1595,6 +1599,7 @@ export async function runRootCommand(
 				modelRegistry,
 				settings: settingsInstance,
 				enableLsp: sessionOptions.enableLsp ?? true,
+				eventBus,
 			}),
 			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 		);

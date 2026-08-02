@@ -157,7 +157,6 @@ function mergeAnthropicBetaHeader(callerHeaders: Record<string, string>, beta: s
 const midConversationSystemBeta = "mid-conversation-system-2026-04-07";
 const contextManagementBeta = "context-management-2025-06-27";
 const structuredOutputsBeta = "structured-outputs-2025-12-15";
-const context1mBeta = "context-1m-2025-08-07";
 const thinkingTokenCountBeta = "thinking-token-count-2026-05-13";
 const fallbackCreditBeta = "fallback-credit-2026-06-01";
 const coworkUtilityBetaDefaults = [
@@ -187,15 +186,18 @@ const serverSideFallbackBeta = "server-side-fallback-2026-06-01";
 function buildCoworkBetas(
 	agentRequest: boolean,
 	thinkingRequest: boolean,
-	longContext: boolean,
 	disableStrictTools = false,
 ): readonly string[] {
+	// `context-1m-2025-08-07` is intentionally never advertised. OAuth
+	// subscription credentials have no long-context credit balance, so Anthropic
+	// hard-429s ("Usage credits are required for long context requests") on any
+	// beta-gated 1M model regardless of prompt size (#7238). Natively-1M models
+	// (e.g. claude-sonnet-5) serve their full window without the beta anyway.
 	if (!agentRequest && !disableStrictTools) return coworkUtilityBetaDefaults;
 	const betas: string[] = [];
 	for (const beta of agentRequest ? coworkAgentBetaDefaults : coworkUtilityBetaDefaults) {
 		if (disableStrictTools && beta === structuredOutputsBeta) continue;
 		betas.push(beta);
-		if (agentRequest && longContext && beta === "claude-code-20250219") betas.push(context1mBeta);
 	}
 	if (!agentRequest) return betas;
 	if (thinkingRequest) betas.push(effortBeta);
@@ -245,7 +247,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 	// Cowork's beta profile is part of the OAuth fingerprint; API-key requests
 	// default to extras only, matching the streaming path.
 	const betaHeader = buildBetaHeader(
-		options.coworkBetas ?? (oauthToken ? buildCoworkBetas(true, true, false) : []),
+		options.coworkBetas ?? (oauthToken ? buildCoworkBetas(true, true) : []),
 		extraBetas,
 	);
 	const acceptHeader = oauthToken ? "application/json" : stream ? "text/event-stream" : "application/json";
@@ -2000,7 +2002,7 @@ const streamAnthropicOnce = (
 				| (AnthropicServerToolContent & { [kStreamingPartialJson]?: string })
 				| (ToolCall & { [kStreamingPartialJson]: string; [kStreamingLastParseLen]?: number })
 			) & { [kStreamingBlockIndex]: number };
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(model.compat.streamIdleTimeoutMs);
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
@@ -2977,14 +2979,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
 		allowAnthropicHeaderOverrides: model.compat.allowAnthropicHeaderOverrides,
 		claudeCodeSessionId,
-		coworkBetas: oauthToken
-			? buildCoworkBetas(
-					hasTools || thinkingEnabled,
-					thinkingEnabled,
-					(model.contextWindow ?? 0) >= 1_000_000,
-					disableStrictTools,
-				)
-			: [],
+		coworkBetas: oauthToken ? buildCoworkBetas(hasTools || thinkingEnabled, thinkingEnabled, disableStrictTools) : [],
 	});
 
 	if (model.provider === "cloudflare-ai-gateway") {
