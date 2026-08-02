@@ -118,7 +118,8 @@ updates never rewrite anything a scrolled reader could be looking at.
 **ED3 (`CSI 3 J`) is emitted in exactly one place** — `#emitFullPaint` with
 `clearScrollback: true` — and is reached only by user gestures: session
 replace/branch/resume (`requestRender(true, { clearScrollback: true })`),
-resize outside a multiplexer, `resetDisplay()` (Ctrl+L). It clears native
+resize outside a multiplexer, `resetDisplay()` (the display-reset chord,
+`Alt+L` by default). It clears native
 history without `ED2` first; the replay overwrites every row from home so
 terminals without synchronized output do not expose a blank viewport. A gesture
 pins the user to the tail, so the history snap is acceptable; multiplexers never

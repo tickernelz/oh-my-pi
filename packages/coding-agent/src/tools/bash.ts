@@ -843,13 +843,18 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			return { kind: "steer" };
 		}
 
+		// Cancellable threshold: a bare Bun.sleep(thresholdMs) leaves a live, ref'd
+		// timer for the full threshold after the command finishes (or abort/steer)
+		// wins the race first — delaying SDK/headless shutdown and accumulating
+		// timers under fast command rates. Settle a withResolvers promise from
+		// setTimeout so the finally can clear it regardless of which waiter wins.
+		const { promise: thresholdPromise, resolve: resolveThreshold } = Promise.withResolvers<{
+			kind: "running";
+		}>();
+		const thresholdTimer = setTimeout(() => resolveThreshold({ kind: "running" }), thresholdMs);
 		const waiters: Array<
 			Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "steer" } | { kind: "aborted" }>
-		> = [job.completion, Bun.sleep(thresholdMs).then(() => ({ kind: "running" as const }))];
-
-		if (!signal && !steeringSignal) {
-			return await Promise.race(waiters);
-		}
+		> = [job.completion, thresholdPromise];
 
 		const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<{ kind: "aborted" }>();
 		const onAbort = () => resolveAborted({ kind: "aborted" });
@@ -866,6 +871,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		try {
 			return await Promise.race(waiters);
 		} finally {
+			clearTimeout(thresholdTimer);
 			signal?.removeEventListener("abort", onAbort);
 			steeringSignal?.removeEventListener("abort", onSteer);
 		}
@@ -920,7 +926,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const rules = this.session.settings.getBashInterceptorRules();
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules);
+				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
 				if (interception.block) {
 					throw new ToolError(interception.message ?? "Command blocked");
 				}

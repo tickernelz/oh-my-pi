@@ -85,6 +85,7 @@ describe("Bedrock inference profile ARNs", () => {
 		const { promise, resolve } = Promise.withResolvers<unknown>();
 
 		void streamBedrock(profileModel, context, {
+			bearerToken: "test-token",
 			signal: controller.signal,
 			reasoning: Effort.High,
 			maxTokens: 16,

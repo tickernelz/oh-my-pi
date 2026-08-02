@@ -14,14 +14,17 @@ export interface SessionStorageStat {
 
 export interface SessionStorageWriter {
 	/**
-	 * Append one newline-terminated line. File and memory storage perform the
-	 * write synchronously in-body; indexed backends queue in call order.
+	 * Append one newline-terminated line. File storage batches same-turn appends
+	 * until its microtask boundary; memory storage updates in-body; indexed
+	 * backends queue in call order.
 	 *
 	 * `line` MUST include the trailing newline.
 	 */
 	append(line: string): Promise<void>;
 	/** Resolve once all queued appends complete. No fsync. */
 	flush(): Promise<void>;
+	/** Drain synchronously flushable queued work when the backend supports it. No fsync. */
+	flushSync?(): void;
 	/** False once close() has begun/finished. */
 	isOpen(): boolean;
 	close(): Promise<void>;
@@ -91,6 +94,8 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#closed = false;
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
+	#pending = "";
+	#flushScheduled = false;
 
 	constructor(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
 		this.#onError = options?.onError;
@@ -113,25 +118,46 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	async append(line: string): Promise<void> {
-		if (this.#closed) throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
-		try {
-			const buf = Buffer.from(line, "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(this.#fd, buf, offset, buf.length - offset);
-				if (written === 0) {
-					throw new Error("Short write");
-				}
-				offset += written;
+	#writeNow(line: string): void {
+		const buf = Buffer.from(line, "utf-8");
+		let offset = 0;
+		while (offset < buf.length) {
+			const written = fs.writeSync(this.#fd, buf, offset, buf.length - offset);
+			if (written === 0) {
+				throw new Error("Short write");
 			}
-		} catch (err) {
-			throw this.#recordError(err);
+			offset += written;
 		}
 	}
 
+	#flushPendingNow(): void {
+		this.#flushScheduled = false;
+		if (this.#pending.length === 0) return;
+		const pending = this.#pending;
+		this.#pending = "";
+		try {
+			this.#writeNow(pending);
+		} catch (err) {
+			this.#recordError(err);
+		}
+	}
+
+	async append(line: string): Promise<void> {
+		if (this.#closed) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		this.#pending += line;
+		if (this.#flushScheduled) return;
+		this.#flushScheduled = true;
+		queueMicrotask(() => this.#flushPendingNow());
+	}
+
 	async flush(): Promise<void> {
+		this.#flushPendingNow();
+		if (this.#error) throw this.#error;
+	}
+
+	flushSync(): void {
+		this.#flushPendingNow();
 		if (this.#error) throw this.#error;
 	}
 
@@ -141,6 +167,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 
 	async close(): Promise<void> {
 		if (this.#closed) return;
+		this.#flushPendingNow();
 		this.#closed = true;
 		// Unregister from finalization - we're closing properly
 		writerRegistry.unregister(this);
@@ -149,6 +176,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		} catch {
 			// Ignore close errors
 		}
+		if (this.#error) throw this.#error;
 	}
 
 	getError(): Error | undefined {
@@ -476,6 +504,10 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	}
 
 	async flush(): Promise<void> {
+		if (this.#error) throw this.#error;
+	}
+
+	flushSync(): void {
 		if (this.#error) throw this.#error;
 	}
 

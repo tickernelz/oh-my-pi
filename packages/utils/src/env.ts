@@ -258,9 +258,13 @@ export function $envpos(name: string, defaultValue: number): number {
 	return parsed;
 }
 
-/** True when `BUN_ENV` or `NODE_ENV` is the string `test`. */
+const BUN_TEST_ENTRY_PATTERN = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+
+/** True when the process is an explicitly marked test child or Bun is running a test entrypoint. */
 export function isBunTestRuntime(): boolean {
-	return Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
+	if (Bun.env.PI_TEST_RUNTIME === "1") return true;
+	const hasTestEnvironment = Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
+	return hasTestEnvironment && BUN_TEST_ENTRY_PATTERN.test(Bun.main);
 }
 
 let terminalHeadless = isBunTestRuntime();
@@ -312,6 +316,23 @@ export function setInteractiveHost(interactive: boolean): boolean {
 	const previous = interactiveHost;
 	interactiveHost = interactive;
 	return previous;
+}
+
+/**
+ * SQLite `busy_timeout` for the session-critical databases (agent.db,
+ * history.db, stats.db).
+ *
+ * Interactive hosts tolerate a longer synchronous wait on lock contention
+ * (SQLITE_BUSY during WAL recovery/checkpoint — see oh-my-pi#2421): the
+ * operator sees a brief freeze and the statement eventually completes.
+ * Headless hosts (print/RPC/ACP/eval/SDK) run a protocol on the same thread —
+ * a multi-second synchronous busy-wait freezes their event loop and stalls
+ * every in-flight frame with no liveness signal, so they use a short timeout
+ * and rely on the existing asynchronous open/retry paths to recover from
+ * contention instead of blocking.
+ */
+export function getDbBusyTimeoutMs(): number {
+	return isInteractiveHost() ? 5000 : 1000;
 }
 
 /**

@@ -99,6 +99,25 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
 	});
 
+	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
+		const dirA = tempDir.join("dirA");
+		const dirB = tempDir.join("dirB");
+		fs.mkdirSync(dirA, { recursive: true });
+		fs.mkdirSync(dirB, { recursive: true });
+		const movableSessionManager = SessionManager.inMemory(dirA);
+
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(result.extensions, result.runtime, dirA, movableSessionManager, modelRegistry);
+
+		expect(runner.cwd).toBe(dirA);
+		expect(runner.createContext().cwd).toBe(dirA);
+
+		await movableSessionManager.moveTo(dirB);
+
+		expect(runner.cwd).toBe(dirB);
+		expect(runner.createContext().cwd).toBe(dirB);
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
@@ -3105,6 +3124,93 @@ describe("ExtensionRunner", () => {
 			} finally {
 				vi.useRealTimers();
 			}
+		});
+	});
+
+	describe("invokeTool same-tool delegation", () => {
+		// Records what the native tool actually received, so the inherited abort/progress channels and
+		// the caller context are observable.
+		function nativeProbe(seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown }): AgentTool {
+			return {
+				name: "bash",
+				label: "Bash",
+				description: "native bash",
+				parameters: Type.Object({ command: Type.String() }),
+				execute: async (_id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => {
+					seen.params = params;
+					seen.signal = signal;
+					seen.onUpdate = onUpdate;
+					return { content: [{ type: "text", text: "native ran" }], details: {} };
+				},
+			} as AgentTool;
+		}
+
+		const runnerWithNative = async (native: AgentTool) => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.setNativeToolResolver(name =>
+				name === native.name ? { tool: native, makeContext: () => ({}) as never } : undefined,
+			);
+			return runner;
+		};
+
+		it("inherits the wrapper call's signal and onUpdate for a bare invokeTool", async () => {
+			const seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
+			const runner = await runnerWithNative(nativeProbe(seen));
+			const controller = new AbortController();
+			const onUpdate = () => {};
+
+			const ctx = runner.createContext(undefined, {
+				toolName: "bash",
+				signal: controller.signal,
+				onUpdate,
+			});
+			await ctx.invokeTool?.({ command: "echo hi" });
+
+			// Aborting the outer tool call must reach the native one, and native progress must stream.
+			expect(seen.signal).toBe(controller.signal);
+			expect(seen.onUpdate).toBe(onUpdate);
+			expect(seen.params).toEqual({ command: "echo hi" });
+		});
+
+		it("lets explicit invokeTool options override the inherited channels", async () => {
+			const seen: { signal?: AbortSignal; onUpdate?: unknown; params?: unknown } = {};
+			const runner = await runnerWithNative(nativeProbe(seen));
+			const outer = new AbortController();
+			const inner = new AbortController();
+			const innerOnUpdate = () => {};
+
+			const ctx = runner.createContext(undefined, {
+				toolName: "bash",
+				signal: outer.signal,
+				onUpdate: () => {},
+			});
+			await ctx.invokeTool?.({ command: "echo hi" }, { signal: inner.signal, onUpdate: innerOnUpdate });
+
+			expect(seen.signal).toBe(inner.signal);
+			expect(seen.onUpdate).toBe(innerOnUpdate);
+		});
+
+		it("omits invokeTool when no native built-in of that name exists", async () => {
+			const runner = await runnerWithNative(nativeProbe({}));
+			expect(runner.createContext(undefined, { toolName: "not_a_builtin" }).invokeTool).toBeUndefined();
+			// Also absent when the context is not scoped to a tool at all.
+			expect(runner.createContext().invokeTool).toBeUndefined();
+		});
+
+		it("bounds recursion per call chain", async () => {
+			const runner = await runnerWithNative(nativeProbe({}));
+			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 8 })).rejects.toThrow(
+				/delegation depth exceeded/,
+			);
+			// A fresh chain at depth 0 is unaffected by another chain's depth.
+			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 0 })).resolves.toBeDefined();
 		});
 	});
 });

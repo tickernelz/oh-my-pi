@@ -464,6 +464,21 @@ export interface ExtensionContext {
 	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
 	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
 	clearTimer(timer: Timer): void;
+	/**
+	 * Run the NATIVE built-in implementation of the tool this handler re-registered, with `params`,
+	 * and return its result. Lets a tool that re-registers a built-in (e.g. wrapping `write` to add
+	 * logging or a policy check) delegate to the original instead of reimplementing it — the native
+	 * tool performs its own side effects and internal bookkeeping.
+	 *
+	 * Delegation is same-tool only: it invokes the built-in of the SAME name as the registering tool,
+	 * never an arbitrary target, so it cannot escalate past the approval already granted for this
+	 * call. Present only when a native built-in of that name exists (undefined otherwise, e.g. for a
+	 * net-new tool that shadows no built-in). Recursion is depth-guarded per call chain.
+	 */
+	invokeTool?<TDetails = unknown>(
+		params: Record<string, unknown>,
+		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
+	): Promise<AgentToolResult<TDetails>>;
 }
 
 /**

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import type { McpToolDefinition } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import type { ConversationStep, McpToolDefinition } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -76,15 +76,19 @@ import {
 	LsSuccessSchema,
 	McpAllowlistPrecheckResultSchema,
 	McpApprovedSchema,
+	McpArgsSchema,
 	McpErrorSchema,
 	McpImageContentSchema,
 	McpRejectedSchema,
 	McpResultSchema,
 	McpSuccessSchema,
 	McpTextContentSchema,
+	McpToolCallSchema,
 	McpToolDefinitionSchema,
+	McpToolErrorSchema,
 	McpToolNotFoundSchema,
 	McpToolResultContentItemSchema,
+	McpToolResultSchema,
 	ModelDetailsSchema,
 	ReadErrorSchema,
 	ReadMcpResourceErrorSchema,
@@ -124,6 +128,8 @@ import {
 	SubagentAwaitResultSchema,
 	SubagentErrorSchema,
 	SubagentResultSchema,
+	ThinkingMessageSchema,
+	ToolCallSchema,
 	UserMessageActionSchema,
 	UserMessageSchema,
 	WebFetchAllowlistPrecheckResultSchema,
@@ -134,6 +140,7 @@ import {
 	WriteShellStdinResultSchema,
 	WriteSuccessSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import { isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
@@ -3914,9 +3921,8 @@ function handleConversationCheckpointUpdate(
 	if (usedTokens <= 0) {
 		return;
 	}
-	if (output.usage.output !== usedTokens) {
-		output.usage.output = usedTokens;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
+	if (output.usage.contextTokens !== usedTokens) {
+		output.usage.contextTokens = usedTokens;
 	}
 }
 
@@ -4047,16 +4053,74 @@ function cursorUserContentKey(content: string | (TextContent | ImageContent)[]):
 	return hash.digest("hex");
 }
 
-/**
- * Extract text content from an assistant message.
- */
-function extractAssistantMessageText(msg: Message): string {
-	if (msg.role !== "assistant") return "";
-	if (!Array.isArray(msg.content)) return "";
-	return msg.content
-		.filter((c): c is TextContent => c.type === "text")
-		.map(c => c.text)
-		.join("\n");
+type CursorRootPromptAssistantContentPart =
+	| { type: "text"; text: string }
+	| {
+			type: "reasoning";
+			text: string;
+			providerOptions: { cursor: { modelName: string } };
+			signature?: string;
+	  }
+	| { type: "tool-call"; toolCallId: string; toolName: string; args: Record<string, unknown> };
+
+function canReplayCursorThinking(msg: AssistantMessage, targetModelId: string | undefined): boolean {
+	return (
+		targetModelId !== undefined &&
+		isKimiK3ModelId(targetModelId) &&
+		msg.api === "cursor-agent" &&
+		msg.provider === "cursor" &&
+		msg.model === targetModelId
+	);
+}
+
+function buildCursorAssistantContent(
+	msg: AssistantMessage,
+	targetModelId: string | undefined,
+): CursorRootPromptAssistantContentPart[] {
+	const content: CursorRootPromptAssistantContentPart[] = [];
+	const replayThinking = canReplayCursorThinking(msg, targetModelId);
+	for (const item of msg.content) {
+		if (item.type === "text") {
+			if (item.text) content.push({ type: "text", text: item.text });
+		} else if (item.type === "thinking") {
+			if (replayThinking && item.thinking) {
+				content.push({
+					type: "reasoning",
+					text: item.thinking,
+					providerOptions: { cursor: { modelName: msg.model } },
+					...(item.thinkingSignature ? { signature: item.thinkingSignature } : {}),
+				});
+			}
+		} else if (item.type === "toolCall") {
+			content.push({
+				type: "tool-call",
+				toolCallId: item.id,
+				toolName: item.name,
+				args: item.arguments,
+			});
+		}
+	}
+	return content;
+}
+
+function assertCursorKimiK3HistoryReplayable(
+	messages: Message[],
+	activeUserMessageIndex: number,
+	targetModelId: string | undefined,
+): void {
+	if (!targetModelId || !isKimiK3ModelId(targetModelId)) return;
+	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
+	for (let i = 0; i < historyEnd; i++) {
+		const msg = messages[i];
+		if (msg.role !== "assistant") continue;
+		const isSameCursorModel = msg.api === "cursor-agent" && msg.provider === "cursor" && msg.model === targetModelId;
+		const hasThinking = msg.content.some(item => item.type === "thinking" && item.thinking.length > 0);
+		if (!isSameCursorModel || !hasThinking) {
+			throw new AIError.ValidationError(
+				`Cursor ${targetModelId} requires complete same-model thinking history; start a new session instead of continuing history from ${msg.provider}/${msg.model}.`,
+			);
+		}
+	}
 }
 
 /**
@@ -4107,7 +4171,9 @@ function buildRootPromptMessagesJson(
 	systemPromptIds: Uint8Array[],
 	blobStore: Map<string, Uint8Array>,
 	activeUserMessageIndex = findLastUserMessageIndex(messages),
+	targetModelId?: string,
 ): Uint8Array[] {
+	assertCursorKimiK3HistoryReplayable(messages, activeUserMessageIndex, targetModelId);
 	const entries: Uint8Array[] = [...systemPromptIds];
 	const pushJson = (obj: unknown) => {
 		const bytes = new TextEncoder().encode(JSON.stringify(obj));
@@ -4122,21 +4188,114 @@ function buildRootPromptMessagesJson(
 			if (content.length === 0) continue;
 			pushJson({ role: "user", content });
 		} else if (msg.role === "assistant") {
-			const text = extractAssistantMessageText(msg);
-			if (!text) continue;
-			pushJson({ role: "assistant", content: [{ type: "text", text }] });
+			const content = buildCursorAssistantContent(msg, targetModelId);
+			if (content.length === 0) continue;
+			pushJson({ role: "assistant", content });
 		} else if (msg.role === "toolResult") {
-			const text = toolResultToText(msg);
-			if (!text) continue;
-			const prefix = msg.isError ? "[Tool Error]" : "[Tool Result]";
+			// Emit even when the result text is empty: the assistant `tool-call` is
+			// already in history, so dropping the pair would replay an orphaned call.
 			pushJson({
-				role: "user",
-				content: [{ type: "text", text: `${prefix}\n${text}` }],
+				role: "tool",
+				id: msg.toolCallId,
+				content: [
+					{
+						type: "tool-result",
+						toolName: msg.toolName,
+						toolCallId: msg.toolCallId,
+						result: toolResultToText(msg),
+						...(msg.isError ? { isError: true } : {}),
+					},
+				],
 			});
 		}
 	}
 
 	return entries;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (Array.isArray(value)) return value.every(isJsonValue);
+	if (!isPlainRecord(value)) return false;
+	for (const key in value) {
+		if (!isJsonValue(value[key])) return false;
+	}
+	return true;
+}
+
+function encodeCursorMcpArguments(toolCall: ToolCall): Record<string, Uint8Array> {
+	const encoded: Record<string, Uint8Array> = {};
+	for (const name in toolCall.arguments) {
+		const value = toolCall.arguments[name];
+		if (value === undefined) continue;
+		if (!isJsonValue(value)) {
+			throw new AIError.ValidationError(`Cursor tool argument ${toolCall.name}.${name} is not JSON-serializable`);
+		}
+		encoded[name] = toBinary(ValueSchema, fromJson(ValueSchema, value));
+	}
+	return encoded;
+}
+
+function createCursorMcpResult(result: ToolResultMessage) {
+	if (result.isError) {
+		return create(McpToolResultSchema, {
+			result: {
+				case: "error",
+				value: create(McpToolErrorSchema, { error: toolResultToText(result) }),
+			},
+		});
+	}
+	return create(McpToolResultSchema, {
+		result: {
+			case: "success",
+			value: create(McpSuccessSchema, {
+				content: result.content.map(item =>
+					item.type === "text"
+						? create(McpToolResultContentItemSchema, {
+								content: { case: "text", value: create(McpTextContentSchema, { text: item.text }) },
+							})
+						: create(McpToolResultContentItemSchema, {
+								content: {
+									case: "image",
+									value: create(McpImageContentSchema, {
+										data: Uint8Array.from(Buffer.from(item.data, "base64")),
+										mimeType: item.mimeType,
+									}),
+								},
+							}),
+				),
+			}),
+		},
+	});
+}
+
+function createCursorToolCallStep(toolCall: ToolCall, result: ToolResultMessage | undefined) {
+	const mcpCall = create(McpToolCallSchema, {
+		args: create(McpArgsSchema, {
+			name: toolCall.name,
+			args: encodeCursorMcpArguments(toolCall),
+			toolCallId: toolCall.id,
+			providerIdentifier: "pi-agent",
+			toolName: toolCall.name,
+		}),
+		...(result ? { result: createCursorMcpResult(result) } : {}),
+	});
+	return create(ConversationStepSchema, {
+		message: {
+			case: "toolCall",
+			value: create(ToolCallSchema, {
+				tool: { case: "mcpToolCall", value: mcpCall },
+				toolCallId: toolCall.id,
+			}),
+		},
+	});
 }
 
 /**
@@ -4151,28 +4310,32 @@ function buildConversationTurns(
 	messages: Message[],
 	blobStore: Map<string, Uint8Array>,
 	activeUserMessageIndex = findLastUserMessageIndex(messages),
+	targetModelId?: string,
 ): Uint8Array[] {
 	const turns: Uint8Array[] = [];
+	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
+	const toolResults = new Map<string, ToolResultMessage>();
+	const pairedToolCallIds = new Set<string>();
+	for (let index = 0; index < historyEnd; index++) {
+		const message = messages[index];
+		if (message.role === "toolResult") {
+			toolResults.set(message.toolCallId, message);
+		} else if (message.role === "assistant") {
+			for (const item of message.content) {
+				if (item.type === "toolCall") pairedToolCallIds.add(item.id);
+			}
+		}
+	}
 
-	// Find turn boundaries - each turn starts with a user message
 	let i = 0;
 	while (i < messages.length) {
 		const msg = messages[i];
-
-		// Skip non-user messages at the start
 		if (msg.role !== "user" && msg.role !== "developer") {
 			i++;
 			continue;
 		}
+		if (i === activeUserMessageIndex) break;
 
-		// The active user message goes in the action, not turns. A prior user
-		// followed by assistant/tool-result messages is complete history and
-		// must remain serialized for resume actions.
-		if (i === activeUserMessageIndex) {
-			break;
-		}
-
-		// Create and serialize user message
 		const userText = extractUserMessageText(msg);
 		if (userText.length === 0 && !hasUserMessageImages(msg)) {
 			i++;
@@ -4184,29 +4347,42 @@ function buildConversationTurns(
 			userText,
 			deterministicUuid(`u:${turns.length}:${cursorUserContentKey(msg.content)}`),
 		);
-		const userMessageBytes = toBinary(UserMessageSchema, userMessage);
-		const userMessageBlobId = storeCursorBlob(blobStore, userMessageBytes);
-
-		// Collect and serialize steps until next user message
+		const userMessageBlobId = storeCursorBlob(blobStore, toBinary(UserMessageSchema, userMessage));
 		const stepBlobIds: Uint8Array[] = [];
 		i++;
 
 		while (i < messages.length && messages[i].role !== "user" && messages[i].role !== "developer") {
 			const stepMsg = messages[i];
-
 			if (stepMsg.role === "assistant") {
-				const text = extractAssistantMessageText(stepMsg);
-				if (text) {
-					const step = create(ConversationStepSchema, {
-						message: {
-							case: "assistantMessage",
-							value: create(AssistantMessageSchema, { text }),
-						},
-					});
+				for (const item of stepMsg.content) {
+					let step: ConversationStep;
+					if (item.type === "text") {
+						if (!item.text) continue;
+						step = create(ConversationStepSchema, {
+							message: {
+								case: "assistantMessage",
+								value: create(AssistantMessageSchema, { text: item.text }),
+							},
+						});
+					} else if (item.type === "thinking") {
+						// Same guard as root-prompt replay: only same-model Cursor K3
+						// thinking is replayed, so foreign/hidden reasoning never leaks
+						// into Cursor's turn history as native thinking.
+						if (!item.thinking || !canReplayCursorThinking(stepMsg, targetModelId)) continue;
+						step = create(ConversationStepSchema, {
+							message: {
+								case: "thinkingMessage",
+								value: create(ThinkingMessageSchema, { text: item.thinking }),
+							},
+						});
+					} else if (item.type === "toolCall") {
+						step = createCursorToolCallStep(item, toolResults.get(item.id));
+					} else {
+						continue;
+					}
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
 				}
-			} else if (stepMsg.role === "toolResult") {
-				// Include tool results as assistant text for context
+			} else if (stepMsg.role === "toolResult" && !pairedToolCallIds.has(stepMsg.toolCallId)) {
 				const text = toolResultToText(stepMsg);
 				if (text) {
 					const prefix = stepMsg.isError ? "[Tool Error]" : "[Tool Result]";
@@ -4219,12 +4395,9 @@ function buildConversationTurns(
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
 				}
 			}
-
 			i++;
 		}
 
-		// Create the serialized turn using Structure types. The bytes fields
-		// (user_message, steps) are blob IDs resolved through the KV store.
 		const agentTurn = create(AgentConversationTurnStructureSchema, {
 			userMessage: userMessageBlobId,
 			steps: stepBlobIds,
@@ -4245,18 +4418,23 @@ function buildConversationTurns(
 export function buildCursorHistoryForTest(
 	messages: Message[],
 	activeUserMessageIndex = findLastUserMessageIndex(messages),
+	targetModelId?: string,
 ): {
 	rootPromptMessagesJson: unknown[];
 	turnUserMessagesJson: JsonValue[];
 	turnStepMessagesJson: JsonValue[][];
 } {
 	const blobStore = new Map<string, Uint8Array>();
-	const rootPromptMessagesJson = buildRootPromptMessagesJson(messages, [], blobStore, activeUserMessageIndex).map(
-		blobId => JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))),
-	);
+	const rootPromptMessagesJson = buildRootPromptMessagesJson(
+		messages,
+		[],
+		blobStore,
+		activeUserMessageIndex,
+		targetModelId,
+	).map(blobId => JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))));
 	const turnUserMessagesJson: JsonValue[] = [];
 	const turnStepMessagesJson: JsonValue[][] = [];
-	for (const turnBlobId of buildConversationTurns(messages, blobStore, activeUserMessageIndex)) {
+	for (const turnBlobId of buildConversationTurns(messages, blobStore, activeUserMessageIndex, targetModelId)) {
 		const turn = fromBinary(ConversationTurnStructureSchema, readCursorBlob(blobStore, turnBlobId));
 		if (turn.turn.case !== "agentConversationTurn") {
 			continue;
@@ -4360,7 +4538,12 @@ function buildGrpcRequest(
 
 	// Build conversation turns from prior messages, excluding only the active user message
 	// when the request is sending one. Resume actions must preserve trailing tool results.
-	const turns = buildConversationTurns(context.messages, blobStore, activeUserMessage ? activeUserMessageIndex : -1);
+	const turns = buildConversationTurns(
+		context.messages,
+		blobStore,
+		activeUserMessage ? activeUserMessageIndex : -1,
+		model.id,
+	);
 
 	// Build `rootPromptMessagesJson` from prior messages. Cursor's server uses this
 	// field (not `turns[]`) to construct the actual model prompt; if we only send the
@@ -4371,6 +4554,7 @@ function buildGrpcRequest(
 		systemPromptIds,
 		blobStore,
 		activeUserMessage ? activeUserMessageIndex : -1,
+		model.id,
 	);
 
 	// Preserve cached non-history state fields (todos, file states, summaries, etc.)

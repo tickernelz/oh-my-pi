@@ -27,6 +27,8 @@ import {
 	ConnectScmSuccessSchema,
 	ConnectScmToolCallSchema,
 	ConversationSearchArgsSchema,
+	ConversationStateStructureSchema,
+	ConversationTokenDetailsSchema,
 	type ExecServerMessage,
 	ExecServerMessageSchema,
 	ExecuteHookArgsSchema,
@@ -196,6 +198,39 @@ function soleResult(frames: AgentClientMessage[]) {
 describe("Cursor modern exec protocol activation", () => {
 	it("advertises the client build whose schema includes modern exec frames", () => {
 		expect(CURSOR_CLIENT_VERSION).toBe("cli-2026.07.23-e383d2b");
+	});
+});
+
+describe("Cursor conversation checkpoints", () => {
+	it("records checkpoint-only occupancy without billing it as token usage", async () => {
+		const output = cursorAssistantMessage();
+
+		await handleServerMessage(
+			create(AgentServerMessageSchema, {
+				message: {
+					case: "conversationCheckpointUpdate",
+					value: create(ConversationStateStructureSchema, {
+						tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 120_000 }),
+					}),
+				},
+			}),
+			output,
+			new AssistantMessageEventStream(),
+			newBlockState(),
+			new Map(),
+			{ write: () => true } as unknown as Parameters<typeof handleServerMessage>[5],
+			undefined,
+			undefined,
+			{ sawTokenDelta: false },
+			[],
+		);
+
+		expect(output.usage).toMatchObject({
+			contextTokens: 120_000,
+			input: 0,
+			output: 0,
+			totalTokens: 0,
+		});
 	});
 });
 

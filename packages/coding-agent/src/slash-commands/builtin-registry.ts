@@ -33,9 +33,9 @@ import {
 } from "../extensibility/plugins/marketplace";
 import { handleLcmCommand, LCM_SUBCOMMANDS } from "../lcm/slash-command";
 import { readMCPConfigFile } from "../mcp/config-writer";
-import { resolveMemoryBackend } from "../memory-backend";
+import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
-import { collectMcpServerNames } from "../modes/controllers/mcp-command-controller";
+import { collectMcpServerNames, MCPCommandController } from "../modes/controllers/mcp-command-controller";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
@@ -1957,7 +1957,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				case "diagnose": {
 					const hook = verb === "stats" ? backend.stats : backend.diagnose;
 					const payload = await hook?.(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
-					await runtime.output(payload ?? `Memory ${verb} is not available for the ${backend.id} backend.`);
+					await runtime.output(payload ?? memoryStatsUnavailableMessage(backend.id, verb));
 					return commandConsumed();
 				}
 				case "mm":
@@ -2639,13 +2639,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			return commandConsumed();
 		},
 		handleTui: async (_command, runtime) => {
-			// Invalidate registry fs caches and the plugin roots cache so
-			// listClaudePluginRoots re-reads from disk on next access.
-			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
-			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-			await runtime.ctx.refreshSkillState();
-			await runtime.ctx.refreshSlashCommandState();
-			resetCapabilities();
+			await reloadTuiPluginState(runtime.ctx);
 			runtime.ctx.showStatus("Plugins reloaded.");
 			runtime.ctx.editor.setText("");
 		},
@@ -3071,6 +3065,24 @@ export function buildTuiBuiltinSlashCommands(runtime: TuiSlashCommandRuntime): R
 export const BUILTIN_SLASH_COMMANDS_INTERNAL: ReadonlyArray<SlashCommandSpec> = BUILTIN_SLASH_COMMAND_REGISTRY;
 
 /**
+ * Reload the interactive session's plugin runtime: invalidate fs/plugin-root
+ * caches, rediscover skills and file slash commands, reset the capability
+ * cache, and reconnect MCP servers (rebinding the session's MCP tools). Shared
+ * by `/reload-plugins`'s TUI handler and the `handle`-adapter's `reloadPlugins`
+ * hook so both honor the command's documented MCP reload scope (#7189).
+ */
+async function reloadTuiPluginState(ctx: InteractiveModeContext): Promise<void> {
+	const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
+	clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+	await ctx.refreshSkillState();
+	await ctx.refreshSlashCommandState();
+	resetCapabilities();
+	if (ctx.mcpManager) {
+		await new MCPCommandController(ctx).reloadServers();
+	}
+}
+
+/**
  * Execute a builtin slash command in the interactive TUI.
  *
  * Returns `false` when no builtin matched. Returns `true` when a command
@@ -3118,13 +3130,7 @@ export async function executeBuiltinSlashCommand(
 				ctx.showStatus(text);
 			},
 			refreshCommands: () => ctx.refreshSlashCommandState(),
-			reloadPlugins: async () => {
-				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
-				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-				await ctx.refreshSkillState();
-				await ctx.refreshSlashCommandState();
-				resetCapabilities();
-			},
+			reloadPlugins: () => reloadTuiPluginState(ctx),
 		};
 		const result = await command.handle(parsed, adapted);
 		ctx.editor.setText("");

@@ -18,8 +18,8 @@ const AWS_DOCUMENTED_OPUS_5_IDS = [
 	"global.anthropic.claude-opus-5",
 ];
 
-// A representative `models.dev` "amazon-bedrock" payload for Claude Opus 5.
-// models.dev lists each inference-profile prefix as its own row (the `eu.`
+// A representative `stencil.so` "amazon-bedrock" payload for Claude Opus 5.
+// stencil.so lists each inference-profile prefix as its own row (the `eu.`
 // row even carries distinct EU pricing), including the `jp.` profile that AWS
 // does not actually expose for this model. We reproduce that shape so the test
 // exercises the real source → catalog path — `mapModelsDevToModels` plus the
@@ -65,7 +65,7 @@ const OPUS_5_MODELS_DEV_FIXTURE = {
 
 describe("Amazon Bedrock Claude Opus 5", () => {
 	test("source mapping plus generation policy yields exactly the AWS-documented inference-profile IDs", () => {
-		// Guard the source (models.dev descriptor + exclusion policy), not the
+		// Guard the source (stencil.so descriptor + exclusion policy), not the
 		// bundled snapshot: the assertion must break if the mapping or policy
 		// stops reproducing the documented IDs, and must not falsely fail when
 		// upstream metadata legitimately shifts.
@@ -80,10 +80,10 @@ describe("Amazon Bedrock Claude Opus 5", () => {
 
 		// Set semantics: the descriptor also derives an `eu.` variant from the
 		// bare `anthropic.` row, so `eu.` legitimately arrives from both that
-		// derivation and the standalone models.dev row (deduped downstream by
+		// derivation and the standalone stencil.so row (deduped downstream by
 		// the generator). We assert the documented ID coverage, not row count.
 		expect(new Set(opus5Ids)).toEqual(new Set(AWS_DOCUMENTED_OPUS_5_IDS));
-		// `models.dev` lists `jp.anthropic.claude-opus-5`, but Bedrock has no such
+		// `stencil.so` lists `jp.anthropic.claude-opus-5`, but Bedrock has no such
 		// inference profile for this model and would reject it, so the generation
 		// policy must drop it before it reaches the catalog.
 		expect(opus5Ids).not.toContain("jp.anthropic.claude-opus-5");

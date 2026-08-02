@@ -2323,10 +2323,13 @@ export function setAutoThemeMapping(mode: "dark" | "light", themeName: string): 
  * The terminal layer queries OSC 11 (background color) and computes luminance;
  * Mode 2031 notifications trigger re-queries rather than providing the value directly.
  */
-export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
+export function onTerminalAppearanceChange(
+	mode: "dark" | "light",
+	event: ThemeChangeEvent = { ephemeral: true },
+): void {
 	if (terminalReportedAppearance === mode) return;
 	terminalReportedAppearance = mode;
-	reevaluateAutoTheme("terminal appearance");
+	reevaluateAutoTheme("terminal appearance", event);
 }
 
 export function setThemeInstance(themeInstance: Theme): void {
@@ -2530,6 +2533,10 @@ function reevaluateAutoTheme(debugLabel: string, event: ThemeChangeEvent = {}, a
 	applyResolvedAutoTheme(resolved, debugLabel, event);
 }
 
+function reevaluateAutoThemeForAppearance(debugLabel: string, appearance?: "dark" | "light"): void {
+	reevaluateAutoTheme(debugLabel, { ephemeral: true }, appearance);
+}
+
 // ============================================================================
 // macOS Appearance Fallback Observer
 // ============================================================================
@@ -2606,7 +2613,7 @@ export function startMacOSAppearanceReprobeFallback(terminal: MacOSAppearanceRep
 			const appearance = probeResponseConfirmed ? terminal.appearance : undefined;
 			cancelProbeSequence();
 			if (!autoDetectedTheme || !appearance) return;
-			reevaluateAutoTheme("macOS appearance reconciliation", {}, appearance);
+			reevaluateAutoThemeForAppearance("macOS appearance reconciliation", appearance);
 		}, MACOS_APPEARANCE_RECONCILE_DELAY_MS);
 		reconciliationTimer.unref?.();
 	};
@@ -2635,7 +2642,7 @@ export function startMacOSAppearanceReprobeFallback(terminal: MacOSAppearanceRep
 					return;
 				}
 				if (appearance === "dark" || appearance === "light") {
-					reevaluateAutoTheme("macOS provisional appearance", {}, appearance);
+					reevaluateAutoThemeForAppearance("macOS provisional appearance", appearance);
 				}
 				scheduleProbeSequence();
 			});
@@ -2670,7 +2677,7 @@ function startMacAppearanceObserver(): void {
 		macObserver = MacAppearanceObserver.start((err, appearance) => {
 			if (!err && (appearance === "dark" || appearance === "light")) {
 				macOSReportedAppearance = appearance;
-				reevaluateAutoTheme("macOS fallback");
+				reevaluateAutoThemeForAppearance("macOS fallback");
 			}
 		});
 	} catch (err) {
@@ -2694,7 +2701,7 @@ function stopMacAppearanceObserver(): void {
 function startSigwinchListener(): void {
 	stopSigwinchListener();
 	sigwinchHandler = () => {
-		reevaluateAutoTheme("SIGWINCH");
+		reevaluateAutoThemeForAppearance("SIGWINCH");
 	};
 	process.on("SIGWINCH", sigwinchHandler);
 	startMacAppearanceObserver();

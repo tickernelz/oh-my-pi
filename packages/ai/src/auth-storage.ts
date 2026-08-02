@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
-import { $env, getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
+import { $env, getAgentDbPath, getDbBusyTimeoutMs, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "./auth-retry";
 import * as AIError from "./error";
 import { isUsageLimitOutcome } from "./error/rate-limit";
@@ -62,6 +62,7 @@ import {
 	type CodexResetCredit,
 	consumeCodexResetCredit,
 	listCodexResetCredits,
+	pickSoonestExpiringCredit,
 } from "./usage/openai-codex-reset";
 import { opencodeGoUsageProvider } from "./usage/opencode-go";
 import { syntheticUsageProvider } from "./usage/synthetic";
@@ -956,7 +957,9 @@ export interface ResetCreditRedeemOutcome {
 	 * Result code. Backend codes: `reset` (success), `already_redeemed`,
 	 * `no_credit`, `nothing_to_reset`. Locally-synthesized: `no_account`
 	 * (target not found), `account_unavailable` (token refresh failed),
-	 * `http_<status>` (unexpected HTTP).
+	 * `credit_list_failed` (transport/auth failure while listing credits —
+	 * retryable, unlike a genuine `no_credit`), `http_<status>` (unexpected
+	 * HTTP).
 	 */
 	code: CodexResetConsumeCode;
 	accountId?: string;
@@ -1265,6 +1268,15 @@ export class AuthStorage {
 	#credentialBackoff: Map<string, Map<number, number>> = new Map();
 	/** Earliest time a freshly-set in-memory block may be cleared by live usage reconciliation. */
 	#credentialBackoffProbeAfter: Map<string, Map<number, number>> = new Map();
+	/**
+	 * Latched true once the persistent credential-block store reports an
+	 * unrecoverable error (SQLite corruption / not-a-database). While set, every
+	 * persisted-block read and write short-circuits for the life of the process:
+	 * availability is preserved through {@link AuthStorage.#credentialBackoff}, but
+	 * cross-process persistence is abandoned rather than re-querying a broken store
+	 * on every credential evaluation.
+	 */
+	#persistedBlockStoreDamaged = false;
 	#usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
@@ -1313,8 +1325,10 @@ export class AuthStorage {
 		}
 		try {
 			this.#store.cleanExpiredCredentialBlocks?.(Date.now());
-		} catch {
-			// Best-effort.
+		} catch (err) {
+			// Best-effort, but init-time corruption must latch the block store
+			// immediately so the first evaluation doesn't re-query a broken DB.
+			this.#handlePersistedBlockStoreError(err);
 		}
 		this.#usageFetch = options.usageFetch ?? fetch;
 		this.#usageRequestTimeoutMs = options.usageRequestTimeoutMs ?? DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
@@ -1484,7 +1498,16 @@ export class AuthStorage {
 	 * Reload credentials from storage.
 	 */
 	async reload(): Promise<void> {
-		const records = this.#store.listAuthCredentials();
+		let records: StoredAuthCredential[];
+		try {
+			records = this.#store.listAuthCredentials();
+		} catch (err) {
+			// Latch + surface repair guidance on corruption, but still fail the
+			// reload: silently continuing with zero credentials would log the
+			// user out of every provider without explanation.
+			this.#handlePersistedBlockStoreError(err);
+			throw err;
+		}
 		const grouped = new Map<string, StoredCredential[]>();
 		for (const record of records) {
 			const list = grouped.get(record.provider) ?? [];
@@ -1702,11 +1725,13 @@ export class AuthStorage {
 		providerKey: string,
 		blockScope: string | undefined,
 	): number | undefined {
+		if (this.#persistedBlockStoreDamaged) return undefined;
 		const getCredentialBlock = this.#store.getCredentialBlock?.bind(this.#store);
 		if (!getCredentialBlock) return undefined;
 		try {
 			return getCredentialBlock(credentialId, providerKey, blockScope ?? "");
 		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) return undefined;
 			logger.debug("Failed to read credential block from persistent store", {
 				err,
 				credentialId,
@@ -1714,6 +1739,26 @@ export class AuthStorage {
 				blockScope,
 			});
 			return undefined;
+		}
+	}
+
+	#readPersistedCredentialBlockReconcileAfter(credentialId: number, providerKey: string, blockScope: string): number {
+		if (this.#persistedBlockStoreDamaged) return 0;
+		const getCredentialBlockReconcileAfter = this.#store.getCredentialBlockReconcileAfter?.bind(this.#store);
+		if (!getCredentialBlockReconcileAfter) return 0;
+		try {
+			return getCredentialBlockReconcileAfter(credentialId, providerKey, blockScope) ?? 0;
+		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) return 0;
+			// Advisory read: transient failures (e.g. SQLITE_BUSY) fall back to
+			// the in-memory probe window, mirroring #readPersistedCredentialBlock.
+			logger.debug("Failed to read credential block reconcile-after time from persistent store", {
+				err,
+				credentialId,
+				providerKey,
+				blockScope,
+			});
+			return 0;
 		}
 	}
 
@@ -1793,7 +1838,7 @@ export class AuthStorage {
 		this.#invalidateUsageReportCache(provider);
 
 		const upsertCredentialBlock = this.#store.upsertCredentialBlock?.bind(this.#store);
-		if (!upsertCredentialBlock) return;
+		if (!upsertCredentialBlock || this.#persistedBlockStoreDamaged) return;
 		const credentialId = this.#getStoredCredentials(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return;
 		try {
@@ -1804,6 +1849,7 @@ export class AuthStorage {
 				blockedUntilMs: nextBlockedUntil,
 			});
 		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) return;
 			logger.debug("Failed to persist credential block", {
 				err,
 				credentialId,
@@ -1813,6 +1859,36 @@ export class AuthStorage {
 				blockedUntilMs: nextBlockedUntil,
 			});
 		}
+	}
+
+	#handlePersistedBlockStoreError(err: unknown): boolean {
+		if (!isSqliteCorruptionError(err)) return false;
+		this.#reportDamagedBlockStore(err);
+		return true;
+	}
+
+	#assertPersistedBlockStoreWritable(): void {
+		if (!this.#persistedBlockStoreDamaged) return;
+		const store = this.#sourceLabel ?? `local ${getAgentDbPath()}`;
+		throw new Error(`Persistent credential block store ${store} is unavailable after SQLite corruption`);
+	}
+
+	/**
+	 * Latches {@link AuthStorage.#persistedBlockStoreDamaged} on the first
+	 * unrecoverable persisted-block store error and surfaces it once at `error`
+	 * level with the store location, so an operator can repair or replace it.
+	 * Later reads/writes short-circuit silently — the in-memory backoff map keeps
+	 * rate-limit blocks applying for the life of the process; only cross-process
+	 * persistence is lost.
+	 */
+	#reportDamagedBlockStore(err: unknown): void {
+		if (this.#persistedBlockStoreDamaged) return;
+		this.#persistedBlockStoreDamaged = true;
+		const store = this.#sourceLabel ?? `local ${getAgentDbPath()}`;
+		logger.error(
+			"Persistent credential store is corrupt; cross-process rate-limit persistence is disabled for this process. In-memory backoff still applies. Repair the store with `sqlite3 <path> '.recover'` or delete it to recreate on next login.",
+			{ err, store },
+		);
 	}
 
 	/**
@@ -2331,10 +2407,19 @@ export class AuthStorage {
 			if (!current) {
 				return { credential: undefined, refreshed: false, removed: false };
 			}
-			if (options.observedCredential && !authCredentialEquals(current, options.observedCredential)) {
+			const currentIsFresh = Date.now() + refreshSkewMs < current.expires;
+			// A peer rotated the credential out from under the caller's observation.
+			// Adopt the stored copy only when it is still usable; a stored copy that
+			// is itself expired must fall through to a refresh rather than be handed
+			// back and fail the downstream `getOAuthApiKey` expiry precondition.
+			if (
+				options.observedCredential &&
+				!authCredentialEquals(current, options.observedCredential) &&
+				currentIsFresh
+			) {
 				return { credential: current, refreshed: false, removed: false };
 			}
-			if (!options.forceRefresh && Date.now() + refreshSkewMs < current.expires) {
+			if (!options.forceRefresh && currentIsFresh) {
 				return { credential: current, refreshed: false, removed: false };
 			}
 			if (options.canRefresh && !options.canRefresh(current)) {
@@ -2374,10 +2459,17 @@ export class AuthStorage {
 			if (!current) {
 				return { credential: undefined, refreshed: false, removed: false };
 			}
-			if (options.observedCredential && !authCredentialEquals(current, options.observedCredential)) {
+			const currentIsFresh = Date.now() + refreshSkewMs < current.expires;
+			// Re-check after acquiring the lease: only adopt the stored copy on an
+			// observed mismatch when it is still usable, mirroring the pre-lease guard.
+			if (
+				options.observedCredential &&
+				!authCredentialEquals(current, options.observedCredential) &&
+				currentIsFresh
+			) {
 				return { credential: current, refreshed: false, removed: false };
 			}
-			if (!options.forceRefresh && Date.now() + refreshSkewMs < current.expires) {
+			if (!options.forceRefresh && currentIsFresh) {
 				return { credential: current, refreshed: false, removed: false };
 			}
 			if (options.canRefresh && !options.canRefresh(current)) {
@@ -5594,7 +5686,13 @@ export class AuthStorage {
 				fetch: this.#usageFetch,
 				signal: options.signal,
 			});
-			const credit = list?.credits.find(entry => (entry.status ?? "available") === "available") ?? list?.credits[0];
+			// Transport/auth failure is NOT "no credits": callers treat `no_credit`
+			// as terminal for the episode, so conflating them would bury a live
+			// credit behind one flaky request.
+			if (!list) {
+				return { ok: false, code: "credit_list_failed", accountId: match.accountId, email: match.email };
+			}
+			const credit = pickSoonestExpiringCredit(list.credits);
 			if (!credit) return { ok: false, code: "no_credit", accountId: match.accountId, email: match.email };
 			creditId = credit.id;
 		}
@@ -5857,9 +5955,12 @@ export class AuthStorage {
 		const scopedBackoffKey = this.#toScopedBackoffKey(providerKey, blockScope);
 		const globalProbeAfterMs = this.#credentialBackoffProbeAfter.get(providerKey)?.get(credentialIndex) ?? 0;
 		const scopedProbeAfterMs = this.#credentialBackoffProbeAfter.get(scopedBackoffKey)?.get(credentialIndex) ?? 0;
-		const getStoreReconcileAfter = this.#store.getCredentialBlockReconcileAfter?.bind(this.#store);
-		const storeGlobalProbeAfterMs = getStoreReconcileAfter?.(credentialId, providerKey, "") ?? 0;
-		const storeScopedProbeAfterMs = getStoreReconcileAfter?.(credentialId, providerKey, blockScope ?? "") ?? 0;
+		const storeGlobalProbeAfterMs = this.#readPersistedCredentialBlockReconcileAfter(credentialId, providerKey, "");
+		const storeScopedProbeAfterMs = this.#readPersistedCredentialBlockReconcileAfter(
+			credentialId,
+			providerKey,
+			blockScope ?? "",
+		);
 		if (Math.max(globalProbeAfterMs, scopedProbeAfterMs, storeGlobalProbeAfterMs, storeScopedProbeAfterMs) > nowMs) {
 			return;
 		}
@@ -6346,16 +6447,30 @@ export class AuthStorage {
 	 * Broker-server seam: list non-expired persisted blocks for snapshot entries.
 	 */
 	listCredentialBlocks(credentialIds: readonly number[]): StoredCredentialBlock[] {
-		return this.#store.listCredentialBlocks?.(credentialIds) ?? [];
+		if (this.#persistedBlockStoreDamaged) return [];
+		const listCredentialBlocks = this.#store.listCredentialBlocks?.bind(this.#store);
+		if (!listCredentialBlocks) return [];
+		try {
+			return listCredentialBlocks(credentialIds);
+		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) return [];
+			throw err;
+		}
 	}
 
 	/**
 	 * Broker-server seam: persist one credential block and notify snapshot waiters.
 	 */
 	upsertCredentialBlock(block: StoredCredentialBlock): void {
+		this.#assertPersistedBlockStoreWritable();
 		const upsertCredentialBlock = this.#store.upsertCredentialBlock?.bind(this.#store);
 		if (!upsertCredentialBlock) return;
-		upsertCredentialBlock(block);
+		try {
+			upsertCredentialBlock(block);
+		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) this.#assertPersistedBlockStoreWritable();
+			throw err;
+		}
 		this.#invalidateUsageReportCacheForProviderKey(block.providerKey);
 		this.#bumpGeneration("credential-block");
 	}
@@ -6364,9 +6479,15 @@ export class AuthStorage {
 	 * Broker-server seam: clear all persisted blocks for one credential and notify snapshot waiters.
 	 */
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void {
+		this.#assertPersistedBlockStoreWritable();
 		const deleteCredentialBlock = this.#store.deleteCredentialBlock?.bind(this.#store);
 		if (!deleteCredentialBlock) return;
-		deleteCredentialBlock(credentialId, providerKey, blockScope);
+		try {
+			deleteCredentialBlock(credentialId, providerKey, blockScope);
+		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) this.#assertPersistedBlockStoreWritable();
+			throw err;
+		}
 		this.#invalidateUsageReportCacheForProviderKey(providerKey);
 		this.#bumpGeneration("credential-block");
 	}
@@ -6382,9 +6503,15 @@ export class AuthStorage {
 	}
 
 	deleteCredentialBlocks(credentialId: number): void {
+		this.#assertPersistedBlockStoreWritable();
 		const deleteCredentialBlocks = this.#store.deleteCredentialBlocks?.bind(this.#store);
 		if (!deleteCredentialBlocks) return;
-		deleteCredentialBlocks(credentialId);
+		try {
+			deleteCredentialBlocks(credentialId);
+		} catch (err) {
+			if (this.#handlePersistedBlockStoreError(err)) this.#assertPersistedBlockStoreWritable();
+			throw err;
+		}
 		this.#bumpGeneration("credential-block");
 	}
 
@@ -6496,6 +6623,19 @@ export function isSqliteBusyError(err: unknown): boolean {
 	if (err === null || typeof err !== "object") return false;
 	const code = (err as { code?: unknown }).code;
 	return typeof code === "string" && code.startsWith("SQLITE_BUSY");
+}
+
+/**
+ * SQLite's unrecoverable-corruption result codes — the `SQLITE_CORRUPT` family
+ * (base plus extended variants like `SQLITE_CORRUPT_VTAB` / `SQLITE_CORRUPT_INDEX`)
+ * and `SQLITE_NOTADB` (the file header is not a database). Unlike
+ * {@link isSqliteBusyError}, these never clear by retrying: the store must be
+ * repaired or replaced, so callers latch and stop touching it.
+ */
+export function isSqliteCorruptionError(err: unknown): boolean {
+	if (err === null || typeof err !== "object" || !("code" in err)) return false;
+	const code = err.code;
+	return typeof code === "string" && (code.startsWith("SQLITE_CORRUPT") || code === "SQLITE_NOTADB");
 }
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
@@ -6934,6 +7074,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			let db: Database | undefined;
 			try {
 				db = new Database(dbPath);
+				// Install the busy handler BEFORE the first lock-taking statement
+				// on this connection. The leases DDL below and the constructor's
+				// schema init both acquire locks during WAL recovery; without a
+				// non-zero `busy_timeout` they fail immediately with SQLITE_BUSY.
+				// See issue #2421.
+				SqliteAuthCredentialStore.#installBusyTimeout(db);
 				try {
 					await fs.chmod(dbPath, 0o600);
 				} catch {
@@ -6970,12 +7116,25 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		`);
 	}
 
+	/**
+	 * Install the per-connection busy handler so lock-taking statements wait for
+	 * a contended writer instead of failing immediately (Bun defaults
+	 * `busy_timeout` to 0). MUST run before the first lock-taking statement on
+	 * the connection: concurrent omp startups race WAL recovery and the leases
+	 * DDL. Uses the centralized timeout so headless hosts keep their bounded
+	 * busy wait instead of the interactive 5s value. See issues #2421, #7298.
+	 */
+	static #installBusyTimeout(db: Database): void {
+		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+	}
+
 	#initializeSchema(): void {
 		// Install the busy handler BEFORE any lock-taking statement (incl.
 		// `PRAGMA journal_mode=WAL`, which acquires an exclusive lock during WAL
 		// recovery). Without this, concurrent omp startups can crash here with
-		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. See issue #2421.
-		this.#db.run("PRAGMA busy_timeout = 5000");
+		// `SQLITE_BUSY` / `SQLITE_BUSY_RECOVERY`. Re-setting when opened via
+		// `open()` (which already installed it) is idempotent. See issue #2421.
+		SqliteAuthCredentialStore.#installBusyTimeout(this.#db);
 		this.#db.run(`
 			PRAGMA journal_mode=WAL;
 			PRAGMA synchronous=NORMAL;

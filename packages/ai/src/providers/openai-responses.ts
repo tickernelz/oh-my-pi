@@ -601,12 +601,11 @@ const streamOpenAIResponsesOnce = (
 							strictRetryAvailable &&
 							!requestSignal.aborted &&
 							(compiledGrammarTooLarge ||
-								shouldRetryWithoutStrictTools(
-									error,
-									capturedErrorResponse,
-									activeStrictToolsApplied,
-									context.tools,
-								));
+								shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
+									model,
+									strictToolsApplied: activeStrictToolsApplied,
+									tools: context.tools,
+								}));
 						if (options?.disableProviderRetries) {
 							if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
 								rememberOpenAIReasoningEffortFallback(
@@ -633,6 +632,7 @@ const streamOpenAIResponsesOnce = (
 							};
 							continue;
 						}
+
 						if (canRetryWithoutStrictTools) {
 							strictRetryAvailable = false;
 							forceDisableStrictTools = true;
