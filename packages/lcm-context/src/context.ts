@@ -618,13 +618,15 @@ interface FreshTailSelection {
 	start: number;
 	tokens: number;
 	count: number;
+	requiredStartFound: boolean;
 }
 
-function selectFreshTail<T extends { atomic_group_id: string | null; token_count: number }>(
+function selectFreshTail<T extends { entry_id: string; atomic_group_id: string | null; token_count: number }>(
 	rows: readonly T[],
 	tokenBudget: number,
 	maxSources: number,
 	maxTokens: number,
+	requiredStartSourceId?: string,
 ): FreshTailSelection {
 	const units = atomicUnits(rows);
 	let start = rows.length;
@@ -641,7 +643,21 @@ function selectFreshTail<T extends { atomic_group_id: string | null; token_count
 		tokens += unitTokens;
 		count += unit.length;
 	}
-	return { start, tokens, count };
+	if (requiredStartSourceId === undefined) return { start, tokens, count, requiredStartFound: true };
+	assertIdentifier(requiredStartSourceId, "freshTail.requiredStartSourceId");
+	let requiredStart = 0;
+	for (const unit of units) {
+		if (unit.some(row => row.entry_id === requiredStartSourceId)) {
+			if (requiredStart < start) {
+				for (let position = requiredStart; position < start; position++) tokens += rows[position]!.token_count;
+				count += start - requiredStart;
+				start = requiredStart;
+			}
+			return { start, tokens, count, requiredStartFound: true };
+		}
+		requiredStart += unit.length;
+	}
+	return { start: rows.length, tokens: 0, count: 0, requiredStartFound: false };
 }
 
 /** Files of the covered sources in first-appearance order, de-duplicated on `fileId`. */
@@ -1816,8 +1832,8 @@ class SqliteLcmContext implements LcmContext {
 		this.#performance.schedulerBranchPasses++;
 		const stats: ScheduleStats = { queued: 0, reused: 0 };
 		const rows = this.#db
-			.query<Pick<ActiveSourceRow, "source_key" | "token_count" | "atomic_group_id">, [number]>(
-				`SELECT bs.source_key, sc.token_count, bs.atomic_group_id
+			.query<Pick<ActiveSourceRow, "entry_id" | "source_key" | "token_count" | "atomic_group_id">, [number]>(
+				`SELECT bs.entry_id, bs.source_key, sc.token_count, bs.atomic_group_id
 				 FROM branch_sources bs JOIN source_contents sc ON sc.source_key = bs.source_key
 				 WHERE bs.branch_row_id = ? AND bs.active = 1 ORDER BY bs.position`,
 			)
@@ -1828,12 +1844,15 @@ class SqliteLcmContext implements LcmContext {
 
 		let tailStart = rows.length;
 		if (summarize) {
-			tailStart = selectFreshTail(
+			const tail = selectFreshTail(
 				rows,
 				summarize.tokenBudget,
 				summarize.freshTail.maxSources,
 				summarize.freshTail.maxTokens,
-			).start;
+				summarize.freshTail.requiredStartSourceId,
+			);
+			if (!tail.requiredStartFound) return stats;
+			tailStart = tail.start;
 		}
 		// An immutable leaf must never be split: pull the boundary back to the start of
 		// any already-scheduled level-0 span the fresh tail would cut through.
@@ -2214,7 +2233,7 @@ class SqliteLcmContext implements LcmContext {
 			return {
 				revision: 0,
 				activeSourceFingerprint: activeSourceFingerprint([]),
-				ready: true,
+				ready: request.freshTail.requiredStartSourceId === undefined,
 				historical: [],
 				freshTailSourceIds: [],
 				uncoveredSourceIds: [],
@@ -2239,7 +2258,29 @@ class SqliteLcmContext implements LcmContext {
 			boundary += unit.length;
 			atomicBoundaries.add(boundary);
 		}
-		const tail = selectFreshTail(rows, tokenBudget, maxTailSources, maxTailTokens);
+		const tail = selectFreshTail(
+			rows,
+			tokenBudget,
+			maxTailSources,
+			maxTailTokens,
+			request.freshTail.requiredStartSourceId,
+		);
+		if (!tail.requiredStartFound) {
+			return {
+				revision: branch.revision,
+				activeSourceFingerprint: fingerprint,
+				ready: false,
+				historical: [],
+				freshTailSourceIds: [],
+				uncoveredSourceIds: rows.map(row => row.entry_id),
+				sourceTokens: rows.reduce((total, row) => total + row.token_count, 0),
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: 0,
+				estimatedTokens: 0,
+				pendingJobs: 0,
+			};
+		}
 		let tailStart = tail.start;
 		const spans = this.#db
 			.query<SpanRow & { stable_handle: string; redacted_text: string; token_count: number }, [number, number]>(
@@ -2474,8 +2515,11 @@ class SqliteLcmContext implements LcmContext {
 		const branch = this.#branchRow(scope);
 		if (!branch) return { projectId: scope.projectId, spans: [] };
 		const rows = this.#activeRows(branch.id);
-		const tailStart = selectFreshTail(rows, tokenBudget, maxSources, maxTokens).start;
-		return { projectId: scope.projectId, spans: this.#pendingSpans(branch.id, branch.revision, tailStart) };
+		const tail = selectFreshTail(rows, tokenBudget, maxSources, maxTokens, request.freshTail.requiredStartSourceId);
+		return {
+			projectId: scope.projectId,
+			spans: tail.requiredStartFound ? this.#pendingSpans(branch.id, branch.revision, tail.start) : [],
+		};
 	}
 
 	#summaryJobAvailability(

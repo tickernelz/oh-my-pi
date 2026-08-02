@@ -22,6 +22,8 @@
 
 ### Fixed
 
+- Fixed Lossless takeover when the active user predates the configured fresh tail by anchoring the complete current turn as raw context; local projection-fit fallbacks remain diagnostic without marking runtime health degraded, while provider and store failures still do.
+
 - Fixed Lossless automatic-maintenance and primary-dispatch races so idle compaction cannot abort itself, canceled probes drain before session replacement, incomplete responses remain atomic, and only the exact projected request and response record LCM ownership.
 
 ## [17.2.1] - 2026-07-30

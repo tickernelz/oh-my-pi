@@ -89,6 +89,8 @@ export interface FreshTailLimits {
 	maxSources: number;
 	/** Target fresh-tail token ceiling; the mandatory newest indivisible unit may exceed it. */
 	maxTokens: number;
+	/** Earliest source that must remain raw with every later source, even beyond the target limits. */
+	requiredStartSourceId?: string;
 }
 
 export interface ProjectionRequest extends ContextScope {

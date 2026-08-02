@@ -31,6 +31,8 @@
 
 ### Fixed
 
+- Fixed fresh-tail projection, scheduling, and pending-job availability to honor a required raw start source, preserve its complete atomic suffix beyond configured targets, and fail closed when the anchor is missing.
+
 - `recoverCorrupt` now runs `PRAGMA quick_check(1)` before schema mutation and serializes quarantine through a sibling lock database, so latent B-tree damage is rebuilt once instead of repeatedly failing reconciliation or racing concurrent openers.
 - Physical corruption recovery now requires exclusive sibling ownership while every live file-backed context retains a shared guard, preventing main/WAL/SHM quarantine beneath another running process.
 - SQLite contention detection now honors explicit cause-chain codes before codeless lock-message fallbacks, so disk-full, permission, and ordinary I/O failures are never retried or quarantined as lock contention.

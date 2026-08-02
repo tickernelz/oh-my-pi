@@ -3,6 +3,7 @@ import type {
 	ContextProjection,
 	ContextScope,
 	DoctorReport,
+	FreshTailLimits,
 	LcmContext,
 	LcmFileMetadata,
 	LcmRegexEngine,
@@ -98,6 +99,7 @@ export type LcmCoverageReadiness = "idle" | "warming" | "ready";
 export type LcmProjectionFailureReason =
 	| "coverage_gap"
 	| "assembly_invalid"
+	| "active_user_anchor_invalid"
 	| "irreducible_input"
 	| "minimum_representation"
 	| "provider_key_mismatch"
@@ -447,6 +449,7 @@ type SummaryWorkerOutcome =
 
 interface ProjectionRequest {
 	limits: LcmProjectionLimits;
+	freshTail: FreshTailLimits;
 	/** `max(live request, branch total)` as evaluated when LCM armed; see `#attemptProjection`. */
 	armTokens: number;
 }
@@ -786,6 +789,20 @@ function liveSuffix(messages: readonly AgentMessage[], persisted: SessionContext
 	return [...messages];
 }
 
+type FreshTailAnchor = { kind: "live" } | { kind: "persisted"; sourceId: string } | { kind: "missing" };
+
+function freshTailAnchor(messages: readonly AgentMessage[], manager: SessionLcmJournal): FreshTailAnchor {
+	if (liveSuffix(messages, manager.buildSessionContext()).some(message => message.role === "user")) {
+		return { kind: "live" };
+	}
+	const entries = manager.getBranch();
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entryMessage(entry)?.role === "user") return { kind: "persisted", sourceId: entry.id };
+	}
+	return { kind: "missing" };
+}
+
 interface HistoricalRenderLimits {
 	maxSummaryTextBytes?: number;
 	maxFiles: number;
@@ -923,6 +940,23 @@ function hasExactProjectionCoverage(projection: ContextProjection, activeSources
 		frontierFingerprint === projection.activeSourceFingerprint &&
 		projection.activeSourceFingerprint === snapshotFingerprint
 	);
+}
+
+function hasRequiredFreshSuffix(
+	projection: ContextProjection,
+	activeSources: readonly SourceEntry[],
+	requiredStartSourceId: string | undefined,
+): boolean {
+	if (requiredStartSourceId === undefined) return true;
+	const activeStart = activeSources.findIndex(source => source.entryId === requiredStartSourceId);
+	const freshStart = projection.freshTailSourceIds.indexOf(requiredStartSourceId);
+	if (activeStart < 0 || freshStart < 0) return false;
+	if (activeSources.length - activeStart !== projection.freshTailSourceIds.length - freshStart) return false;
+	for (let offset = 0; activeStart + offset < activeSources.length; offset++) {
+		if (activeSources[activeStart + offset]!.entryId !== projection.freshTailSourceIds[freshStart + offset])
+			return false;
+	}
+	return true;
 }
 
 function normalizedSourceTokens(snapshot: SourceSnapshot): number {
@@ -1125,7 +1159,7 @@ export class SessionLcm {
 	#disposed = false;
 	#operationTail: Promise<void> = Promise.resolve();
 	#reconcileTask: Promise<boolean> | undefined;
-	#pendingReconcileSummarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> | undefined;
+	#pendingReconcileSummarize: false | { tokenBudget: number; freshTail: FreshTailLimits } | undefined;
 	#summaryTask: Promise<void> | undefined;
 	#summaryAbortController: AbortController | undefined;
 	#summaryRestartRequested = false;
@@ -1524,10 +1558,7 @@ export class SessionLcm {
 	}
 
 	#noteFailure(failure: ProjectionFailure, retryAt?: number): void {
-		const nonDegrading =
-			failure.category === "unfit" &&
-			(failure.reason === "irreducible_input" || failure.reason === "minimum_representation");
-		if (!nonDegrading) {
+		if (failure.category === "provider" || failure.category === "store") {
 			this.#healthFailure = failure;
 			this.#runtimeHealth = "degraded";
 			if (failure.category === "provider") this.#providerFailureScope = this.#activeBranch?.snapshot.scope;
@@ -1556,10 +1587,7 @@ export class SessionLcm {
 	#restoreHealth(): void {
 		if (this.#runtimeHealth === "quarantined") return;
 		this.#runtimeHealth =
-			this.#healthFailure ||
-			this.#preferredUnfit ||
-			this.#preferredFailures.size > 0 ||
-			this.#fallbackFailures.size > 0
+			this.#healthFailure || this.#preferredFailures.size > 0 || this.#fallbackFailures.size > 0
 				? "degraded"
 				: this.#context
 					? "healthy"
@@ -1607,9 +1635,7 @@ export class SessionLcm {
 		this.#coverageReadiness = complete ? "ready" : "warming";
 		if (!complete) return;
 		this.#preferredUnfit = false;
-		if (this.#healthFailure?.category === "store" || this.#healthFailure?.category === "unfit") {
-			this.#healthFailure = undefined;
-		}
+		if (this.#healthFailure?.category === "store") this.#healthFailure = undefined;
 		if (this.#preferredFailures.size === 0 && this.#fallbackFailures.size === 0) this.#retryAt = undefined;
 		this.#restoreHealth();
 	}
@@ -1694,7 +1720,7 @@ export class SessionLcm {
 			{
 				...scope,
 				tokenBudget: request.limits.tokenBudget,
-				freshTail: request.limits.freshTail,
+				freshTail: request.freshTail,
 			},
 			policy,
 			SUMMARY_PROVIDER_RETRY_LIMIT,
@@ -1763,7 +1789,7 @@ export class SessionLcm {
 	}
 
 	async #ensureOpen(
-		deferredSummarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> = false,
+		deferredSummarize: false | { tokenBudget: number; freshTail: FreshTailLimits } = false,
 	): Promise<LcmContext | undefined> {
 		if (this.#disposed) return undefined;
 		this.#syncSessionIdentity();
@@ -1888,7 +1914,7 @@ export class SessionLcm {
 		const projection = context.project({
 			...scope,
 			tokenBudget: request.limits.tokenBudget,
-			freshTail: request.limits.freshTail,
+			freshTail: request.freshTail,
 		});
 		return projection;
 	}
@@ -1984,13 +2010,7 @@ export class SessionLcm {
 					const complete =
 						projection.pendingJobs === 0 && hasExactProjectionCoverage(projection, normalized.snapshot.entries);
 					this.#coverageReadiness = complete ? "ready" : "warming";
-					if (
-						complete &&
-						(this.#healthFailure?.category === "store" ||
-							(this.#healthFailure?.category === "unfit" && this.#healthFailure.reason === "coverage_gap"))
-					) {
-						this.#healthFailure = undefined;
-					}
+					if (complete && this.#healthFailure?.category === "store") this.#healthFailure = undefined;
 					this.#restoreHealth();
 				}
 				const allowFallback = projection === undefined || projection.pendingJobs === 0;
@@ -2030,7 +2050,7 @@ export class SessionLcm {
 
 	#requestReconcile(
 		open: boolean,
-		summarize: false | Pick<LcmProjectionLimits, "tokenBudget" | "freshTail"> = false,
+		summarize: false | { tokenBudget: number; freshTail: FreshTailLimits } = false,
 	): Promise<boolean> {
 		this.#dirty = true;
 		if (summarize !== false || this.#pendingReconcileSummarize === undefined) {
@@ -2311,7 +2331,7 @@ export class SessionLcm {
 								{
 									...scope,
 									tokenBudget: request.limits.tokenBudget,
-									freshTail: request.limits.freshTail,
+									freshTail: request.freshTail,
 								},
 								policy,
 								SUMMARY_PROVIDER_RETRY_LIMIT,
@@ -2750,7 +2770,9 @@ export class SessionLcm {
 		return outcome;
 	}
 
-	#projectCurrent(messages: readonly AgentMessage[], limits: LcmProjectionLimits, attempt: number): ProjectionCheck {
+	#projectCurrent(messages: readonly AgentMessage[], request: ProjectionRequest, attempt: number): ProjectionCheck {
+		const limits = request.limits;
+		const freshTail = request.freshTail;
 		const native: ProjectAttempt = { messages: messages as AgentMessage[], owned: false };
 		if (attempt !== this.#projectionAttempt) return { result: native };
 		const context = this.#context;
@@ -2759,22 +2781,33 @@ export class SessionLcm {
 		let projection = context.project({
 			...branch.snapshot.scope,
 			tokenBudget: limits.tokenBudget,
-			freshTail: limits.freshTail,
+			freshTail,
 		});
 		if (this.#currentBranch?.revision !== projection.revision) {
 			const reconciled = context.reconcile(branch.snapshot, {
-				summarize: { tokenBudget: limits.tokenBudget, freshTail: limits.freshTail },
+				summarize: { tokenBudget: limits.tokenBudget, freshTail },
 			});
 			this.#activateBranch(branch, reconciled.revision);
 			this.#syncSummaryFailures(context);
 			projection = context.project({
 				...branch.snapshot.scope,
 				tokenBudget: limits.tokenBudget,
-				freshTail: limits.freshTail,
+				freshTail,
 			});
 		}
 		if (this.#currentBranch?.revision !== projection.revision) {
 			return { result: native, projection, terminal: { category: "store" } };
+		}
+		const requiredStartMissing =
+			freshTail.requiredStartSourceId !== undefined &&
+			!projection.freshTailSourceIds.includes(freshTail.requiredStartSourceId);
+		if (requiredStartMissing) {
+			this.#noteProjection(projection, false, attempt);
+			return {
+				result: native,
+				projection,
+				terminal: { category: "unfit", reason: "active_user_anchor_invalid" },
+			};
 		}
 		if (projection.pendingJobs > 0 && !this.#summaryRetryDeferred && !this.#summaryTask && !this.#summaryWakeTask) {
 			this.#startSummaryJobs();
@@ -2790,6 +2823,14 @@ export class SessionLcm {
 		if (!hasExactProjectionCoverage(projection, branch.snapshot.entries)) {
 			this.#noteProjection(projection, false, attempt);
 			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
+		}
+		if (!hasRequiredFreshSuffix(projection, branch.snapshot.entries, freshTail.requiredStartSourceId)) {
+			this.#noteProjection(projection, false, attempt);
+			return {
+				result: native,
+				projection,
+				terminal: { category: "unfit", reason: "active_user_anchor_invalid" },
+			};
 		}
 		let measurementCount = 0;
 		const fitted = (projectedMessages: AgentMessage[], candidateTokens: number): ProjectionCheck => {
@@ -2856,7 +2897,7 @@ export class SessionLcm {
 
 		requiredMessages.push(...liveSuffix(messages, this.#host.sessionManager.buildSessionContext()));
 		const activeFinalUserIndex = requiredMessages.findLastIndex(message => message.role === "user");
-		if (activeFinalUserIndex <= firstUserIndex || requiredMessages[firstUserIndex + 1]?.role === "toolResult") {
+		if (activeFinalUserIndex < firstUserIndex || requiredMessages[firstUserIndex + 1]?.role === "toolResult") {
 			this.#noteProjection(projection, false, attempt);
 			return { result: native, projection, terminal: { category: "unfit", reason: "assembly_invalid" } };
 		}
@@ -3168,11 +3209,42 @@ export class SessionLcm {
 		}
 
 		this.#summaryRetryDeferred = false;
-		this.#lastProjectionRequest = { limits, armTokens };
+		const anchor = freshTailAnchor(messages, this.#host.sessionManager);
+		if (anchor.kind === "missing") {
+			if (!atHard) {
+				return finish(
+					native,
+					{
+						kind: "native_passthrough",
+						reason: "below_hard",
+						metrics: this.#routeMetrics(limits),
+					},
+					this.#withMatchingActiveRevision(routeScope),
+				);
+			}
+			const failure = { category: "unfit", reason: "active_user_anchor_invalid" } as const;
+			this.#failOpen(failure, attempt);
+			return finish(
+				native,
+				{
+					kind: "native_fallback",
+					...failure,
+					metrics: this.#routeMetrics(limits),
+				},
+				routeScope,
+			);
+		}
+		const requiredStartSourceId = anchor.kind === "persisted" ? anchor.sourceId : undefined;
+		const freshTail: FreshTailLimits = {
+			...limits.freshTail,
+			...(requiredStartSourceId ? { requiredStartSourceId } : {}),
+		};
+		const projectionRequest = { limits, freshTail, armTokens };
+		this.#lastProjectionRequest = projectionRequest;
 		if (this.#coverageReadiness !== "ready") this.#coverageReadiness = "warming";
 		const reconcile = this.#requestReconcile(true, {
 			tokenBudget: limits.tokenBudget,
-			freshTail: limits.freshTail,
+			freshTail,
 		});
 		if (!atHard) {
 			void reconcile.catch(error => {
@@ -3214,7 +3286,7 @@ export class SessionLcm {
 			while (!signal?.aborted && isCurrent()) {
 				const progressVersion = this.#summaryProgressVersion;
 				const settlement = this.#summaryProgressSignal.promise;
-				const check = await this.#enqueue(() => this.#projectCurrent(messages, limits, attempt));
+				const check = await this.#enqueue(() => this.#projectCurrent(messages, projectionRequest, attempt));
 				if (!isCurrent()) return native;
 				if (check.result.owned) {
 					return finish(
@@ -3258,7 +3330,7 @@ export class SessionLcm {
 									{
 										...this.#activeBranch!.snapshot.scope,
 										tokenBudget: limits.tokenBudget,
-										freshTail: limits.freshTail,
+										freshTail,
 									},
 									policy,
 									SUMMARY_PROVIDER_RETRY_LIMIT,
@@ -3546,9 +3618,14 @@ export class SessionLcm {
 		const messages = this.#host.sessionManager.buildSessionContext().messages;
 		const limits = this.#host.projectionLimits(messages);
 		if (!limits) return null;
-		if (!(await this.#requestReconcile(true, { tokenBudget: limits.tokenBudget, freshTail: limits.freshTail }))) {
-			return null;
-		}
+		const anchor = freshTailAnchor(messages, this.#host.sessionManager);
+		if (anchor.kind === "missing") return null;
+		const requiredStartSourceId = anchor.kind === "persisted" ? anchor.sourceId : undefined;
+		const freshTail: FreshTailLimits = {
+			...limits.freshTail,
+			...(requiredStartSourceId ? { requiredStartSourceId } : {}),
+		};
+		if (!(await this.#requestReconcile(true, { tokenBudget: limits.tokenBudget, freshTail }))) return null;
 		const availability = await this.#enqueue(() => {
 			const context = this.#context;
 			const scope = this.#activeBranch?.snapshot.scope;
@@ -3556,7 +3633,7 @@ export class SessionLcm {
 			const policy = this.#configureSummaryRetryPolicy(context);
 			if (!policy) return null;
 			const availability = context.retrySummaryJobs(
-				{ ...scope, tokenBudget: limits.tokenBudget, freshTail: limits.freshTail },
+				{ ...scope, tokenBudget: limits.tokenBudget, freshTail },
 				policy,
 				SUMMARY_PROVIDER_RETRY_LIMIT,
 				mode,

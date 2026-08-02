@@ -839,7 +839,10 @@ describe("SessionLcm", () => {
 			["gap", (ids: string[]) => ({ ids: [ids[0]!, ids[2]!], fingerprint: activeSourceFingerprint(ids) })],
 			[
 				"duplicate",
-				(ids: string[]) => ({ ids: [ids[0]!, ids[1]!, ids[1]!], fingerprint: activeSourceFingerprint(ids) }),
+				(ids: string[]) => ({
+					ids: [ids[0]!, ids[1]!, ids[1]!, ids[2]!],
+					fingerprint: activeSourceFingerprint(ids),
+				}),
 			],
 			[
 				"reorder",
@@ -852,7 +855,7 @@ describe("SessionLcm", () => {
 			[
 				"stale-source-set",
 				(ids: string[]) => {
-					const staleIds = ids.map((_id, index) => `stale-${index}`);
+					const staleIds = [`stale-${ids[0]}`, `stale-${ids[1]}`, ids[2]!];
 					return { ids: staleIds, fingerprint: activeSourceFingerprint(staleIds) };
 				},
 			],
@@ -1263,19 +1266,21 @@ describe("SessionLcm", () => {
 
 	it("returns a request-local maintenance fallback without staging route history", async () => {
 		const manager = SessionManager.inMemory("/maintenance-local-fallback");
-		appendUser(manager, "uncovered request", 1);
+		appendUser(manager, "first request", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active request", 3);
 		const context = new FakeLcmContext();
 		context.projectImpl = (_request, snapshot) => ({
 			revision: context.snapshots.length,
 			ready: false,
 			historical: [],
 			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
-			freshTailSourceIds: [],
-			uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+			freshTailSourceIds: [snapshot.entries.at(-1)!.entryId],
+			uncoveredSourceIds: snapshot.entries.slice(0, -1).map(entry => entry.entryId),
 			sourceTokens: snapshot.entries.length,
 			selectedLevelCounts: {},
 			coveredSourceCount: 0,
-			freshSourceCount: 0,
+			freshSourceCount: 1,
 			estimatedTokens: 0,
 			pendingJobs: 0,
 		});
@@ -1553,32 +1558,27 @@ describe("SessionLcm", () => {
 	}
 
 	for (const reason of ["coverage_gap", "assembly_invalid", "fit_invariant"] as const) {
-		const clearsOnReconcile = reason === "coverage_gap";
-		it(`an unchanged complete reconcile ${clearsOnReconcile ? "clears" : "does not clear"} ${reason} while preserving lastFailure`, async () => {
+		it(`keeps runtime health healthy for local ${reason} fallback while preserving lastFailure`, async () => {
 			const manager = SessionManager.inMemory(`/unchanged-reconcile-${reason}`);
-			if (reason === "assembly_invalid") {
-				manager.appendMessage({ ...createAssistantMessage("first assistant"), timestamp: 1 });
-				manager.appendMessage({ ...createAssistantMessage("latest assistant"), timestamp: 2 });
-			} else {
-				appendUser(manager, "first request", 1);
-				appendUser(manager, "active request", 2);
-			}
+			appendUser(manager, "first request", 1);
+			appendUser(manager, "active request", 2);
 			const context = new FakeLcmContext();
 			let coverageAvailable = reason !== "coverage_gap";
 			context.projectImpl = (_request, snapshot) => {
 				const ready = readyHistoricalProjection(snapshot, `unchanged-${reason}`);
+				if (reason === "assembly_invalid") {
+					return { ...ready, activeSourceFingerprint: "mismatch" };
+				}
 				return coverageAvailable
 					? ready
 					: {
 							...ready,
 							ready: false,
 							historical: [],
-							freshTailSourceIds: [],
-							uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+							uncoveredSourceIds: snapshot.entries.slice(0, -1).map(entry => entry.entryId),
 							selectedLevelCounts: {},
 							coveredSourceCount: 0,
-							freshSourceCount: 0,
-							estimatedTokens: 0,
+							estimatedTokens: ready.freshSourceCount,
 						};
 			};
 			const measurements =
@@ -1601,7 +1601,7 @@ describe("SessionLcm", () => {
 				expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
 				const failed = (await lcm.status()).runtime;
 				expect(failed).toMatchObject({
-					health: "degraded",
+					health: "healthy",
 					lastFailure: { category: "unfit", reason },
 				});
 
@@ -1617,7 +1617,7 @@ describe("SessionLcm", () => {
 				});
 				manager.appendCustomEntry("lcm-health-probe", { reason });
 				const reconciled = (await lcm.status()).runtime;
-				expect(reconciled.health).toBe(clearsOnReconcile ? "healthy" : "degraded");
+				expect(reconciled.health).toBe("healthy");
 				expect(reconciled.lastFailure).toEqual(failed.lastFailure);
 			} finally {
 				await lcm.close();
@@ -1681,19 +1681,21 @@ describe("SessionLcm", () => {
 
 	it("stages a first fallback against the exact reconciled scope", async () => {
 		const manager = SessionManager.inMemory("/first-fallback-scope");
-		appendUser(manager, "uncovered request", 1);
+		appendUser(manager, "first request", 1);
+		manager.appendMessage({ ...createAssistantMessage("older work"), timestamp: 2 });
+		appendUser(manager, "active request", 3);
 		const context = new FakeLcmContext();
 		context.projectImpl = (_request, snapshot) => ({
 			revision: 1,
 			ready: false,
 			historical: [],
 			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
-			freshTailSourceIds: [],
-			uncoveredSourceIds: snapshot.entries.map(entry => entry.entryId),
+			freshTailSourceIds: [snapshot.entries.at(-1)!.entryId],
+			uncoveredSourceIds: snapshot.entries.slice(0, -1).map(entry => entry.entryId),
 			sourceTokens: snapshot.entries.length,
 			selectedLevelCounts: {},
 			coveredSourceCount: 0,
-			freshSourceCount: 0,
+			freshSourceCount: 1,
 			estimatedTokens: 0,
 			pendingJobs: 0,
 		});
@@ -1964,7 +1966,11 @@ describe("SessionLcm", () => {
 		expect(context.completedJobIds.size).toBe(0);
 		expect(context.reconcileOptions[0]?.summarize).toEqual({
 			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
+			freshTail: {
+				maxSources: 8,
+				maxTokens: 40,
+				requiredStartSourceId: context.snapshots[0]!.entries[0]!.entryId,
+			},
 		});
 		completionGate.resolve();
 		await context.summaryCompleted.promise;
@@ -1992,7 +1998,11 @@ describe("SessionLcm", () => {
 		expect(complete).toHaveBeenCalled();
 		expect(context.reconcileOptions[0]?.summarize).toEqual({
 			tokenBudget: 80,
-			freshTail: { maxSources: 8, maxTokens: 40 },
+			freshTail: {
+				maxSources: 8,
+				maxTokens: 40,
+				requiredStartSourceId: context.snapshots[0]!.entries[0]!.entryId,
+			},
 		});
 		await lcm.close();
 	});
@@ -2935,7 +2945,7 @@ describe("SessionLcm", () => {
 	}
 
 	for (const unfitFirst of [true, false] as const) {
-		it(`keeps preferred unfit degraded when its sibling settles ${unfitFirst ? "after" : "before"} it`, async () => {
+		it(`keeps preferred unfit healthy when its sibling settles ${unfitFirst ? "after" : "before"} it`, async () => {
 			const manager = SessionManager.inMemory(`/preferred-unfit-${unfitFirst ? "first" : "last"}`);
 			appendUser(manager, "preferred siblings", 1);
 			const context = new FakeLcmContext();
@@ -2989,10 +2999,10 @@ describe("SessionLcm", () => {
 			const afterBoth = await lcm.status();
 
 			if (unfitFirst) {
-				expect(afterFirst.runtime.health).toBe("degraded");
+				expect(afterFirst.runtime.health).toBe("healthy");
 				expect(afterFirst.runtime.lastFailure).toBeUndefined();
 			}
-			expect(afterBoth.runtime.health).toBe("degraded");
+			expect(afterBoth.runtime.health).toBe("healthy");
 			expect(afterBoth.runtime.lastFailure).toBeUndefined();
 
 			context.projectImpl = (_request, snapshot) => ({
@@ -4158,6 +4168,7 @@ describe("SessionLcm", () => {
 
 	it("keeps skipped file bytes out of SQLite sources and records only bounded identity metadata", async () => {
 		const manager = SessionManager.inMemory("/worktree-files");
+		appendUser(manager, "inspect the attachment", 0);
 		const contentHash = new Bun.CryptoHasher("sha256").update("original file bytes").digest("hex");
 		manager.appendMessage({
 			role: "fileMention",
@@ -4174,7 +4185,7 @@ describe("SessionLcm", () => {
 		});
 		const { lcm, context } = createHarness(manager);
 		await lcm.project(manager.buildSessionContext().messages);
-		const source = context.snapshots.at(-1)?.entries[0];
+		const source = context.snapshots.at(-1)?.entries.find(entry => entry.files?.length);
 		expect(source?.redactedText).not.toContain("raw-file-bytes-must-not-persist");
 		expect(JSON.stringify(context.snapshots)).not.toContain("raw-secret");
 		expect(source?.files).toHaveLength(1);
@@ -4205,6 +4216,7 @@ describe("SessionLcm", () => {
 		const contentHash = new Bun.CryptoHasher("sha256").update(original).digest("hex");
 		const outsideMention = path.relative(cwd, outsidePath);
 		const manager = SessionManager.inMemory(cwd);
+		appendUser(manager, "inspect the referenced files", 0);
 		manager.appendMessage({
 			role: "fileMention",
 			files: [
@@ -4387,6 +4399,227 @@ describe("SessionLcm", () => {
 			await lcm.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
+	});
+
+	it("fails open when the request has no active user anchor", async () => {
+		const manager = SessionManager.inMemory("/missing-active-user-anchor");
+		manager.appendMessage({ ...createAssistantMessage("orphaned assistant"), timestamp: 1 });
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot): ContextProjection => ({
+			revision: 1,
+			ready: true,
+			historical: [],
+			activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+			freshTailSourceIds: snapshot.entries.map(entry => entry.entryId),
+			uncoveredSourceIds: [],
+			sourceTokens: snapshot.entries.length,
+			selectedLevelCounts: {},
+			coveredSourceCount: 0,
+			freshSourceCount: snapshot.entries.length,
+			estimatedTokens: 1,
+			pendingJobs: 0,
+		});
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 1, maxTokens: 1 },
+		}));
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(result.messages).toBe(input);
+		expect(result.owned).toBe(false);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime).toMatchObject({
+			health: "healthy",
+			lastRequestRoute: {
+				kind: "native_fallback",
+				category: "unfit",
+				reason: "active_user_anchor_invalid",
+			},
+			lastFailure: { category: "unfit", reason: "active_user_anchor_invalid" },
+		});
+		expect(await lcm.retrySummaries()).toBeNull();
+		await lcm.close();
+	});
+
+	it("fails open without degrading when an exact projection summarizes the active user", async () => {
+		const manager = SessionManager.inMemory("/invalid-active-user-anchor");
+		appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
+		appendUser(manager, "active instruction", 3);
+		manager.appendMessage({ ...createAssistantMessage("continued work"), timestamp: 4 });
+		const context = new FakeLcmContext();
+		context.projectImpl = (_request, snapshot) => readyHistoricalProjection(snapshot, "invalid-active-anchor");
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 1, maxTokens: 1 },
+		}));
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(result.messages).toBe(input);
+		expect(result.owned).toBe(false);
+		expect(lcm.commitPrimaryRequestRoute(result.routeKey)).toBe(true);
+		expect((await lcm.status()).runtime).toMatchObject({
+			health: "healthy",
+			lastRequestRoute: {
+				kind: "native_fallback",
+				category: "unfit",
+				reason: "active_user_anchor_invalid",
+			},
+			lastFailure: { category: "unfit", reason: "active_user_anchor_invalid" },
+		});
+		await lcm.close();
+	});
+
+	it("anchors a persisted active user before its complete tool continuation", async () => {
+		const manager = SessionManager.inMemory("/active-user-anchor");
+		const first = appendUser(manager, "first", 1);
+		manager.appendMessage({ ...createAssistantMessage("settled"), timestamp: 2 });
+		const active = appendUser(manager, "active instruction", 3);
+		const toolCall = {
+			...createAssistantMessage(""),
+			timestamp: 4,
+			stopReason: "toolUse" as const,
+			content: [{ type: "toolCall" as const, id: "anchor-call", name: "read", arguments: { path: "fixture" } }],
+		};
+		manager.appendMessage(toolCall);
+		const toolResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "anchor-call",
+			toolName: "read",
+			content: [{ type: "text", text: "fixture result" }],
+			isError: false,
+			timestamp: 5,
+		};
+		manager.appendMessage(toolResult);
+		const completed = { ...createAssistantMessage("completed"), timestamp: 6 };
+		manager.appendMessage(completed);
+		const context = new FakeLcmContext();
+		const observedAnchors: Array<string | undefined> = [];
+		context.projectImpl = (request, snapshot): ContextProjection => {
+			const requiredStartSourceId = request.freshTail.requiredStartSourceId;
+			observedAnchors.push(requiredStartSourceId);
+			const anchoredIndex = snapshot.entries.findIndex(entry => entry.entryId === requiredStartSourceId);
+			const freshStart = anchoredIndex >= 0 ? anchoredIndex : snapshot.entries.length - 1;
+			const historical = snapshot.entries.slice(0, freshStart);
+			const fresh = snapshot.entries.slice(freshStart);
+			return {
+				revision: 1,
+				ready: true,
+				historical:
+					historical.length === 0
+						? []
+						: [
+								{
+									kind: "summary",
+									summaryId: "active-anchor-summary",
+									summaryHandle: "active-anchor-handle",
+									level: 0,
+									redactedText: "history before active instruction",
+									tokenCount: 4,
+									sourceIds: historical.map(entry => entry.entryId),
+									citations: historical.map((entry, position) => ({
+										...snapshot.scope,
+										sourceId: entry.entryId,
+										sourceKey: `source-${position}`,
+										contentHash: entry.contentHash,
+										position,
+									})),
+									files: [],
+								},
+							],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+				freshTailSourceIds: fresh.map(entry => entry.entryId),
+				uncoveredSourceIds: [],
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: historical.length > 0 ? { 0: 1 } : {},
+				coveredSourceCount: historical.length,
+				freshSourceCount: fresh.length,
+				estimatedTokens: 10,
+				pendingJobs: 0,
+			};
+		};
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 1, maxTokens: 1 },
+		}));
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(observedAnchors).not.toContain(undefined);
+		expect(observedAnchors.at(-1)).toBe(context.snapshots.at(-1)!.entries[2]!.entryId);
+		expect(result.owned).toBe(true);
+		expect(result.messages[0]).toBe(first);
+		expect(result.messages).toContain(active);
+		expect(result.messages).toContain(toolCall);
+		expect(result.messages).toContain(toolResult);
+		expect(result.messages).toContain(completed);
+		const providerMessages = convertToLlm(result.messages);
+		const toolCallIndex = providerMessages.findIndex(
+			message =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "anchor-call"),
+		);
+		expect(toolCallIndex).toBeGreaterThan(-1);
+		expect(providerMessages[toolCallIndex + 1]).toMatchObject({ role: "toolResult", toolCallId: "anchor-call" });
+		await lcm.close();
+	});
+
+	it("allows the first user to anchor a one-user tool continuation", async () => {
+		const manager = SessionManager.inMemory("/first-user-anchor");
+		const first = appendUser(manager, "only user instruction", 1);
+		const continued = { ...createAssistantMessage("continued work"), timestamp: 2 };
+		manager.appendMessage(continued);
+		const context = new FakeLcmContext();
+		let observedAnchor: string | undefined;
+		context.projectImpl = (request, snapshot) => {
+			const requiredStartSourceId = request.freshTail.requiredStartSourceId;
+			observedAnchor = requiredStartSourceId;
+			const anchored = snapshot.entries[0]?.entryId === requiredStartSourceId;
+			const fresh = anchored ? snapshot.entries : snapshot.entries.slice(-1);
+			return {
+				revision: 1,
+				ready: true,
+				historical: [],
+				activeSourceFingerprint: activeSourceFingerprint(snapshot.entries.map(entry => entry.entryId)),
+				freshTailSourceIds: fresh.map(entry => entry.entryId),
+				uncoveredSourceIds: anchored ? [] : snapshot.entries.slice(0, -1).map(entry => entry.entryId),
+				sourceTokens: snapshot.entries.length,
+				selectedLevelCounts: {},
+				coveredSourceCount: 0,
+				freshSourceCount: fresh.length,
+				estimatedTokens: snapshot.entries.length,
+				pendingJobs: 0,
+			};
+		};
+		const { lcm } = createHarness(manager, context, undefined, undefined, () => ({
+			sourceTokens: 101,
+			prewarmThresholdTokens: 40,
+			hardThresholdTokens: 100,
+			tokenBudget: 100_000,
+			freshTail: { maxSources: 1, maxTokens: 1 },
+		}));
+		const input = manager.buildSessionContext().messages;
+
+		const result = await lcm.project(input);
+
+		expect(observedAnchor).toBe(context.snapshots.at(-1)!.entries[0]!.entryId);
+		expect(result.owned).toBe(true);
+		expect(result.messages).toEqual([first, continued]);
+		await lcm.close();
 	});
 
 	it("preserves a colliding same-millisecond live tail around transient history", async () => {

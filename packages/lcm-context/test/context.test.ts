@@ -1718,6 +1718,21 @@ describe("LCM context contracts", () => {
 		});
 	});
 
+	test("required fresh start fails closed before the branch exists", () => {
+		const projection = context.project({
+			...MAIN,
+			branchId: "missing",
+			tokenBudget: 100,
+			freshTail: { maxSources: 1, maxTokens: 100, requiredStartSourceId: "absent-user" },
+		});
+		expect(projection).toMatchObject({
+			ready: false,
+			historical: [],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: [],
+		});
+	});
+
 	test("active-source fingerprint preserves Unicode UTF-8 length framing", () => {
 		const sourceIds = ["ascii", "é", "東京", "😀", "e\u0301"];
 		const hasher = new Bun.CryptoHasher("sha256");
@@ -1883,6 +1898,101 @@ describe("LCM context contracts", () => {
 		});
 		expect(projection.freshTailSourceIds).toEqual(["tail-new-1", "tail-new-2"]);
 		expect(projection.uncoveredSourceIds).toEqual(["tail-old"]);
+	});
+
+	test("required fresh start overrides tail targets without trimming its suffix", () => {
+		const sources = [
+			entry(MAIN, "anchor-old", "older context that may be summarized"),
+			entry(MAIN, "anchor-user", "active user instruction", "anchor-old"),
+			{ ...entry(MAIN, "anchor-call", "assistant tool call", "anchor-user", "anchor-tool-turn"), kind: "assistant" },
+			{
+				...entry(MAIN, "anchor-result", "matching tool result", "anchor-call", "anchor-tool-turn"),
+				kind: "tool_result",
+			},
+			entry(MAIN, "anchor-final", "assistant continuation", "anchor-result"),
+		];
+		const request = {
+			...MAIN,
+			tokenBudget: 1,
+			freshTail: { maxSources: 1, maxTokens: 1, requiredStartSourceId: "anchor-user" },
+		};
+
+		expect(context.reconcile(snapshot(MAIN, sources), { summarize: request })).toMatchObject({ queuedJobs: 1 });
+		const pending = context.project(request);
+		expect(pending).toMatchObject({
+			ready: false,
+			pendingJobs: 1,
+			uncoveredSourceIds: ["anchor-old"],
+			freshTailSourceIds: ["anchor-user", "anchor-call", "anchor-result", "anchor-final"],
+		});
+		completeEveryJob(context);
+		const projection = context.project(request);
+
+		expect(projection).toMatchObject({ ready: true, pendingJobs: 0, uncoveredSourceIds: [] });
+		expect(projection.historical.flatMap(item => item.sourceIds)).toEqual(["anchor-old"]);
+		expect(projection.freshTailSourceIds).toEqual(["anchor-user", "anchor-call", "anchor-result", "anchor-final"]);
+	});
+
+	test("required fresh start excludes older pending spans inside its suffix", () => {
+		const sources = [
+			entry(MAIN, "pending-old-1", "first older source"),
+			entry(MAIN, "pending-old-2", "second older source", "pending-old-1"),
+			entry(MAIN, "pending-user", "active user instruction", "pending-old-2"),
+			{
+				...entry(MAIN, "pending-call", "assistant tool call", "pending-user", "pending-tool-turn"),
+				kind: "assistant",
+			},
+			{
+				...entry(MAIN, "pending-result", "matching tool result", "pending-call", "pending-tool-turn"),
+				kind: "tool_result",
+			},
+			entry(MAIN, "pending-final", "assistant continuation", "pending-result"),
+		];
+		const unanchored = { tokenBudget: 100, freshTail: { maxSources: 1, maxTokens: 100 } };
+		expect(context.reconcile(snapshot(MAIN, sources), { summarize: unanchored })).toMatchObject({ queuedJobs: 3 });
+
+		const anchored = {
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 1, maxTokens: 100, requiredStartSourceId: "pending-user" },
+		};
+		context.reconcile(snapshot(MAIN, sources), { summarize: anchored });
+		const projection = context.project(anchored);
+
+		expect(projection).toMatchObject({
+			ready: false,
+			pendingJobs: 1,
+			uncoveredSourceIds: ["pending-old-1", "pending-old-2"],
+			freshTailSourceIds: ["pending-user", "pending-call", "pending-result", "pending-final"],
+		});
+		const policy = context.configureSummaryRetryPolicy(MAIN.projectId, "provider/model");
+		if (policy.kind !== "ready") throw new Error("retry policy did not initialize");
+		expect(context.summaryJobAvailability(anchored, policy, 5)).toMatchObject({
+			runnable: 1,
+			leased: 0,
+			backoff: 0,
+			exhausted: 0,
+			missing: 0,
+			policyMismatch: 0,
+		});
+	});
+
+	test("missing required fresh start never falls back to the configured tail", () => {
+		const sources = [entry(MAIN, "missing-old", "old"), entry(MAIN, "missing-new", "new", "missing-old")];
+		context.reconcile(snapshot(MAIN, sources), { summarize: false });
+
+		const projection = context.project({
+			...MAIN,
+			tokenBudget: 100,
+			freshTail: { maxSources: 1, maxTokens: 100, requiredStartSourceId: "absent-user" },
+		});
+
+		expect(projection).toMatchObject({
+			ready: false,
+			historical: [],
+			freshTailSourceIds: [],
+			uncoveredSourceIds: ["missing-old", "missing-new"],
+		});
 	});
 
 	test("fresh tail counts the newest source against the source target", () => {
