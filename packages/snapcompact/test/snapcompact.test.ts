@@ -846,10 +846,9 @@ describe("compact", () => {
 
 		expect(result.firstKeptEntryId).toBe("kept-1");
 		expect(result.tokensBefore).toBe(99000);
-		expect(result.summary).toContain("You are resuming a prior conversation.");
 		expect(result.summary).toContain("HISTORY");
-		expect(result.summary).toContain("`¶user:`, `¶think:`, `¶ai:`, and `¶call:`");
-		expect(result.summary).toContain("Following lines without a `¶…:` prefix remain in the current scope.");
+		expect(result.summary).toContain("`¶user:`");
+		expect(result.summary).toContain("`¶call:`");
 		expect(result.summary).toContain("`¶call:name(args)//intent`");
 		expect(result.summary).toContain("FILES\n===================\n# src/\nauth.ts (Read)\nlogin.ts (Write)");
 

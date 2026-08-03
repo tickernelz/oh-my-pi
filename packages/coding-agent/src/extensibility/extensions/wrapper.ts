@@ -239,6 +239,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// short-circuit above.
 		const resolvedArgs = approvalArgs(effectiveParams, context);
 		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
+		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
 			throw new Error(
 				`Tool "${this.tool.name}" is blocked by user policy.\n` +

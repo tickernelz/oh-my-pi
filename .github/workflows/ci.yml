@@ -387,5 +387,3 @@ jobs:
            env:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
-
-

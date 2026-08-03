@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isEexist, isEisdir, isEnoent, postmortem } from "@oh-my-pi/pi-utils";
+import { getGlobalDaemonRuntimeDir, isEexist, isEisdir, isEnoent, postmortem } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
@@ -43,8 +43,9 @@ export interface DaemonBrokerClientOptions {
 	idleGraceMs?: number;
 }
 
-/** Persistent per-process connection to one project's daemon broker. */
+/** Persistent per-process connection to one project or global daemon broker. */
 export interface DaemonBrokerClient {
+	/** Canonical project directory or synthetic directory identifying a global scope. */
 	readonly projectDir: string;
 	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult>;
 	close(): void;
@@ -299,7 +300,19 @@ class SocketDaemonClient implements DaemonBrokerClient {
 const sharedClients = new Map<string, Promise<DaemonBrokerClient>>();
 let cancelExitCleanup: (() => void) | undefined;
 
-/** Create an independent socket connection to one project's shared daemon broker. */
+function sharedDaemonClient(key: string, create: () => Promise<DaemonBrokerClient>): Promise<DaemonBrokerClient> {
+	let pending = sharedClients.get(key);
+	if (!pending) {
+		pending = create();
+		sharedClients.set(key, pending);
+		if (!cancelExitCleanup) {
+			cancelExitCleanup = postmortem.register("daemon-broker-clients", () => closeDaemonClients());
+		}
+	}
+	return pending;
+}
+
+/** Create an independent socket connection to one daemon broker scope. */
 export async function createDaemonBrokerClient(
 	projectDir: string,
 	options: DaemonBrokerClientOptions = {},
@@ -313,18 +326,24 @@ export async function createDaemonBrokerClient(
 /** Get the process-shared daemon broker client for one canonical project directory. */
 export async function daemonClientForProject(projectDir: string): Promise<DaemonBrokerClient> {
 	const canonical = await canonicalProjectDir(projectDir);
-	let pending = sharedClients.get(canonical);
-	if (!pending) {
-		pending = createDaemonBrokerClient(canonical);
-		sharedClients.set(canonical, pending);
-		if (!cancelExitCleanup) {
-			cancelExitCleanup = postmortem.register("daemon-broker-clients", () => closeDaemonClients());
-		}
-	}
-	return pending;
+	return sharedDaemonClient(`project:${canonical}`, () => createDaemonBrokerClient(canonical));
 }
 
-/** Close every project broker connection held by this omp process. */
+/** Get the process-shared client that leases one profile-independent, machine-global daemon broker. */
+export async function daemonClientForGlobal(service: string): Promise<DaemonBrokerClient> {
+	const runtimeDir = getGlobalDaemonRuntimeDir(service);
+	// Canonicalize only after creation so the first caller and later callers
+	// derive the same Windows pipe key even when an ancestor is a symlink.
+	await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+	const canonical = await fs.realpath(runtimeDir);
+	return sharedDaemonClient(`global:${canonical}`, () =>
+		createDaemonBrokerClient(canonical, {
+			runtimeDir: canonical,
+		}),
+	);
+}
+
+/** Close every project and machine-global broker connection held by this omp process. */
 export async function closeDaemonClients(): Promise<void> {
 	const pending = [...sharedClients.values()];
 	sharedClients.clear();

@@ -1415,12 +1415,13 @@ export function getPackageDir(): string {
 	return getOmpPackageDir() ?? (isCompiledBinary() ? path.dirname(process.execPath) : process.cwd());
 }
 
-// Legacy pi's `@earendil-works/pi-coding-agent` re-exported `estimateTokens`
-// and `compact` from its package root (via `./core/compaction/index.ts`). In
-// omp both live in `@oh-my-pi/pi-agent-core/compaction`, and the coding-agent
-// barrel below does not forward them, so legacy extensions importing either
-// fail Bun's static export check during validation (issues #6583, #7174).
-export { compact, estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
+// Legacy pi's `@earendil-works/pi-coding-agent` re-exported `estimateTokens`,
+// `compact`, and `serializeConversation` from its package root (via
+// `./core/compaction/index.ts`). In omp they live in
+// `@oh-my-pi/pi-agent-core/compaction`, and the coding-agent barrel below does
+// not forward them, so legacy extensions importing them fail Bun's static
+// export check during validation (issues #6583, #7174, #7403).
+export { compact, estimateTokens, serializeConversation } from "@oh-my-pi/pi-agent-core/compaction";
 
 // Same barrel gap for two more legacy package-root exports: pi re-exported the
 // `CONFIG_DIR_NAME` constant and the CLI parser `parseArgs`. In omp

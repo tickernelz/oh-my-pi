@@ -1231,11 +1231,11 @@ describe("Cursor modern exec frames: Pi tools", () => {
 		expect(answer.value.result.value.diff).toBe("-before\n+after");
 		expect(answer.value.result.value.patch).toBe("@@");
 
-		// The synthesized display block must use the local edit tool's snake_case
-		// replace schema, or the rebuilt transcript renders empty edits.
+		// The synthesized display block must use the local edit tool's replace
+		// schema, or the rebuilt transcript renders empty edits.
 		const block = output.content.find((b): b is ToolCallState => b.type === "toolCall");
 		expect(block?.name).toBe("edit");
-		expect(block?.arguments).toEqual({ path: "/repo/a.ts", edits: [{ old_text: "before", new_text: "after" }] });
+		expect(block?.arguments).toEqual({ path: "/repo/a.ts", old_string: "before", new_string: "after" });
 	});
 
 	it("answers each remaining Pi frame with a populated success payload", async () => {

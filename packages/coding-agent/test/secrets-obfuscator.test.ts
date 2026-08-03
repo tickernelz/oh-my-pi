@@ -57,7 +57,7 @@ describe("compileSecretRegex", () => {
 describe("builtinCredentialSecretEntries", () => {
 	// Issue #6968: an unconfigured credential-shaped token in a tool result used
 	// to fall through to pi-ai's irreversible `[*_token_redacted]` rewrite, so an
-	// edit-tool `old_text` echoing that placeholder could never match the file.
+	// edit-tool `old_string` echoing that placeholder could never match the file.
 	// The contract: the token is hidden from provider-visible text AND restored
 	// byte-exact in tool-call arguments before tool execution.
 	it("hides unconfigured credential-shaped tokens and restores them in tool-call arguments", () => {
@@ -71,9 +71,9 @@ describe("builtinCredentialSecretEntries", () => {
 			expect(providerView).not.toContain(token);
 			// Re-obfuscation is a fixed point: the placeholder itself is never re-matched.
 			expect(obfuscator.obfuscate(providerView)).toBe(providerView);
-			// The model echoes the placeholder into edit-tool old_text verbatim.
-			const args = deobfuscateToolArguments(obfuscator, { old_text: providerView });
-			expect(args.old_text).toBe(fileLine);
+			// The model echoes the placeholder into edit-tool old_string verbatim.
+			const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+			expect(args.old_string).toBe(fileLine);
 		}
 	});
 });
@@ -99,8 +99,8 @@ describe("lazy placeholder key", () => {
 		expect(providerView).not.toContain(token);
 		obfuscator.obfuscate(`repeat: ${token}`);
 		expect(resolutions).toBe(1);
-		const args = deobfuscateToolArguments(obfuscator, { old_text: providerView });
-		expect(args.old_text).toBe(`MOONSHOT_API_KEY=${token}`);
+		const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+		expect(args.old_string).toBe(`MOONSHOT_API_KEY=${token}`);
 	});
 
 	it("redacts a lazily resolved key from the same input that triggers resolution", () => {

@@ -246,6 +246,7 @@ export interface ToolExecutionHandle extends Component {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	setToolActivityVisible(visible: boolean): void;
 	/** Freeze the block as final history: stop spinners and let it commit to scrollback. */
 	seal(): void;
 }
@@ -287,6 +288,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#toolLabel: string;
 	#args: any;
 	#expanded = false;
+	#toolActivityVisible = true;
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
@@ -901,6 +903,11 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#updateDisplay();
 	}
 
+	setToolActivityVisible(visible: boolean): void {
+		this.#toolActivityVisible = visible;
+		super.invalidate();
+	}
+
 	setShowImages(show: boolean): void {
 		this.#showImages = show;
 		this.#updateDisplay();
@@ -960,6 +967,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	}
 
 	override render(width: number): readonly string[] {
+		if (!this.#toolActivityVisible) return [];
 		const lines = super.render(width);
 		// Update the paint-tracking flags after `super.render(width)` — the
 		// override runs on every compose the parent Container performs, so a

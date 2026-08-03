@@ -37,7 +37,9 @@ async function pingComputerWorker(
 		argv,
 	});
 	const response = Promise.withResolvers<unknown>();
-	worker.addEventListener("message", event => response.resolve(event.data));
+	worker.addEventListener("message", event => {
+		if (event.data?.type === "pong" && event.data.id === id) response.resolve(event.data);
+	});
 	worker.addEventListener("error", event => response.reject(event.error ?? new Error(event.message)));
 	worker.postMessage({ type: "ping", id });
 	try {

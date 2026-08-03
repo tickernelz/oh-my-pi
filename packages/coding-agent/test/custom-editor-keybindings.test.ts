@@ -19,6 +19,17 @@ describe("CustomEditor keybindings", () => {
 		expect(onRetry).toHaveBeenCalledTimes(1);
 	});
 
+	it("routes the configured tool activity visibility chord through handleInput", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onToggleToolActivity = vi.fn();
+
+		editor.setActionKeys("app.tools.toggleVisibility", ["alt+h"]);
+		editor.onToggleToolActivity = onToggleToolActivity;
+		editor.handleInput("\x1bh");
+
+		expect(onToggleToolActivity).toHaveBeenCalledTimes(1);
+	});
+
 	it("lets custom handlers keep precedence over the default retry chord", () => {
 		const editor = new CustomEditor(getEditorTheme());
 		const onRetry = vi.fn();

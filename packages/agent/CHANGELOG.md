@@ -9,6 +9,18 @@
 ### Changed
 
 - Compaction summary messages can carry a sanitized `lcmFallback` category so hosts can explain when native compaction replaced unavailable Lossless context work.
+## [17.2.5] - 2026-08-03
+
+### Breaking Changes
+
+- Tool examples embedded in tool descriptions now always render in Python call syntax, and the `exampleDialect` option has been removed from `AppendOnlyContextManager` build options.
+- Updated `normalizeTools` to accept a `NormalizeToolsOptions` configuration object (`{ injectIntent, pruneDescriptions }`) instead of positional booleans.
+
+### Fixed
+
+- Fixed an issue where runs would fail with an error if an Anthropic stream was truncated after complete tool calls were streamed; the agent now recovers and executes those tool calls.
+- Fixed an issue where artifact recovery reads could be incorrectly elided during compaction.
+
 ## [17.2.4] - 2026-08-01
 
 ### Fixed

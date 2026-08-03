@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
-import { $env, getAgentDbPath, getDbBusyTimeoutMs, logger } from "@oh-my-pi/pi-utils";
+import { $env, $envExact, getAgentDbPath, getDbBusyTimeoutMs, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "./auth-retry";
 import * as AIError from "./error";
 import { isUsageLimitOutcome } from "./error/rate-limit";
@@ -647,7 +647,7 @@ export type AuthStorageOptions = {
  * Does NOT support "!command" syntax (that requires pi-natives).
  */
 async function defaultConfigValueResolver(config: string): Promise<string | undefined> {
-	const envValue = process.env[config];
+	const envValue = $envExact(config);
 	return envValue || config;
 }
 

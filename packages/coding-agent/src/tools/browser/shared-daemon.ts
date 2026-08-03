@@ -11,7 +11,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type DaemonBrokerClient, daemonClientForProject } from "../../launch/client";
+import { daemonClientForProject } from "../../launch/client";
+import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
 import { daemonRuntimeDir } from "../../launch/paths";
 import type { DaemonSnapshot } from "../../launch/protocol";
 import { throwIfAborted } from "../tool-errors";
@@ -20,7 +21,6 @@ import { resolveSharedBrowserLaunchSpec } from "./launch";
 /** Chrome prints this on stderr once the CDP listener is up; the broker's ready probe captures the line. */
 const READY_LOG_PATTERN = String.raw`DevTools listening on ws://\S+`;
 const READY_TIMEOUT_MS = 30_000;
-const STOP_TIMEOUT_MS = 5_000;
 const PROBE_TIMEOUT_MS = 1_500;
 /** describe→start rounds before giving up; bounds cross-process start races and wedged-Chrome replacement. */
 const ENSURE_ATTEMPTS = 3;
@@ -59,58 +59,6 @@ async function probeEndpoint(wsEndpoint: string): Promise<boolean> {
 	}
 }
 
-/** Snapshot the daemon, treating "unknown daemon" as absent. */
-async function describeQuietly(
-	client: DaemonBrokerClient,
-	name: string,
-	signal?: AbortSignal,
-): Promise<DaemonSnapshot | undefined> {
-	try {
-		const result = await client.request({ op: "describe", name }, signal);
-		return result.op === "describe" ? result.daemon : undefined;
-	} catch (error) {
-		throwIfAborted(signal);
-		logger.debug("Shared browser describe failed", {
-			name,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return undefined;
-	}
-}
-
-/** Block until the daemon reports ready; undefined on timeout or pre-ready exit. */
-async function waitReady(
-	client: DaemonBrokerClient,
-	name: string,
-	signal?: AbortSignal,
-): Promise<DaemonSnapshot | undefined> {
-	try {
-		const result = await client.request({ op: "wait", name, for: "ready", timeoutMs: READY_TIMEOUT_MS }, signal);
-		if (result.op !== "wait" || result.timedOut) return undefined;
-		return result.daemon;
-	} catch (error) {
-		throwIfAborted(signal);
-		logger.debug("Shared browser ready wait failed", {
-			name,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return undefined;
-	}
-}
-
-/** Best-effort stop before replacing a wedged or endpoint-less daemon. */
-async function stopQuietly(client: DaemonBrokerClient, name: string, signal?: AbortSignal): Promise<void> {
-	try {
-		await client.request({ op: "stop", name, timeoutMs: STOP_TIMEOUT_MS }, signal);
-	} catch (error) {
-		throwIfAborted(signal);
-		logger.debug("Shared browser stop failed", {
-			name,
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
-}
-
 /**
  * Ensure the project-shared automation Chromium is running and reachable,
  * launching it under the daemon broker when needed. Idempotent across
@@ -139,16 +87,17 @@ export async function ensureSharedBrowser(opts: {
 	await fs.mkdir(userDataDir, { recursive: true });
 	for (let attempt = 0; attempt < ENSURE_ATTEMPTS; attempt++) {
 		throwIfAborted(opts.signal);
-		const existing = await describeQuietly(client, name, opts.signal);
+		const existing = await describeQuietly(client, name, "Shared browser", opts.signal);
 		if (existing && existing.state !== "exited" && existing.state !== "failed") {
-			const settled = existing.readyAt !== undefined ? existing : await waitReady(client, name, opts.signal);
+			const settled =
+				existing.readyAt !== undefined ? existing : await waitReady(client, name, "Shared browser", opts.signal);
 			const wsEndpoint = wsEndpointOf(settled);
 			if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
 				return { wsEndpoint, daemonName: name, projectDir: client.projectDir };
 			}
 			// Live record but unreachable Chrome (wedged, or readiness never
 			// matched): replace it rather than handing out a dead endpoint.
-			await stopQuietly(client, name, opts.signal);
+			await stopQuietly(client, name, "Shared browser", opts.signal);
 			continue;
 		}
 		try {
@@ -175,7 +124,7 @@ export async function ensureSharedBrowser(opts: {
 			if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
 				return { wsEndpoint, daemonName: name, projectDir: client.projectDir };
 			}
-			await stopQuietly(client, name, opts.signal);
+			await stopQuietly(client, name, "Shared browser", opts.signal);
 		} catch (error) {
 			throwIfAborted(opts.signal);
 			// Lost a cross-process start race ("already starting/ready"); the next

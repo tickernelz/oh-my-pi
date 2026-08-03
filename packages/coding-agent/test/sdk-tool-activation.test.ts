@@ -636,7 +636,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	// roster is built once, at creation — switching to Cursor later does not
 	// rebuild it. These two cover both directions of that wiring: the granted
 	// session must still reach a replace-mode instance for `pi_edit` (whose
-	// `old_text`/`new_text` args do not validate against the default `hashline`
+	// `old_string`/`new_string` args do not validate against the default `hashline`
 	// schema), and the restricted one must still be refused.
 	//
 	// The handlers are internal to the session; `streamFn` is where they are
@@ -793,7 +793,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 									type: "toolCall",
 									id: toolCallId,
 									name: "edit",
-									arguments: { path: target, edits: [{ old_text: "beta", new_text: "gamma" }] },
+									arguments: { path: target, old_string: "beta", new_string: "gamma" },
 								},
 							],
 						},

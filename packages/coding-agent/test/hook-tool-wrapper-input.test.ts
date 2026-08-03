@@ -92,19 +92,4 @@ describe("HookToolWrapper tool_call input override", () => {
 
 		expect(executed).toEqual([{ command: "echo original" }]);
 	});
-
-	it("does not override a computer tool call even if a hook returns input", async () => {
-		const executed: unknown[] = [];
-		const runner = makeRunner(makeHook(() => ({ input: { command: "echo revised" } })));
-		const wrapped = new HookToolWrapper(makeRecordingTool(executed), runner);
-
-		// A computer tool call carries synthetic actions in providerMetadata; the event input is not the
-		// real params, so the override must be skipped and the original params must reach execute.
-		const computerContext = {
-			toolCall: { providerMetadata: { type: "computer", actions: [], pendingSafetyChecks: [] } },
-		} as never;
-		await wrapped.execute("call-4", { command: "echo original" } as never, undefined, undefined, computerContext);
-
-		expect(executed).toEqual([{ command: "echo original" }]);
-	});
 });

@@ -20,6 +20,14 @@ import { JsRuntime, type RuntimeHooks } from "../../eval/js/shared/runtime";
 import { resizeImage } from "../../utils/image-resize";
 import { resolveToCwd } from "../path-utils";
 import { formatScreenshot } from "../render-utils";
+import {
+	bindRunFacade,
+	CELL_BUDGET_SLACK_MS,
+	markHandled,
+	resolvePredicateTimeout,
+	type WaitPredicateOptions,
+	waitForRun,
+} from "../run-scope";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tool-errors";
 import {
 	type AriaSnapshotOptions,
@@ -36,14 +44,6 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat } from "./readable";
-import {
-	bindBrowserRunFacade,
-	CELL_BUDGET_SLACK_MS,
-	markHandled,
-	resolvePredicateTimeout,
-	type WaitPredicateOptions,
-	waitForBrowserRun,
-} from "./run-cancellation";
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
 	Observation,
@@ -827,6 +827,7 @@ export class WorkerCore {
 				const page = await target.page();
 				if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
 				this.#page = page;
+				await this.#claimRelayTarget(page);
 				this.#observeDialogs();
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 				if (payload.url) {
@@ -851,6 +852,26 @@ export class WorkerCore {
 			return target;
 		}
 		throw new ToolError(`Target ${targetId} is no longer available on the attached browser`);
+	}
+
+	/**
+	 * Tell the omp browser relay this worker drives the adopted page, so the
+	 * relay adds it to the per-window "omp" tab group. Best-effort: plain CDP
+	 * backends (real Chrome, cmux) reject the relay-private method.
+	 */
+	async #claimRelayTarget(page: Page): Promise<void> {
+		let session: CDPSession | undefined;
+		try {
+			session = await page.createCDPSession();
+			// Puppeteer's protocol map cannot express the relay-private method; the
+			// send signature is otherwise identical.
+			const raw = session as unknown as { send(method: string): Promise<unknown> };
+			await raw.send("OMP.claimTarget");
+		} catch {
+			// Not the omp relay; nothing to claim.
+		} finally {
+			await session?.detach().catch(() => undefined);
+		}
 	}
 
 	/**
@@ -975,9 +996,9 @@ export class WorkerCore {
 			const runtime = this.#ensureRuntime(msg.session);
 			runtime.setCwd(msg.session.cwd);
 			runtime.setRunScope({
-				page: bindBrowserRunFacade(runPage.page, signal),
-				browser: bindBrowserRunFacade(browser, signal),
-				tab: bindBrowserRunFacade(tabApi, signal),
+				page: bindRunFacade(runPage.page, signal),
+				browser: bindRunFacade(browser, signal),
+				tab: bindRunFacade(tabApi, signal),
 				assert: (cond: unknown, text?: string): void => {
 					if (!cond) throw new ToolError(text ?? "Assertion failed");
 				},
@@ -991,7 +1012,7 @@ export class WorkerCore {
 							: { timeout: resolvePredicateTimeout(msg.timeoutMs, opts?.timeout), interval: opts?.interval };
 					return markHandled(
 						this.#runOp(active, label, signal, Number.POSITIVE_INFINITY, sig =>
-							waitForBrowserRun(msOrPredicate, sig, resolved),
+							waitForRun(msOrPredicate, sig, resolved),
 						),
 					);
 				},

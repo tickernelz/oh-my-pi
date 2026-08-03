@@ -372,8 +372,7 @@ describe("bridge tool resolution beyond the model-facing registry", () => {
 	it("substitutes a replace-mode edit into a granted advisor tool map", async () => {
 		// The advisor roster hands the bridge the instances it built for the
 		// advisor's own loop — default `hashline` mode, whose schema is a single
-		// `input` string. A `pi_edit` frame's `old_text`/`new_text` pairs fail
-		// validation against it, so the file goes unmodified. This is the
+		// `input` string. A `pi_edit` frame's `old_string`/`new_string` args fail
 		// substitution the advisor path applies before constructing handlers.
 		const target = path.join(cwd, "sample.txt");
 		await Bun.write(target, "alpha\nbeta\n");
@@ -1695,7 +1694,36 @@ describe("CursorExecHandlers Pi frame translation", () => {
 			args: { path: "a.ts", edits: [{ oldText: "before", newText: "after" }] },
 		} as never);
 
-		expect(calls[0]).toEqual({ path: "a.ts", edits: [{ old_text: "before", new_text: "after" }] });
+		expect(calls[0]).toEqual({ path: "a.ts", old_string: "before", new_string: "after" });
+	});
+
+	it("sends a multi-replacement pi_edit frame as one batched tool call", async () => {
+		// One frame must stay one tool lifecycle: looping per replacement would
+		// emit duplicate start/end events under the same toolCallId and return
+		// only the last replacement's diff. Multi-replacement frames therefore
+		// ride the internal `edits` batch form, in frame order.
+		const { handlers, calls } = recordingHandlers("edit");
+
+		await handlers.piEdit({
+			toolCallId: "c1",
+			args: {
+				path: "a.ts",
+				edits: [
+					{ oldText: "one", newText: "ONE" },
+					{ oldText: "two", newText: "TWO" },
+				],
+			},
+		} as never);
+
+		expect(calls).toEqual([
+			{
+				path: "a.ts",
+				edits: [
+					{ old_string: "one", new_string: "ONE" },
+					{ old_string: "two", new_string: "TWO" },
+				],
+			},
+		]);
 	});
 
 	it("lists directories for pi_ls through read, defaulting an empty path to cwd", async () => {

@@ -78,17 +78,19 @@ describe("resolveModelServiceTier", () => {
 });
 
 describe("shouldSendServiceTier", () => {
-	it("sends flex/scale/priority on the OpenAI family and OpenRouter", () => {
-		for (const p of ["openai", "openai-codex", "openrouter"]) {
+	it("sends every tier on the OpenAI family and supported tiers elsewhere", () => {
+		for (const p of ["openai", "openai-codex"] as const) {
 			expect(shouldSendServiceTier("flex", p)).toBe(true);
 			expect(shouldSendServiceTier("scale", p)).toBe(true);
 			expect(shouldSendServiceTier("priority", p)).toBe(true);
-			expect(shouldSendServiceTier("default", p)).toBe(false);
-			expect(shouldSendServiceTier("auto", p)).toBe(false);
+			expect(shouldSendServiceTier("default", p)).toBe(true);
+			expect(shouldSendServiceTier("auto", p)).toBe(true);
 		}
+		expect(shouldSendServiceTier("flex", "openrouter")).toBe(true);
+		expect(shouldSendServiceTier("default", "openrouter")).toBe(false);
 		expect(shouldSendServiceTier("priority", customCodex)).toBe(true);
 		expect(shouldSendServiceTier("scale", customOpenAI)).toBe(true);
-		expect(shouldSendServiceTier("default", customOpenAI)).toBe(false);
+		expect(shouldSendServiceTier("default", customOpenAI)).toBe(true);
 		for (const model of customOpenAIAliases) {
 			expect(shouldSendServiceTier("priority", model)).toBe(true);
 		}

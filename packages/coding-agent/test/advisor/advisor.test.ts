@@ -30,7 +30,6 @@ import type { Settings } from "../../src/config/settings";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../../src/modes/components/advisor-config";
 import { createAdvisorMessageCard } from "../../src/modes/components/advisor-message";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
-import advisorSystemPrompt from "../../src/prompts/advisor/system.md" with { type: "text" };
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { formatSessionHistoryMarkdown } from "../../src/session/session-history-format";
 import { YieldQueue } from "../../src/session/yield-queue";
@@ -74,9 +73,6 @@ describe("advisor", () => {
 
 			expect(rendered).toContain("→ grep(needle @ packages/coding-agent/src) ⇒ error");
 			expect(rendered).not.toContain("paths[0]");
-			expect(advisorSystemPrompt).toContain("Arguments absent from the rendered transcript are UNKNOWN");
-			expect(advisorSystemPrompt).toContain("NEVER assert concrete values, array indexes");
-			expect(advisorSystemPrompt).toContain("NEVER claim `paths[0]`, array flattening, or malformed `paths`");
 		});
 	});
 

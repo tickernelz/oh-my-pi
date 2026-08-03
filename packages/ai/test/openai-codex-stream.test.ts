@@ -509,6 +509,7 @@ describe("openai-codex streaming", () => {
 		const fetchMock: FetchImpl = async () =>
 			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
 		const textEndContents: string[] = [];
+		const eventTypes: string[] = [];
 
 		const stream = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
@@ -516,14 +517,35 @@ describe("openai-codex streaming", () => {
 		});
 		const readPromise = (async () => {
 			for await (const event of stream) {
+				eventTypes.push(event.type);
 				if (event.type === "text_end") textEndContents.push(event.content);
 			}
 		})();
 		const result = await stream.result();
 		await readPromise;
 
-		return { result, textEndContents };
+		return { result, textEndContents, eventTypes };
 	}
+
+	it("surfaces result-bearing native images with stale generating status", async () => {
+		const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+		const { result, eventTypes } = await runCodexSseEvents([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "image_generation_call", id: "ig_1", status: "generating", result: null },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "image_generation_call", id: "ig_1", status: "generating", result: data },
+			},
+			{ type: "response.completed", response: { id: "resp_image", status: "completed" } },
+		]);
+
+		expect(result.content).toEqual([{ type: "image", data, mimeType: "image/png" }]);
+		expect(eventTypes).toContain("image_end");
+	});
 
 	for (const testCase of [
 		{
@@ -1808,7 +1830,7 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
-	it("includes service_tier in SSE payloads when requested", async () => {
+	it("includes the default service_tier in SSE payloads when requested", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -1855,10 +1877,10 @@ describe("openai-codex streaming", () => {
 		const result = await streamOpenAICodexResponses(model, context, {
 			fetch: fetchMock as FetchImpl,
 			apiKey: token,
-			serviceTier: "priority",
+			serviceTier: "default",
 		}).result();
 		expect(result.stopReason).toBe("stop");
-		expect(capturedBody?.service_tier).toBe("priority");
+		expect(capturedBody?.service_tier).toBe("default");
 		expect(result.usage.cost.input).toBeCloseTo(0.00001);
 		expect(result.usage.cost.output).toBeCloseTo(0.000012);
 		expect(result.usage.cost.total).toBeCloseTo(0.000022);

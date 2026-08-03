@@ -1,10 +1,10 @@
-import { untilAborted } from "@oh-my-pi/pi-utils";
-import { ToolError, throwIfAborted } from "../tool-errors";
+import { untilAborted } from "@oh-my-pi/pi-utils/abortable";
+import { ToolError, throwIfAborted } from "./tool-errors";
 
 /**
  * Marks a run-scoped promise as observed without changing its behavior for awaited callers.
  *
- * Browser run teardown aborts can reject promises created for evaluated code after user code
+ * Run teardown aborts can reject promises created for evaluated code after user code
  * has stopped observing them (for example fire-and-forget `wait()`/facade calls). In 16.3.0
  * those zero-consumer rejections reached the process-level `unhandledRejection` handler and
  * killed every subagent sharing the process (issues #4499/#4672). Attaching a no-op rejection
@@ -33,8 +33,8 @@ export interface WaitPredicateOptions {
 /**
  * Effective `wait(predicate)` deadline for a given cell budget. Always strictly below
  * the cell budget so the named `wait(predicate) timed out` error wins the race against
- * the opaque whole-cell "Browser code execution timed out". `0`/`Infinity` ("disable")
- * map to the largest bounded deadline; negative/NaN garbage falls back to the default.
+ * the opaque whole-cell execution timeout. `0`/`Infinity` ("disable") map to the largest
+ * bounded deadline; negative/NaN garbage falls back to the default.
  */
 export function resolvePredicateTimeout(cellTimeoutMs: number, explicit?: number): number {
 	const budgetBound = Math.max(1, cellTimeoutMs - CELL_BUDGET_SLACK_MS);
@@ -44,15 +44,15 @@ export function resolvePredicateTimeout(cellTimeoutMs: number, explicit?: number
 }
 
 /**
- * Run-scoped `wait()` helper for evaluated browser code, honoring the owning run's
- * cancellation signal.
+ * Run-scoped `wait()` helper for evaluated code (browser and computer workers), honoring
+ * the owning run's cancellation signal.
  *
  * - `wait(ms)` sleeps for `ms` milliseconds.
  * - `wait(fn, { timeout?, interval? })` polls `fn` (sync or async) until it returns a
  *   truthy value and resolves with that value; throws a named `ToolError` on timeout
  *   instead of stalling into the whole-cell deadline. Predicate errors propagate.
  */
-export function waitForBrowserRun(
+export function waitForRun(
 	msOrPredicate: number | (() => unknown),
 	signal: AbortSignal,
 	opts?: WaitPredicateOptions,
@@ -86,8 +86,8 @@ export function waitForBrowserRun(
 	return markHandled(promise);
 }
 
-/** Binds a long-lived browser facade to one evaluated run's abort signal. */
-export function bindBrowserRunFacade<T extends object>(target: T, signal: AbortSignal): T {
+/** Binds a long-lived scope facade (page/tab/desktop objects) to one evaluated run's abort signal. */
+export function bindRunFacade<T extends object>(target: T, signal: AbortSignal): T {
 	const cache = new Map<PropertyKey, unknown>();
 	return new Proxy(target, {
 		get(current, prop) {
@@ -121,7 +121,7 @@ export function bindBrowserRunFacade<T extends object>(target: T, signal: AbortS
 				// brand-check internal slots that a Proxy cannot forward, and reading a
 				// signal needs no abort gating anyway.
 				if (value instanceof AbortSignal) return value;
-				const wrapped = bindBrowserRunFacade(value, signal);
+				const wrapped = bindRunFacade(value, signal);
 				cache.set(prop, wrapped);
 				return wrapped;
 			}

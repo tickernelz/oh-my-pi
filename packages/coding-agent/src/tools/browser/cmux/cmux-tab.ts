@@ -8,16 +8,11 @@ import { resizeImage } from "../../../utils/image-resize";
 import type { ToolSession } from "../../index";
 import { resolveToCwd } from "../../path-utils";
 import { formatScreenshot } from "../../render-utils";
+import { bindRunFacade, resolvePredicateTimeout, type WaitPredicateOptions, waitForRun } from "../../run-scope";
 import { ToolAbortError, ToolError, throwIfAborted } from "../../tool-errors";
 import { type AriaSnapshotOptions, assertSelectorString, buildAriaSnapshotScript } from "../aria/aria-snapshot";
 import { DEFAULT_VIEWPORT } from "../launch";
 import { extractReadableFromHtml, type ReadableFormat } from "../readable";
-import {
-	bindBrowserRunFacade,
-	resolvePredicateTimeout,
-	type WaitPredicateOptions,
-	waitForBrowserRun,
-} from "../run-cancellation";
 import { cloneSafe, RunOutput } from "../run-output";
 import type { Observation, ReadyInfo, RunResultOk, ScreenshotResult, SessionSnapshot } from "../tab-protocol";
 import {
@@ -1345,16 +1340,16 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 		// Keep both inside try so a concurrent in-process eval/browser run surfaces as
 		// a rejected promise the supervisor can report, never an unhandled rejection.
 		runtime.setCwd(opts.snapshot.cwd);
-		const runTab = bindBrowserRunFacade(tab, signal);
+		const runTab = bindRunFacade(tab, signal);
 		runtime.setRunScope({
-			page: bindBrowserRunFacade(tab.page, signal),
-			browser: bindBrowserRunFacade(tab.browser, signal),
+			page: bindRunFacade(tab.page, signal),
+			browser: bindRunFacade(tab.browser, signal),
 			tab: runTab,
 			assert: (cond: unknown, text?: string): void => {
 				if (!cond) throw new ToolError(text ?? "Assertion failed");
 			},
 			wait: (msOrPredicate: number | (() => unknown), waitOpts?: WaitPredicateOptions): Promise<unknown> =>
-				waitForBrowserRun(
+				waitForRun(
 					msOrPredicate,
 					signal,
 					typeof msOrPredicate === "number"

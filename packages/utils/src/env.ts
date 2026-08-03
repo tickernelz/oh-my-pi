@@ -247,6 +247,35 @@ export function $pickenv(...keys: string[]): string | undefined {
 }
 
 /**
+ * Read an environment variable by its EXACT, case-sensitive name.
+ *
+ * `process.env` / `Bun.env` lookups are case-insensitive on Windows (Node backs
+ * them with `uv_os_getenv`, Bun with a `CaseInsensitiveASCIIStringArrayHashMap`),
+ * so a lowercase literal like `public` silently resolves to a differently-cased
+ * system variable — Windows ships `PUBLIC=C:\Users\Public`. Enumerated keys are
+ * the only signal that preserves the real casing, so this trusts the lookup only
+ * when a key with identical casing is actually present. On POSIX (case-sensitive
+ * env) it is equivalent to a direct lookup.
+ *
+ * Use this instead of `process.env[name] ?? literal` wherever `name` may be a
+ * user-supplied literal (e.g. a stored API key) rather than a genuine env-var
+ * reference — otherwise the literal gets hijacked by a same-named system var.
+ *
+ * @param name - Environment variable name to look up.
+ * @param env - Environment source; defaults to `process.env`.
+ */
+export function $envExact(name: string, env: Record<string, string | undefined> = process.env): string | undefined {
+	const value = env[name];
+	if (value === undefined) return undefined;
+	// Enumeration preserves real key casing on Windows, unlike the getter; the
+	// value is trusted only when an exact-case entry actually exists.
+	for (const key in env) {
+		if (key === name) return value;
+	}
+	return undefined;
+}
+
+/**
  * Parses a positive decimal integer from `$env[name]`.
  * Empty, invalid, NaN, zero, or negative values return `defaultValue`.
  */
@@ -360,8 +389,12 @@ const TRUTHY: Dict<boolean> = {
 	ON: true,
 	on: true,
 };
-export function $flag(name: string, def: boolean = false): boolean {
-	const value = $env[name];
+/** Parse a boolean-ish env value ("1", "yes", "on", …); `def` when unset/empty. */
+export function parseFlag(value: string | undefined, def = false): boolean {
 	if (!value) return def;
 	return TRUTHY[value] === true;
+}
+
+export function $flag(name: string, def: boolean = false): boolean {
+	return parseFlag($env[name], def);
 }

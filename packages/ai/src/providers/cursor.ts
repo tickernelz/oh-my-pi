@@ -1816,11 +1816,14 @@ async function handleExecServerMessage(
 		case "piEditArgs": {
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
-			// `PiEditReplacement` is the local `edit` tool's replace mode verbatim:
-			// snake_case `old_text`/`new_text` entries against one path.
+			// `PiEditReplacement` maps onto the local `edit` tool's replace mode:
+			// one snake_case `old_string`/`new_string` per call. Multi-replacement
+			// frames display the first replacement; the exec handler applies all.
+			const firstEdit = args.edits[0];
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "edit", {
 				path: args.path,
-				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
+				old_string: firstEdit?.oldText ?? "",
+				new_string: firstEdit?.newText ?? "",
 			});
 			const { execResult } = await resolveExecHandler(
 				{ args, toolCallId },

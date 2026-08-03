@@ -111,9 +111,9 @@ describe("EDIT_MODE_STRATEGIES.matcherPaths", () => {
 
 describe("EDIT_MODE_STRATEGIES.matcherEntries", () => {
 	it("replace + patch return one (path, digest) entry from the top-level path", () => {
-		expect(
-			EDIT_MODE_STRATEGIES.replace.matcherEntries({ path: "src/foo.ts", edits: [{ new_text: "x = 1" }] }),
-		).toEqual([{ path: "src/foo.ts", digest: "x = 1" }]);
+		expect(EDIT_MODE_STRATEGIES.replace.matcherEntries({ path: "src/foo.ts", new_string: "x = 1" })).toEqual([
+			{ path: "src/foo.ts", digest: "x = 1" },
+		]);
 		expect(
 			EDIT_MODE_STRATEGIES.patch.matcherEntries({ path: "src/bar.ts", edits: [{ op: "update", diff: "@@\n+y" }] }),
 		).toEqual([{ path: "src/bar.ts", digest: "y" }]);

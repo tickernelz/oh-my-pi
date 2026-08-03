@@ -214,10 +214,10 @@ export function resolveModelServiceTier(
 
 /**
  * True when the tier should be sent on the wire as the provider's service-tier
- * request field. OpenAI / OpenAI-Codex accept `flex`/`scale`/`priority`; Google
- * (Gemini API + Vertex) and OpenRouter accept `flex`/`priority`; Fireworks
- * Serverless realizes only its Priority serving path. Anthropic is absent — it
- * realizes `priority` via `speed: "fast"`, not a service-tier field.
+ * request field. OpenAI / OpenAI-Codex accept every {@link ServiceTier};
+ * Google (Gemini API + Vertex) and OpenRouter accept `flex`/`priority`;
+ * Fireworks Serverless realizes only its Priority serving path. Anthropic is
+ * absent because it realizes `priority` via `speed: "fast"`.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
@@ -225,12 +225,11 @@ export function shouldSendServiceTier(
 ): boolean {
 	if (!serviceTier) return false;
 	const provider = typeof target === "string" ? target : target?.provider;
-	if (provider === "openai" || provider === "openai-codex" || provider === "openrouter") {
+	if (provider === "openai" || provider === "openai-codex") return true;
+	if (provider === "openrouter") {
 		return serviceTier === "flex" || serviceTier === "scale" || serviceTier === "priority";
 	}
-	if (typeof target !== "string" && target && isOpenAIServiceTierModel(target)) {
-		return serviceTier === "flex" || serviceTier === "scale" || serviceTier === "priority";
-	}
+	if (typeof target !== "string" && target && isOpenAIServiceTierModel(target)) return true;
 	if (provider === "google") {
 		return serviceTier === "flex" || serviceTier === "priority";
 	}
@@ -848,6 +847,8 @@ export interface AssistantRetryRecovery {
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
 	nonMessageTokens: number; // estimated non-message total at send time
+	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
+	historyRewriteTokensRemoved?: number;
 	lastMessageTimestamp?: number;
 }
 

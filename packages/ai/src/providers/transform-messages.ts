@@ -300,7 +300,7 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * credential redaction is enabled. Exported so hosts can route the same shapes
  * through reversible obfuscation (keyed placeholders restored before local tool
  * execution) instead of the irreversible `[*_token_redacted]` rewrite below —
- * an irreversible placeholder echoed back in edit-tool `old_text` can never
+ * an irreversible placeholder echoed back in edit-tool `old_string` can never
  * match the real bytes on disk.
  */
 export const SENSITIVE_TOKEN_RE =

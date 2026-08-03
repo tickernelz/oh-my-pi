@@ -132,13 +132,31 @@ describe("AgentSession magic keyword settings", () => {
 
 		await session.prompt("please workflowz this");
 
+		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{
+			content?: string;
+			customType?: string;
+		}>;
+		const notice = promptMessages.find(message => message.customType === "workflow-notice");
+		expect(notice?.customType).toBe("workflow-notice");
+		expect(notice?.content).toContain("`eval`");
+		expect(notice?.content).toContain("`parallel(thunks)`");
+		expect(notice?.content).toContain("**Python (`eval`, Python backend):**");
+		expect(notice?.content).toContain("**JavaScript (`eval`, JavaScript backend):**");
+	});
+
+	it("updates the workflowz notice when scout is disabled during the session", async () => {
+		const created = await createMagicKeywordSession(root);
+		session = created.session;
+		authStorage = created.authStorage;
+		created.settings.set("task.disabledAgents", ["scout"]);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+
+		await session.prompt("please workflowz this");
+
 		const promptMessages = promptSpy.mock.calls[0]![0] as unknown as Array<{ content?: string; customType?: string }>;
 		const notice = promptMessages.find(message => message.customType === "workflow-notice")?.content ?? "";
-		expect(notice).toContain("Author the orchestration in the `eval` tool");
-		expect(notice).toContain("Every eval call has:");
-		expect(notice).toContain("`parallel(thunks)`");
-		expect(notice).toContain("**Python (`eval`, Python backend):**");
-		expect(notice).toContain("**JavaScript (`eval`, JavaScript backend):**");
+		expect(notice.toLowerCase()).not.toContain("scout");
+		expect(notice).toContain("Explore inline FIRST");
 	});
 
 	it("skips workflowz notice when the task tool is inactive", async () => {

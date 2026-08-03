@@ -42,11 +42,11 @@ describe("formatSessionDumpText tool parameters", () => {
 			],
 		});
 
-		expect(out).toContain("# Tool: web_search");
-		expect(out).toContain("Parameters: {");
-		expect(out).toContain("/** search query */");
-		expect(out).toContain("query: string;");
-		expect(out).toContain('recency?: "day" | "week";');
+		expect(out).toContain("namespace functions {");
+		expect(out).toContain("type web_search = (_: {");
+		expect(out).toContain("// search query");
+		expect(out).toContain("query: string,");
+		expect(out).toContain('recency?: "day" | "week",');
 		// Arktype JSON Schema should not leak arktype internals into the dump.
 		expect(out).not.toContain("_arktype");
 		expect(out).not.toContain("ArkType");
@@ -70,12 +70,12 @@ describe("formatSessionDumpText tool parameters", () => {
 			],
 		});
 
-		expect(out).toContain("# Tool: legacy");
-		expect(out).toContain("/** a path */");
-		expect(out).toContain("path: string;");
+		expect(out).toContain("type legacy = (_: {");
+		expect(out).toContain("// a path");
+		expect(out).toContain("path: string,");
 	});
 
-	it("includes tool examples in the model's native syntax", () => {
+	it("includes tool examples in Python call syntax", () => {
 		const findSchema = type({ paths: "string[]" });
 
 		const out = formatSessionDumpText({
@@ -92,7 +92,7 @@ describe("formatSessionDumpText tool parameters", () => {
 
 		expect(out).toContain("## Available Tools");
 		expect(out).toContain("<examples>");
-		expect(out).toContain('<invoke name="glob">');
+		expect(out).toContain('glob(paths=["src/**/*.ts"])');
 	});
 
 	it("omits the Available Tools section if inlineToolDescriptors is true", () => {

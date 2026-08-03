@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-agent-core",
-  "version": "17.2.4",
+  "version": "17.2.5",
   "description": "General-purpose agent with transport abstraction, state management, and attachment support",
   "homepage": "https://github.com/tickernelz/oh-my-pi#readme",
   "author": "Can Boluk",

@@ -626,6 +626,11 @@ export function getPuppeteerDir(): string {
 	return dirs.rootSubdir("puppeteer", "cache");
 }
 
+/** Get the browser relay extension install directory (~/.omp/browser-relay). */
+export function getBrowserRelayDir(): string {
+	return dirs.rootSubdir("browser-relay", "data");
+}
+
 /** Get DOCS_RS cache directory () */
 export function getDocsRsCacheDir(): string {
 	return dirs.rootSubdir("webcache", "cache");
@@ -854,6 +859,14 @@ export function getSecretPlaceholderKeyPath(): string {
 export function getDaemonRuntimeDir(projectDir: string): string {
 	const key = Bun.hash.wyhash(path.resolve(projectDir)).toString(16).padStart(16, "0");
 	return dirs.rootSubdir(path.join("run", "daemons", key), "state");
+}
+
+/** Get a profile-independent runtime directory for a machine-global daemon service. */
+export function getGlobalDaemonRuntimeDir(service: string): string {
+	if (!/^[a-z0-9][a-z0-9._-]*$/i.test(service)) {
+		throw new Error(`Invalid global daemon service name: ${JSON.stringify(service)}`);
+	}
+	return path.join(getBaseConfigRoot(), "run", "daemons", "global", service);
 }
 
 /** Get the provider in-flight root directory (~/.omp/run/provider-inflight; XDG default: $XDG_STATE_HOME/omp/run/provider-inflight). */

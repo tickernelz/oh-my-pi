@@ -14,6 +14,7 @@ import {
 	computeHashlineDiff,
 	DEFAULT_FUZZY_THRESHOLD,
 	findMatch,
+	replaceText,
 } from "@oh-my-pi/pi-coding-agent/edit";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -221,6 +222,26 @@ describe("adjustIndentation", () => {
 		const result = adjustIndentation(oldText, actualText, newText);
 		// Should remove up to 4 chars, but line only has 2, so remove 2
 		expect(result).toBe("bar");
+	});
+});
+
+describe("replaceText", () => {
+	test("does not re-match inserted text while replacing all fuzzy source matches", () => {
+		const oldText = "a".repeat(50);
+		const firstActual = `${"a".repeat(49)}b`;
+		const secondActual = `${"a".repeat(44)}cccccc`;
+		const newText = `${oldText}\nexpanded`;
+
+		expect(
+			replaceText(`${firstActual}\n${secondActual}`, oldText, newText, {
+				all: true,
+				fuzzy: true,
+				threshold: 0.8,
+			}),
+		).toEqual({
+			content: `${newText}\n${newText}`,
+			count: 2,
+		});
 	});
 });
 

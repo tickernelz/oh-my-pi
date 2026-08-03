@@ -8,6 +8,7 @@ type CapturedRequest = {
 	url: string;
 	headers: RequestInit["headers"];
 	body: Record<string, unknown> | null;
+	signal?: AbortSignal | null;
 };
 
 const originalCodexSearchModel = process.env.PI_CODEX_WEB_SEARCH_MODEL;
@@ -264,6 +265,7 @@ describe("searchCodex model selection", () => {
 				url: typeof url === "string" ? url : url.toString(),
 				headers: init?.headers,
 				body: init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : null,
+				signal: init?.signal,
 			};
 			return Promise.resolve(
 				new Response(responseBody ?? makeSseResponse(responseModel), {
@@ -293,6 +295,19 @@ describe("searchCodex model selection", () => {
 		expect(capturedRequest?.body?.model).toBe("gpt-5.6-luna");
 		expect(result.model).toBe("gpt-5.6-luna");
 		expect(result.sources).toEqual([{ title: "Example Article", url: "https://example.com/article" }]);
+	});
+
+	it("applies the configured request timeout to Codex search", async () => {
+		const timeoutSignal = new AbortController().signal;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
+
+		await searchCodex({
+			...makeSearchParams("slow codex search", mockCodexFetch("gpt-5.6-luna")),
+			timeoutMs: 180_000,
+		});
+
+		expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+		expect(capturedRequest?.signal).toBe(timeoutSignal);
 	});
 
 	function sentUserText(): string | undefined {

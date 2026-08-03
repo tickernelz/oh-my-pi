@@ -8,7 +8,7 @@ export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
 export const DAEMON_PTY_COLUMNS = 120;
 export const DAEMON_PTY_ROWS = 40;
 
-/** Environment key carrying the broker's canonical project directory. */
+/** Environment key carrying the broker's canonical project or synthetic global scope directory. */
 export const DAEMON_PROJECT_DIR_ENV = "OMP_DAEMON_PROJECT_DIR";
 
 /** Environment key carrying the broker's private runtime directory. */
@@ -45,7 +45,7 @@ export interface DaemonSpec {
 	detached: boolean;
 }
 
-/** Serializable daemon state visible to every client in one project directory. */
+/** Serializable daemon state visible to every client in one broker scope. */
 export interface DaemonSnapshot {
 	name: string;
 	id: string;

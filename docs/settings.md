@@ -496,9 +496,9 @@ tools:
 
 Individual built-in tools are toggled by their own keys, e.g. `bash.enabled`, `launch.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `computer.enabled`, `astEdit.enabled`, `astGrep.enabled`, and `web_search.enabled`. The `inspect_image` tool is controlled by the tri-state `inspect_image.mode` (`auto`|`on`|`off`, default `auto`): `auto` exposes it only when the active model lacks native image input, and the `/vision` slash command overrides the mode per session.
 
-### Native computer use
+### Window-scoped computer use
 
-The disabled-by-default `computer` essential tool captures and controls the real host desktop through native OS APIs. It is separate from `browser`: `computer` can drive IDEs, terminals, native applications, browser windows, and system dialogs, while `browser` manages Chromium/CDP tabs and structured page automation.
+The disabled-by-default `computer` essential tool captures and controls one real host window through native OS APIs. Numeric targets isolate an application without focusing it or moving the real pointer; the synthetic `desktop` target preserves the previous selected-display composite and global input behavior. It remains separate from `browser`, which manages Chromium/CDP tabs and structured page automation.
 
 ```yaml
 computer:
@@ -511,13 +511,13 @@ computer:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `computer.enabled` | boolean | `false` | Enable the native computer tool. Natively capable OpenAI GA models use the `{ "type": "computer" }` wire form; every other function-calling model gets `computer` as a regular function tool. The `/computer` slash command toggles this for the current session only. |
+| `computer.enabled` | boolean | `false` | Enable the window-aware computer function tool. Every result lists current numeric window ids plus `desktop`; the `/computer` slash command toggles the tool for the current session only. |
 | `computer.backend` | enum | `auto` | `auto` or `native`; both require native capture/input and never fall back to browser automation. |
-| `computer.display` | string | `all` | Composite all active displays, or use a numeric display ID reported by a successful computer result. |
+| `computer.display` | string | `all` | Controls the `desktop` target only: composite all active displays, or use one numeric display ID. |
 | `computer.maxWidth` | number | `1920` | Maximum composite screenshot width in pixels. Image transports that cannot preserve original detail, including GitHub Copilot Responses and xAI OAuth, cap the effective width at `1280`; Claude-family models use the same cap as a compatibility fallback. |
 | `computer.maxHeight` | number | `1200` | Maximum composite screenshot height in pixels. Those coordinate-safe transports cap the effective height at `896`; other models retain the configured limit. |
 
-Computer settings are captured when the desktop controller is created. A model switch that crosses the coordinate-safe sizing boundary recreates the controller and resnapshots those settings; changing config alone does not, so start a new session after a settings change. The recreated controller has no prior coordinate frame, so capture a fresh screenshot before the next pointer action. Before enabling input, configure `tools.approvalMode` or `tools.approval.computer` and grant platform permissions. See [Native computer use](computer-use.md).
+Computer settings are captured when the desktop controller is created. A model switch that crosses the coordinate-safe sizing boundary recreates the controller and resnapshots those settings; changing config alone does not, so start a new session after a settings change. Every call must name `desktop` or a numeric id from the preceding window list. Switching targets invalidates the prior coordinate frame, so capture the new target before pointer input. Before enabling input, configure `tools.approvalMode` or `tools.approval.computer` and grant platform permissions. See [Window-scoped computer use](computer-use.md).
 
 ### Shell, eval, and LSP
 
@@ -716,6 +716,7 @@ searxng:
 | Key | Type | Default | Values / notes |
 |---|---|---|---|
 | `providers.webSearchOrder` | array | `[]` | Provider IDs in priority order for `web_search` (`perplexity`, `gemini`, `anthropic`, `codex`, `zai`, `exa`, `jina`, `kagi`, `tavily`, `brave`, `kimi`, `parallel`, `synthetic`, `searxng`, …). Duplicates and unknown IDs are ignored; unlisted providers retain their built-in relative order afterward. Empty = built-in order. Replaces the removed `providers.webSearch` enum (a legacy value migrates to the head of this list). |
+| `providers.webSearchTimeoutSeconds` | number | `60` | Hard timeout in seconds supplied to each `web_search` provider transport before the automatic chain advances to the next fallback. Use a larger value for slower model-backed providers; values above `300` are capped at five minutes. This is not a whole-chain deadline, and provider-specific upstream or aggregate limits may still be shorter. |
 | `providers.webSearchGeminiModel` | string | _(unset)_ | Gemini model ID for Google Search grounding when `web_search` uses Gemini; defaults to `gemini-2.5-flash`, overridden by `GEMINI_SEARCH_MODEL`. |
 | `providers.imageOrder` | array | `[]` | Image-generation provider IDs in priority order (`openai`, `openai-codex`, `antigravity`, `xai`, `gemini`, `openrouter`). Unlisted providers follow the active session provider and the built-in order. Replaces the removed `providers.image` enum (a legacy value migrates to the head of this list). |
 | `providers.fetch` | enum | `auto` | `auto`, `native`, `trafilatura`, `lynx`, `parallel`, `jina`. |

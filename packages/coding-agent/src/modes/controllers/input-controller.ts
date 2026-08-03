@@ -8,8 +8,11 @@ import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { extractImagePathFromText } from "../../modes/components/custom-editor";
+import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
+import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
+import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { materializeImageReferenceLinks, shiftImageMarkers } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
@@ -327,10 +330,10 @@ export class InputController {
 			}
 
 			if (this.ctx.loopModeEnabled) {
-				this.ctx.pauseLoop();
 				if (this.ctx.session.isStreaming) {
 					this.#abortStreamingTurn();
 				} else {
+					this.ctx.pauseLoop();
 					this.ctx.cancelPendingSubmission();
 				}
 				return;
@@ -455,6 +458,11 @@ export class InputController {
 		this.ctx.editor.onCopyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
+		this.ctx.editor.setActionKeys(
+			"app.tools.toggleVisibility",
+			this.ctx.keybindings.getKeys("app.tools.toggleVisibility"),
+		);
+		this.ctx.editor.onToggleToolActivity = () => this.toggleToolActivityVisibility();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
@@ -1845,7 +1853,37 @@ export class InputController {
 	}
 
 	toggleToolOutputExpansion(): void {
+		if (this.ctx.hideToolActivity) {
+			const visibilityKey = this.ctx.keybindings.getDisplayString("app.tools.toggleVisibility");
+			const visibilityHint = visibilityKey ? `${visibilityKey} or /settings` : "/settings";
+			this.ctx.showStatus(`Tool activity is hidden — show it with ${visibilityHint} before expanding`);
+			return;
+		}
 		this.setToolsExpanded(!this.ctx.toolOutputExpanded);
+	}
+
+	toggleToolActivityVisibility(): void {
+		this.ctx.hideToolActivity = !this.ctx.hideToolActivity;
+		this.ctx.settings.set("display.hideToolActivity", this.ctx.hideToolActivity);
+
+		if (!this.ctx.hideToolActivity) {
+			this.ctx.toolOutputExpanded = false;
+		}
+
+		for (const child of this.ctx.chatContainer.children) {
+			if (child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent) {
+				if (!this.ctx.hideToolActivity) child.setExpanded(false);
+				child.setToolActivityVisible(!this.ctx.hideToolActivity);
+			} else if (child instanceof AssistantMessageComponent) {
+				child.setToolResultImagesVisible(!this.ctx.hideToolActivity);
+			} else if (child instanceof StrippedToolCallsPlaceholder) {
+				child.setToolActivityVisible(!this.ctx.hideToolActivity);
+			}
+		}
+
+		if (this.ctx.hideToolActivity) this.ctx.ui.clearInlineImages();
+		this.ctx.ui.resetDisplay();
+		this.ctx.showStatus(`Tool activity: ${this.ctx.hideToolActivity ? "hidden" : "visible"}`);
 	}
 
 	setToolsExpanded(expanded: boolean): void {
