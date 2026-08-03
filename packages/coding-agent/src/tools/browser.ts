@@ -15,6 +15,7 @@ import {
 	holdBrowser,
 	releaseBrowser,
 } from "./browser/registry";
+import { resolveRelayKind } from "./browser/relay/kind";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import {
 	type AcquireTabResult,
@@ -39,6 +40,7 @@ export {
 export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
+export { DEFAULT_RELAY_URL, type RelayKind, resolveRelayKind } from "./browser/relay/kind";
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
 const DEFAULT_TAB_NAME = "main";
@@ -46,6 +48,7 @@ const DEFAULT_TAB_NAME = "main";
 const appSchema = type({
 	"path?": type("string").describe("binary path to spawn"),
 	"cdp_url?": type("string").describe("existing cdp endpoint"),
+	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
 	"args?": type("string[]").describe("extra cli args"),
 	"target?": type("string").describe("substring to pick a window"),
 });
@@ -95,7 +98,24 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe };
 	}
-	// A configured endpoint is a default, not an override: explicit app options win.
+	const relayUrl = session.settings.get("browser.relayUrl") as string | undefined;
+	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
+	// final kill switch (a relay that is down would otherwise brick the tool).
+	if (app?.relay) {
+		const relayKind = resolveRelayKind({ settingEnabled: true, url: relayUrl });
+		if (relayKind) return relayKind;
+	}
+	// Relay before cdpUrl among settings: enabling the opt-out-by-default relay
+	// is a deliberate mode selection, while cdpUrl is a standing fallback
+	// endpoint. A configured endpoint is a default, not an override: explicit
+	// app options win.
+	if (app?.relay !== false) {
+		const relayKind = resolveRelayKind({
+			settingEnabled: session.settings.get("browser.relay") as boolean | undefined,
+			url: relayUrl,
+		});
+		if (relayKind) return relayKind;
+	}
 	const configuredCdpUrl = (session.settings.get("browser.cdpUrl") as string | undefined)?.trim();
 	if (configuredCdpUrl) {
 		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
@@ -427,6 +447,8 @@ function describeBrowser(handle: BrowserHandle): string {
 			return `spawned ${handle.kind.path} (pid ${handle.pid ?? "?"})`;
 		case "connected":
 			return `connected ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
+		case "relay":
+			return `relay ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
 	}
 }
 
@@ -438,6 +460,8 @@ function describeKind(kind: BrowserKind): string {
 			return `spawned:${kind.path}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
+		case "relay":
+			return `relay:${kind.cdpUrl}`;
 		case "cmux":
 			return `cmux:${kind.surface ?? "split"}`;
 	}
@@ -448,6 +472,7 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	if (a.kind === "headless" && b.kind === "headless") return a.headless === b.headless;
 	if (a.kind === "spawned" && b.kind === "spawned") return a.path === b.path;
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
+	if (a.kind === "relay" && b.kind === "relay") return a.cdpUrl === b.cdpUrl;
 	if (a.kind === "cmux" && b.kind === "cmux") return a.socketPath === b.socketPath;
 	return false;
 }

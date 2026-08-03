@@ -115,7 +115,7 @@ interface EditRenderArgs {
 	patch?: string;
 	input?: string;
 	_input?: string;
-	all?: boolean;
+	replace_all?: boolean;
 	// Patch mode fields
 	op?: Operation;
 	rename?: unknown;

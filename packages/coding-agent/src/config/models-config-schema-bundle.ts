@@ -262,6 +262,15 @@ export const getModelsConfigSchemaBundle = once(() => {
 
 	const ProviderDiscoverySchema = type({
 		type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
+		"timeoutMs?": "number",
+	}).narrow((value, ctx) => {
+		if (
+			value.timeoutMs !== undefined &&
+			(typeof value.timeoutMs !== "number" || value.timeoutMs <= 0 || !Number.isFinite(value.timeoutMs))
+		) {
+			return ctx.mustBe("timeoutMs a positive finite number");
+		}
+		return true;
 	});
 
 	const ProviderAuthSchema = type('"apiKey" | "none" | "oauth"');

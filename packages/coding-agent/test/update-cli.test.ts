@@ -15,6 +15,7 @@ import {
 	assertDownstreamUpdateTarget,
 	downloadVerifiedBinary,
 	getDownstreamBinaryName,
+	isMuslLinuxForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
 	resolveDownstreamReleaseBinaryAsset,
@@ -162,6 +163,36 @@ describe("update install origin handling", () => {
 
 	it("preserves the legacy plugin update shorthand", () => {
 		expect(parseUpdateArgs(["update", "-l"])).toEqual({ force: false, check: false, plugins: true });
+	});
+});
+
+describe("update-cli libc detection", () => {
+	it("does not mistake an installed musl loader for a glibc host", () => {
+		expect(
+			isMuslLinuxForTest({
+				platform: "linux",
+				alpineRelease: false,
+				lddOutput: "ldd (Ubuntu GLIBC 2.39-0ubuntu8.7) 2.39",
+			}),
+		).toBe(false);
+	});
+
+	it("recognizes a musl host from ldd output", () => {
+		expect(
+			isMuslLinuxForTest({
+				platform: "linux",
+				alpineRelease: false,
+				lddOutput: "musl libc (x86_64)",
+			}),
+		).toBe(true);
+	});
+});
+
+describe("update-cli install target detection", () => {
+	it("uses bun update when prioritized omp is inside bun global bin", () => {
+		const method = resolveUpdateMethodForTest("/Users/test/.bun/bin/omp", "/Users/test/.bun/bin");
+
+		expect(method).toBe("bun");
 	});
 
 	it("detects package-manager origins only to reject them", () => {

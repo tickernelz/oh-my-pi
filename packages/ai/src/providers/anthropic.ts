@@ -2563,7 +2563,22 @@ const streamAnthropicOnce = (
 					if (!sawEvent || !sawMessageStart) {
 						throw new AIError.AnthropicStreamEnvelopeError("stream ended before message_start");
 					}
+					if (!sawTerminalEnvelope) {
+						// Neither a message_delta stop_reason nor message_stop arrived: the
+						// connection died mid-generation. Finalizing the partial message as
+						// a clean "stop" would make the agent loop treat the truncated turn
+						// as complete (silent mid-sentence halt), so fail the turn. The
+						// envelope error is transparently retried before replay-unsafe
+						// content streams; afterwards it surfaces as an error turn whose
+						// complete tool calls the agent loop salvages
+						// (`recoverTransientErrorToolTurn` recognizes the envelope-error
+						// text and `retainCompletedToolCalls` drops half-streamed calls).
+						throw new AIError.AnthropicStreamEnvelopeError("stream ended before message_stop");
+					}
 					if (!sawMessageStop) {
+						// A stop_reason arrived via message_delta, so generation finished;
+						// only the trailing message_stop frame is missing (non-conforming
+						// gateway). Degrade to best-effort instead of discarding the turn.
 						reportAnthropicEnvelopeAnomaly("stream ended before message_stop");
 					}
 					if (openBlocks.size > 0) {
@@ -2808,15 +2823,48 @@ type SystemBlockOptions = {
 	cacheControl?: AnthropicCacheControl;
 };
 
-function applyClaudeCodeSystemCache(
+/**
+ * Place system-block cache breakpoints that survive volatile project context.
+ *
+ * omp normally appends its project footer (cwd, date, workspace tree) after the
+ * stable system prefix. When cwd is outside a single direct child repository,
+ * an active-repo context block follows that footer. Caching up to the last three
+ * eligible blocks therefore covers both layouts:
+ *
+ * - stable prefix, project footer
+ * - stable prefix, project footer, active-repo context
+ *
+ * A footer change can then fall back to the stable-prefix entry instead of
+ * re-writing the entire system cache (issue #7324).
+ *
+ * @returns breakpoints placed, capped by `maxBreakpoints`.
+ */
+function cacheSystemPrefixBreakpoints(
 	blocks: AnthropicSystemBlock[],
 	cacheControl: AnthropicCacheControl | undefined,
+	maxBreakpoints: number,
+	firstCacheableIndex: number,
 ): number {
-	if (!cacheControl || blocks.length === 0) return 0;
-	const lastIndex = blocks.length - 1;
-	if (blocks[lastIndex].cache_control != null) return 0;
-	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cloneAnthropicCacheControl(cacheControl) };
-	return 1;
+	if (!cacheControl || maxBreakpoints <= 0) return 0;
+	let placed = 0;
+	for (let index = blocks.length - 1; index >= firstCacheableIndex && placed < maxBreakpoints; index--) {
+		if (blocks[index].cache_control != null) continue;
+		blocks[index] = { ...blocks[index], cache_control: cloneAnthropicCacheControl(cacheControl) };
+		placed++;
+	}
+	return placed;
+}
+
+/**
+ * First system-block index that may carry a cache breakpoint. Skips the OAuth
+ * cloak blocks that must stay uncached: the CC billing header (block 0, a
+ * per-request fingerprint) and the Claude Code identity instruction (block 1).
+ */
+function firstCacheableSystemIndex(blocks: readonly AnthropicSystemBlock[]): number {
+	let index = 0;
+	if (blocks[index]?.text?.startsWith(CLAUDE_BILLING_HEADER_PREFIX)) index++;
+	if (blocks[index]?.text === claudeCodeSystemInstruction) index++;
+	return index;
 }
 
 export function buildAnthropicSystemBlocks(
@@ -2840,7 +2888,7 @@ export function buildAnthropicSystemBlocks(
 		for (const prompt of sanitizedPrompts) {
 			blocks.push({ type: "text", text: prompt });
 		}
-		applyClaudeCodeSystemCache(blocks, cacheControl);
+		cacheSystemPrefixBreakpoints(blocks, cacheControl, 3, firstCacheableSystemIndex(blocks));
 
 		return blocks;
 	}
@@ -3111,17 +3159,6 @@ type CacheControlBlock = {
 	cache_control?: AnthropicCacheControl | null;
 };
 
-function applyCacheControlToLastBlock<T extends CacheControlBlock>(
-	blocks: T[],
-	cacheControl: AnthropicCacheControl,
-): boolean {
-	if (blocks.length === 0) return false;
-	const lastIndex = blocks.length - 1;
-	if (blocks[lastIndex].cache_control != null) return false;
-	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cloneAnthropicCacheControl(cacheControl) };
-	return true;
-}
-
 function applyCacheControlToLastTextBlock(
 	blocks: Array<ContentBlockParam & CacheControlBlock>,
 	cacheControl: AnthropicCacheControl,
@@ -3155,24 +3192,32 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
 	let isCCLayout = false;
 
 	if (params.system && Array.isArray(params.system) && params.system.length > 0) {
-		isCCLayout =
-			params.system.length >= 3 &&
-			(params.system[0] as { text?: string }).text?.startsWith(CLAUDE_BILLING_HEADER_PREFIX) === true;
-		if (isCCLayout) {
-			const placed = Math.min(
-				MAX_CACHE_BREAKPOINTS - cacheBreakpointsUsed,
-				applyClaudeCodeSystemCache(params.system as AnthropicSystemBlock[], cacheControl),
-			);
-			cacheBreakpointsUsed += placed;
-		} else if (applyCacheControlToLastBlock(params.system, cacheControl)) {
-			cacheBreakpointsUsed++;
-		}
+		isCCLayout = params.system[0]?.text?.startsWith(CLAUDE_BILLING_HEADER_PREFIX) === true;
+		const maxSystemBreakpoints = Math.min(3, MAX_CACHE_BREAKPOINTS - cacheBreakpointsUsed);
+		cacheBreakpointsUsed += cacheSystemPrefixBreakpoints(
+			params.system as AnthropicSystemBlock[],
+			cacheControl,
+			maxSystemBreakpoints,
+			isCCLayout ? firstCacheableSystemIndex(params.system as AnthropicSystemBlock[]) : 0,
+		);
 	}
 
 	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
 
-	const start = isCCLayout ? Math.max(0, params.messages.length - 1) : Math.max(0, params.messages.length - 2);
-	for (let i = start; i < params.messages.length; i++) {
+	// `convertAnthropicMessages` appends this neutral pad after a trailing
+	// assistant because Anthropic rejects assistant-prefill endings. It is absent
+	// from the next normal turn, so caching it wastes a scarce breakpoint; anchor
+	// the cache window on the preceding real assistant instead.
+	const trailingIndex = params.messages.length - 1;
+	const trailingMessage = params.messages[trailingIndex];
+	const hasTrailingAssistantPad =
+		trailingMessage?.role === "user" &&
+		trailingMessage.content === "Continue." &&
+		params.messages[trailingIndex - 1]?.role === "assistant";
+	const messageEnd = hasTrailingAssistantPad ? trailingIndex - 1 : trailingIndex;
+	const messageWindowSize = isCCLayout ? 1 : 2;
+	const start = Math.max(0, messageEnd - messageWindowSize + 1);
+	for (let i = messageEnd; i >= start; i--) {
 		if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) break;
 		const message = params.messages[i];
 		if (!message) continue;

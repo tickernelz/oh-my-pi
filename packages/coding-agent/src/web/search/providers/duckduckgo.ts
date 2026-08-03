@@ -305,6 +305,7 @@ async function callDuckDuckGoHtml(params: SearchParams, form: URLSearchParams, s
 	const page = await browserFetch(DUCKDUCKGO_HTML_URL, {
 		fetch: params.fetch ?? fetch,
 		signal,
+		timeoutMs: params.timeoutMs,
 		referer: "https://html.duckduckgo.com/",
 		init: {
 			method: "POST",
@@ -334,7 +335,7 @@ async function callDuckDuckGoHtml(params: SearchParams, form: URLSearchParams, s
 /** Execute a DuckDuckGo web search via the no-JS HTML frontend. */
 export async function searchDuckDuckGo(params: SearchParams): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.numSearchResults ?? params.limit, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
-	const signal = withHardTimeout(params.signal);
+	const signal = withHardTimeout(params.signal, params.timeoutMs);
 	const sources: SearchSource[] = [];
 	const seen = new Set<string>();
 	let form: URLSearchParams | undefined = createDuckDuckGoForm(params);

@@ -191,7 +191,7 @@ export interface SessionAdvisorsOptions {
 	/**
 	 * Build the `replace`-mode `edit` a Cursor `pi_edit` frame needs. The
 	 * advisor's own instance follows the configured `edit.mode` (`hashline` by
-	 * default), whose schema the frame's `old_text`/`new_text` pairs do not
+	 * default), whose schema the frame's `old_string`/`new_string` args do not
 	 * match, so without this every native advisor edit fails validation.
 	 */
 	createEditTool?(): AgentTool | undefined;
@@ -760,7 +760,7 @@ export class SessionAdvisors {
 			// to delete workspace files it was never granted (issue #5680 review).
 			const advisorCanMutateFiles = advisorToolMap.has("write") || advisorToolMap.has("edit");
 			if (advisorCanMutateFiles) availableAdvisorToolNames.add("delete");
-			// `pi_edit` speaks `replace`'s `old_text`/`new_text` schema, which the
+			// `pi_edit` speaks `replace`'s `old_string`/`new_string` schema, which the
 			// advisor's ordinary `EditTool` (built at the session's configured
 			// `edit.mode`, `hashline` by default) does not accept. The bridge map
 			// swaps in a `replace` instance for the exec channel only — the

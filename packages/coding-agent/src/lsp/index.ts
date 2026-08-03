@@ -47,6 +47,7 @@ import {
 } from "./edits";
 import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
+import { MUX_RESTART_METHOD } from "./mux/protocol";
 import {
 	type CodeAction,
 	type CodeActionContext,
@@ -535,6 +536,13 @@ async function reloadServer(client: LspClient, serverName: string, signal?: Abor
 		// from the registry by identity and awaiting confirmed process exit) so
 		// the next request cold-starts a fresh client. A kill that never confirms
 		// exit is not a restart: surface the teardown failure truthfully.
+		//
+		// On a broker-shared link a per-session teardown only detaches this
+		// process while the wedged server keeps serving everyone else — ask the
+		// mux to kill the shared server first (best-effort; it also severs us).
+		if (client.proc.sharedMux) {
+			await sendNotification(client, MUX_RESTART_METHOD, undefined, AbortSignal.timeout(2_000)).catch(() => {});
+		}
 		if (!(await shutdownClientInstance(client))) {
 			throw new Error(`Failed to restart ${serverName}: server process did not exit after kill`);
 		}

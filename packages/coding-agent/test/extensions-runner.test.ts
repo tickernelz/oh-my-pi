@@ -2542,6 +2542,50 @@ describe("ExtensionRunner", () => {
 			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
 		});
 
+		it("reports the effective tier after a tool_call handler revises xd:// input", async () => {
+			const recordPath = path.join(tempDir.path(), "xdev-effective-tier.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-xdev-tier.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const tool = createRecordingTool(recordPath);
+			tool.approval = args =>
+				args &&
+				typeof args === "object" &&
+				"command" in args &&
+				typeof args.command === "string" &&
+				args.command.includes("revised")
+					? "write"
+					: "read";
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			let effectiveTier: string | undefined;
+			const xdevContext = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				xdevApproved: true,
+				xdevTierResolved: (tier: string) => {
+					effectiveTier = tier;
+				},
+			} as never;
+
+			await wrapped.execute("xdev-tier-id", { command: "echo original" }, undefined, undefined, xdevContext);
+			expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toEqual({ command: "echo revised" });
+			expect(effectiveTier).toBe("write");
+		});
+
 		it("emits tool_call before the approval prompt so approval sees the final input", async () => {
 			const order: string[] = [];
 			const extCode = `

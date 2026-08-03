@@ -203,7 +203,7 @@ export function collectEnvSecrets(): SecretEntry[] {
  * API keys) that are NOT configured via secrets.yml or the environment. Without
  * these, such a token in a tool result falls through to pi-ai's irreversible
  * provider-boundary redaction (`[openai_token_redacted]`); the model then echoes
- * that placeholder into edit-tool `old_text`, which can never match the real
+ * that placeholder into edit-tool `old_string`, which can never match the real
  * bytes on disk (issue #6968). Routing the same shapes through the obfuscator
  * mints reversible keyed placeholders that `deobfuscateToolArguments` restores
  * before tool execution, keeping exact-match edits working while the credential

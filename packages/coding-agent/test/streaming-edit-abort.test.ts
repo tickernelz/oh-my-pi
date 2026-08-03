@@ -134,15 +134,11 @@ function buildEditTool(): AgentTool {
 }
 
 function buildReplaceEditTool(): AgentTool {
-	const entrySchema = type({
-		old_text: "string",
-		new_text: "string",
-	});
 	const schema = type({
 		path: "string",
-		edits: entrySchema.array(),
+		old_string: "string",
+		new_string: "string",
 	});
-
 	return {
 		name: "edit",
 		label: "Edit",
@@ -444,7 +440,8 @@ it("keeps the session alive when replace mode streams an ssh:// path", async () 
 	const chunks = chunkStringRandomly("alpha", 7);
 	const streamFn = createStreamingEdit(remotePath, chunks, abortSignalRef, (streamPath, oldText) => ({
 		path: streamPath,
-		edits: [{ old_text: oldText, new_text: "beta" }],
+		old_string: oldText,
+		new_string: "beta",
 	}));
 	const { session, authStorage } = await createSession(tempDir, streamFn, buildReplaceEditTool());
 

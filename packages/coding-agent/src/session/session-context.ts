@@ -154,6 +154,21 @@ function snapcompactHistoryBlocksForContext(
 	return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, options));
 }
 
+export function getOpenAiRemoteCompactionPayload(
+	compaction: CompactionEntry | null | undefined,
+): ProviderPayload | undefined {
+	const candidate = compaction?.preserveData?.openaiRemoteCompaction;
+	if (!candidate || typeof candidate !== "object") return undefined;
+	const remote = candidate as { provider?: unknown; replacementHistory?: unknown };
+	if (typeof remote.provider !== "string" || remote.provider.length === 0) return undefined;
+	if (!Array.isArray(remote.replacementHistory)) return undefined;
+	return {
+		type: "openaiResponsesHistory",
+		provider: remote.provider,
+		items: remote.replacementHistory as Array<Record<string, unknown>>,
+	};
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -366,18 +381,7 @@ export function buildSessionContext(
 			}
 		}
 	} else if (compaction) {
-		const providerPayload: ProviderPayload | undefined = (() => {
-			const candidate = compaction.preserveData?.openaiRemoteCompaction;
-			if (!candidate || typeof candidate !== "object") return undefined;
-			const remote = candidate as { provider?: unknown; replacementHistory?: unknown };
-			if (typeof remote.provider !== "string" || remote.provider.length === 0) return undefined;
-			if (!Array.isArray(remote.replacementHistory)) return undefined;
-			return {
-				type: "openaiResponsesHistory",
-				provider: remote.provider,
-				items: remote.replacementHistory as Array<Record<string, unknown>>,
-			};
-		})();
+		const providerPayload = getOpenAiRemoteCompactionPayload(compaction);
 		const remoteReplacementHistory = providerPayload?.items;
 
 		// Re-attach any archived snapcompact frames so the model can keep

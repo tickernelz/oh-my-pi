@@ -403,6 +403,12 @@ describe("Settings", () => {
 			expect(getDefault("terminal.showProgress")).toBe(false);
 		});
 
+		it("shows tool activity by default", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("display.hideToolActivity")).toBe(false);
+			expect(getDefault("display.hideToolActivity")).toBe(false);
+		});
+
 		it("keeps the normal startup splash disabled by default", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("startup.showSplash")).toBe(false);

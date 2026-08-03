@@ -327,6 +327,52 @@ describe("openai-completions wire-quirk compat detection", () => {
 		).toBe(false);
 	});
 
+	it("downgrades forced tool choice only for DeepSeek reasoning models on OpenCode gateways", () => {
+		const deepseekReasoning = {
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
+			reasoning: true,
+		} as const;
+
+		expect(
+			buildOpenAICompat(
+				completionsSpec({
+					...deepseekReasoning,
+					provider: "opencode-zen",
+					baseUrl: "https://opencode.ai/zen/v1",
+				}),
+			).supportsForcedToolChoice,
+		).toBe(false);
+		expect(
+			buildOpenAICompat(
+				completionsSpec({
+					...deepseekReasoning,
+					provider: "custom",
+					baseUrl: "https://opencode.ai/zen/go/v1",
+				}),
+			).supportsForcedToolChoice,
+		).toBe(false);
+		expect(
+			buildOpenAICompat(
+				completionsSpec({
+					...deepseekReasoning,
+					provider: "nvidia",
+					baseUrl: "https://integrate.api.nvidia.com/v1",
+				}),
+			).supportsForcedToolChoice,
+		).toBe(true);
+		expect(
+			buildOpenAICompat(
+				completionsSpec({
+					...deepseekReasoning,
+					provider: "opencode-zen",
+					baseUrl: "https://opencode.ai/zen/v1",
+					reasoning: false,
+				}),
+			).supportsForcedToolChoice,
+		).toBe(true);
+	});
+
 	it("requires a synthetic assistant bridge after tool results only for Mistral hosts", () => {
 		// Mistral/Devstral reject a user message directly after a tool result; the chat
 		// builder bridges it with a synthetic assistant turn, keyed on the Mistral host.

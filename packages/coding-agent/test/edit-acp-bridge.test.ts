@@ -10,7 +10,7 @@ import {
 	type EditToolDetails,
 	executeHashlineSingle,
 	executePatchSingle,
-	executeReplaceSingle,
+	executeReplace,
 	type hashlineEditParamsSchema,
 } from "@oh-my-pi/pi-coding-agent/edit";
 import { HashlineFilesystem } from "@oh-my-pi/pi-coding-agent/edit/hashline/filesystem";
@@ -355,9 +355,9 @@ describe("executeHashlineSingle model-visible payload under write-time drift", (
 	});
 });
 
-// ─── executeReplaceSingle ─────────────────────────────────────────────────────
+// ─── executeReplace ─────────────────────────────────────────────────────────
 
-describe("executeReplaceSingle ACP fs routing", () => {
+describe("executeReplace ACP fs routing", () => {
 	let tmpDir: string;
 
 	beforeEach(async () => {
@@ -379,10 +379,10 @@ describe("executeReplaceSingle ACP fs routing", () => {
 		const { writethrough, spy: writeSpy } = makeWritethroughMock();
 		const session = createSession(tmpDir, { bridge });
 
-		await executeReplaceSingle({
+		await executeReplace({
 			session,
 			path: filePath,
-			params: { old_text: "old content", new_text: "new content", all: false },
+			params: { old_string: "old content", new_string: "new content", replace_all: false },
 			allowFuzzy: false,
 			fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
 			writethrough,
@@ -413,10 +413,10 @@ describe("executeReplaceSingle ACP fs routing", () => {
 
 		const { writethrough, spy: writeSpy } = makeWritethroughMock();
 
-		await executeReplaceSingle({
+		await executeReplace({
 			session,
 			path: planPath,
-			params: { old_text: "old plan", new_text: "new plan", all: false },
+			params: { old_string: "old plan", new_string: "new plan", replace_all: false },
 			allowFuzzy: false,
 			fuzzyThreshold: DEFAULT_FUZZY_THRESHOLD,
 			writethrough,

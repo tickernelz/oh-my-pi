@@ -103,39 +103,42 @@ function formatFastModeStatus(session: AgentSession): string {
 }
 
 /** Detailed, session-effective `/computer status` diagnostics. */
-function formatComputerUseStatus(session: AgentSession): string {
+async function formatComputerUseStatus(session: AgentSession): Promise<string> {
 	const enabled = session.settings.get("computer.enabled");
 	const active = session.getEnabledToolNames().includes("computer");
 	const model = session.model;
 	const modelName = model ? formatModelString(model) : "none";
-	const exposure = !enabled || !active ? "not exposed" : computerExposureMode(model);
-	const toolState = active ? "active" : enabled ? "unavailable" : "inactive";
+	const exposure = !enabled
+		? "not exposed (disabled)"
+		: !active
+			? "not exposed (tool inactive)"
+			: computerExposureMode(model);
 	const configured = {
-		backend: session.settings.get("computer.backend"),
 		display: session.settings.get("computer.display"),
 		maxWidth: session.settings.get("computer.maxWidth"),
 		maxHeight: session.settings.get("computer.maxHeight"),
 	};
-	const computerTool = session.getToolByName("computer") as Pick<ComputerTool, "effectiveConfiguration"> | undefined;
-	const effective = computerTool?.effectiveConfiguration ?? configured;
-	const configurationChanged =
-		effective.backend !== configured.backend ||
-		effective.display !== configured.display ||
-		effective.maxWidth !== configured.maxWidth ||
-		effective.maxHeight !== configured.maxHeight;
+	const computerTool = active
+		? (session.getToolByName("computer") as Pick<ComputerTool, "capabilities"> | undefined)
+		: undefined;
+	const capabilities = await computerTool?.capabilities();
+	const capabilityStatus = capabilities
+		? [
+				`backend=${capabilities.backend}${capabilities.displayServer ? `/${capabilities.displayServer}` : ""}`,
+				`capture=${capabilities.capture} (${capabilities.capturePermission})`,
+				`input=${capabilities.input} (${capabilities.inputPermission})`,
+				`ax=${capabilities.ax} (${capabilities.axPermission})`,
+				`backgroundWindowInput=${capabilities.backgroundWindowInput}`,
+				`deliveryModes=${capabilities.deliveryModes.join(",") || "none"}`,
+			].join(", ")
+		: "session not started";
 	return [
 		`Computer use: ${enabled ? "enabled" : "disabled"}`,
-		`tool: ${toolState}`,
-		`backend: ${effective.backend}`,
-		`display: ${effective.display}`,
-		`capture: ${effective.maxWidth}×${effective.maxHeight}`,
-		...(configurationChanged
-			? [
-					`next-session settings: backend=${configured.backend}, display=${configured.display}, capture=${configured.maxWidth}×${configured.maxHeight}`,
-				]
-			: []),
-		`model: ${modelName}`,
+		`tool: ${active ? "active" : "inactive"}`,
 		`exposure: ${exposure}`,
+		`model: ${modelName}`,
+		`configured: display=${configured.display}, maxWidth=${configured.maxWidth}, maxHeight=${configured.maxHeight}`,
+		`capabilities: ${capabilityStatus}`,
 	].join(" · ");
 }
 
@@ -152,7 +155,7 @@ async function applyComputerUseToggle(session: AgentSession, enable: boolean): P
 	}
 	session.settings.override("computer.enabled", enable);
 	return enable
-		? `Computer use enabled for this session. ${formatComputerUseStatus(session)}`
+		? `Computer use enabled for this session. ${await formatComputerUseStatus(session)}`
 		: "Computer use disabled for this session.";
 }
 
@@ -674,7 +677,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
-				await runtime.output(formatComputerUseStatus(runtime.session));
+				await runtime.output(await formatComputerUseStatus(runtime.session));
 				return commandConsumed();
 			}
 			if (!arg || arg === "toggle" || arg === "on" || arg === "off") {
@@ -687,7 +690,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
-				runtime.ctx.showStatus(formatComputerUseStatus(runtime.ctx.session));
+				runtime.ctx.showStatus(await formatComputerUseStatus(runtime.ctx.session));
 				runtime.ctx.editor.setText("");
 				return;
 			}

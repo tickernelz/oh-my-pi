@@ -11,6 +11,16 @@
 - Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
 - Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
 - Fixed `extractRetryHint` to honor the longest valid delay across retry headers, formatted markers, and prose hints instead of stopping at the first match.
+## [17.2.5] - 2026-08-03
+
+### Added
+
+- Added utility functions `parseFlag()`, `getBrowserRelayDir()`, and `getGlobalDaemonRuntimeDir()` to support browser relay mode and global daemon runtime directory resolution.
+
+### Changed
+
+- Updated the lightweight CLI runner to support static command metadata, allowing root help to render without importing full command implementations.
+
 ## [17.2.4] - 2026-08-01
 
 ### Added

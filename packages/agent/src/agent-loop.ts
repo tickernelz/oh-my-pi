@@ -43,7 +43,6 @@ import {
 	recoverHarmonyToolCall,
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
-import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { agentPauseGate } from "./pause";
@@ -832,13 +831,16 @@ function injectIntentIntoSchema(
 	};
 }
 
-export function normalizeTools(
-	tools: AgentContext["tools"],
-	injectIntent: boolean,
-	exampleDialect?: Dialect,
-	pruneDescriptions = false,
-): Context["tools"] {
-	injectIntent = injectIntent && Bun.env.PI_NO_INTENT !== "1";
+export interface NormalizeToolsOptions {
+	/** Inject the `i` intent field into tool schemas (subject to `PI_NO_INTENT`). */
+	injectIntent: boolean;
+	/** Strip descriptions from the wire specs when the catalog rides in the system prompt. */
+	pruneDescriptions?: boolean;
+}
+
+export function normalizeTools(tools: AgentContext["tools"], options: NormalizeToolsOptions): Context["tools"] {
+	const pruneDescriptions = options.pruneDescriptions === true;
+	const injectIntent = options.injectIntent && Bun.env.PI_NO_INTENT !== "1";
 	return tools?.map(t => {
 		const intentMode = resolveIntentMode(t.intent);
 		const doInjectIntent = injectIntent && intentMode !== "omit";
@@ -856,9 +858,7 @@ export function normalizeTools(
 		let parameters = toolWireSchema(t) as TSchema;
 		if (doInjectIntent) parameters = injectIntentIntoSchema(parameters, intentMode) as TSchema;
 		const description = t.description ?? "";
-		const examplesBlock = exampleDialect
-			? renderToolExamples({ ...t, parameters }, exampleDialect, doInjectIntent ? INTENT_FIELD : undefined)
-			: "";
+		const examplesBlock = renderToolExamples({ ...t, parameters }, doInjectIntent ? INTENT_FIELD : undefined);
 		const finalDescription = examplesBlock ? `${description}\n\n${examplesBlock}` : description;
 		return { ...t, parameters, description: finalDescription };
 	});
@@ -1509,21 +1509,22 @@ async function prepareProviderCall(
 	const llmMessages = await config.convertToLlm(messages);
 	const normalizedMessages = normalizeMessagesForProvider(llmMessages, model);
 	const ownedDialect: Dialect | undefined = config.dialect ?? resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT);
-	const exampleDialect = ownedDialect ?? preferredDialect(model.id);
 	const pruneToolDescriptions = !!config.pruneToolDescriptions && !ownedDialect;
 	let llmContext: Context;
 	if (config.appendOnlyContext) {
 		config.appendOnlyContext.syncMessages(normalizedMessages);
 		llmContext = config.appendOnlyContext.build(context, {
 			intentTracing: !!config.intentTracing,
-			exampleDialect,
 			pruneToolDescriptions,
 		});
 	} else {
 		llmContext = {
 			systemPrompt: context.systemPrompt,
 			messages: normalizedMessages,
-			tools: normalizeTools(context.tools, !!config.intentTracing, exampleDialect, pruneToolDescriptions),
+			tools: normalizeTools(context.tools, {
+				injectIntent: !!config.intentTracing,
+				pruneDescriptions: pruneToolDescriptions,
+			}),
 		};
 	}
 	if (config.transformProviderContext) {
@@ -1963,8 +1964,10 @@ function recoverTransientErrorToolTurn(
 		if (tool.customWireName !== undefined) availableToolNames.add(tool.customWireName);
 	}
 	if (!toolCalls.every(toolCall => availableToolNames.has(toolCall.name))) return message;
+	const errorText = `${message.errorMessage ?? ""}\n${message.stopDetails?.explanation ?? ""}`;
 	if (
-		!AIError.isStreamReadErrorText(`${message.errorMessage ?? ""}\n${message.stopDetails?.explanation ?? ""}`) &&
+		!AIError.isStreamReadErrorText(errorText) &&
+		!AIError.isStreamEnvelopeErrorText(errorText) &&
 		!AIError.isTransientStreamParseError(message.errorMessage) &&
 		!AIError.isTransientStreamParseError(message.stopDetails?.explanation)
 	)

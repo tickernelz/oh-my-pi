@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { compact, estimateTokens } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import {
+	compact,
+	estimateTokens,
+	serializeConversation,
+} from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 
 // Issue #6583: pi extensions import `estimateTokens` from
 // `@earendil-works/pi-coding-agent`, which aliases to this shim. Legacy pi
@@ -23,5 +27,12 @@ describe("legacy shim compaction helpers", () => {
 	// 'compact' not found". Pin the callable re-export.
 	it("re-exports compact as a callable function", () => {
 		expect(typeof compact).toBe("function");
+	});
+	// Issue #7403: `serializeConversation` is another package-root compaction
+	// helper used by pi-openai-server-compaction. Its absence prevented the
+	// extension from passing static validation.
+	it("re-exports serializeConversation with legacy transcript formatting", () => {
+		const serialized = serializeConversation([{ role: "user", content: "summarize this", timestamp: 0 }]);
+		expect(serialized).toBe("[User]: summarize this");
 	});
 });

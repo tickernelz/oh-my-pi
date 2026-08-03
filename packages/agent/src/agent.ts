@@ -24,7 +24,6 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
-import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
@@ -781,12 +780,10 @@ export class Agent {
 		const messages = normalizeMessagesForProvider(llmMessages, model);
 		const tools = ownedDialect
 			? []
-			: (normalizeTools(
-					this.#toolsForModel(model),
-					this.#intentTracing,
-					preferredDialect(model.id),
-					this.#pruneToolDescriptions,
-				) ?? []);
+			: (normalizeTools(this.#toolsForModel(model), {
+					injectIntent: this.#intentTracing,
+					pruneDescriptions: this.#pruneToolDescriptions,
+				}) ?? []);
 		let context: Context = { systemPrompt, messages, tools };
 		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
 		return context;

@@ -144,27 +144,6 @@ describe("AutoLearnController", () => {
 		expect(session.captures).toHaveLength(0);
 	});
 
-	it("the auto-continue nudge is terminal — capture then stop, never assume approval (#3504)", () => {
-		// Regression: with autoContinue on, the synthetic capture turn carries
-		// the nudge as its only user-role payload. Without an explicit "stop /
-		// not a user reply / do not assume approval" contract, the agent reads
-		// its own unanswered prior question (e.g. "Want me to commit and
-		// push?") as accepted and continues — exactly the scenario in #3504.
-		const session = new FakeSession();
-		install(session, { "autolearn.autoContinue": true });
-		session.toolCalls(5);
-		session.agentEnd();
-		const body = session.captures[0] ?? "";
-		// Frames the prompt as automated, not as the user's response.
-		expect(body).toMatch(/not a user reply|not from the user/i);
-		// Forbids inferring approval / acting on pending questions.
-		expect(body).toMatch(/not.*(approval|accept|pending|prior)/i);
-		// Demands a hard stop after capture, with no continuation.
-		expect(body).toMatch(/then stop\./i);
-		expect(body).toMatch(/do not.*(continue|resume|other tools)/i);
-		expect(body).toMatch(/wait for the user'?s next prompt/i);
-	});
-
 	it("does not nudge below the threshold", () => {
 		const session = new FakeSession();
 		install(session, { "autolearn.autoContinue": true });

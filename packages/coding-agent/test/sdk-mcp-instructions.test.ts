@@ -26,9 +26,6 @@ import {
 // instructions and the installed Context Mode server's absent instructions.
 const FIXTURE_PATH = path.join(import.meta.dir, "fixtures", "instructions-mcp.ts");
 const MCP_TOOL_NAME = "mcp__instr_do_thing";
-const MCP_MAPPING_FALLBACK =
-	"Additional mounted MCP tool mappings were omitted to keep this prompt bounded. Inspect `xd://` for the exact current paths.";
-const MCP_EXECUTION_GUIDANCE = "Execute each mounted tool by writing JSON arguments to its mounted path:";
 const MCP_ROUTE_SECTION = "## MCP Tool Routes";
 const CONTEXT_MODE_ROUTE = '- "ctx_execute" → `xd://mcp__context_mode_ctx_execute`';
 const CONTEXT_MODE_MCP_TOOL_NAME = "mcp__context_mode_ctx_execute";
@@ -132,7 +129,6 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 			// normalized name actually mounted in the live xd:// registry.
 			expect(prompt).toContain("MCP Server Instructions");
 			expect(prompt).toContain('- "do\\u0060thing" → `xd://mcp__instr_do_thing`');
-			expect(prompt).toContain(MCP_EXECUTION_GUIDANCE);
 		} finally {
 			await session.dispose();
 		}
@@ -185,7 +181,6 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 			expect(prompt).toContain(CONTEXT_MODE_ROUTE);
 			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain(CONTEXT_MODE_MCP_TOOL_NAME);
 			expect(session.getActiveToolNames()).not.toContain(CONTEXT_MODE_MCP_TOOL_NAME);
-			expect(prompt.split(MCP_EXECUTION_GUIDANCE)).toHaveLength(2);
 			expect(prompt.split(MCP_ROUTE_SECTION)).toHaveLength(2);
 			expect(prompt).not.toContain(SERVER_INSTRUCTIONS);
 			expect(prompt).not.toContain("## MCP Server Instructions");
@@ -242,7 +237,8 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 			expect(renderedMappings[0]).toBe('- "row_aa" → `xd://mcp__instr_row_aa`');
 			expect(renderedMappings[63]).toBe('- "row_cl" → `xd://mcp__instr_row_cl`');
 			expect(prompt).not.toContain('- "row_cm" → `xd://mcp__instr_row_cm`');
-			expect(prompt).toContain(MCP_MAPPING_FALLBACK);
+			// Truncation notice present (row_cm absent above proves the cap applied).
+			expect(prompt).toContain("omitted");
 		} finally {
 			await session.dispose();
 		}

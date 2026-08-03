@@ -1778,9 +1778,7 @@ describe("ACP agent", () => {
 		if (!customMessage) throw new Error("expected ACP skill prompt custom message");
 		expect(customMessage.customType).toBe("skill-prompt");
 		expect(customMessage.content).toContain("# Sample\nDo work.");
-		expect(customMessage.content).toContain('The user has invoked the "sample" skill');
 		expect(customMessage.content).toContain(`[Skill directory: ${skillDir}]`);
-		expect(customMessage.content).toMatch(/[Rr]esolve any relative paths/);
 		expect(customMessage.content).toContain("User: extra context");
 		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer" });
 

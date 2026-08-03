@@ -10,6 +10,21 @@
 
 - Fixed healthy broker-sourced Codex usage leaving a remote gateway credential blocked until expiry: reconciliation now awaits a scoped broker delete fenced by the exact expiry and monotonic row version it inspected, so a concurrent newer 429 block is preserved.
 - Fixed durable single-attempt provider calls to retain auth and capability learning without extra wire requests, surface GitLab timeouts instead of publishing partial output, and prevent caller-aborted Codex requests from disabling shared WebSocket transport.
+## [17.2.5] - 2026-08-03
+
+### Changed
+
+- Standardized tool-call examples in `renderToolExamples` and `renderToolInventory` to use Python keyword-argument syntax (`name(key="value")`) across all models, removing the model-specific dialect parameter and the `DialectRenderOptions.example` flag.
+- Updated `renderToolInventory` to render the tool catalog as a unified OpenAI-Harmony-style `## functions` block using TypeScript type declarations and comments, replacing the previous per-tool Markdown sections.
+- Added a `style: "harmony"` option to `jsonSchemaToTypeScript` for generating compact, comma-delimited TypeScript definitions.
+
+### Fixed
+
+- Fixed a session-blocking issue where unescaped Harmony control tokens in replayed assistant responses and tool inputs caused subsequent requests to be rejected with `invalid_prompt` errors.
+- Fixed an issue where Codex Responses dropped native image-generation results from assistant content and replays due to stale `generating` statuses.
+- Fixed Anthropic stream truncation handling where unexpected connection closures were incorrectly treated as clean stops, causing the agent loop to halt silently mid-sentence.
+- Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
+
 ## [17.2.4] - 2026-08-01
 
 ### Fixed

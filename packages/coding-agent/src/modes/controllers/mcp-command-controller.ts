@@ -1793,16 +1793,22 @@ export class MCPCommandController {
 			const oauth = await this.#resolveOAuthEndpointsFromServer(runtimeBaseConfig, options.authChallenge);
 			const serverUrl =
 				runtimeBaseConfig.type === "http" || runtimeBaseConfig.type === "sse" ? runtimeBaseConfig.url : undefined;
-			// A user-supplied client secret may live in either block (the wizard
-			// writes it to auth.clientSecret); DCR secrets are embedded in the
-			// stored credential and never echoed back into config files.
-			const configuredClientId = found.config.oauth?.clientId ?? currentAuth?.clientId;
+			// Client credentials drive the token exchange, so they must come from the
+			// env-expanded runtime config; `found.config`/`currentAuth` may still hold
+			// `${...}` placeholders (the wizard writes the secret to auth.clientSecret).
+			// DCR secrets are embedded in the stored credential and never echoed back
+			// into config files.
+			const runtimeAuth = currentAuth ? expandEnvVarsDeep(currentAuth) : undefined;
+			const configuredClientId = runtimeBaseConfig.oauth?.clientId ?? runtimeAuth?.clientId;
 			const existingCredential = lookupMcpOAuthCredentialForServer(authStorage, currentAuth, serverUrl)?.credential;
 			const flowClientId = oauth.clientId ?? configuredClientId ?? existingCredential?.clientId ?? "";
 			const storedClientSecret =
 				existingCredential?.clientId === flowClientId ? existingCredential.clientSecret : undefined;
+			const flowClientSecret =
+				runtimeBaseConfig.oauth?.clientSecret ?? runtimeAuth?.clientSecret ?? storedClientSecret ?? "";
+			// Persisted separately below: keep the raw `${...}` placeholder in the file
+			// rather than writing the resolved secret back to (possibly shared) config.
 			const userClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret;
-			const flowClientSecret = userClientSecret ?? storedClientSecret ?? "";
 
 			if (!options.silent) {
 				this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));

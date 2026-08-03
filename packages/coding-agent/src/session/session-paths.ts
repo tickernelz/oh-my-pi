@@ -2,10 +2,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
-import { getSessionsDir, getTerminalSessionsDir, isEnoent, logger, resolveEquivalentPath } from "@oh-my-pi/pi-utils";
+import {
+	getSessionsDir,
+	getTerminalSessionsDir,
+	isEnoent,
+	isRecord,
+	logger,
+	resolveEquivalentPath,
+} from "@oh-my-pi/pi-utils";
 import type { SessionStorage } from "./session-storage";
 
-const migratedSessionRoots = new Set<string>();
+const SESSION_HEADER_PREFIX_BYTES = 4096;
 
 /**
  * Merge or rename a legacy session directory into its canonical target.
@@ -35,12 +42,16 @@ function encodeLegacyAbsoluteSessionDirName(cwd: string): string {
 	return `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 
-function encodeRelativeSessionDirName(prefix: string, relative: string): string {
+function encodeLegacyRelativeSessionDirName(prefix: string, relative: string): string {
 	const encoded = relative.replace(/[/\\:]/g, "-");
 	return encoded ? (prefix.endsWith("-") ? `${prefix}${encoded}` : `${prefix}-${encoded}`) : prefix;
 }
 
-function getDefaultSessionDirName(cwd: string): { encodedDirName: string; resolvedCwd: string } {
+function getDefaultSessionDirName(cwd: string): {
+	encodedDirName: string;
+	legacyRelativeDirName: string | undefined;
+	resolvedCwd: string;
+} {
 	const resolvedCwd = path.resolve(cwd);
 	const canonicalCwd = resolveEquivalentPath(resolvedCwd);
 	const home = os.homedir();
@@ -49,83 +60,121 @@ function getDefaultSessionDirName(cwd: string): { encodedDirName: string; resolv
 	const canonicalTempRoot = resolveEquivalentPath(tempRoot);
 	const homeRelative = path.relative(canonicalHome, canonicalCwd);
 	const tempRelative = path.relative(canonicalTempRoot, canonicalCwd);
-	const encodedDirName =
-		homeRelative === "" || (!homeRelative.startsWith("..") && !path.isAbsolute(homeRelative))
-			? encodeRelativeSessionDirName("-", homeRelative)
-			: tempRelative === "" || (!tempRelative.startsWith("..") && !path.isAbsolute(tempRelative))
-				? encodeRelativeSessionDirName("-tmp", tempRelative)
-				: encodeLegacyAbsoluteSessionDirName(canonicalCwd);
-	return { encodedDirName, resolvedCwd };
-}
 
-/**
- * Resolve the canonical and legacy session directories for a cwd without
- * creating, migrating, renaming, or otherwise touching either directory.
- */
-export function getSessionDirCandidatesReadOnly(cwd: string, sessionsRoot: string = getSessionsDir()): string[] {
-	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
-	const current = path.join(sessionsRoot, encodedDirName);
-	const legacy = path.join(sessionsRoot, encodeLegacyAbsoluteSessionDirName(resolvedCwd));
-	return current === legacy ? [current] : [current, legacy];
-}
-
-/**
- * Migrate old `--<home-encoded>-*--` session dirs to the new `-*` format.
- * Runs once per sessions root on first access, best-effort.
- */
-function migrateHomeSessionDirs(sessionsRoot: string): void {
-	if (migratedSessionRoots.has(sessionsRoot)) return;
-	migratedSessionRoots.add(sessionsRoot);
-
-	const home = os.homedir();
-	const homeEncoded = home.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
-	const oldPrefix = `--${homeEncoded}-`;
-	const oldExact = `--${homeEncoded}--`;
-
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(sessionsRoot);
-	} catch {
-		return;
+	let scope: "home" | "tmp" | "abs";
+	let legacyRelativeDirName: string | undefined;
+	if (homeRelative === "" || (!homeRelative.startsWith("..") && !path.isAbsolute(homeRelative))) {
+		scope = "home";
+		legacyRelativeDirName = encodeLegacyRelativeSessionDirName("-", homeRelative);
+	} else if (tempRelative === "" || (!tempRelative.startsWith("..") && !path.isAbsolute(tempRelative))) {
+		scope = "tmp";
+		legacyRelativeDirName = encodeLegacyRelativeSessionDirName("-tmp", tempRelative);
+	} else {
+		scope = "abs";
 	}
 
+	const normalized = canonicalCwd.replaceAll("\\", "/");
+	const readable = path
+		.basename(canonicalCwd)
+		.replace(/[^a-zA-Z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(-80);
+	const digest = Bun.SHA256.hash(normalized, "hex");
+	const encodedDirName = `${scope}-${readable || "project"}-${digest}`;
+	return { encodedDirName, legacyRelativeDirName, resolvedCwd };
+}
+
+/** Resolve canonical and legacy session directories without touching them. */
+export function getSessionDirCandidatesReadOnly(cwd: string, sessionsRoot: string = getSessionsDir()): string[] {
+	const { encodedDirName, legacyRelativeDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	const candidates = new Set<string>();
+	for (const name of [encodedDirName, legacyRelativeDirName, encodeLegacyAbsoluteSessionDirName(resolvedCwd)]) {
+		if (name) candidates.add(path.join(sessionsRoot, name));
+	}
+	return [...candidates];
+}
+
+function readSessionCwd(sessionFile: string, buffer: Buffer): string | undefined {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(sessionFile, "r");
+		const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+		const prefix = buffer.toString("utf8", 0, bytesRead);
+		for (const line of prefix.split(/\r?\n/, 3)) {
+			try {
+				const record: unknown = JSON.parse(line);
+				if (isRecord(record) && record.type === "session" && typeof record.cwd === "string") {
+					return record.cwd;
+				}
+			} catch {
+				// Ignore title slots or truncated/corrupt headers.
+			}
+		}
+	} catch {
+		// Best-effort migration leaves unreadable sessions in the current bucket.
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+	return undefined;
+}
+
+function moveSessionBundle(sourceDir: string, targetDir: string, sessionName: string, entries: string[]): void {
+	fs.mkdirSync(targetDir, { recursive: true });
+	const artifactsName = path.basename(sessionName, ".jsonl");
 	for (const entry of entries) {
-		let remainder: string;
-		if (entry === oldExact) {
-			remainder = "";
-		} else if (entry.startsWith(oldPrefix) && entry.endsWith("--")) {
-			remainder = entry.slice(oldPrefix.length, -2);
+		if (entry !== sessionName && entry !== artifactsName && !entry.startsWith(`${sessionName}.`)) continue;
+		const source = path.join(sourceDir, entry);
+		if (!fs.existsSync(source)) continue;
+		const target = path.join(targetDir, entry);
+		const existing = fs.statSync(target, { throwIfNoEntry: false });
+		if (!existing) {
+			fs.renameSync(source, target);
+		} else if (existing.isDirectory() && fs.statSync(source).isDirectory()) {
+			migrateSessionDirPath(source, target);
 		} else {
+			fs.rmSync(source, { recursive: true, force: true });
+		}
+	}
+}
+
+function rerouteCollidingSessions(
+	cwd: string,
+	legacyDir: string,
+	sessionsRoot: string,
+	kind: "relative" | "absolute",
+): void {
+	const entries = fs.readdirSync(legacyDir);
+	const currentCwd = resolveEquivalentPath(path.resolve(cwd));
+	const buffer = Buffer.allocUnsafe(SESSION_HEADER_PREFIX_BYTES);
+	for (const entry of entries) {
+		if (!entry.endsWith(".jsonl")) continue;
+		const recordedCwd = readSessionCwd(path.join(legacyDir, entry), buffer);
+		if (!recordedCwd) continue;
+		const recordedCanonical = resolveEquivalentPath(path.resolve(recordedCwd));
+		if (
+			recordedCanonical === currentCwd ||
+			!fs.statSync(recordedCanonical, { throwIfNoEntry: false })?.isDirectory()
+		) {
 			continue;
 		}
-
-		const newName = remainder ? `-${remainder}` : "-";
-		const oldPath = path.join(sessionsRoot, entry);
-		const newPath = path.join(sessionsRoot, newName);
-
-		try {
-			migrateSessionDirPath(oldPath, newPath);
-		} catch {
-			// Best effort
-		}
-	}
-}
-
-function migrateLegacyAbsoluteSessionDir(cwd: string, sessionDir: string, sessionsRoot: string): void {
-	const legacyDir = path.join(sessionsRoot, encodeLegacyAbsoluteSessionDirName(cwd));
-	if (legacyDir === sessionDir || !fs.existsSync(legacyDir)) return;
-
-	try {
-		migrateSessionDirPath(legacyDir, sessionDir);
-	} catch {
-		// Best effort
+		const recordedNames = getDefaultSessionDirName(recordedCanonical);
+		const recordedLegacyName =
+			kind === "relative"
+				? recordedNames.legacyRelativeDirName
+				: encodeLegacyAbsoluteSessionDirName(recordedCanonical);
+		if (recordedLegacyName !== path.basename(legacyDir)) continue;
+		moveSessionBundle(legacyDir, path.join(sessionsRoot, recordedNames.encodedDirName), entry, entries);
 	}
 }
 
 export function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {
 	const currentDirName = path.basename(sessionDir);
-	const { encodedDirName } = getDefaultSessionDirName(cwd);
-	if (currentDirName !== encodedDirName && currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)) {
+	const { encodedDirName, legacyRelativeDirName } = getDefaultSessionDirName(cwd);
+	if (
+		currentDirName !== encodedDirName &&
+		currentDirName !== legacyRelativeDirName &&
+		currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)
+	) {
 		return undefined;
 	}
 	return path.dirname(sessionDir);
@@ -141,10 +190,23 @@ export function computeDefaultSessionDir(
 	storage: SessionStorage,
 	sessionsRoot: string = getSessionsDir(),
 ): string {
-	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
-	migrateHomeSessionDirs(sessionsRoot);
+	const { encodedDirName, legacyRelativeDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
 	const sessionDir = path.join(sessionsRoot, encodedDirName);
-	migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);
+	const legacyDirs: Array<{ kind: "relative" | "absolute"; name: string | undefined }> = [
+		{ kind: "relative", name: legacyRelativeDirName },
+		{ kind: "absolute", name: encodeLegacyAbsoluteSessionDirName(resolvedCwd) },
+	];
+	for (const legacy of legacyDirs) {
+		if (!legacy.name) continue;
+		const legacyDir = path.join(sessionsRoot, legacy.name);
+		if (legacyDir === sessionDir || !fs.existsSync(legacyDir)) continue;
+		try {
+			rerouteCollidingSessions(resolvedCwd, legacyDir, sessionsRoot, legacy.kind);
+			migrateSessionDirPath(legacyDir, sessionDir);
+		} catch {
+			// Best effort
+		}
+	}
 	storage.ensureDirSync(sessionDir);
 	return sessionDir;
 }

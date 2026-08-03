@@ -46,8 +46,7 @@ describe("editToolRenderer", () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderCall(
 			{
-				edits: [{}],
-				__partialJson: '{"edits":[{"path":"packages/coding-agent/src/edit/renderer.ts","old_text":"before',
+				__partialJson: '{"path":"packages/coding-agent/src/edit/renderer.ts","old_string":"before',
 			},
 			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "replace" } },
 			uiTheme,

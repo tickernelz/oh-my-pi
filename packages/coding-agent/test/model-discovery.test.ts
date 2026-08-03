@@ -12,6 +12,7 @@ import { resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider
 import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { applyLlamaCppQwenThinking, discoveryProbeTimeoutMs } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -1160,6 +1161,47 @@ describe("ModelRegistry runtime discovery", () => {
 		expect((plain?.compat as DialectFields | undefined)?.reasoningDisableMode).not.toBe("qwen-template-false");
 	});
 
+	test("configured provider discovery accepts timeoutMs and passes it to probes", async () => {
+		const customConfigPath = path.join(tempDir, "models.yml");
+		fs.writeFileSync(
+			customConfigPath,
+			`
+providers:
+  custom-remote:
+    baseUrl: "http://127.0.0.1:8080"
+    api: "openai-completions"
+    auth: "none"
+    discovery:
+      type: "llama.cpp"
+      timeoutMs: 45000
+`,
+			"utf-8",
+		);
+
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(JSON.stringify({ data: [{ id: "remote-model-1" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+
+		const registry = new ModelRegistry(authStorage, customConfigPath, { fetch: fetchMock });
+		await registry.refresh();
+		const state = registry.getProviderDiscoveryState("custom-remote");
+		expect(state?.status).toBe("ok");
+		const models = getModelsForProvider(registry, "custom-remote");
+		expect(models.map(m => m.id)).toEqual(["remote-model-1"]);
+	});
 	test("configured llama.cpp Qwen model keeps its /v1 runtime URL despite a native-root baseUrl override", async () => {
 		writeRawModelsJson({
 			"llama.cpp": {
@@ -1269,6 +1311,23 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(discoveryProbeTimeoutMs("http://remote-llama.test:8080", 150)).toBe(remoteBudgets[0]);
 	});
 
+	test("discoveryProbeTimeoutMs uses explicit customTimeoutMs when provided", () => {
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 30_000)).toBe(30_000);
+		expect(discoveryProbeTimeoutMs("http://remote-llama.test:8080", 250, 30_000)).toBe(30_000);
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 5_000)).toBe(5_000);
+		// Invalid custom timeouts fall back to standard loopback/remote resolution
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, -100)).toBe(250);
+		expect(discoveryProbeTimeoutMs("http://127.0.0.1:8080", 250, 0)).toBe(250);
+	});
+
+	test("ProviderDiscoverySchema validates timeoutMs", () => {
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: 30_000 })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "ollama", timeoutMs: 5_000 })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: -500 })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: 0 })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: Number.NaN })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: "30000" as any })).toBe(false);
+	});
 	test("llama.cpp discovery marks per-model architecture image modalities as vision-capable", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);

@@ -73,7 +73,7 @@ import {
 	inheritReferenceThinking,
 	resolveModelReference,
 } from "@oh-my-pi/pi-catalog/identity";
-import { isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { $envExact, isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
@@ -329,7 +329,7 @@ interface CommandApiKeyResolution {
  */
 function resolveConfigValue(valueConfig: string): string | undefined {
 	if (valueConfig.startsWith("!")) return resolveCommandConfig(valueConfig.slice(1).trim());
-	const envValue = Bun.env[valueConfig];
+	const envValue = $envExact(valueConfig);
 	if (envValue) return envValue;
 	return valueConfig;
 }
@@ -972,14 +972,18 @@ export class ModelRegistry {
 	 * Refresh dynamic metadata that can appear only after a local model loads.
 	 */
 	async refreshSelectedModelMetadata(model: Model<Api>): Promise<Model<Api>> {
-		const isLlamaCppDiscovery = this.#discoverableProviders.some(
+		const llamaCppDiscoveryConfig = this.#discoverableProviders.find(
 			providerConfig => providerConfig.provider === model.provider && providerConfig.discovery.type === "llama.cpp",
 		);
-		if (!isLlamaCppDiscovery) {
+		if (!llamaCppDiscoveryConfig) {
 			return model;
 		}
 		this.#ensureFullSnapshot();
-		const runtimeMetadata = await discoverLlamaCppModelRuntimeMetadata(model, this.#nonResolvingDiscoveryContext());
+		const runtimeMetadata = await discoverLlamaCppModelRuntimeMetadata(
+			model,
+			this.#nonResolvingDiscoveryContext(),
+			llamaCppDiscoveryConfig.discovery.timeoutMs,
+		);
 		if (runtimeMetadata === undefined) {
 			return this.find(model.provider, model.id) ?? model;
 		}

@@ -2,7 +2,13 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { filterProcessEnv, getDbBusyTimeoutMs, parseEnvFile, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
+import {
+	$envExact,
+	filterProcessEnv,
+	getDbBusyTimeoutMs,
+	parseEnvFile,
+	setInteractiveHost,
+} from "@oh-my-pi/pi-utils/env";
 
 const tempDirs: string[] = [];
 const runtimeProbePath = path.join(import.meta.dir, "fixtures", "test-runtime-probe.ts");
@@ -186,5 +192,65 @@ describe("isBunTestRuntime", () => {
 				underscoreProbePath,
 			),
 		).toBe(true);
+	});
+});
+
+/**
+ * Faithful model of Windows `process.env`: case-insensitive reads, but
+ * enumeration (`ownKeys`) preserves the real key casing — exactly Node
+ * (`uv_os_getenv` + `uv_os_environ`) and Bun (`CaseInsensitiveASCIIStringArrayHashMap`).
+ */
+function windowsLikeEnv(backing: Record<string, string>): Record<string, string | undefined> {
+	return new Proxy(backing, {
+		get(target, prop) {
+			if (typeof prop !== "string") return Reflect.get(target, prop);
+			for (const key in target) {
+				if (key.toLowerCase() === prop.toLowerCase()) return target[key];
+			}
+			return undefined;
+		},
+		has(target, prop) {
+			if (typeof prop !== "string") return Reflect.has(target, prop);
+			for (const key in target) {
+				if (key.toLowerCase() === prop.toLowerCase()) return true;
+			}
+			return false;
+		},
+	}) as Record<string, string | undefined>;
+}
+
+describe("$envExact", () => {
+	it("returns the value for an exact-case key", () => {
+		const env = { OPENCODE_API_KEY: "sk-live", PATH: "/usr/bin" };
+		expect($envExact("OPENCODE_API_KEY", env)).toBe("sk-live");
+	});
+
+	it("returns undefined for an absent name", () => {
+		expect($envExact("MISSING_VAR", { PATH: "/usr/bin" })).toBeUndefined();
+	});
+
+	it("does not hijack a literal via a case-differing Windows system var", () => {
+		// Windows ships PUBLIC=C:\Users\Public and reads are case-insensitive, so
+		// a bare `env["public"]` returns it — the /login #7361 401 root cause.
+		const env = windowsLikeEnv({ PUBLIC: "C:\\Users\\Public" });
+		expect(env.public).toBe("C:\\Users\\Public");
+		expect($envExact("public", env)).toBeUndefined();
+	});
+
+	it("still resolves a genuine exact-case reference on a case-insensitive env", () => {
+		const env = windowsLikeEnv({ MY_KEY: "secret" });
+		expect($envExact("MY_KEY", env)).toBe("secret");
+		expect($envExact("my_key", env)).toBeUndefined();
+	});
+
+	it("reads process.env by default", () => {
+		const name = `PI_ENVEXACT_TEST_${Date.now()}`;
+		process.env[name] = "value";
+		try {
+			expect($envExact(name)).toBe("value");
+		} finally {
+			delete process.env[name];
+		}
+		expect($envExact(name)).toBeUndefined();
 	});
 });

@@ -347,15 +347,14 @@ describe("matcherDigest", () => {
 		).toBe(createContent);
 	});
 
-	test("replace: digests new_text of every edit", () => {
+	test("replace: digests new_string", () => {
 		expect(
 			EDIT_MODE_STRATEGIES.replace.matcherDigest({
-				edits: [
-					{ old_text: "a", new_text: "const b = 1;" },
-					{ old_text: "c", new_text: "const d = 2;" },
-				],
+				path: "foo.ts",
+				old_string: "a",
+				new_string: "const b = 1;",
 			}),
-		).toBe("const b = 1;\nconst d = 2;");
+		).toBe("const b = 1;");
 		expect(EDIT_MODE_STRATEGIES.replace.matcherDigest({})).toBeUndefined();
 	});
 });

@@ -1124,7 +1124,7 @@ class DaemonBroker {
 	}
 }
 
-/** Start the detached per-project daemon broker selected by the CLI worker host. */
+/** Start the detached project or global daemon broker selected by the CLI worker host. */
 export async function startDaemonBrokerFromEnvironment(): Promise<void> {
 	const projectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const runtimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];

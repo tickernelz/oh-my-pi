@@ -11,9 +11,9 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { Browser, Page, Target } from "puppeteer-core";
-import { chromiumCanLaunch } from "./chromium-probe";
+import { chromiumAvailable } from "./chromium-probe";
 
-const CHROMIUM_AVAILABLE = await chromiumCanLaunch();
+const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
 interface FakePageOptions {
 	url: string;

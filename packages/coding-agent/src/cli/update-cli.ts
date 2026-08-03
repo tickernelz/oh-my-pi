@@ -378,10 +378,30 @@ export function assertDownstreamUpdateTarget(
 	);
 }
 
-function isMuslLinux(): boolean {
-	if (process.platform !== "linux") return false;
-	if (fs.existsSync("/etc/alpine-release")) return true;
-	return fs.existsSync(`/lib/ld-musl-${process.arch === "arm64" ? "aarch64" : "x86_64"}.so.1`);
+interface MuslDetectionOptions {
+	platform?: NodeJS.Platform;
+	alpineRelease?: boolean;
+	lddOutput?: string;
+}
+
+function detectLddOutput(): string | undefined {
+	try {
+		const result = Bun.spawnSync(["ldd", "--version"], { stdout: "pipe", stderr: "pipe" });
+		return `${result.stdout.toString("utf-8")}\n${result.stderr.toString("utf-8")}`;
+	} catch {
+		return undefined;
+	}
+}
+
+function isMuslLinux(options: MuslDetectionOptions = {}): boolean {
+	if ((options.platform ?? process.platform) !== "linux") return false;
+	if (options.alpineRelease ?? fs.existsSync("/etc/alpine-release")) return true;
+	return /\bmusl\b/i.test(options.lddOutput ?? detectLddOutput() ?? "");
+}
+
+/** Test seam for libc detection. */
+export function isMuslLinuxForTest(options: Required<MuslDetectionOptions>): boolean {
+	return isMuslLinux(options);
 }
 
 /** Downstream canary binaries are intentionally limited to Linux x64, including WSL. */

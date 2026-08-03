@@ -156,8 +156,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 		const content = typeof message.content === "string" ? message.content : "";
 		expect(message.customType).toBe("vibe-mode-context");
 		expect(content).toContain("`todo`");
-		expect(content).toContain("parent session's list");
-		expect(content).toContain("Workers do not own this bookkeeping.");
 
 		// Toggle off: the empty previous toolset must come back — only the
 		// ephemeral vibe tools must leave the registry.

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [17.2.5] - 2026-08-03
+
+### Fixed
+
+- Fixed an issue where newly advertised chat models were dropped during dynamic discovery for the `alibaba-token-plan` provider.
+- Fixed a `400` error when forcing a specific tool with DeepSeek reasoning models on OpenCode Zen/Go gateways by automatically downgrading the tool selection mode to `auto` while keeping the tool advertised.
+
 ## [17.2.4] - 2026-08-01
 
 ### Added

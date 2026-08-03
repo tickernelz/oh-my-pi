@@ -38,6 +38,58 @@ Parsing comes from frontmatter via `parseAgentFields()` (`src/discovery/helpers.
 - `read-summarize: false` (parsed as `readSummarize`) forces the subagent's `read` tool to return verbatim file content instead of structural summaries — `runSubprocess` applies it as a `read.summarize.enabled: false` override on the subagent's isolated settings (`src/task/executor.ts`). `scout` and `librarian` ship with it disabled. Defaults to enabled when the field is absent.
 - `prewalk: true` starts the subagent on its resolved model and hands off to the default prewalk target (the `smol` role) at its first edit/write, exactly like the session-level `--prewalk`; a string value (e.g. `prewalk: "@smol"` or `prewalk: "openai/gpt-5-mini"`) picks a custom target. The `task.agentPrewalk` settings record (agent name → `"on"` / `"off"` / pattern, toggled per agent from `/agents` with `P`) overrides the frontmatter. Resolution happens in `runSubprocess` (`src/task/executor.ts`); an unresolvable target or a target equal to the starting model skips the hand-off instead of failing the spawn.
 
+## Role-backed custom agents
+
+OMP discovers user agents from `~/.omp/agent/agents/*.md` and project agents from `.omp/agents/*.md`.
+
+Give the agent a role alias in frontmatter, then dispatch it by name. For model routing, task dispatch sets only `agent`; it does not set a worker model:
+
+`~/.omp/agent/agents/reviewer.md`:
+
+```md
+---
+name: reviewer
+description: Review a change for correctness.
+model: "@review"
+---
+Review the assigned change and report concrete findings.
+```
+
+Set the role mapping in `~/.omp/agent/config.yml`:
+
+```yaml
+modelRoles:
+  review: openai/gpt-5.4:high
+```
+
+`@review` resolves through `modelRoles.review`. Each `modelRoles.<role>` value stores a concrete model selector and may append a thinking suffix such as `:high` (`src/config/model-resolver.ts`). Changing that mapping affects subsequent task resolutions without editing agent definitions.
+
+For a dispatch, set the agent name and task:
+
+```json
+{"context":"Review the current change in this repository.","tasks":[{"agent":"reviewer","task":"Report concrete correctness findings."}]}
+```
+
+`/model`'s Roles view can assign and persist custom role mappings such as `review`, `fast`, and `good`. Changing only the active or default session selection does not remap those roles.
+
+### `vibe_spawn` tier routing
+
+`vibe_spawn` maps `fast` to bundled `sonic` and `good` to bundled `task`. Both resolve through `task.agentModelOverrides` before their bundled agent model defaults (`src/vibe/runtime.ts`, `src/task/agents.ts`).
+
+Route these tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
+
+```yaml
+task:
+  agentModelOverrides:
+    sonic: "@fast_worker"
+    task: "@good_worker"
+modelRoles:
+  fast_worker: openai/gpt-5-mini
+  good_worker: openai/gpt-5.4:high
+```
+
+The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model.
+
 ## Bundled agents
 
 Bundled agents are embedded at build time (`src/task/agents.ts`) using text imports.

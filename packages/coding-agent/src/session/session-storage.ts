@@ -14,13 +14,22 @@ export interface SessionStorageStat {
 
 export interface SessionStorageWriter {
 	/**
-	 * Append one newline-terminated line. File storage batches same-turn appends
-	 * until its microtask boundary; memory storage updates in-body; indexed
-	 * backends queue in call order.
+	 * Append one newline-terminated line.
+	 *
+	 * File and memory storage apply the line synchronously before the returned
+	 * promise settles, so a software crash after `append` returns (or after a
+	 * fire-and-forget call begins) still sees the entry on disk / in body. No
+	 * `fsync` — power loss may still drop the last page. Indexed backends update
+	 * the local index immediately and queue the remote publish in call order.
 	 *
 	 * `line` MUST include the trailing newline.
 	 */
 	append(line: string): Promise<void>;
+	/**
+	 * Synchronous append only when the backend durably applies the line before return.
+	 * Backends with queued remote I/O must omit this method.
+	 */
+	appendSync?(line: string): void;
 	/** Resolve once all queued appends complete. No fsync. */
 	flush(): Promise<void>;
 	/** Drain synchronously flushable queued work when the backend supports it. No fsync. */
@@ -94,8 +103,6 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#closed = false;
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
-	#pending = "";
-	#flushScheduled = false;
 
 	constructor(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
 		this.#onError = options?.onError;
@@ -130,34 +137,29 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		}
 	}
 
-	#flushPendingNow(): void {
-		this.#flushScheduled = false;
-		if (this.#pending.length === 0) return;
-		const pending = this.#pending;
-		this.#pending = "";
+	appendSync(line: string): void {
+		if (this.#closed) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		// Write in-body so software crash after the call still sees the entry.
+		// Microtask batching used to leave completed transcript lines only in
+		// memory until the next event-loop turn; process crash then lost every
+		// post-checkpoint event. flush/flushSync remain no-op drains (no fsync).
 		try {
-			this.#writeNow(pending);
+			this.#writeNow(line);
 		} catch (err) {
-			this.#recordError(err);
+			throw this.#recordError(err);
 		}
 	}
 
 	async append(line: string): Promise<void> {
-		if (this.#closed) throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
-		this.#pending += line;
-		if (this.#flushScheduled) return;
-		this.#flushScheduled = true;
-		queueMicrotask(() => this.#flushPendingNow());
+		this.appendSync(line);
 	}
 
 	async flush(): Promise<void> {
-		this.#flushPendingNow();
 		if (this.#error) throw this.#error;
 	}
 
 	flushSync(): void {
-		this.#flushPendingNow();
 		if (this.#error) throw this.#error;
 	}
 
@@ -167,7 +169,6 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 
 	async close(): Promise<void> {
 		if (this.#closed) return;
-		this.#flushPendingNow();
 		this.#closed = true;
 		// Unregister from finalization - we're closing properly
 		writerRegistry.unregister(this);
@@ -492,7 +493,7 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	async append(line: string): Promise<void> {
+	appendSync(line: string): void {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		try {
@@ -501,6 +502,10 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	async append(line: string): Promise<void> {
+		this.appendSync(line);
 	}
 
 	async flush(): Promise<void> {

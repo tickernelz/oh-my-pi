@@ -406,17 +406,22 @@ export class SessionPersistenceIndeterminateError extends AggregateError {
  * tree by `(id, parentId)`, and the mutable leaf pointer selects which path is
  * active for future appends and for LLM context construction.
  *
- * Durability is software-crash safe but not power-loss safe: appends are normally
- * handed to the OS synchronously in-body but never `fsync`'d. While an in-place
- * atomic rewrite publishes, a synchronous `flushSync` still persists fenced
- * appends by superseding the pending publish against the same (stable) path.
- * A {@link moveTo} relocation is the one exception: the session file is being
- * renamed to a new path, so appends landing in the rename window are held in
- * memory and persisted only by the move's trailing rewrite. A `flushSync` in
- * that narrow window cannot durably place them — writing the vacated source
- * would recreate the orphan the move eliminates, and a queued backend publish
- * (fire-and-forget on `IndexedSessionStorage`) could land after the rename all
- * the same. This gap is inherent to closing the writer for a Windows-safe rename.
+ * Durability is software-crash safe but not power-loss safe: completed entries
+ * (user/assistant/toolResult messages, tool_execution_start markers, custom
+ * entries) are handed to the OS synchronously in-body on append and never
+ * `fsync`'d. In-flight streaming text is intentionally not durable until
+ * `message_end` persists the finished message.
+ *
+ * While an in-place atomic rewrite is publishing, a concurrent completed append
+ * supersedes that publish with a synchronous full-body rewrite so the entry is
+ * software-crash durable before the append returns; the abandoned atomic's
+ * `commitGuard` then refuses to clobber the fresher body.
+ *
+ * During {@link moveTo}, appends write a full body to the live relocation path
+ * (source until rename, destination once the rename has landed) so a crash mid-
+ * move still preserves completed entries without recreating a vacated source.
+ * A trailing atomic rewrite still rewrites the header cwd after the path is
+ * repointed.
  */
 export class SessionManager {
 	#cwd: string;
@@ -487,15 +492,12 @@ export class SessionManager {
 	/** Set by synchronous appends that land while an atomic replacement is active. */
 	#atomicRewriteDirty = false;
 	/**
-	 * True while {@link moveTo} is renaming the session file but has not yet
-	 * repointed `#sessionFile`. Both the synchronous append hot path
-	 * ({@link #appendToSessionFile}) and synchronous rewrites
-	 * ({@link #rewriteSynchronously}, reached via `flushSync` on Ctrl+C) would
-	 * otherwise touch the pre-rename path — opening a fresh writer or writing the
-	 * full body — recreating the very orphan the move eliminates. Both defer
-	 * while this is set; the move's trailing atomic rewrite persists them.
+	 * Active {@link moveTo} relocation. Concurrent completed appends write a
+	 * full body to the live path: source while it still exists, destination
+	 * once rename has landed (source gone). Never recreates a vacated source.
+	 * `null` outside an active relocation.
 	 */
-	#sessionFileRelocating = false;
+	#sessionFileRelocating: { source: string; dest: string } | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
@@ -637,11 +639,9 @@ export class SessionManager {
 		return error;
 	}
 
-	#notifyDurableEntryObservers(entries: readonly SessionEntry[] = []): void {
-		const notifications = [...this.#pendingDurableObserverNotifications, ...entries];
-		this.#pendingDurableObserverNotifications = [];
+	#emitDurableEntryObservers(entries: readonly SessionEntry[]): void {
 		const seen = new Set<string>();
-		for (const entry of notifications) {
+		for (const entry of entries) {
 			if (seen.has(entry.id)) continue;
 			seen.add(entry.id);
 			for (const observer of [...this.#durableEntryObservers]) {
@@ -652,6 +652,12 @@ export class SessionManager {
 				}
 			}
 		}
+	}
+
+	#notifyDurableEntryObservers(entries: readonly SessionEntry[] = []): void {
+		const notifications = [...this.#pendingDurableObserverNotifications, ...entries];
+		this.#pendingDurableObserverNotifications = [];
+		this.#emitDurableEntryObservers(notifications);
 	}
 
 	#notifyDurableEntries(entries: readonly SessionEntry[] = []): void {
@@ -795,30 +801,56 @@ export class SessionManager {
 	}
 
 	/**
+	 * Live path for concurrent completed appends during {@link moveTo}.
+	 * Prefers destination once rename has landed (source gone); otherwise
+	 * source. Never invents a path that does not already exist.
+	 */
+	#liveRelocationWritePath(): string | null {
+		const relocating = this.#sessionFileRelocating;
+		if (!relocating) return null;
+		if (this.#storage.existsSync(relocating.dest)) return relocating.dest;
+		if (this.#storage.existsSync(relocating.source)) return relocating.source;
+		// Rename in flight with neither path visible (rare cross-device edge):
+		// fall back to destination so we do not recreate a vacated source.
+		return relocating.dest;
+	}
+
+	/**
 	 * Synchronously rewrite the whole file (header + entries) and keep no open
 	 * writer; the next append re-opens one. `writeTextSync` returns with the
 	 * bytes in the kernel page cache, so the file is software-crash durable.
+	 *
+	 * During {@link moveTo}, writes to the live relocation path (source pre-
+	 * rename, destination post-rename) rather than always `#sessionFile`, so
+	 * concurrent completed entries are durable without recreating a vacated source.
 	 */
 	#rewriteSynchronously(): void {
-		if (!this.#persist || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
-		// A move is renaming the file out from under `#sessionFile`. Writing the
-		// full body now would target either the vacated source (recreating the
-		// orphan the move eliminates) or a path a queued backend publish may clobber
-		// post-rename, so defer to moveTo's trailing atomic rewrite. This narrows
-		// flushSync durability for entries in the rename window (see class doc).
-		if (this.#sessionFileRelocating) return;
+		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
+		const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
+		if (!targetPath) return;
 
 		try {
 			const body = this.#fileBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
-			this.#storage.writeTextSync(this.#sessionFile, body);
-			this.#fileIsCurrent = true;
-			this.#materializeBreadcrumb();
-			this.#rewriteRequired = false;
-			this.#hasTitleSlot = true;
-			this.#notifyDurableEntryObservers();
+			this.#storage.writeTextSync(targetPath, body);
+			// Only mark the manager current when writing the active session path.
+			// Mid-move writes update the live relocation path; `#sessionFile` is
+			// still the pre-repoint source until moveTo repoints it.
+			if (!this.#sessionFileRelocating || targetPath === this.#sessionFile) {
+				this.#fileIsCurrent = true;
+				this.#materializeBreadcrumb();
+				this.#rewriteRequired = false;
+				this.#hasTitleSlot = true;
+			} else {
+				// Destination body is current on disk; in-memory still needs a
+				// header-cwd rewrite after repoint, but entries are durable.
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
+				this.#hasTitleSlot = true;
+			}
+			if (this.#fileIsCurrent && !this.#rewriteRequired) this.#notifyDurableEntryObservers();
 		} catch (err) {
 			this.#noteDiskFailure(err);
 		}
@@ -905,23 +937,22 @@ export class SessionManager {
 			return false;
 		}
 
-		// Atomic replacement window: the old path may be moved aside underneath
-		// any newly-opened append handle (Windows EPERM fallback), or a `moveTo`
-		// may be renaming the session file to a new directory. Do not open a
-		// writer here; the active rewrite loops and serializes a fresh full body,
-		// and the move's trailing atomic rewrite folds in these deferred entries.
-		// A superseding synchronous rewrite bumps `#diskEpoch`, at which point
-		// the pending atomic publish is guaranteed to abandon via its
-		// `commitGuard`, so appends can (and must) take the hot path so they
-		// don't strand in memory while `close()` returns without a rewrite.
-		if (
-			this.#sessionFileRelocating ||
-			(this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch)
-		) {
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
+		// Atomic replacement / move window: do not open a fresh append writer that
+		// a Windows EPERM replace could detach from the current JSONL path.
+		// - moveTo: write a full body to the live relocation path (source pre-
+		//   rename, destination post-rename) so completed entries are durable
+		//   without recreating a vacated source.
+		// - in-place atomic fence: supersede the pending publish with a
+		//   synchronous full-body rewrite; bumping `#diskEpoch` abandons the
+		//   in-flight atomic via its `commitGuard`.
+		if (this.#sessionFileRelocating) {
+			this.#rewriteSynchronously();
+			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
+		}
+		if (this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch) {
 			this.#atomicRewriteDirty = true;
-			return false;
+			this.#rewriteSynchronously();
+			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 		// Cold/divergent: not on disk yet, or in-memory entries diverged from the
 		// file → rewrite the whole file synchronously and keep going.
@@ -930,15 +961,36 @@ export class SessionManager {
 			return this.#fileIsCurrent && !this.#rewriteRequired && !this.#diskFailure;
 		}
 
-		// Hot path: queue the entry directly on the writer, outside the async disk
-		// chain. File writers batch same-turn appends until their microtask
-		// boundary; flush(), flushSync(), and close() drain that batch explicitly.
+		// Hot path: write the entry directly on the writer, outside the async disk
+		// chain. Prefer appendSync so write failures latch `#diskFailure` before
+		// this call returns (not via a discarded rejected Promise after a later
+		// microtask). Callers stay non-throwing here — the core turn loop invokes
+		// appendMessage/appendCustomEntry without try/catch; flushSync/close and
+		// subsequent appends still throw the latched error. File writers apply
+		// each line to the OS page cache before return.
 		// A mid-close writer leaves `#writer` undefined, so `#appendWriter` simply
 		// opens a fresh append handle and the entry still lands.
 		try {
 			const writer = this.#appendWriter();
-			void writer.append(this.#lineFor(entry)).catch(err => this.#noteDiskFailure(err));
-			return writer.getError() === undefined;
+			const line = this.#lineFor(entry);
+			if (writer.appendSync) {
+				writer.appendSync(line);
+				return writer.getError() === undefined;
+			}
+			void writer.append(line).then(
+				() => {
+					if (!this.#fileIsCurrent || this.#rewriteRequired || this.#diskFailure) return;
+					const index = this.#pendingDurableObserverNotifications.findIndex(
+						candidate => candidate.id === entry.id,
+					);
+					if (index === -1) return;
+					this.#emitDurableEntryObservers(this.#pendingDurableObserverNotifications.splice(0, index + 1));
+				},
+				err => {
+					this.#noteDiskFailure(err);
+				},
+			);
+			return false;
 		} catch (err) {
 			this.#noteDiskFailure(err);
 			return false;
@@ -955,12 +1007,11 @@ export class SessionManager {
 		}
 
 		// Title changes use their own asynchronous append path rather than
-		// #appendToSessionFile. Defer them under the same move fence so they cannot
-		// recreate the vacated source path before #sessionFile is repointed.
+		// #appendToSessionFile. During move, write the full body (including the
+		// title entry) to the live relocation path so a crash mid-move still
+		// keeps the title change; the trailing rewrite still updates header cwd.
 		if (this.#sessionFileRelocating) {
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
-			this.#atomicRewriteDirty = true;
+			this.#rewriteSynchronously();
 			return;
 		}
 
@@ -1403,14 +1454,15 @@ export class SessionManager {
 				: computeDefaultSessionDir(resolvedCwd, this.#storage));
 
 		let sessionFileExisted = false;
-		// Fence synchronous appends and rewrites away from the session file for the
-		// duration of the relocation (see `#sessionFileRelocating`). This flag —
-		// not a `#diskEpoch` bump — is used deliberately: bumping the epoch here
-		// would cancel any disk task already queued at the current epoch (e.g. a
-		// header-only `ensureOnDisk()` materializing rewrite) before the drain
-		// below runs it, silently dropping an explicitly materialized session.
+		// Track source+dest for concurrent completed appends during relocation
+		// (see `#sessionFileRelocating`). Existence of either path decides the
+		// live write target — not a `#diskEpoch` bump, which would cancel any
+		// disk task already queued at the current epoch (e.g. a header-only
+		// `ensureOnDisk()` materializing rewrite) before the drain below runs it.
 		if (this.#persist && this.#sessionFile) {
-			this.#sessionFileRelocating = true;
+			const source = this.#sessionFile;
+			const dest = path.join(nextSessionDir, path.basename(source));
+			this.#sessionFileRelocating = { source, dest };
 		}
 
 		try {
@@ -1474,8 +1526,8 @@ export class SessionManager {
 				this.#sessionFile = newSessionFile;
 				this.#artifactManager = null;
 				this.#artifactManagerSessionFile = null;
-				// Path is repointed; a sync rewrite may now safely target the new file.
-				this.#sessionFileRelocating = false;
+				// Path is repointed; hot-path appends may use `#sessionFile` again.
+				this.#sessionFileRelocating = null;
 			}
 
 			this.#cwd = resolvedCwd;
@@ -1500,7 +1552,7 @@ export class SessionManager {
 
 			if (this.#sessionFile) this.#rememberBreadcrumb(resolvedCwd, this.#sessionFile);
 		} finally {
-			this.#sessionFileRelocating = false;
+			this.#sessionFileRelocating = null;
 		}
 	}
 
