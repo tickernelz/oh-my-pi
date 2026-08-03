@@ -1321,6 +1321,7 @@ export class Settings {
 			"modelRoles",
 			"autocompleteMaxVisible",
 			"shellPath",
+			"python.interpreter",
 			...getLcmSettingPaths(),
 			"gc.blobs",
 			"gc.archive",
