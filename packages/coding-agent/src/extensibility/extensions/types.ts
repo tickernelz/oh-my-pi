@@ -7,6 +7,10 @@
  * - Register commands, keyboard shortcuts, and CLI flags
  * - Interact with the user via UI primitives
  */
+
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
 	AgentMessage,
 	AgentToolResult,
@@ -36,8 +40,6 @@ import type {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type { AutocompleteItem, AutocompleteProvider, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { Type as arktype } from "arktype";
-import type * as zod from "zod/v4";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -102,7 +104,6 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
-import type * as TypeBox from "../typebox";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -593,6 +594,36 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 		theme: Theme,
 		args?: Static<TParams>,
 	) => Component;
+}
+
+/** Whether a tool's source is scoped to the user, the project, or a transient runtime session. */
+export type SourceScope = "user" | "project" | "temporary";
+
+/** Whether a tool's source came from an installed package or a top-level (loose) file. */
+export type SourceOrigin = "package" | "top-level";
+
+/**
+ * Provenance metadata describing where a registered tool came from. Mirrors the
+ * `@earendil-works/pi-coding-agent` `SourceInfo` contract so extensions authored
+ * against upstream pi (e.g. gentle-pi) can read `sourceInfo.source` unchanged.
+ */
+export interface SourceInfo {
+	/** Synthetic or on-disk identifier for the tool's origin (e.g. `<builtin:read>`). */
+	path: string;
+	/** Origin class: `"builtin"`, `"sdk"`, `"mcp"`, or `"extension"`. */
+	source: string;
+	scope: SourceScope;
+	origin: SourceOrigin;
+	baseDir?: string;
+}
+
+/** Tool metadata returned by {@link ExtensionAPI.getAllTools}: identity, schema, and source provenance. */
+export interface ToolInfo {
+	name: string;
+	description: string;
+	parameters: TSchema;
+	promptGuidelines?: string[];
+	sourceInfo: SourceInfo;
 }
 
 // ============================================================================
@@ -1108,12 +1139,13 @@ export interface ExtensionAPI {
 	/** File logger for error/warning/debug messages */
 	logger: typeof PiLogger;
 
-	/** Injected zod-backed typebox shim for legacy `Type.Object(...)` parameter authoring. */
+	/** Injected TypeBox shim for legacy `Type.Object(...)` parameter authoring. */
 	typebox: typeof TypeBox;
 
-	/** Injected arktype module for arktype-authored extension tools (canonical going forward). */
-	arktype: typeof arktype;
-	/** Injected zod/v4 module for canonical extension tool parameter schemas. */
+	/** Injected omptype schema builder for extension tools. */
+	arktype: typeof ArkType;
+
+	/** Injected Zod-compatible omptype builder for extension tools. */
 	zod: typeof zod;
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
@@ -1266,8 +1298,8 @@ export interface ExtensionAPI {
 	/** Get the list of currently active tool names. */
 	getActiveTools(): string[];
 
-	/** Get all configured tools (built-in + extension tools). */
-	getAllTools(): string[];
+	/** Get all configured tools (built-in + extension tools) with schema and source metadata. */
+	getAllTools(): ToolInfo[];
 
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): Promise<void>;
@@ -1463,7 +1495,7 @@ export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => 
 
 export type GetActiveToolsHandler = () => string[];
 
-export type GetAllToolsHandler = () => string[];
+export type GetAllToolsHandler = () => ToolInfo[];
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 

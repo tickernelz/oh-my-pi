@@ -1972,7 +1972,7 @@ mod proc_snapshot {
 		stat: Stat,
 		args: Vec<String>,
 		uid:  Option<(u32, u32)>,
-		gid:  Option<u32>,
+		gid:  Option<(u32, u32)>,
 	}
 
 	#[derive(Clone)]
@@ -1983,8 +1983,13 @@ mod proc_snapshot {
 		pgrp:       i32,
 		session:    i32,
 		tty:        i64,
+		tpgid:      i32,
+		flags:      u64,
+		minflt:     u64,
+		majflt:     u64,
 		utime:      u64,
 		stime:      u64,
+		priority:   i32,
 		nice:       i32,
 		threads:    u32,
 		start_time: u64,
@@ -2033,7 +2038,7 @@ mod proc_snapshot {
 				})
 				.unwrap_or_default();
 			let uid = status_ids(pid, "Uid:").map(|ids| (ids.0, ids.1));
-			let gid = status_ids(pid, "Gid:").map(|ids| ids.0);
+			let gid = status_ids(pid, "Gid:");
 			(read_stat(pid)?.start_time == stat.start_time).then_some(Self {
 				pid,
 				stat,
@@ -2071,12 +2076,42 @@ mod proc_snapshot {
 			self.uid.map(|ids| ids.1)
 		}
 
-		pub const fn real_group_id(&self) -> Option<u32> {
-			self.gid
+		pub fn real_group_id(&self) -> Option<u32> {
+			self.gid.map(|ids| ids.0)
+		}
+
+		pub fn effective_group_id(&self) -> Option<u32> {
+			self.gid.map(|ids| ids.1)
 		}
 
 		pub fn terminal_id(&self) -> Option<u64> {
 			(self.stat.tty != 0).then_some(self.stat.tty as u32 as u64)
+		}
+
+		pub fn terminal_group_id(&self) -> Option<i32> {
+			(self.stat.tpgid > 0).then_some(self.stat.tpgid)
+		}
+
+		pub const fn priority(&self) -> Option<i32> {
+			Some(self.stat.priority)
+		}
+
+		pub const fn flags(&self) -> Option<u64> {
+			Some(self.stat.flags)
+		}
+
+		pub const fn minor_faults(&self) -> Option<u64> {
+			Some(self.stat.minflt)
+		}
+
+		pub const fn major_faults(&self) -> Option<u64> {
+			Some(self.stat.majflt)
+		}
+
+		pub fn wchan(&self) -> Option<String> {
+			let value = fs::read_to_string(format!("/proc/{}/wchan", self.pid)).ok()?;
+			let value = value.trim();
+			(!value.is_empty() && value != "0" && value != "-").then(|| value.to_string())
 		}
 
 		pub const fn state(&self) -> char {
@@ -2191,8 +2226,13 @@ mod proc_snapshot {
 			pgrp: fields.get(2)?.parse().ok()?,
 			session: fields.get(3)?.parse().ok()?,
 			tty: fields.get(4)?.parse().ok()?,
+			tpgid: fields.get(5)?.parse().ok()?,
+			flags: fields.get(6)?.parse().ok()?,
+			minflt: fields.get(7)?.parse().ok()?,
+			majflt: fields.get(9)?.parse().ok()?,
 			utime: fields.get(11)?.parse().ok()?,
 			stime: fields.get(12)?.parse().ok()?,
+			priority: fields.get(15)?.parse().ok()?,
 			nice: fields.get(16)?.parse().ok()?,
 			threads: fields.get(17)?.parse().ok()?,
 			start_time: fields.get(19)?.parse().ok()?,
@@ -2324,6 +2364,37 @@ mod proc_snapshot {
 
 		pub fn terminal_id(&self) -> Option<u64> {
 			(!matches!(self.info.e_tdev, 0 | u32::MAX)).then_some(self.info.e_tdev as u64)
+		}
+
+		pub fn terminal_group_id(&self) -> Option<i32> {
+			i32::try_from(self.info.e_tpgid)
+				.ok()
+				.filter(|tpgid| *tpgid > 0)
+		}
+
+		pub const fn effective_group_id(&self) -> Option<u32> {
+			Some(self.info.pbi_gid)
+		}
+
+		pub fn priority(&self) -> Option<i32> {
+			Some(self.task.as_ref()?.pti_priority)
+		}
+
+		pub const fn flags(&self) -> Option<u64> {
+			Some(self.info.pbi_flags as u64)
+		}
+
+		pub fn minor_faults(&self) -> Option<u64> {
+			u64::try_from(self.task.as_ref()?.pti_faults).ok()
+		}
+
+		pub fn major_faults(&self) -> Option<u64> {
+			u64::try_from(self.task.as_ref()?.pti_pageins).ok()
+		}
+
+		#[allow(clippy::unused_self, reason = "matches the cross-platform ProcInfo contract")]
+		pub const fn wchan(&self) -> Option<String> {
+			None
 		}
 
 		pub const fn state(&self) -> char {
@@ -2700,6 +2771,34 @@ mod proc_snapshot {
 		}
 
 		pub fn terminal_id(&self) -> Option<u64> {
+			None
+		}
+
+		pub fn terminal_group_id(&self) -> Option<i32> {
+			None
+		}
+
+		pub fn effective_group_id(&self) -> Option<u32> {
+			None
+		}
+
+		pub fn priority(&self) -> Option<i32> {
+			None
+		}
+
+		pub fn flags(&self) -> Option<u64> {
+			None
+		}
+
+		pub fn minor_faults(&self) -> Option<u64> {
+			None
+		}
+
+		pub fn major_faults(&self) -> Option<u64> {
+			None
+		}
+
+		pub fn wchan(&self) -> Option<String> {
 			None
 		}
 
@@ -4413,6 +4512,21 @@ enum PsField {
 	Threads,
 	Command,
 	Args,
+	Tpgid,
+	StateChar,
+	Priority,
+	Flags,
+	Ruser,
+	Ruid,
+	Rgroup,
+	Rgid,
+	Egroup,
+	Egid,
+	Wchan,
+	MinorFaults,
+	MajorFaults,
+	CpuSeconds,
+	Size,
 }
 
 impl PsField {
@@ -4440,6 +4554,21 @@ impl PsField {
 			Self::Threads => "NLWP",
 			Self::Command => "COMMAND",
 			Self::Args => "COMMAND",
+			Self::Tpgid => "TPGID",
+			Self::StateChar => "S",
+			Self::Priority => "PRI",
+			Self::Flags => "F",
+			Self::Ruser => "RUSER",
+			Self::Ruid => "RUID",
+			Self::Rgroup => "RGROUP",
+			Self::Rgid => "RGID",
+			Self::Egroup => "GROUP",
+			Self::Egid => "GID",
+			Self::Wchan => "WCHAN",
+			Self::MinorFaults => "MINFL",
+			Self::MajorFaults => "MAJFL",
+			Self::CpuSeconds => "TIME",
+			Self::Size => "SZ",
 		}
 	}
 
@@ -4459,6 +4588,16 @@ impl PsField {
 				| Self::ResidentSize
 				| Self::Nice
 				| Self::Threads
+				| Self::Tpgid
+				| Self::Priority
+				| Self::Flags
+				| Self::Ruid
+				| Self::Rgid
+				| Self::Egid
+				| Self::MinorFaults
+				| Self::MajorFaults
+				| Self::CpuSeconds
+				| Self::Size
 		)
 	}
 }
@@ -4507,7 +4646,11 @@ struct PsProcessRow {
 	ppid:          Option<i32>,
 	pgid:          Option<i32>,
 	sid:           Option<i32>,
+	tpgid:         Option<i32>,
 	user:          Option<u32>,
+	ruid:          Option<u32>,
+	rgid:          Option<u32>,
+	egid:          Option<u32>,
 	terminal:      Option<u64>,
 	state:         char,
 	start_time:    u64,
@@ -4518,6 +4661,11 @@ struct PsProcessRow {
 	resident_size: Option<u64>,
 	threads:       Option<u32>,
 	nice:          Option<i32>,
+	priority:      Option<i32>,
+	flags:         Option<u64>,
+	minor_faults:  Option<u64>,
+	major_faults:  Option<u64>,
+	wchan:         Option<String>,
 	command:       String,
 	args:          String,
 }
@@ -4537,9 +4685,13 @@ impl PsProcessRow {
 			ppid: process.ppid(),
 			pgid: process.group_id(),
 			sid: process.session_id(),
+			tpgid: process.terminal_group_id(),
 			user: process
 				.effective_user_id()
 				.or_else(|| process.real_user_id()),
+			ruid: process.real_user_id(),
+			rgid: process.real_group_id(),
+			egid: process.effective_group_id(),
 			terminal: process.terminal_id(),
 			state: process.state(),
 			start_time: process.start_time(),
@@ -4550,6 +4702,11 @@ impl PsProcessRow {
 			resident_size: process.resident_bytes(),
 			threads: process.thread_count(),
 			nice: process.nice(),
+			priority: process.priority(),
+			flags: process.flags(),
+			minor_faults: process.minor_faults(),
+			major_faults: process.major_faults(),
+			wchan: process.wchan(),
 			command,
 			args,
 		}
@@ -4854,25 +5011,40 @@ fn parse_ps_format(
 			.and_then(|(name, width)| width.parse::<usize>().ok().map(|width| (name, width)))
 			.unwrap_or((field_spec, 0));
 		let field = match name.to_ascii_lowercase().as_str() {
-			"user" | "uname" => PsField::User,
+			"user" | "uname" | "euser" => PsField::User,
 			"uid" | "euid" => PsField::Uid,
-			"pid" | "lwp" => PsField::Pid,
+			"pid" | "lwp" | "tid" | "spid" | "tgid" => PsField::Pid,
 			"ppid" => PsField::Ppid,
 			"pgid" | "pgrp" => PsField::Pgid,
 			"sid" | "sess" => PsField::Sid,
+			"tpgid" => PsField::Tpgid,
 			"tty" | "tt" | "tname" => PsField::Tty,
-			"stat" | "state" | "s" => PsField::State,
+			"stat" | "state" => PsField::State,
+			"s" => PsField::StateChar,
 			"start" | "stime" | "bsdstart" => PsField::Start,
 			"lstart" | "start_time" => PsField::LongStart,
 			"etime" | "elapsed" => PsField::Elapsed,
 			"etimes" => PsField::ElapsedSeconds,
-			"time" | "cputime" => PsField::CpuTime,
+			"time" | "cputime" | "bsdtime" => PsField::CpuTime,
+			"times" | "cputimes" => PsField::CpuSeconds,
 			"pcpu" | "%cpu" => PsField::CpuPercent,
 			"c" => PsField::CpuInteger,
 			"pmem" | "%mem" => PsField::MemPercent,
 			"vsz" | "vsize" => PsField::VirtualSize,
-			"rss" | "rssize" => PsField::ResidentSize,
+			"rss" | "rssize" | "rsz" => PsField::ResidentSize,
+			"sz" => PsField::Size,
 			"ni" | "nice" => PsField::Nice,
+			"pri" | "opri" | "priority" => PsField::Priority,
+			"f" | "flag" | "flags" => PsField::Flags,
+			"ruser" | "logname" => PsField::Ruser,
+			"ruid" => PsField::Ruid,
+			"rgroup" => PsField::Rgroup,
+			"rgid" => PsField::Rgid,
+			"group" | "egroup" => PsField::Egroup,
+			"gid" | "egid" => PsField::Egid,
+			"wchan" | "mwchan" => PsField::Wchan,
+			"min_flt" | "minflt" => PsField::MinorFaults,
+			"maj_flt" | "majflt" => PsField::MajorFaults,
 			"nlwp" | "thcount" => PsField::Threads,
 			"comm" | "ucomm" | "fname" => PsField::Command,
 			"args" | "command" | "cmd" => PsField::Args,
@@ -5003,7 +5175,7 @@ fn ps_columns(options: &PsOptions) -> Vec<PsColumn> {
 		]
 	} else if options.long_format {
 		vec![
-			(PsField::State, "S"),
+			(PsField::StateChar, "S"),
 			(PsField::Uid, "UID"),
 			(PsField::Pid, "PID"),
 			(PsField::Ppid, "PPID"),
@@ -5023,6 +5195,7 @@ fn ps_columns(options: &PsOptions) -> Vec<PsColumn> {
 			(PsField::Ppid, "PPID"),
 			(PsField::Pgid, "PGID"),
 			(PsField::Sid, "SID"),
+			(PsField::Tpgid, "TPGID"),
 			(PsField::State, "STAT"),
 			(PsField::Tty, "TTY"),
 			(PsField::CpuTime, "TIME"),
@@ -5114,11 +5287,21 @@ fn render_ps_table(rows: &[PsProcessRow], columns: &[PsColumn], no_headers: bool
 		HashMap::new()
 	};
 	let mut user_names = HashMap::new();
-	if has_field(PsField::User) {
-		for uid in rows.iter().filter_map(|row| row.user) {
+	if has_field(PsField::User) || has_field(PsField::Ruser) {
+		let uids = rows.iter().flat_map(|row| [row.user, row.ruid]).flatten();
+		for uid in uids {
 			user_names
 				.entry(uid)
 				.or_insert_with(|| ps_user_name(uid).unwrap_or_else(|| uid.to_string()));
+		}
+	}
+	let mut group_names = HashMap::new();
+	if has_field(PsField::Rgroup) || has_field(PsField::Egroup) {
+		let gids = rows.iter().flat_map(|row| [row.rgid, row.egid]).flatten();
+		for gid in gids {
+			group_names
+				.entry(gid)
+				.or_insert_with(|| ps_group_name(gid).unwrap_or_else(|| gid.to_string()));
 		}
 	}
 	let values: Vec<Vec<String>> = rows
@@ -5134,6 +5317,7 @@ fn render_ps_table(rows: &[PsProcessRow], columns: &[PsColumn], no_headers: bool
 						timezone.as_ref(),
 						&terminal_names,
 						&user_names,
+						&group_names,
 					)
 				})
 				.collect()
@@ -5193,6 +5377,7 @@ fn render_ps_value(
 	timezone: Option<&TimeZone>,
 	terminal_names: &HashMap<u64, String>,
 	user_names: &HashMap<u32, String>,
+	group_names: &HashMap<u32, String>,
 ) -> String {
 	match field {
 		PsField::User => row
@@ -5212,11 +5397,15 @@ fn render_ps_value(
 		PsField::Sid => row
 			.sid
 			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Tpgid => row
+			.tpgid
+			.map_or_else(|| "-1".to_string(), |value| value.to_string()),
 		PsField::Tty => row
 			.terminal
 			.and_then(|terminal| terminal_names.get(&terminal).cloned())
 			.unwrap_or_else(|| "?".to_string()),
 		PsField::State => format_ps_state(row),
+		PsField::StateChar => row.state.to_string(),
 		PsField::Start => timezone.map_or_else(
 			|| "?".to_string(),
 			|timezone| format_ps_start(row.started_at, row.age, timezone, false),
@@ -5253,6 +5442,47 @@ fn render_ps_value(
 		PsField::Threads => row
 			.threads
 			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Priority => row
+			.priority
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Flags => row
+			.flags
+			.map_or_else(|| "?".to_string(), |value| format!("{value:x}")),
+		PsField::Ruser => row
+			.ruid
+			.and_then(|uid| user_names.get(&uid).cloned())
+			.unwrap_or_else(|| "?".to_string()),
+		PsField::Ruid => row
+			.ruid
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Rgroup => row
+			.rgid
+			.and_then(|gid| group_names.get(&gid).cloned())
+			.unwrap_or_else(|| "?".to_string()),
+		PsField::Rgid => row
+			.rgid
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Egroup => row
+			.egid
+			.and_then(|gid| group_names.get(&gid).cloned())
+			.unwrap_or_else(|| "?".to_string()),
+		PsField::Egid => row
+			.egid
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::Wchan => row.wchan.clone().unwrap_or_else(|| "-".to_string()),
+		PsField::MinorFaults => row
+			.minor_faults
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::MajorFaults => row
+			.major_faults
+			.map_or_else(|| "?".to_string(), |value| value.to_string()),
+		PsField::CpuSeconds => row
+			.cpu_time
+			.map_or_else(|| "?".to_string(), |time| time.as_secs().to_string()),
+		PsField::Size => row
+			.virtual_size
+			.zip(ps_page_size())
+			.map_or_else(|| "?".to_string(), |(bytes, page)| bytes.div_ceil(page).to_string()),
 		PsField::Command => row.command.clone(),
 		PsField::Args => row.args.clone(),
 	}
@@ -5270,6 +5500,9 @@ fn format_ps_state(row: &PsProcessRow) -> String {
 	}
 	if row.threads.is_some_and(|threads| threads > 1) {
 		state.push('l');
+	}
+	if row.terminal.is_some() && row.tpgid.is_some() && row.tpgid == row.pgid {
+		state.push('+');
 	}
 	state
 }
@@ -5385,6 +5618,50 @@ fn ps_user_name(uid: u32) -> Option<String> {
 
 #[cfg(not(unix))]
 fn ps_user_name(_uid: u32) -> Option<String> {
+	None
+}
+
+#[cfg(unix)]
+fn ps_group_name(gid: u32) -> Option<String> {
+	use std::ffi::CStr;
+	let mut record = std::mem::MaybeUninit::<libc::group>::zeroed();
+	let mut result = std::ptr::null_mut();
+	let mut buffer = vec![0_u8; 16 * 1024];
+	// SAFETY: all pointers refer to live storage for this call; a non-null
+	// result guarantees `record` and its gr_name pointer were initialized.
+	let status = unsafe {
+		libc::getgrgid_r(
+			gid,
+			record.as_mut_ptr(),
+			buffer.as_mut_ptr().cast(),
+			buffer.len(),
+			&raw mut result,
+		)
+	};
+	if status != 0 || result.is_null() {
+		return None;
+	}
+	// SAFETY: getgrgid_r succeeded and the backing buffer remains alive.
+	let name = unsafe { CStr::from_ptr(record.assume_init().gr_name) };
+	Some(name.to_string_lossy().into_owned())
+}
+
+#[cfg(not(unix))]
+fn ps_group_name(_gid: u32) -> Option<String> {
+	None
+}
+
+/// System memory page size in bytes, used for the SZ (pages) column.
+#[cfg(unix)]
+fn ps_page_size() -> Option<u64> {
+	// SAFETY: sysconf reads a process-global constant.
+	u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+		.ok()
+		.filter(|value| *value > 0)
+}
+
+#[cfg(not(unix))]
+fn ps_page_size() -> Option<u64> {
 	None
 }
 
@@ -6284,6 +6561,60 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	async fn ps_builtin_supports_extended_format_specifiers() {
+		let pid = std::process::id();
+		let (result, output) = execute_captured(format!(
+			"ps -p {pid} -o \
+			 pid=,tpgid=,ruid=,rgid=,egid=,pri=,f=,min_flt=,maj_flt=,times=,sz=,s=,ruser=,rgroup=,\
+			 tgid="
+		))
+		.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		let fields: Vec<&str> = output.split_whitespace().collect();
+		assert_eq!(fields.len(), 15, "{output:?}");
+		assert_eq!(fields[0], pid.to_string());
+		assert_eq!(fields[14], pid.to_string(), "tgid aliases pid");
+		#[cfg(unix)]
+		{
+			// tpgid is an integer; -1 without a controlling terminal.
+			assert!(fields[1].parse::<i32>().is_ok(), "tpgid: {:?}", fields[1]);
+			for (index, name) in [(2, "ruid"), (3, "rgid"), (4, "egid")] {
+				assert!(fields[index].parse::<u32>().is_ok(), "{name}: {:?}", fields[index]);
+			}
+			assert!(fields[5].parse::<i64>().is_ok(), "pri: {:?}", fields[5]);
+			assert!(u64::from_str_radix(fields[6], 16).is_ok(), "flags: {:?}", fields[6]);
+			assert!(fields[7].parse::<u64>().is_ok(), "min_flt: {:?}", fields[7]);
+			assert!(fields[8].parse::<u64>().is_ok(), "maj_flt: {:?}", fields[8]);
+			assert!(fields[9].parse::<u64>().is_ok(), "times: {:?}", fields[9]);
+			assert!(fields[10].parse::<u64>().is_ok(), "sz: {:?}", fields[10]);
+			assert_eq!(fields[11].chars().count(), 1, "state: {:?}", fields[11]);
+			assert_ne!(fields[12], "?", "ruser should resolve to a name");
+			assert_ne!(fields[13], "?", "rgroup should resolve to a name");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn ps_builtin_accepts_tpgid_alongside_job_control_columns() {
+		// Exact form from the field report that failed with
+		// "unknown output format specifier 'tpgid'".
+		let pid = std::process::id();
+		let (result, output) =
+			execute_captured(format!("ps -o pid,ppid,pgid,tpgid,sess,stat,tty,command -p {pid}"))
+				.await;
+		assert_eq!(result.exit_code, Some(0), "{output:?}");
+		let header = output.lines().next().unwrap_or_default();
+		for label in ["PID", "PPID", "PGID", "TPGID", "SID", "STAT", "TTY", "COMMAND"] {
+			assert!(header.contains(label), "missing {label} in {header:?}");
+		}
+		assert!(output.lines().skip(1).any(|line| {
+			line
+				.split_whitespace()
+				.next()
+				.is_some_and(|value| value == pid.to_string())
+		}));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
 	async fn top_builtin_emits_one_finite_snapshot() {
 		#[cfg(target_os = "macos")]
 		let command = "top -l 1 -n 3";
@@ -6307,6 +6638,29 @@ mod tests {
 			.expect("top kept sampling after its output pipe closed");
 		assert_eq!(execution.0.exit_code, Some(0));
 		assert!(execution.1.contains("top - snapshot 1"), "{:?}", execution.1);
+	}
+
+	/// Regression: builtin tail upstream of an early-exiting consumer printed
+	/// "tail: Broken pipe" and failed (`tail -c N big.jsonl | jq …` with jq
+	/// aborting on a parse error). Real tail dies silently from SIGPIPE; the
+	/// builtin must exit 141 with no diagnostic. `pipefail` exposes tail's own
+	/// status, so rc=141 proves the broken pipe actually fired (head closed
+	/// the pipe early) and was mapped to the silent SIGPIPE exit, not 1.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn tail_builtin_is_silent_when_downstream_closes_pipe() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let file = dir.path().join("big.txt");
+		// ~589 KiB: forces the seekable bounded_tail path, and the 400 KB tail
+		// overflows the OS pipe buffer so tail is still writing when head exits.
+		let command = format!(
+			"seq 1 100000 > '{file}'; set -o pipefail; tail -c 400000 '{file}' | head -c 10 > \
+			 /dev/null; echo rc=$?",
+			file = file.display()
+		);
+		let (result, output) = execute_captured(command).await;
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("rc=141"), "{output:?}");
+		assert!(!output.contains("Broken pipe"), "{output:?}");
 	}
 
 	/// The kill builtin accepts a numeric signal and applies it to every process
@@ -8229,12 +8583,12 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 
 	/// A segment that carries a file redirect is still segmented, and the brush
 	/// `Display` reconstruction the runner executes must round-trip through
-	/// brush's own parser **without losing the redirect**. `echo hidden
-	/// >/dev/null` suppresses its own stdout: if the reconstruction dropped the
-	/// redirect, `hidden` would leak into the captured output. Proves the
-	/// reconstruction path is semantically sound for the redirect-bearing
-	/// shapes the per-stage whitelist accepts (not just syntactically
-	/// parseable).
+	/// brush's own parser **without losing the redirect**.
+	/// `echo hidden >/dev/null` suppresses its own stdout: if the reconstruction
+	/// dropped the redirect, `hidden` would leak into the captured output.
+	/// Proves the reconstruction path is semantically sound for the
+	/// redirect-bearing shapes the per-stage whitelist accepts (not just
+	/// syntactically parseable).
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn segmented_chain_with_redirect_executes_correctly() {

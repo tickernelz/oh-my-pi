@@ -66,6 +66,22 @@ export function dropUnsupportedBedrockGeoIds(models: readonly ModelSpec[]): Mode
 	return models.filter(model => !(model.provider === "amazon-bedrock" && model.id === "jp.anthropic.claude-opus-5"));
 }
 
+const BEDROCK_MANTLE_OPENAI_MODEL_IDS: Record<string, true> = {
+	"openai.gpt-5.4": true,
+	"openai.gpt-5.5": true,
+	"openai.gpt-5.6-luna": true,
+	"openai.gpt-5.6-sol": true,
+	"openai.gpt-5.6-terra": true,
+};
+
+/**
+ * models.dev exposes these Responses-only models under amazon-bedrock, whose
+ * descriptor uses Converse. The working Mantle rows come from the static seed.
+ */
+export function dropBedrockMantleOpenAIModels(models: readonly ModelSpec[]): ModelSpec[] {
+	return models.filter(model => !(model.provider === "amazon-bedrock" && BEDROCK_MANTLE_OPENAI_MODEL_IDS[model.id]));
+}
+
 /** True when any component of a model's per-million-token cost is nonzero. */
 export function hasBillableCost(cost: ModelSpec["cost"]): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;

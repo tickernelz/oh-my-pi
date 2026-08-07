@@ -144,6 +144,7 @@ import { isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
+	logger,
 	parseJsonWithRepair,
 	parseStreamingJson,
 	parseStreamingJsonThrottled,
@@ -215,6 +216,7 @@ import {
 	piLimit,
 	piLsPath,
 	piReadDisplayPath,
+	piReadPathHasRange,
 	piTimeout,
 } from "./cursor/exec-modern";
 
@@ -233,6 +235,7 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const warnedCursorKimiK3ReplayMessages = new Set<string>();
 
 export interface CursorOptions extends StreamOptions {
 	customSystemPrompt?: string;
@@ -1320,7 +1323,7 @@ async function handleExecServerMessage(
 					buildReadResultFromToolResult(
 						args.path,
 						toolResult,
-						args.offset !== undefined || args.limit !== undefined,
+						args.offset !== undefined || args.limit !== undefined || piReadPathHasRange(args.path),
 					),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
@@ -2437,15 +2440,21 @@ function toolResultDetailBoolean(toolResult: ToolResultMessage, key: string): bo
 /**
  * The file's own line count, when the tool recorded one.
  *
- * `details.meta.truncation.totalLines` is the whole file; the flat
- * `details.truncation.totalLines` counts from the window's start line and is
- * deliberately not consulted here. Absent for a read that returned the file
- * whole, where the payload IS the file and counting it is exact.
+ * Read results expose the source-wide count directly when known. Older tool
+ * results carry it at `details.meta.truncation.totalLines`; the flat
+ * `details.truncation.totalLines` counts from a window's start and is
+ * deliberately not consulted here.
  */
 function readTotalLinesFromDetails(toolResult: ToolResultMessage): number | undefined {
-	if (!toolResult.details || typeof toolResult.details !== "object") return undefined;
-	const meta = (toolResult.details as { meta?: { truncation?: { totalLines?: unknown } } }).meta;
-	const totalLines = meta?.truncation?.totalLines;
+	const details = toolResult.details;
+	if (!details || typeof details !== "object") return undefined;
+	const direct = "totalLines" in details ? details.totalLines : undefined;
+	if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+	const meta = "meta" in details ? details.meta : undefined;
+	if (!meta || typeof meta !== "object") return undefined;
+	const truncation = "truncation" in meta ? meta.truncation : undefined;
+	if (!truncation || typeof truncation !== "object") return undefined;
+	const totalLines = "totalLines" in truncation ? truncation.totalLines : undefined;
 	return typeof totalLines === "number" && Number.isFinite(totalLines) ? totalLines : undefined;
 }
 
@@ -2465,7 +2474,7 @@ function buildReadResultFromToolResult(path: string, toolResult: ToolResultMessa
 	// whole file. Under a composed window it is the window's, and answering a
 	// 20-line page of a 100-line file with `total_lines: 20` tells a paginating
 	// server it has reached the end.
-	const totalLines = readTotalLinesFromDetails(toolResult) ?? (text ? text.split("\n").length : 0);
+	const totalLines = readTotalLinesFromDetails(toolResult) ?? (rangeApplied ? 0 : text ? text.split("\n").length : 0);
 	return create(ReadResultSchema, {
 		result: {
 			case: "success",
@@ -3902,6 +3911,15 @@ export function processInteractionUpdate(
 		}
 	} else if (updateCase === "turnEnded") {
 		output.stopReason = "stop";
+		if (
+			isKimiK3ModelId(output.model) &&
+			!output.content.some(item => item.type === "thinking" && item.thinking.length > 0)
+		) {
+			logger.warn(
+				"Cursor kimi-k3 turn completed without thinking blocks; persisted history will replay this turn without reasoning",
+				{ model: output.model, messageTimestamp: output.timestamp },
+			);
+		}
 	} else if (updateCase === "tokenDelta") {
 		const tokenDelta = update.message.value;
 		usageState.sawTokenDelta = true;
@@ -4113,17 +4131,34 @@ function assertCursorKimiK3HistoryReplayable(
 ): void {
 	if (!targetModelId || !isKimiK3ModelId(targetModelId)) return;
 	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
+	const missingThinkingTurns: number[] = [];
+	const newlyWarnedKeys: string[] = [];
+	let assistantTurn = 0;
 	for (let i = 0; i < historyEnd; i++) {
 		const msg = messages[i];
 		if (msg.role !== "assistant") continue;
+		assistantTurn++;
 		const isSameCursorModel = msg.api === "cursor-agent" && msg.provider === "cursor" && msg.model === targetModelId;
-		const hasThinking = msg.content.some(item => item.type === "thinking" && item.thinking.length > 0);
-		if (!isSameCursorModel || !hasThinking) {
+		if (!isSameCursorModel) {
+			// Foreign history genuinely cannot replay K3 thinking: another model's
+			// turns carry no K3-signed reasoning to reconstruct.
 			throw new AIError.ValidationError(
-				`Cursor ${targetModelId} requires complete same-model thinking history; start a new session instead of continuing history from ${msg.provider}/${msg.model}.`,
+				`Cursor ${targetModelId} cannot continue history from a different model (${msg.provider}/${msg.model}); start a new session.`,
 			);
 		}
+		const hasThinking = msg.content.some(item => item.type === "thinking" && item.thinking.length > 0);
+		if (hasThinking) continue;
+		const warningKey = `${msg.api}\0${msg.provider}\0${msg.model}\0${msg.timestamp}`;
+		if (warnedCursorKimiK3ReplayMessages.has(warningKey)) continue;
+		missingThinkingTurns.push(assistantTurn);
+		newlyWarnedKeys.push(warningKey);
 	}
+	if (missingThinkingTurns.length === 0) return;
+	for (const key of newlyWarnedKeys) warnedCursorKimiK3ReplayMessages.add(key);
+	logger.warn(
+		`Cursor kimi-k3 history contains same-model assistant turn(s) ${missingThinkingTurns.join(", ")} without thinking blocks; replaying those spans without reasoning may make generation less stable`,
+		{ model: targetModelId, assistantTurns: missingThinkingTurns },
+	);
 }
 
 /**

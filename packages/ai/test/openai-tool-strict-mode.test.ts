@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type {
@@ -12,7 +13,6 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { type } from "arktype";
 
 const testTool: Tool = {
 	name: "echo",
@@ -271,7 +271,7 @@ describe("OpenAI tool strict mode", () => {
 					name: "dynamic_map",
 					description: "Dynamic object map",
 					parameters: type({
-						values: "Record<string, string>?",
+						"values?": { "[string]": "string" },
 					}),
 				},
 			],

@@ -250,7 +250,7 @@ export class InputController {
 			this.#btwBranchListenerInstalled = true;
 			this.ctx.ui.addInputListener(data => {
 				if (!matchesKey(data, "b")) return undefined;
-				if (!this.ctx.canBranchBtw()) return undefined;
+				if (!this.ctx.handlesBtwBranchKey()) return undefined;
 				if (this.ctx.ui.getFocused() !== this.ctx.editor) return undefined;
 				if (this.ctx.editor.getText().trim()) return undefined;
 				void this.ctx.handleBtwBranchKey();
@@ -801,6 +801,19 @@ export class InputController {
 				this.ctx.queueCompactionMessage(text, "steer", images);
 				return;
 			}
+			// Extension commands are local actions. Execute them before the normal
+			// submission path creates an optimistic user message; otherwise a
+			// consumed command remains rendered like a prompt sent to the model.
+			if (this.#isLocalExtensionCommand(text)) {
+				this.ctx.editor.clearDraft(text);
+				try {
+					await this.ctx.session.prompt(text, { images: inputImages });
+				} catch (error) {
+					this.ctx.editor.setText(text);
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				}
+				return;
+			}
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
@@ -914,14 +927,18 @@ export class InputController {
 	 * Local extension commands are consumed before reaching the shared session
 	 * title gate and must not name the conversation.
 	 */
-	#maybeStartTitleGeneration(text: string): void {
-		const runner = this.ctx.session.extensionRunner;
+	#isLocalExtensionCommand(text: string): boolean {
 		const extensionCommandSpace = text.indexOf(" ");
-		const isLocalExtensionCommand =
+		return (
 			text.startsWith("/") &&
-			runner?.getCommand(extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace)) !==
-				undefined;
-		if (isLocalExtensionCommand) {
+			this.ctx.session.extensionRunner?.getCommand(
+				extensionCommandSpace === -1 ? text.slice(1) : text.slice(1, extensionCommandSpace),
+			) !== undefined
+		);
+	}
+
+	#maybeStartTitleGeneration(text: string): void {
+		if (this.#isLocalExtensionCommand(text)) {
 			return;
 		}
 		this.ctx.session.maybeStartTitleGeneration(text, () => {

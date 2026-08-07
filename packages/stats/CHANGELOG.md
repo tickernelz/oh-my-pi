@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [17.2.10] - 2026-08-06
+
+### Changed
+
+- Optimized package dependencies by replacing `date-fns` with `@oh-my-pi/pi-utils/dates` and removing unused test dependencies.
+
+## [17.2.9] - 2026-08-05
+
+### Fixed
+
+- Restricted the stats dashboard to IPv4 loopback and removed wildcard CORS access to its API ([#7633](https://github.com/can1357/oh-my-pi/issues/7633)).
+
 ## [17.2.4] - 2026-08-01
 
 ### Fixed

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getLcmDir, isEnoent, normalizePathForComparison } from "@oh-my-pi/pi-utils";
-import { withFileLock } from "../config/file-lock";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import type { LcmProject } from "./project-identity";
 
 const CATALOG_VERSION = 1;

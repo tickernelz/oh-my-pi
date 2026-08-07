@@ -11,14 +11,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
+import { $which, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { $ } from "bun";
-import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import { verifyPinnedChecksumManifest } from "./downstream-artifact-verification";
 import {
-	compareDownstreamVersions,
 	DOWNSTREAM_INSTALL_COMMAND,
 	DOWNSTREAM_REPO,
 	type DownstreamReleaseInfo,
@@ -377,7 +376,6 @@ export function assertDownstreamUpdateTarget(
 			`Install the downstream binary with: ${DOWNSTREAM_INSTALL_COMMAND}`,
 	);
 }
-
 interface MuslDetectionOptions {
 	platform?: NodeJS.Platform;
 	alpineRelease?: boolean;
@@ -647,7 +645,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		process.exit(1);
 	}
 
-	const comparison = compareDownstreamVersions(release.version, VERSION);
+	const comparison = compareVersions(release.version, VERSION);
 	if (comparison <= 0 && !opts.force) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;

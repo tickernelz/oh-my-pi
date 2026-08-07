@@ -7,7 +7,13 @@ import {
 	ProviderHttpError,
 	STREAM_ENVELOPE_ERROR_PREFIX,
 } from "./classes";
-import { isOpaqueStatusBody, isUsageLimitStatus, matchesUsageLimitText, parseRateLimitReason } from "./rate-limit";
+import {
+	isAccountScopedCapText,
+	isOpaqueStatusBody,
+	isUsageLimitStatus,
+	matchesUsageLimitText,
+	parseRateLimitReason,
+} from "./rate-limit";
 
 export const Flag = {
 	Class: 0x1000,
@@ -107,10 +113,17 @@ const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|
 export const LLAMA_CPP_TOOL_CALL_PARSE_PATTERN =
 	/failed to parse tool call arguments as json|\[json\.exception\.parse_error\.101\]/i;
 
-// Copilot routing flap: HTTP 400 `model_not_supported` (structural code on the
-// error, also surfaced in text). Treated as transient — a retry usually lands
-// on a backend that has the model.
-const COPILOT_MODEL_NOT_SUPPORTED_PATTERN = /model_not_supported/i;
+// Copilot fleet skew: HTTP 400 rejecting a model that `/models` advertised on
+// the very same host. Two codes appear in the wild — `model_not_supported`
+// (per-OAuth-client rollout gap) and `model_not_available_for_integrator`
+// (replicas whose integrator allowlist predates the model). Both flap
+// request-to-request, so a retry usually lands on a backend that has the model.
+const COPILOT_TRANSIENT_MODEL_CODES: Record<string, true> = {
+	model_not_supported: true,
+	model_not_available_for_integrator: true,
+};
+const COPILOT_MODEL_UNAVAILABLE_PATTERN =
+	/model_not_supported|model_not_available_for_integrator|not available for integrator/i;
 // Anthropic strict-tool grammar too large / schema too complex (400 invalid_request_error).
 // Feature-gated deployments (Azure Foundry, Baseten, …) reject `strict: true`
 // tools outright when the hosted model lacks structured outputs, e.g.
@@ -332,21 +345,40 @@ function classifyText(errorMessage: string | undefined, errorStatus: number | un
 		const isOpaque = isOpaqueStatusBody(cleanMessage);
 
 		const isLimitStatus = isUsageLimitStatus(statusClean);
+		const reason = parseRateLimitReason(cleanMessage);
+		// Concurrency caps (e.g. Vertex "Online prediction concurrent requests
+		// quota exceeded") are shed-and-backoff, not credential-rotatable —
+		// exclude them even when the quota-worded phrasing matches the generic
+		// usage-limit text matcher, whose `quota.?exceeded` arm would otherwise
+		// set Flag.UsageLimit and burn a healthy sibling credential. HTTP 402 is
+		// excluded from this gate: it is categorically an account-billing cap, so
+		// a 402 whose body merely mentions concurrency still classifies as a
+		// usage limit, mirroring isUsageLimitOutcome.
+		const isBillingCapStatus = statusClean === 402;
+		const concurrencyExcluded = reason === "CONCURRENT_LIMIT" && !isBillingCapStatus;
 		if (
-			matchesUsageLimitText(cleanMessage) ||
-			(isLimitStatus && (isOpaque || parseRateLimitReason(cleanMessage) === "QUOTA_EXHAUSTED"))
+			!concurrencyExcluded &&
+			(matchesUsageLimitText(cleanMessage) ||
+				((statusClean === 403 || statusClean === undefined) && isAccountScopedCapText(cleanMessage)) ||
+				(isLimitStatus &&
+					(isOpaque || reason === "QUOTA_EXHAUSTED" || (isBillingCapStatus && reason === "CONCURRENT_LIMIT"))))
 		) {
 			kinds |= Flag.UsageLimit;
 		}
 
 		if (isTimeoutText(errorMessage)) kinds |= Flag.Transient | Flag.Timeout;
 		else if (isTransientErrorText(errorMessage)) kinds |= Flag.Transient;
+		// A concurrency cap (e.g. Vertex "Online prediction concurrent requests
+		// quota exceeded") is transient — shed-and-backoff. The bare wording need
+		// not match TRANSIENT_TRANSPORT_PATTERN, so flag it explicitly to keep
+		// AIError.retriable from treating the temporary cap as terminal.
+		if (reason === "CONCURRENT_LIMIT") kinds |= Flag.Transient;
 		if ((api === "openai-responses" || api === "openai-codex-responses") && isStaleResponsesText(errorMessage)) {
 			kinds |= Flag.StaleResponsesItem;
 		}
 
-		// Copilot per-client routing flap is transient.
-		if (statusClean === 400 && COPILOT_MODEL_NOT_SUPPORTED_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
+		// Copilot fleet-skew model rejection is transient.
+		if (statusClean === 400 && COPILOT_MODEL_UNAVAILABLE_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
 		if (matchesStrictToolsRejection(cleanMessage, statusClean)) kinds |= Flag.Grammar;
 		if (matchesFastModeUnsupported(cleanMessage, statusClean)) kinds |= Flag.FastModeUnsupported;
 	}
@@ -398,7 +430,10 @@ export function classify(error: unknown, api?: Api): number {
 			if (code === "overloaded_error" || code === "rate_limit_error") {
 				linkKinds |= Flag.Transient;
 			}
-			if (codeStatus === 401 || codeStatus === 403) {
+			if (
+				(codeStatus === 401 || codeStatus === 403) &&
+				!(codeStatus === 403 && parseRateLimitReason(link.message) === "CONCURRENT_LIMIT")
+			) {
 				linkKinds |= Flag.AuthFailed;
 			} else if (codeStatus === 429) {
 				if ((linkKinds & Flag.UsageLimit) === 0) {
@@ -460,16 +495,37 @@ export function isFastModeUnsupported(error: unknown): boolean {
 }
 
 /**
- * GitHub Copilot 400 `model_not_supported` routing flap — transient. Reads the
- * structural `code` (and falls back to {@link Flag.Transient} text classification).
+ * Depth-bounded search for a provider error `code`. SDK error objects keep the
+ * parsed response body on `.error`, and Copilot's body is itself
+ * `{ error: { code } }`, so the code sits up to two envelopes below the thrown
+ * error depending on which SDK produced it.
+ */
+function providerErrorCode(error: object): string | undefined {
+	let node: object = error;
+	for (let depth = 0; depth < 3; depth++) {
+		if ("code" in node && typeof node.code === "string") return node.code;
+		if (!("error" in node)) return undefined;
+		const nested: unknown = node.error;
+		if (!nested || typeof nested !== "object") return undefined;
+		node = nested;
+	}
+	return undefined;
+}
+
+/**
+ * GitHub Copilot 400 rejecting a model its own `/models` catalog advertises —
+ * transient fleet skew, not a malformed request. Reads the structural `code`
+ * through the SDK/body envelopes, then falls back to the stringified body both
+ * SDK families put in `message` (shapes drift; the wire text does not).
  */
 export function isCopilotTransientModelError(error: unknown): boolean {
-	if (status(error) === 400 && error && typeof error === "object") {
-		const info = error as { code?: unknown; error?: { code?: unknown } | null };
-		const code = typeof info.code === "string" ? info.code : info.error?.code;
-		if (code === "model_not_supported") return true;
-	}
-	return false;
+	if (!error || typeof error !== "object" || status(error) !== 400) return false;
+	const code = providerErrorCode(error);
+	// `Object.hasOwn`, not a bare index: `code` is provider-controlled, and a
+	// prototype key (`__proto__`, `toString`, …) would otherwise read truthy.
+	if (code !== undefined && Object.hasOwn(COPILOT_TRANSIENT_MODEL_CODES, code)) return true;
+	const message: unknown = "message" in error ? error.message : undefined;
+	return typeof message === "string" && COPILOT_MODEL_UNAVAILABLE_PATTERN.test(message);
 }
 
 export function classifyMessage(message: {

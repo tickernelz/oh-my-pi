@@ -4,18 +4,23 @@ import { MODELS_DEV_PROVIDER_DESCRIPTORS, mapModelsDevToModels } from "@oh-my-pi
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { dropUnsupportedBedrockGeoIds } from "../scripts/generated-policies";
 
-// AWS's Bedrock model card for Claude Opus 5 lists exactly these Programmatic
-// Access IDs — the bare model ID plus the us./eu./au. Geo and global.
-// inference profiles. Japan is explicitly marked unsupported for Geo
+// AWS's Bedrock model card for Claude Opus 5 lists these commercial/geo
+// Programmatic Access IDs — the bare model ID plus the us./eu./au. Geo and
+// global inference profiles. Japan is explicitly marked unsupported for Geo
 // inference in the same card's regional-availability table, so no `jp.`
 // profile exists for this model (unlike several Opus 4.x generations).
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html
+//
+// The catalog also synthesizes `us-gov.*` Claude geo profiles for AWS GovCloud
+// (same path as the derived `eu.*` row) so GovCloud selectors resolve without
+// requiring a full inference-profile ARN.
 const AWS_DOCUMENTED_OPUS_5_IDS = [
 	"anthropic.claude-opus-5",
 	"us.anthropic.claude-opus-5",
 	"eu.anthropic.claude-opus-5",
 	"au.anthropic.claude-opus-5",
 	"global.anthropic.claude-opus-5",
+	"us-gov.anthropic.claude-opus-5",
 ];
 
 // A representative `stencil.so` "amazon-bedrock" payload for Claude Opus 5.
@@ -78,10 +83,10 @@ describe("Amazon Bedrock Claude Opus 5", () => {
 		);
 		const opus5Ids = dropUnsupportedBedrockGeoIds(mapped).map(model => model.id);
 
-		// Set semantics: the descriptor also derives an `eu.` variant from the
-		// bare `anthropic.` row, so `eu.` legitimately arrives from both that
-		// derivation and the standalone stencil.so row (deduped downstream by
-		// the generator). We assert the documented ID coverage, not row count.
+		// Set semantics: the descriptor also derives `eu.` and `us-gov.` variants
+		// from the bare `anthropic.` row, so `eu.` legitimately arrives from both
+		// that derivation and the standalone stencil.so row (deduped downstream
+		// by the generator). We assert the documented ID coverage, not row count.
 		expect(new Set(opus5Ids)).toEqual(new Set(AWS_DOCUMENTED_OPUS_5_IDS));
 		// `stencil.so` lists `jp.anthropic.claude-opus-5`, but Bedrock has no such
 		// inference profile for this model and would reject it, so the generation

@@ -52,8 +52,8 @@ import { convertToLlm, createHistoricalContextMessage } from "../src/session/mes
 import { buildSessionContext } from "../src/session/session-context";
 import type { CompactionEntry, SessionEntry } from "../src/session/session-entries";
 import {
-	estimateLcmProjectionMessageTokenUpperBound,
 	estimateLcmProjectionMessageTokens,
+	estimateLcmProjectionMessageTokenUpperBound,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
@@ -404,8 +404,7 @@ async function measureTiming(storePath: string, branchCount: number): Promise<Ti
 			branches: branchCount,
 			projectionWallP95Ms: percentile(wall, 0.95),
 			projectionCpuP95Ms: percentile(cpu, 0.95),
-			projectionLineageRowsRead:
-				(after?.projectionLineageRowsRead ?? 0) - (before?.projectionLineageRowsRead ?? 0),
+			projectionLineageRowsRead: (after?.projectionLineageRowsRead ?? 0) - (before?.projectionLineageRowsRead ?? 0),
 			schedulerBranchPasses: after?.schedulerBranchPasses ?? 0,
 			completionToClaimP95Ms: percentile(completionToClaimMs, 0.95),
 			duplicateCompletionHashes,
@@ -427,11 +426,7 @@ interface LcmCostResult {
 	attemptsByOutcome: Record<string, number>;
 }
 
-async function measureLcmCost(
-	projectRoot: string,
-	storePath: string,
-	manager: SessionManager,
-): Promise<LcmCostResult> {
+async function measureLcmCost(projectRoot: string, storePath: string, manager: SessionManager): Promise<LcmCostResult> {
 	let dispatchedAttempts = 0;
 	let attemptOrdinal = 0;
 	let maintenanceRequests = 0;
@@ -999,7 +994,10 @@ requireInvariant(
 		report.timing.multiBranch.duplicateCompletionHashes === 0,
 	"a completion input hash was dispatched twice",
 );
-requireInvariant(report.retryProbe.attempts === 2, `retry probe recorded ${report.retryProbe.attempts} attempts, expected 2`);
+requireInvariant(
+	report.retryProbe.attempts === 2,
+	`retry probe recorded ${report.retryProbe.attempts} attempts, expected 2`,
+);
 requireInvariant(report.retryProbe.succeededAfterRetry, "retry probe never succeeded after the backoff advanced");
 requireInvariant(
 	(report.retryProbe.outcomes.provider_error ?? 0) === 1,
@@ -1051,8 +1049,7 @@ if (onReferenceWorkload) {
 		`projection CPU p95 ${report.timing.multiBranch.projectionCpuP95Ms.toFixed(3)} ms is not ${REQUIRED_SPEEDUP}x better than the pre-change ${PRE_CHANGE_REFERENCE.projectionCpuP95Ms} ms`,
 	);
 	requireInvariant(
-		report.timing.multiBranch.schedulerBranchPasses * REQUIRED_SPEEDUP <=
-			PRE_CHANGE_REFERENCE.schedulerBranchPasses,
+		report.timing.multiBranch.schedulerBranchPasses * REQUIRED_SPEEDUP <= PRE_CHANGE_REFERENCE.schedulerBranchPasses,
 		`scheduler branch passes ${report.timing.multiBranch.schedulerBranchPasses} is not ${REQUIRED_SPEEDUP}x better than the pre-change ${PRE_CHANGE_REFERENCE.schedulerBranchPasses}`,
 	);
 	requireInvariant(

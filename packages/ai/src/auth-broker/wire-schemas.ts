@@ -4,7 +4,7 @@
  * Direct consumers of this module receive the shared real ArkType objects.
  * Internal client/server startup imports the lazy resource instead.
  */
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 
 import { getAuthBrokerWireSchemas } from "./wire-schema-resource";
 

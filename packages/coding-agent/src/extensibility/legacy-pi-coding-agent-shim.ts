@@ -54,13 +54,14 @@ import { ReadTool } from "../tools/read";
 import { formatBytes } from "../tools/render-utils";
 import { WriteTool } from "../tools/write";
 import { EventBus } from "../utils/event-bus";
+import { convertImageToPng } from "../utils/image-loading";
 import { discoverExtensionPaths, loadExtensionFromFactory, loadExtensions } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type { ExtensionFactory, ToolDefinition } from "./extensions/types";
+import { Type } from "./legacy-typebox";
 import { getEnabledPlugins, resolvePluginExtensionPaths, type ScopedInstalledPlugin } from "./plugins/loader";
 import type { Skill } from "./skills";
 import { loadSkillsFromDir } from "./skills";
-import { Type } from "./typebox";
 
 const TOOL_DEFINITION_MARKER = "__isToolDefinition";
 const LEGACY_BUILTIN_TOOL_MARKER = "__ompLegacyBuiltinTool";
@@ -381,6 +382,28 @@ async function executeLegacyBashOperations(
 			throw new Error(appendStatus(text, `Command timed out after ${err.message.slice("timeout:".length)} seconds`));
 		}
 		throw err;
+	}
+}
+
+/**
+ * Convert an image attachment to PNG using the legacy package-root contract.
+ *
+ * Invalid or unsupported image data returns `null`, matching Pi's historical
+ * helper instead of surfacing Bun's decoder error to extensions.
+ */
+export async function convertToPng(
+	base64Data: string,
+	mimeType: string,
+): Promise<{ data: string; mimeType: string } | null> {
+	if (mimeType === "image/png") {
+		return { data: base64Data, mimeType };
+	}
+
+	try {
+		const converted = await convertImageToPng({ type: "image", data: base64Data, mimeType });
+		return { data: converted.data, mimeType: converted.mimeType };
+	} catch {
+		return null;
 	}
 }
 
@@ -1434,4 +1457,4 @@ export { parseArgs } from "../cli/args";
 export * from "../index";
 export { formatBytes as formatSize } from "../tools/render-utils";
 export { copyToClipboard } from "../utils/clipboard";
-export { Type } from "./typebox";
+export { Type } from "./legacy-typebox";

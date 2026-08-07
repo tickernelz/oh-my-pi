@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { renderToolInventory } from "../src/dialect/inventory";
 import type { InbandTool } from "../src/dialect/types";
 
@@ -26,15 +26,14 @@ describe("renderToolInventory", () => {
 		expect(out).toContain("});");
 	});
 
-	it("renders examples as comment lines above the declaration", () => {
+	it("renders examples as @example comment lines above the declaration", () => {
 		const out = renderToolInventory([searchTool]);
-		expect(out).toContain("// <examples>");
-		expect(out).toContain("// # Basic");
+		expect(out).toContain('// @example "Basic"');
 		expect(out).toContain('// web_search(query="rust", recency="week")');
-		expect(out).toContain("// </examples>");
+		expect(out).not.toContain("<examples>");
 		// Examples sit between the description and the type declaration.
-		expect(out.indexOf("// Searches the web.")).toBeLessThan(out.indexOf("// <examples>"));
-		expect(out.indexOf("// </examples>")).toBeLessThan(out.indexOf("type web_search"));
+		expect(out.indexOf("// Searches the web.")).toBeLessThan(out.indexOf('// @example "Basic"'));
+		expect(out.indexOf('// @example "Basic"')).toBeLessThan(out.indexOf("type web_search"));
 	});
 
 	it("omits the examples comment block when a tool has none", () => {
@@ -45,7 +44,7 @@ describe("renderToolInventory", () => {
 		};
 		const out = renderToolInventory([tool]);
 		expect(out).toContain("type noop = (_: {");
-		expect(out).not.toContain("<examples>");
+		expect(out).not.toContain("@example");
 	});
 
 	it("renders a parameterless tool without an args object", () => {

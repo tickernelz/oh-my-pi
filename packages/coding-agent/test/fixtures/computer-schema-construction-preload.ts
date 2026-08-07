@@ -1,5 +1,5 @@
 import { spyOn } from "bun:test";
-import * as arktype from "arktype";
+import * as arktype from "@oh-my-pi/omptype";
 
 declare global {
 	var __computerSchemaConstructionCount: number;
@@ -7,8 +7,9 @@ declare global {
 
 globalThis.__computerSchemaConstructionCount = 0;
 const originalType = arktype.type;
+const invokeType = originalType as unknown as (definition: unknown) => unknown;
 const countedType = new Proxy(originalType, {
-	apply(target, thisArg, args) {
+	apply(_target, thisArg, args) {
 		const definition = args[0];
 		if (
 			definition !== null &&
@@ -18,7 +19,7 @@ const countedType = new Proxy(originalType, {
 		) {
 			globalThis.__computerSchemaConstructionCount += 1;
 		}
-		return Reflect.apply(target, thisArg, args);
+		return Reflect.apply(invokeType, thisArg, args);
 	},
 });
 const typeSpy = spyOn(arktype, "type").mockImplementation(countedType);

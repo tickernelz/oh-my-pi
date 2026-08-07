@@ -12,11 +12,11 @@ This document covers the current extension runtime in:
 
 For discovery paths and filesystem loading rules, see [`extension-loading.md`](./extension-loading.md).
 
-For packaged user-facing extension CLIs/features such as `packages/swarm-extension`, see [`user-facing-packages.md`](./user-facing-packages.md).
+For packaged user-facing extension CLIs/features, see [`user-facing-packages.md`](./user-facing-packages.md).
 
 ## What an extension is
 
-An extension is a TS/JS module exporting a default factory:
+An extension is a TS/JS module exporting a default factory. Factories may initialize synchronously or return a promise:
 
 ```ts
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -70,7 +70,7 @@ Important constraint from `loader.ts`:
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-  const { z } = pi.zod;
+  const z = pi.zod;
 
   pi.setLabel("Safety + Utilities");
 
@@ -132,8 +132,9 @@ In interactive mode, `input` handlers run before the built-in first-message auto
 Also exposed:
 
 - `pi.logger`
-- `pi.typebox` (zod-backed compatibility shim for legacy TypeBox-style schemas)
-- `pi.zod` (injected `zod/v4` module — canonical for tool parameter schemas)
+- `pi.arktype` (the omptype `type(...)` schema builder)
+- `pi.zod` (Zod-compatible builder backed by omptype)
+- `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
 ### Message delivery semantics
@@ -157,6 +158,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `sessionManager` (read-only)
 - `modelRegistry`, `model`
 - `models` (read-only model query — see below)
+- `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
 - `getContextUsage()`
 - `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
 - `compact(...)`
@@ -203,7 +205,7 @@ If you use raw `setInterval`/`setTimeout` or detached promises instead, you own 
 const current = ctx.models.current();
 const contrasting = ctx.models
   .list()
-  .find(m => current && ctx.models.family(m) !== ctx.models.family(current));
+  .find((m) => current && ctx.models.family(m) !== ctx.models.family(current));
 ```
 
 ## 3) Command context (`ExtensionCommandContext`)
@@ -276,11 +278,13 @@ Cancelable pre-events:
 Bridging a push-capable MCP into a session steer:
 
 ```ts
-pi.on("mcp_notification", event => {
+pi.on("mcp_notification", (event) => {
   if (event.server !== "peer-bus") return;
   if (event.method !== "notifications/peer_message") return;
   const params = event.params as { from: string; text: string };
-  pi.sendUserMessage(`[from ${params.from}] ${params.text}`, { deliverAs: "steer" });
+  pi.sendUserMessage(`[from ${params.from}] ${params.text}`, {
+    deliverAs: "steer",
+  });
 });
 ```
 
@@ -298,7 +302,7 @@ Current runtime note: `ExtensionRunner.emitResourcesDiscover(...)` is implemente
 
 ## Tool authoring details
 
-`registerTool` uses `ToolDefinition` from `types.ts`.
+`registerTool` uses `ToolDefinition` from `types.ts`. Its `parameters` field accepts omptype schemas; the injected TypeBox compatibility shim remains available for legacy extensions.
 
 Current `execute` signature:
 
@@ -335,7 +339,7 @@ are already approved as, and delegation depth is guarded against accidental self
 Template:
 
 ```ts
-const { z } = pi.zod;
+const z = pi.zod;
 
 pi.registerTool({
   name: "my_tool",
@@ -364,7 +368,7 @@ pi.registerTool({
 });
 ```
 
-`tool_call`/`tool_result` intercept all tools once the registry is wrapped in `sdk.ts`, including built-ins and extension/custom tools. `ToolDefinition` also supports optional `hidden`, `defaultInactive`, `deferrable`, `approval`, `mcpServerName`, `mcpToolName`, `renderCall`, and `renderResult` fields.
+`tool_call`/`tool_result` intercept all tools once the registry is wrapped in `sdk.ts`, including built-ins and extension/custom tools. `ToolDefinition` also supports optional `hidden`, `defaultInactive`, `loadMode` (`"discoverable"` by default, or `"essential"`), `deferrable`, `approval` (`"exec"` by default), `strict`, `mcpServerName`, `mcpToolName`, `renderCall`, and `renderResult` fields.
 
 ## UI integration points
 
@@ -417,7 +421,7 @@ ACP installs an elicitation-bridged UI context (`createAcpExtensionUiContext` in
 
 For durable extension state:
 
-1. Persist with `pi.appendEntry(customType, data)`.
+1. Persist with `pi.appendEntry("com.example.my-extension.state", data)`. The `customType` namespace is global: use a package- or reverse-domain-qualified value and avoid the core-reserved values in the [`custom` session-entry reference](./session.md#custom).
 2. Rebuild state from `ctx.sessionManager.getBranch()` on `session_start`, `session_branch`, `session_tree`.
 3. Keep tool result `details` structured when state should be visible/reconstructible from tool result history.
 
@@ -427,7 +431,10 @@ Example reconstruction pattern:
 pi.on("session_start", async (_event, ctx) => {
   let latest;
   for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type === "custom" && entry.customType === "my-state") {
+    if (
+      entry.type === "custom" &&
+      entry.customType === "com.example.my-extension.state"
+    ) {
       latest = entry.data;
     }
   }
@@ -454,7 +461,9 @@ import { Container, Text } from "@oh-my-pi/pi-tui";
 
 pi.registerAssistantThinkingRenderer((context, theme) => {
   const container = new Container();
-  container.addChild(new Text(theme.fg("dim", `thinking chars: ${context.text.length}`), 1, 0));
+  container.addChild(
+    new Text(theme.fg("dim", `thinking chars: ${context.text.length}`), 1, 0),
+  );
   return container;
 });
 ```

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import {
@@ -19,9 +20,8 @@ import type {
 	TerminalAppearance,
 } from "@oh-my-pi/pi-tui";
 import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLuminance } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import chalk from "chalk";
-import { LRUCache } from "lru-cache/raw";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
@@ -1118,7 +1118,7 @@ const spinnerFramesSchema = type("unknown").narrow((value): value is SpinnerFram
 const themeJsonSchema = type({
 	"$schema?": "string",
 	name: "string",
-	"vars?": "Record<string, string | number>",
+	"vars?": { "[string]": "string | number" },
 	colors: themeColorsSchema,
 	"export?": {
 		"pageBg?": "string | number",
@@ -1127,7 +1127,7 @@ const themeJsonSchema = type({
 	},
 	"symbols?": {
 		"preset?": "'unicode' | 'nerd' | 'ascii'",
-		"overrides?": "Record<string, string>",
+		"overrides?": { "[string]": "string" },
 		"spinnerFrames?": spinnerFramesSchema,
 	},
 });

@@ -38,25 +38,25 @@ export const DISCOVERY_DEFAULT_CONTEXT_WINDOW = OPENAI_COMPAT_DISCOVERY_DEFAULT_
 export const DISCOVERY_DEFAULT_MAX_TOKENS = OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS;
 
 /**
- * Run `fn` with an abort signal that fires after `timeoutMs`, clearing the
- * backing timer the instant the operation settles.
+ * Run `fn` with a hard deadline while also signalling cooperative transports
+ * to abort. The independent rejection keeps discovery bounded when a runtime
+ * leaves its fetch promise pending after `AbortSignal.abort()` (observed with
+ * Windows localhost probes).
  *
- * Unlike the built-in abort-signal timeout API, the timer never outlives the
- * request: on the success path it is cancelled before `fn` resolves, so the
- * signal is never aborted and no pending callback lingers on the heap. A leaked
- * abort-signal timeout (e.g. discovery against a mocked fetch that resolves
- * instantly) fires seconds later and sets its abort `reason` — which crashed
- * Bun's concurrent GC while it marked the signal's wrapped reason during an
- * unrelated allocation (`JSAbortSignal::visitAdditionalChildren`).
+ * The backing timer is cleared as soon as `fn` settles, unlike
+ * `AbortSignal.timeout()`, whose delayed reason previously crashed Bun's
+ * concurrent GC during an unrelated allocation.
  */
 async function withTimeoutSignal<T>(timeoutMs: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
 	const controller = new AbortController();
-	const timer = setTimeout(
-		() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")),
-		timeoutMs,
-	);
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => {
+		const error = new DOMException("The operation timed out.", "TimeoutError");
+		controller.abort(error);
+		timeout.reject(error);
+	}, timeoutMs);
 	try {
-		return await fn(controller.signal);
+		return await Promise.race([fn(controller.signal), timeout.promise]);
 	} finally {
 		clearTimeout(timer);
 	}
@@ -724,6 +724,31 @@ export async function discoverLlamaCppModelRuntimeMetadata(
 	}
 }
 
+/**
+ * Read image-input support from an OpenAI-compatible `/v1/models` row. Handles
+ * direct `input` arrays, Synthetic-style top-level `input_modalities`, and
+ * OpenRouter-style `architecture.input_modalities`; returns undefined when none
+ * is present so the bundled reference (or the `["text"]` default) can take over.
+ */
+function extractOpenAIModelsListInputCapabilities(item: {
+	input?: unknown;
+	input_modalities?: unknown;
+	architecture?: unknown;
+}): ("text" | "image")[] | undefined {
+	const modalities = new Set<string>();
+	const collect = (value: unknown): void => {
+		if (!Array.isArray(value)) return;
+		for (const entry of value) {
+			if (typeof entry === "string") modalities.add(entry.toLowerCase());
+		}
+	};
+	collect(item.input);
+	collect(item.input_modalities);
+	if (isRecord(item.architecture)) collect(item.architecture.input_modalities);
+	if (modalities.size === 0) return undefined;
+	return modalities.has("image") ? ["text", "image"] : ["text"];
+}
+
 export async function discoverOpenAIModelsList(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
@@ -752,7 +777,14 @@ export async function discoverOpenAIModelsList(
 				}
 				headers = h;
 				return (await res.json()) as {
-					data?: Array<{ id?: string; max_model_len?: unknown; context_length?: unknown }>;
+					data?: Array<{
+						id?: string;
+						max_model_len?: unknown;
+						context_length?: unknown;
+						input?: unknown;
+						input_modalities?: unknown;
+						architecture?: unknown;
+					}>;
 				};
 			}),
 			nativeMetadataPromise,
@@ -796,7 +828,9 @@ export async function discoverOpenAIModelsList(
 				baseUrl,
 				reasoning: reference?.reasoning ?? false,
 				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
-				input: nativeMetadataForModel?.input ?? reference?.input ?? ["text"],
+				input: nativeMetadataForModel?.input ??
+					extractOpenAIModelsListInputCapabilities(item) ??
+					reference?.input ?? ["text"],
 				...(providerConfig.discovery.type === "lm-studio" ? { imageInputDecoder: "stb" as const } : {}),
 				// Proxy/gateway pricing is provider-specific and rarely matches
 				// upstream bundled catalogs, so keep costs local-unknown even
