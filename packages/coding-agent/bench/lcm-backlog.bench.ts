@@ -13,14 +13,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import type {
-	SummaryProviderAttempt,
-	SummaryProviderAttemptStart,
-	SummaryProviderUsage,
-} from "@oh-my-pi/lcm-context";
+import type { SummaryProviderAttempt, SummaryProviderAttemptStart, SummaryProviderUsage } from "@oh-my-pi/lcm-context";
 import {
-	estimateLcmProjectionMessageTokenUpperBound,
 	estimateLcmProjectionMessageTokens,
+	estimateLcmProjectionMessageTokenUpperBound,
 	LcmCompletionError,
 	type LcmCompletionRequest,
 	type LcmCompletionResult,
@@ -80,12 +76,7 @@ interface RunResult {
 
 type BenchmarkEnv = "LCM_BACKLOG_CONCURRENCY" | "LCM_BACKLOG_DELAY_MS" | "LCM_BACKLOG_SAMPLES";
 
-function envInteger(
-	name: BenchmarkEnv,
-	fallback: number,
-	minimum: number,
-	maximum = Number.MAX_SAFE_INTEGER,
-): number {
+function envInteger(name: BenchmarkEnv, fallback: number, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number {
 	const raw = Bun.env[name];
 	if (raw === undefined) return fallback;
 	if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a base-10 integer`);
@@ -268,9 +259,9 @@ async function measure(): Promise<Map<Width, RunResult[]>> {
 			for (const width of order) {
 				const runDir = path.join(root, `sample-${sample}-width-${width}`);
 				await fs.mkdir(runDir);
-				results.get(width)!.push(
-					await runSample(manager, projectRoot, path.join(runDir, "context.sqlite"), width, sample),
-				);
+				results
+					.get(width)!
+					.push(await runSample(manager, projectRoot, path.join(runDir, "context.sqlite"), width, sample));
 			}
 		}
 		return results;
@@ -303,7 +294,10 @@ for (const width of WIDTHS) {
 		requireInvariant(Number.isFinite(result.elapsedMs) && result.elapsedMs > 0, `${label}: elapsed time is invalid`);
 		requireInvariant(result.peak === width, `${label}: peak ${result.peak}, expected ${width}`);
 		requireInvariant(!result.limitExceeded && result.peak <= width, `${label}: exceeded worker limit ${width}`);
-		requireInvariant(result.workerLimit === width, `${label}: runtime limit ${result.workerLimit}, expected ${width}`);
+		requireInvariant(
+			result.workerLimit === width,
+			`${label}: runtime limit ${result.workerLimit}, expected ${width}`,
+		);
 		requireInvariant(result.projectionReady, `${label}: final projection is not ready`);
 		requireInvariant(result.leafJobs >= MIN_LEAF_JOBS, `${label}: created only ${result.leafJobs} leaf jobs`);
 		requireInvariant(result.allCompletionsUnique, `${label}: a completion request ran more than once`);
@@ -311,7 +305,10 @@ for (const width of WIDTHS) {
 			result.dispatchedAttempts === result.completionCalls,
 			`${label}: ${result.dispatchedAttempts} dispatched attempts for ${result.completionCalls} completion calls`,
 		);
-		requireInvariant(result.deniedAttempts === 0, `${label}: ${result.deniedAttempts} attempts denied before dispatch`);
+		requireInvariant(
+			result.deniedAttempts === 0,
+			`${label}: ${result.deniedAttempts} attempts denied before dispatch`,
+		);
 		requireInvariant(
 			result.providerCostUsd > 0 && result.providerInputTokens > 0,
 			`${label}: synthetic provider usage was not recorded`,

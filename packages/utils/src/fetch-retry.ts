@@ -12,7 +12,14 @@ const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/gi;
 // "try again in 5 min" / "try again in ~158 min." / "try again in 2h" /
 // "try again in 90 minutes" / "try again in 1 hour"
 const TRY_AGAIN_PATTERN = /try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/gi;
-const BODY_DELAY_PATTERNS = [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TRY_AGAIN_PATTERN] as const;
+// "Your limit will reset in 13 minutes" / "reset in 13 minutes" / "will reset in 2h"
+const WILL_RESET_IN_PATTERN = /(?:will\s+)?reset in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/gi;
+const BODY_DELAY_PATTERNS = [
+	PLEASE_RETRY_PATTERN,
+	RETRY_DELAY_FIELD_PATTERN,
+	TRY_AGAIN_PATTERN,
+	WILL_RESET_IN_PATTERN,
+] as const;
 
 /**
  * Server-suggested retry delay extraction. Merges the patterns historically used
@@ -28,6 +35,7 @@ const BODY_DELAY_PATTERNS = [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TR
  * Body patterns:
  *  - `retry-after-ms=1234` appended to formatted provider errors
  *  - `Your quota will reset after 18h31m10s` / `10m15s` / `39s`
+ *  - `Your limit will reset in 13 minutes` / `reset in 2h`
  *  - `Please retry in 250ms` / `Please retry in 12s`
  *  - `"retryDelay": "34.074824224s"` (JSON error detail field)
  *  - `try again in 250ms` / `try again in 12s` / `try again in 5 min` / `try again in ~158 min`

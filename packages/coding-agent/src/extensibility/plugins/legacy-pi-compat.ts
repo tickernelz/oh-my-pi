@@ -423,6 +423,25 @@ function isGlobalRequireCall(node: StructuralAstNode | null, scope: BindingScope
 	);
 }
 
+/**
+ * Whether `node` is a `createRequire(...)` factory call imported from
+ * `node:module` (or its `module` alias).
+ */
+function isCreateRequireInvocation(
+	node: StructuralAstNode | null,
+	createRequireBindings: ReadonlySet<string>,
+	moduleNamespaceBindings: ReadonlySet<string>,
+): boolean {
+	if (node?.type !== "CallExpression") return false;
+	const callee = asAstNode(node.callee);
+	if (callee?.type === "Identifier" && typeof callee.name === "string") {
+		return createRequireBindings.has(callee.name);
+	}
+	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "createRequire") return false;
+	const object = asAstNode(callee.object);
+	return object?.type === "Identifier" && typeof object.name === "string" && moduleNamespaceBindings.has(object.name);
+}
+
 function staticMemberPropertyName(node: StructuralAstNode): string | null {
 	const property = asAstNode(node.property);
 	if (node.computed !== true && property?.type === "Identifier" && typeof property.name === "string") {
@@ -458,6 +477,28 @@ function collectExtensionSpecifierReferences(
 			references.push({ kind, specifier: node.value, start: node.start, end: node.end });
 		}
 	};
+	const createRequireBindings = new Set<string>();
+	const moduleNamespaceBindings = new Set<string>();
+	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
+		const source = asAstNode(node.source);
+		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
+		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
+			const specifier = asAstNode(value);
+			const local = asAstNode(specifier?.local);
+			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
+			if (specifier?.type === "ImportNamespaceSpecifier") {
+				moduleNamespaceBindings.add(local.name);
+			} else if (specifier?.type === "ImportSpecifier") {
+				const imported = asAstNode(specifier.imported);
+				if (
+					(imported?.type === "Identifier" && imported.name === "createRequire") ||
+					(imported?.type === "StringLiteral" && imported.value === "createRequire")
+				) {
+					createRequireBindings.add(local.name);
+				}
+			}
+		}
+	}
 	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
 		if (
 			node.type === "ImportDeclaration" ||
@@ -478,6 +519,18 @@ function collectExtensionSpecifierReferences(
 				record("import", nodeArgument(node, 0));
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				record("require", nodeArgument(node, 0));
+			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
+				// `createRequire(base)(spec)` — pin the invoked bare dependency so it
+				// loads without a runtime `node_modules` lookup. Relative specifiers
+				// resolve against `base`, which is not rewritten, so restrict to bare.
+				const argument = nodeArgument(node, 0);
+				if (
+					argument?.type === "StringLiteral" &&
+					typeof argument.value === "string" &&
+					isBareExtensionDependencySpecifier(argument.value)
+				) {
+					record("require", argument);
+				}
 			}
 		}
 	}
@@ -682,13 +735,11 @@ function clearLegacyPiResolutionCaches(): void {
 registerPluginCacheInvalidator(clearLegacyPiResolutionCaches);
 const PACKAGE_IMPORT_EXCLUDED = Symbol("packageImportExcluded");
 
-// Extensions that imported TypeBox directly used to resolve against a real
-// `@sinclair/typebox` or `typebox` install. The runtime dep was replaced with
-// the Zod-backed shim under `extensibility/typebox.ts`; plugins still importing
-// either public name are redirected to that shim so existing extensions keep
-// working without code changes. Submodules like `@sinclair/typebox/compiler`
-// are intentionally not remapped — those expose TypeBox-only APIs the shim does
-// not provide and plugins relying on them must vendor TypeBox directly.
+// Extensions importing TypeBox directly are redirected to omptype's TypeBox
+// facade, keeping legacy builders while producing callable omptype schemas at
+// the tool wire boundary. Submodules such as `@sinclair/typebox/compiler` are
+// intentionally not remapped: plugins relying on those TypeBox-only APIs must
+// vendor TypeBox directly.
 const TYPEBOX_SPECIFIER_FILTER = /^(?:@sinclair\/typebox|typebox)$/;
 
 // Compat-shim path resolution. In compiled-binary mode every bundled surface
@@ -736,20 +787,13 @@ function sourceShimPath(file: string): string {
 }
 
 /**
- * Resolve the path the TypeBox compatibility shim ships at, then drop it when
- * the source file is missing.
+ * Resolve the coding-agent compatibility surface that composes omptype's
+ * TypeBox facade with legacy `Type.Unsafe`, then drop the remap when that
+ * entrypoint is missing.
  *
- * In compiled-binary mode the shim is served through the
- * `omp-legacy-pi-bundled:` virtual namespace (issue #3423) — bunfs paths are
- * unreachable on Bun 1.3.14+, so the virtual specifier is always available and
- * needs no filesystem probe. In dev / source-link / installed-package mode the
- * shim is an on-disk source file; validation mirrors
- * `__validateLegacyPiPackageRootOverrides` (#2168): if the computed candidate
- * doesn't exist (e.g. an install that dropped the source — issue #3414),
- * `resolveTypeBoxSpecifier` returns `undefined` and
- * `rewriteLegacyExtensionSource` leaves bare `typebox` / `@sinclair/typebox`
- * specifiers alone, so Bun falls through to native resolution against the
- * extension's own `node_modules`.
+ * In compiled-binary mode the surface is served through the
+ * `omp-legacy-pi-bundled:` virtual namespace (issue #3423). Dev, source-link,
+ * and installed-package modes use the shipped source module.
  *
  * Exported for tests; production callers use `TYPEBOX_SHIM_PATH`.
  */
@@ -764,14 +808,14 @@ export function __resolveTypeBoxShimPath(
 	return pathExistsSync(sourcePath) ? sourcePath : null;
 }
 
-const TYPEBOX_SHIM_PATH = __resolveTypeBoxShimPath(IS_COMPILED_BINARY, sourceShimPath("typebox.ts"));
+const TYPEBOX_SHIM_PATH = __resolveTypeBoxShimPath(IS_COMPILED_BINARY, sourceShimPath("legacy-typebox.ts"));
 
 // Legacy extensions historically imported `Type` (and `Static`/`TSchema`) from
 // the package root of `@(scope)/pi-ai`. pi-ai 15.1.0 removed the runtime `Type`
 // export (see `packages/ai/CHANGELOG.md`), so the bare canonical specifier no
 // longer satisfies those imports. The override below redirects only the bare
 // pi-ai package root onto a sibling shim that re-exports the canonical surface
-// plus the borrowed `Type` runtime from the Zod-backed TypeBox shim. Subpath
+// plus the borrowed `Type` runtime from the omptype TypeBox facade. Subpath
 // imports such as `@oh-my-pi/pi-ai/oauth` continue to resolve directly
 // against the bundled pi-ai package.
 const LEGACY_PI_AI_SHIM_PATH = IS_COMPILED_BINARY

@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	activeSourceFingerprint,
-	openLcmContext,
 	type ContextProjection,
 	type LcmContext,
+	openLcmContext,
 	type SourceSnapshot,
 	type SummaryProviderAttempt,
 	type SummaryProviderAttemptStart,
@@ -13,13 +13,17 @@ import {
 import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Api, AssistantMessage, Context, Model, ModelSpec, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
-import { getBlobsDir } from "@oh-my-pi/pi-utils";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import harnessCompatibility from "./lcm-replay-compatibility.json" with { type: "json" };
+import { getBlobsDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "../src/config/settings";
 import type { Skill } from "../src/extensibility/skills";
 import { decodeLcmHandle, encodeLcmHandle } from "../src/lcm/operations";
+import { computeNonMessageTokens } from "../src/modes/utils/context-usage";
 import { AgentSession } from "../src/session/agent-session";
+import { BlobStore } from "../src/session/blob-store";
+import { convertToLlm, wrapSteeringForModel } from "../src/session/messages";
+import type { FileEntry, SessionEntry } from "../src/session/session-entries";
 import {
 	estimateLcmProjectionMessageTokens,
 	estimateLcmProjectionMessageTokenUpperBound,
@@ -30,14 +34,10 @@ import {
 	normalizeLcmBranch,
 	SessionLcm,
 } from "../src/session/session-lcm";
-import { BlobStore } from "../src/session/blob-store";
 import { resolveBlobRefsInEntries } from "../src/session/session-loader";
-import { computeNonMessageTokens } from "../src/modes/utils/context-usage";
-import { Settings } from "../src/config/settings";
-import type { FileEntry, SessionEntry } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
-import { convertToLlm, wrapSteeringForModel } from "../src/session/messages";
 import { MemorySessionStorage } from "../src/session/session-storage";
+import harnessCompatibility from "./lcm-replay-compatibility.json" with { type: "json" };
 
 const HARNESS_SCHEMA = "lcm-replay/v4";
 const HARNESS_IDENTITY_SCHEMA = "lcm-replay-harness-source/v1";
@@ -355,10 +355,7 @@ const FAILURE_CONTROL_ORDER: readonly ReplayFailureControlName[] = [
 	"minimum-representation",
 ];
 
-const FAILURE_CONTROL_EXPECTATIONS: Record<
-	ReplayFailureControlName,
-	Omit<ReplayFailureControl, "name">
-> = {
+const FAILURE_CONTROL_EXPECTATIONS: Record<ReplayFailureControlName, Omit<ReplayFailureControl, "name">> = {
 	store: { route: "native_fallback", category: "store", reason: null, providerCalls: 0, storeRowsChanged: 0 },
 	"provider-exhausted": {
 		route: "native_fallback",
@@ -592,9 +589,6 @@ function hashBytes(value: Uint8Array): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
-
-
-
 function canonicalValue(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonicalValue);
 	if (!value || typeof value !== "object") return value;
@@ -635,12 +629,7 @@ async function realPathThroughNearestParent(target: string, label: string): Prom
 				await fs.lstat(cursor);
 				throw new Error(`${label} must resolve inside compaction-results/lcm-replay`);
 			} catch (statError) {
-				if (
-					!statError ||
-					typeof statError !== "object" ||
-					!("code" in statError) ||
-					statError.code !== "ENOENT"
-				) {
+				if (!statError || typeof statError !== "object" || !("code" in statError) || statError.code !== "ENOENT") {
 					throw statError;
 				}
 			}
@@ -666,11 +655,7 @@ async function assertArtifactPath(candidate: string, label: string, access: "rea
 	const canonicalRoot = await realPathThroughNearestParent(ARTIFACT_ROOT, label);
 	const canonicalTarget = await realPathThroughNearestParent(resolved, label);
 	const relative = path.relative(canonicalRoot, canonicalTarget);
-	if (
-		relative === "" ||
-		relative.startsWith("..") ||
-		path.isAbsolute(relative)
-	) {
+	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
 		throw new Error(`${label} must resolve inside compaction-results/lcm-replay`);
 	}
 	return resolved;
@@ -700,7 +685,9 @@ function renderedSummaryHandles(messages: readonly unknown[]): { valid: boolean;
 				? [content]
 				: Array.isArray(content)
 					? content.flatMap(part =>
-							part && typeof part === "object" && !Array.isArray(part) &&
+							part &&
+							typeof part === "object" &&
+							!Array.isArray(part) &&
 							typeof (part as Record<string, unknown>).text === "string"
 								? [(part as Record<string, unknown>).text as string]
 								: [],
@@ -727,8 +714,10 @@ interface ReproducibleRuntimeInputs {
 	nonMessageTokens: number;
 }
 
-function reproducibleRuntimeInputs(envelope: CapturedRuntimeEnvelope | undefined): ReproducibleRuntimeInputs | undefined {
-	if (!envelope || !envelope.systemPrompt.every(part => typeof part === "string")) return undefined;
+function reproducibleRuntimeInputs(
+	envelope: CapturedRuntimeEnvelope | undefined,
+): ReproducibleRuntimeInputs | undefined {
+	if (!envelope?.systemPrompt.every(part => typeof part === "string")) return undefined;
 	const tools: AgentTool[] = [];
 	for (const value of envelope.toolSchemas) {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -1073,7 +1062,11 @@ async function createContentFreeManager(root: string, sourceCount: number): Prom
 	});
 }
 
-async function loadRealManager(replayPath: string, markerId: string | undefined, agentDir?: string): Promise<{
+async function loadRealManager(
+	replayPath: string,
+	markerId: string | undefined,
+	agentDir?: string,
+): Promise<{
 	manager: SessionManager;
 	identity: MarkerIdentity;
 	rawPrefix: string;
@@ -1176,8 +1169,10 @@ function providerStream(metrics: ProviderMetrics, fixture: FixtureName): StreamF
 		const promptText = JSON.stringify(context);
 		const promptHash = hashText(promptText);
 		const inputTokens = canonicalTokens(promptText);
-		const detailTokens = fixture === "boundary-summary" ? Math.max(1, Math.floor((options?.maxTokens ?? 2) / 2) - 32) : 0;
-		const outputText = fixture === "boundary-summary" ? `Boundary summary ${promptHash}: ${"detail ".repeat(detailTokens)}` : ".";
+		const detailTokens =
+			fixture === "boundary-summary" ? Math.max(1, Math.floor((options?.maxTokens ?? 2) / 2) - 32) : 0;
+		const outputText =
+			fixture === "boundary-summary" ? `Boundary summary ${promptHash}: ${"detail ".repeat(detailTokens)}` : ".";
 		const outputTokens = canonicalTokens(outputText);
 		metrics.calls++;
 		metrics.active++;
@@ -1219,7 +1214,13 @@ function providerStream(metrics: ProviderMetrics, fixture: FixtureName): StreamF
 					cacheRead: 0,
 					cacheWrite: 0,
 					totalTokens: inputTokens + outputTokens,
-					cost: { input: inputCost, output: outputCost, cacheRead: 0, cacheWrite: 0, total: inputCost + outputCost },
+					cost: {
+						input: inputCost,
+						output: outputCost,
+						cacheRead: 0,
+						cacheWrite: 0,
+						total: inputCost + outputCost,
+					},
 				};
 				const message: AssistantMessage = {
 					role: "assistant",
@@ -1338,7 +1339,9 @@ export function sqliteReport(
 	const db = new Database(storePath, { readonly: true, strict: true });
 	try {
 		const quickCheck = db.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check ?? "missing";
-		const schemaVersion = Number(db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0);
+		const schemaVersion = Number(
+			db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0,
+		);
 		const schema = db
 			.query<{ type: string; name: string; tblName: string; sql: string | null }, []>(
 				`SELECT type, name, tbl_name AS tblName, sql FROM sqlite_schema
@@ -1349,9 +1352,7 @@ export function sqliteReport(
 		let rows = 0;
 		for (const table of schema.filter(entry => entry.type === "table")) {
 			const quotedTable = `"${table.name.replaceAll('"', '""')}"`;
-			const columns = db
-				.query<{ name: string; pk: number }, []>(`PRAGMA table_info(${quotedTable})`)
-				.all();
+			const columns = db.query<{ name: string; pk: number }, []>(`PRAGMA table_info(${quotedTable})`).all();
 			const names = columns.map(column => column.name);
 			const primary = columns
 				.filter(column => column.pk > 0)
@@ -1368,7 +1369,9 @@ export function sqliteReport(
 								`SELECT ${quotedColumns.join(", ")} FROM ${quotedTable} ORDER BY ${orderBy}`,
 							)
 							.all()
-							.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, logicalValue(value)])));
+							.map(row =>
+								Object.fromEntries(Object.entries(row).map(([key, value]) => [key, logicalValue(value)])),
+							);
 			rows += tableRows.length;
 			logicalTables.push({ name: table.name, columns: names, rows: tableRows });
 		}
@@ -1694,7 +1697,10 @@ async function singleChildControl(root: string): Promise<ReplayControlEvidence> 
 		return {
 			kind: "single-child-frontier",
 			childJobs: final.jobRows.filter(
-				row => row.job_id === selectedChild.jobId && Number(row.level) === selectedChild.level && row.status === "completed",
+				row =>
+					row.job_id === selectedChild.jobId &&
+					Number(row.level) === selectedChild.level &&
+					row.status === "completed",
 			).length,
 			parentJobs: final.jobRows.filter(
 				row => row.job_id === parent.jobId && Number(row.level) === parent.level && row.status === "completed",
@@ -1785,7 +1791,11 @@ async function staleLeaseControl(root: string): Promise<ReplayControlEvidence> {
 	}
 }
 
-function failureControlProjection(snapshot: SourceSnapshot, revision: number, invalidFingerprint = false): ContextProjection {
+function failureControlProjection(
+	snapshot: SourceSnapshot,
+	revision: number,
+	invalidFingerprint = false,
+): ContextProjection {
 	const historical = snapshot.entries.slice(0, -1);
 	const fresh = snapshot.entries.at(-1)!;
 	const activeIds = snapshot.entries.map(entry => entry.entryId);
@@ -1975,7 +1985,7 @@ async function executeFailureControl(root: string, name: ReplayFailureControlNam
 	} finally {
 		await lcm.close();
 	}
-	if (!route || route.kind !== "native_fallback") throw new Error(`${name} control did not dispatch native fallback`);
+	if (route?.kind !== "native_fallback") throw new Error(`${name} control did not dispatch native fallback`);
 	if (route.category === "deadline") throw new Error(`${name} control emitted the removed deadline fallback`);
 	const postStoreHash = context
 		? sqliteReport(storePath, snapshot.scope.projectId, snapshot.scope.sessionId, snapshot.scope.branchId)
@@ -2129,16 +2139,16 @@ async function runSample(
 			});
 			openedContext = context;
 			const reconcile = context.reconcile.bind(context);
-				context.reconcile = (source, reconcileOptions) => {
-					snapshot.value ??= structuredClone(source);
-					return reconcile(snapshot.value, reconcileOptions);
-				};
+			context.reconcile = (source, reconcileOptions) => {
+				snapshot.value ??= structuredClone(source);
+				return reconcile(snapshot.value, reconcileOptions);
+			};
 			const project = context.project.bind(context);
-				context.project = request => {
-					const projection = project(request);
-					lastProjection = projection;
-					return projection;
-				};
+			context.project = request => {
+				const projection = project(request);
+				lastProjection = projection;
+				return projection;
+			};
 			const settleSummaryAttempt = context.settleSummaryAttempt.bind(context);
 			context.settleSummaryAttempt = (lease, attempt, outcome) => {
 				const settled = settleSummaryAttempt(lease, attempt, outcome);
@@ -2198,12 +2208,7 @@ async function runSample(
 				: {
 						localRequestTokens,
 						requestTokensFloor: capture.requestTokensFloor,
-						...(await publicOwnershipDecision(
-							session,
-							input,
-							controller.signal,
-							capture.requestTokensFloor,
-						)),
+						...(await publicOwnershipDecision(session, input, controller.signal, capture.requestTokensFloor)),
 					};
 		const projectionPromise = session.projectLcmContext(input, controller.signal);
 		let projected: AgentMessage[];
@@ -2331,7 +2336,9 @@ async function runSample(
 					handle.projectId === sourceScope.projectId &&
 					handle.sessionId === sourceScope.sessionId &&
 					handle.branchId === sourceScope.branchId &&
-					Boolean(resolvedContext.expandSummary({ ...sourceScope, summaryHandle: handle.summaryHandle, limit: 1 })),
+					Boolean(
+						resolvedContext.expandSummary({ ...sourceScope, summaryHandle: handle.summaryHandle, limit: 1 }),
+					),
 			);
 		await session.dispose();
 		openedContext = undefined;
@@ -2384,7 +2391,9 @@ async function runSample(
 				item.sourceIds.map(entryId => sourceKeyById.get(entryId)).filter((key): key is string => key !== undefined),
 			) ?? [];
 		const freshSourceKeys =
-			projection?.freshTailSourceIds.map(entryId => sourceKeyById.get(entryId)).filter((key): key is string => key !== undefined) ?? [];
+			projection?.freshTailSourceIds
+				.map(entryId => sourceKeyById.get(entryId))
+				.filter((key): key is string => key !== undefined) ?? [];
 		const projectedSourceKeys = [...historicalSourceKeys, ...freshSourceKeys];
 		const uncovered = projection?.uncoveredSourceIds.length ?? activeSourceKeys.length;
 		const covered = historicalSourceKeys.length;
@@ -2522,9 +2531,7 @@ async function runSample(
 			},
 			promptInputTokens,
 			underfillRatio:
-				typeof messageTokenBudget === "number"
-					? Math.max(0, 1 - promptInputTokens / messageTokenBudget)
-					: 0,
+				typeof messageTokenBudget === "number" ? Math.max(0, 1 - promptInputTokens / messageTokenBudget) : 0,
 			storeRowsChanged,
 			sqliteQuickCheck: sqlite.quickCheck,
 			serializedStoreHash: initialSqlite?.serializedStoreHash ?? sqlite.serializedStoreHash,
@@ -2584,7 +2591,9 @@ function averageUsage(samples: readonly SampleReport[]): SampleReport["providerU
 		}),
 		{ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 	);
-	return Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, value / samples.length])) as SampleReport["providerUsage"];
+	return Object.fromEntries(
+		Object.entries(totals).map(([key, value]) => [key, value / samples.length]),
+	) as SampleReport["providerUsage"];
 }
 
 function aggregateMetrics(
@@ -2702,11 +2711,7 @@ function jobsByIdentity(rows: readonly Record<string, unknown>[]): Map<string, R
 	return result;
 }
 
-function replaySummaryInputHash(
-	projectId: string,
-	level: number,
-	inputs: readonly Record<string, unknown>[],
-): string {
+function replaySummaryInputHash(projectId: string, level: number, inputs: readonly Record<string, unknown>[]): string {
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const part of [
 		"lcm-summary-input-v1",
@@ -2728,7 +2733,11 @@ function withoutRetryAuthorization(row: Record<string, unknown>): Record<string,
 	return normalized;
 }
 
-function assertMigratedJobs(before: readonly Record<string, unknown>[], after: readonly Record<string, unknown>[], label: string): void {
+function assertMigratedJobs(
+	before: readonly Record<string, unknown>[],
+	after: readonly Record<string, unknown>[],
+	label: string,
+): void {
 	const candidates = jobsByIdentity(after);
 	if (candidates.size !== before.length) throw new Error(`${label} added or removed pre-existing jobs`);
 	for (const row of before) {
@@ -2861,7 +2870,12 @@ function assertLogicalTablesUnchanged(
 	}
 }
 
-function assertPreExistingRowsPreserved(before: SqliteReport, after: SqliteReport, tableName: string, label: string): void {
+function assertPreExistingRowsPreserved(
+	before: SqliteReport,
+	after: SqliteReport,
+	tableName: string,
+	label: string,
+): void {
 	if (!before.logicalTablesComplete || !after.logicalTablesComplete) return;
 	const original = logicalTablesByName(before, label).get(tableName);
 	const candidate = logicalTablesByName(after, label).get(tableName);
@@ -2981,9 +2995,7 @@ function assertProjectionAppendRows(
 
 	const beforeJobs = jobsByIdentity(before.jobRows);
 	const afterJobs = jobsByIdentity(after.jobRows);
-	const addedJobs = new Map(
-		[...afterJobs].filter(([jobId]) => !beforeJobs.has(jobId)),
-	);
+	const addedJobs = new Map([...afterJobs].filter(([jobId]) => !beforeJobs.has(jobId)));
 	const targetSourceKeys = after.sourceRows.map((row, index) => {
 		if (row.position !== index) throw new Error(`${label} target branch source positions are not contiguous`);
 		return row.sourceKey;
@@ -3012,11 +3024,7 @@ function assertProjectionAppendRows(
 		);
 		const linkedSummary =
 			typeof row.summary_id === "string" && summaryProjects.get(row.summary_id) === policy.scope.projectId;
-		if (
-			row.branch_row_id !== branch.id ||
-			row.revision !== branch.revision ||
-			(!linkedJob && !linkedSummary)
-		) {
+		if (row.branch_row_id !== branch.id || row.revision !== branch.revision || (!linkedJob && !linkedSummary)) {
 			throw new Error(`${label} added branch_summary_spans outside the declared projection scope or linkage`);
 		}
 	}
@@ -3134,13 +3142,7 @@ function assertProjectionAppendRows(
 }
 
 function assertMigrationLogicalTables(before: SqliteReport, after: SqliteReport, label: string): void {
-	assertLogicalTablesUnchanged(
-		before,
-		after,
-		new Set(["summary_jobs"]),
-		new Set(["summary_retry_policies"]),
-		label,
-	);
+	assertLogicalTablesUnchanged(before, after, new Set(["summary_jobs"]), new Set(["summary_retry_policies"]), label);
 	if (!before.logicalTablesComplete || !after.logicalTablesComplete) return;
 	const beforeJobs = logicalTablesByName(before, label).get("summary_jobs");
 	const afterJobs = logicalTablesByName(after, label).get("summary_jobs");
@@ -3400,7 +3402,6 @@ interface CapturedRetryPolicy {
 	retryEpoch: number;
 }
 
-
 async function configureCapturedRetryPolicy(
 	context: LcmContext,
 	schemaVersion: number,
@@ -3411,7 +3412,8 @@ async function configureCapturedRetryPolicy(
 	const policyContext = context as unknown as {
 		configureSummaryRetryPolicy?: (projectId: string, retryKey: string) => unknown | Promise<unknown>;
 	};
-	if (!policyContext.configureSummaryRetryPolicy) throw new Error("schema-10 context lacks configureSummaryRetryPolicy");
+	if (!policyContext.configureSummaryRetryPolicy)
+		throw new Error("schema-10 context lacks configureSummaryRetryPolicy");
 	const result = await policyContext.configureSummaryRetryPolicy(projectId, retryKey);
 	if (
 		!result ||
@@ -3453,7 +3455,6 @@ function contentFreeBoundary(snapshot: SourceSnapshot): ContentFreeBoundary {
 	);
 	return { thresholdTokens, freshTail };
 }
-
 
 function contentFreeContextOptions(): {
 	leafChunk: { maxSources: number; maxTokens: number };
@@ -3500,7 +3501,6 @@ function legacyContentFreeBoundary(sourceCount: number): ContentFreeBoundary {
 function legacyContentFreeFixtureHash(sourceCount: number): string {
 	return hashText(canonicalJson({ kind: "content-free-shape", sourceCount, schema: HARNESS_SCHEMA }));
 }
-
 
 function runtimeEnvelopeIsAuthoritative(
 	envelope: CapturedRuntimeEnvelope | undefined,
@@ -3731,19 +3731,19 @@ async function capture(inputOptions: CaptureOptions): Promise<ReplayReport> {
 	const loaded =
 		realLoaded ??
 		(await (async () => {
-					const manager = await createSyntheticManager(syntheticRoot, options.fixture);
-					const replication = manager.snapshotForReplication();
-					const prefix = `${[replication.header, ...replication.entries].map(entry => JSON.stringify(entry)).join("\n")}\n`;
-					return {
-						manager,
-						identity: syntheticIdentity(manager, options.fixture),
-						rawPrefix: prefix,
-						resolvedPrefix: prefix,
-						missingBlobRefs: [] as string[],
-						blobEvidence: { verifiedRefs: [], digestMismatchRefs: [], readFailureRefs: [] } satisfies BlobEvidence,
-						prefixIdentity: { rawHash: hashText(prefix), resolvedHash: hashText(prefix) },
-					};
-				})());
+			const manager = await createSyntheticManager(syntheticRoot, options.fixture);
+			const replication = manager.snapshotForReplication();
+			const prefix = `${[replication.header, ...replication.entries].map(entry => JSON.stringify(entry)).join("\n")}\n`;
+			return {
+				manager,
+				identity: syntheticIdentity(manager, options.fixture),
+				rawPrefix: prefix,
+				resolvedPrefix: prefix,
+				missingBlobRefs: [] as string[],
+				blobEvidence: { verifiedRefs: [], digestMismatchRefs: [], readFailureRefs: [] } satisfies BlobEvidence,
+				prefixIdentity: { rawHash: hashText(prefix), resolvedHash: hashText(prefix) },
+			};
+		})());
 	const messages = loaded.manager.buildSessionContext().messages;
 	const sourceTokens = messages.reduce((total, message) => total + estimateTokens(message), 0);
 	const normalizedSnapshot =
@@ -3771,7 +3771,9 @@ async function capture(inputOptions: CaptureOptions): Promise<ReplayReport> {
 		snapshotBytes = sourceStore.snapshotBytes;
 	}
 	await Promise.all(
-		[options.out, options.snapshotOut, options.sourceOut].map(output => fs.mkdir(path.dirname(output), { recursive: true })),
+		[options.out, options.snapshotOut, options.sourceOut].map(output =>
+			fs.mkdir(path.dirname(output), { recursive: true }),
+		),
 	);
 	await Promise.all([
 		writePrivateArtifact(rawPrefixPath, loaded.rawPrefix),
@@ -3882,7 +3884,9 @@ async function capture(inputOptions: CaptureOptions): Promise<ReplayReport> {
 	const logicalSnapshot: { bytes?: Uint8Array } = {};
 	const samples: SampleReport[] = [];
 	for (let sampleOrdinal = 1; sampleOrdinal <= options.samples; sampleOrdinal++) {
-		samples.push(await runSample(loaded.manager, options.fixture, runOptions, sampleOrdinal, snapshot, logicalSnapshot));
+		samples.push(
+			await runSample(loaded.manager, options.fixture, runOptions, sampleOrdinal, snapshot, logicalSnapshot),
+		);
 	}
 	const preparedSourceRows = canonicalJson(treatmentStore.sourceRows);
 	if (samples.some(sample => canonicalJson(sample.sourceRows) !== preparedSourceRows)) {
@@ -3950,7 +3954,10 @@ async function capture(inputOptions: CaptureOptions): Promise<ReplayReport> {
 		missingBlobRefs: loaded.missingBlobRefs,
 		syntheticFixture:
 			classification === "historical-reconstruction-impossible"
-				? { kind: "content-free-shape", sourceCount: Math.max(CONTENT_FREE_MIN_SOURCES, snapshot.value.entries.length) }
+				? {
+						kind: "content-free-shape",
+						sourceCount: Math.max(CONTENT_FREE_MIN_SOURCES, snapshot.value.entries.length),
+					}
 				: null,
 		baselineEligibility,
 		qualification,
@@ -4069,8 +4076,10 @@ function validateReconstruction(report: ReplayReport, label: string): void {
 		throw new Error(`${label} authoritative scope and runtime qualification is missing`);
 	}
 	if (qualification) {
-		if (qualification.projectId !== report.fixture.projectId) throw new Error(`${label} project qualification mismatch`);
-		if (qualification.sessionId !== report.fixture.sessionId) throw new Error(`${label} session qualification mismatch`);
+		if (qualification.projectId !== report.fixture.projectId)
+			throw new Error(`${label} project qualification mismatch`);
+		if (qualification.sessionId !== report.fixture.sessionId)
+			throw new Error(`${label} session qualification mismatch`);
 		if (qualification.branchId !== report.fixture.branchId) throw new Error(`${label} branch qualification mismatch`);
 		if (
 			canonicalJson(qualification.orderedSourceKeys) !==
@@ -4117,13 +4126,18 @@ function validateReconstruction(report: ReplayReport, label: string): void {
 		}
 	}
 	if (reconstruction.classification === "exact-historical-replay") {
-		if (reconstruction.syntheticFixture !== null) throw new Error(`${label} exact replay cannot carry a synthetic pair`);
+		if (reconstruction.syntheticFixture !== null)
+			throw new Error(`${label} exact replay cannot carry a synthetic pair`);
 	} else {
 		const synthetic = reconstruction.syntheticFixture;
-		if (!synthetic || synthetic.kind !== "content-free-shape" || !Number.isSafeInteger(synthetic.sourceCount)) {
+		if (synthetic?.kind !== "content-free-shape" || !Number.isSafeInteger(synthetic.sourceCount)) {
 			throw new Error(`${label} historical-reconstruction-impossible case requires a content-free synthetic pair`);
 		}
-		if (!report.syntheticPair || !/^[a-f0-9]{64}$/.test(report.syntheticPair.fixtureHash) || report.syntheticPair.samples.length !== 5) {
+		if (
+			!report.syntheticPair ||
+			!/^[a-f0-9]{64}$/.test(report.syntheticPair.fixtureHash) ||
+			report.syntheticPair.samples.length !== 5
+		) {
 			throw new Error(`${label} synthetic content-free pair must contain five executed samples`);
 		}
 	}
@@ -4239,7 +4253,8 @@ function assertPreparedStoreCompatibility(
 	const migrating = baseline.treatment.schemaVersion === 9 && candidate.treatment.schemaVersion === 10;
 	if (migrating) {
 		const retryKey = candidate.treatment.retryKey;
-		if (!candidateMigrated || !retryKey) throw new Error(`${label} schema-10 migrated template or retry key is missing`);
+		if (!candidateMigrated || !retryKey)
+			throw new Error(`${label} schema-10 migrated template or retry key is missing`);
 		assertPreparedTransition(before, candidateMigrated, `${label} schema migration`);
 		assertPolicyPreparation(
 			candidateMigrated,
@@ -4292,7 +4307,10 @@ function assertComparable(baseline: ReplayReport, candidate: ReplayReport): void
 
 	if (baseline.harnessSchema !== candidate.harnessSchema) throw new Error("harnessSchema mismatch");
 	if (baseline.sourceSnapshotHash !== candidate.sourceSnapshotHash) throw new Error("sourceSnapshotHash mismatch");
-	for (const [label, report] of [["baseline", baseline], ["candidate", candidate]] as const) {
+	for (const [label, report] of [
+		["baseline", baseline],
+		["candidate", candidate],
+	] as const) {
 		if (report.fixture.harnessSourceHash && report.workloadFingerprint !== replayWorkloadFingerprint(report)) {
 			throw new Error(`${label} workload fingerprint does not match immutable identity`);
 		}
@@ -4310,10 +4328,16 @@ function assertComparable(baseline: ReplayReport, candidate: ReplayReport): void
 	if (!fingerprintsMatch && !harnessCompatibility) {
 		throw new Error("workloadFingerprint mismatch");
 	}
-	if (canonicalJson(workloadIdentity(baseline, fingerprintsMatch)) !== canonicalJson(workloadIdentity(candidate, fingerprintsMatch))) {
+	if (
+		canonicalJson(workloadIdentity(baseline, fingerprintsMatch)) !==
+		canonicalJson(workloadIdentity(candidate, fingerprintsMatch))
+	) {
 		throw new Error("workload identity, prefix/suffix, scope, sourceKey, or SQLite snapshot drifted");
 	}
-	for (const [label, report] of [["baseline", baseline], ["candidate", candidate]] as const) {
+	for (const [label, report] of [
+		["baseline", baseline],
+		["candidate", candidate],
+	] as const) {
 		if (report.metrics.sqliteQuickCheck !== "ok" || report.samples.some(sample => sample.sqliteQuickCheck !== "ok")) {
 			throw new Error(`${label} SQLite quick_check failed`);
 		}
@@ -4371,7 +4395,8 @@ function assertComparable(baseline: ReplayReport, candidate: ReplayReport): void
 	}
 	const baselineTreatment = comparableTreatment(baseline.treatment);
 	const candidateTreatment = comparableTreatment(candidate.treatment);
-	if (canonicalJson(baselineTreatment) !== canonicalJson(candidateTreatment)) throw new Error("treatment metadata drifted");
+	if (canonicalJson(baselineTreatment) !== canonicalJson(candidateTreatment))
+		throw new Error("treatment metadata drifted");
 	const waitUnchanged = baseline.treatment.hardProjectionWaitMs === candidate.treatment.hardProjectionWaitMs;
 	const historicalWaitRemoved =
 		harnessCompatibility !== undefined &&
@@ -4415,16 +4440,13 @@ function assertComparable(baseline: ReplayReport, candidate: ReplayReport): void
 		candidate,
 		beforeReport,
 		afterReport,
-		baselineMigratedEvidence
-			? evidenceReport(baselineMigratedEvidence, baseline.treatment.schemaVersion)
-			: undefined,
+		baselineMigratedEvidence ? evidenceReport(baselineMigratedEvidence, baseline.treatment.schemaVersion) : undefined,
 		candidateMigratedEvidence
 			? evidenceReport(candidateMigratedEvidence, candidate.treatment.schemaVersion)
 			: undefined,
 		"prepared",
 	);
 }
-
 
 function validateReportedAggregate(report: ReplayReport, label: string): void {
 	const pristine = report.storeEvidence?.pristine;
@@ -4547,7 +4569,9 @@ function validateSummaryBindings(
 				summaryRow.stable_handle !== span.summaryHandle ||
 				summaryRow.project_id !== expectedScope.projectId
 			) {
-				throw new Error(`${label} sample ${sample.sample} summary id/handle pair does not match its reopened store row`);
+				throw new Error(
+					`${label} sample ${sample.sample} summary id/handle pair does not match its reopened store row`,
+				);
 			}
 			const preparedSummaryRow = template?.summaryRows.find(row => row.summary_id === span.summaryId);
 			if (preparedSummaryRow && canonicalJson(summaryRow) !== canonicalJson(preparedSummaryRow)) {
@@ -4558,7 +4582,9 @@ function validateSummaryBindings(
 			}
 			const recordedRows = (templateLineageRows ?? []).filter(row => row.summaryId === span.summaryId);
 			if (recordedRows.length > 0 && canonicalJson(span.lineageRows) !== canonicalJson(recordedRows)) {
-				throw new Error(`${label} sample ${sample.sample} summary lineage contradicts its prepared template placement`);
+				throw new Error(
+					`${label} sample ${sample.sample} summary lineage contradicts its prepared template placement`,
+				);
 			}
 			const matches = lineagePlacements(span.lineageRows).filter(placement =>
 				placementMatchesSpan(placement, span, sample, expectedScope.projectId),
@@ -4571,7 +4597,9 @@ function validateSummaryBindings(
 			const placement = matches[0]!;
 			const first = placement[0]!;
 			if (first.startPosition !== historicalCursor) {
-				throw new Error(`${label} sample ${sample.sample} persisted summary lineage leaves an active-branch coverage gap`);
+				throw new Error(
+					`${label} sample ${sample.sample} persisted summary lineage leaves an active-branch coverage gap`,
+				);
 			}
 			historicalCursor = first.endPosition;
 			persistedHistoricalSourceKeys.push(...placement.map(row => row.sourceKey));
@@ -4580,11 +4608,15 @@ function validateSummaryBindings(
 			const activeSourceKeys = sample.sourceRows.map(row => row.sourceKey);
 			const persistedFreshSourceKeys = sample.sourceRows.slice(historicalCursor).map(row => row.sourceKey);
 			if (
-				canonicalJson(persistedHistoricalSourceKeys) !== canonicalJson(sample.sourceCoverage.historicalSourceKeys) ||
+				canonicalJson(persistedHistoricalSourceKeys) !==
+					canonicalJson(sample.sourceCoverage.historicalSourceKeys) ||
 				canonicalJson(persistedFreshSourceKeys) !== canonicalJson(sample.sourceCoverage.freshSourceKeys) ||
-				canonicalJson([...persistedHistoricalSourceKeys, ...persistedFreshSourceKeys]) !== canonicalJson(activeSourceKeys)
+				canonicalJson([...persistedHistoricalSourceKeys, ...persistedFreshSourceKeys]) !==
+					canonicalJson(activeSourceKeys)
 			) {
-				throw new Error(`${label} sample ${sample.sample} persisted summary lineage contradicts active branch coverage`);
+				throw new Error(
+					`${label} sample ${sample.sample} persisted summary lineage contradicts active branch coverage`,
+				);
 			}
 			const evidence = sample.handles;
 			if (!evidence?.providerVisible || !Array.isArray(evidence.tokens)) {
@@ -4615,7 +4647,9 @@ function validateSummaryBindings(
 					decoded.reference.summaryHandle !== span.summaryHandle ||
 					(span.summaryRow?.stable_handle ?? handlesById.get(span.summaryId)) !== decoded.reference.summaryHandle
 				) {
-					throw new Error(`${label} sample ${sample.sample} rendered summary handle does not bind to its ordered store row`);
+					throw new Error(
+						`${label} sample ${sample.sample} rendered summary handle does not bind to its ordered store row`,
+					);
 				}
 			}
 		}
@@ -4652,7 +4686,7 @@ function validateAttemptEvidence(
 function validateCancellationSample(sample: SampleReport, expectedProjectId: string, label: string): void {
 	const evidence = sample.controlEvidence;
 	validateAttemptEvidence(sample.attempts, expectedProjectId, label);
-	if (!evidence || evidence.kind !== "cancellation") throw new Error(`${label} lacks cleanup evidence`);
+	if (evidence?.kind !== "cancellation") throw new Error(`${label} lacks cleanup evidence`);
 	const outcomes = sample.attempts.rows.map(attempt => attempt.outcome).sort();
 	if (
 		!evidence.started ||
@@ -4710,7 +4744,6 @@ function validateCancellationControl(report: ReplayReport, label: string, requir
 	validateCancellationSample(control.sample, control.scope.projectId, `${label} cancellation control`);
 }
 
-
 function validateFailureControls(report: ReplayReport, label: string): void {
 	if (report.fixture.name !== "real") return;
 	const controls = report.failureControls;
@@ -4718,8 +4751,12 @@ function validateFailureControls(report: ReplayReport, label: string): void {
 		throw new Error(`${label} deterministic replay failure controls are missing or out of order`);
 	}
 	for (const control of controls) {
-		if (canonicalJson(control) !== canonicalJson({ name: control.name, ...FAILURE_CONTROL_EXPECTATIONS[control.name] })) {
-			throw new Error(`${label} ${control.name} failure control contradicts its route, provider-call, or store-write evidence`);
+		if (
+			canonicalJson(control) !== canonicalJson({ name: control.name, ...FAILURE_CONTROL_EXPECTATIONS[control.name] })
+		) {
+			throw new Error(
+				`${label} ${control.name} failure control contradicts its route, provider-call, or store-write evidence`,
+			);
 		}
 	}
 }
@@ -4734,7 +4771,7 @@ function validateBaselineSampleEvidence(
 	}
 	const synthetic = frozenClassification === "historical-reconstruction-impossible";
 	const samples = synthetic ? report.syntheticPair?.samples : report.samples;
-	if (!samples || samples.length !== 5 || canonicalJson(samples.map(sample => sample.sample)) !== "[1,2,3,4,5]") {
+	if (samples?.length !== 5 || canonicalJson(samples.map(sample => sample.sample)) !== "[1,2,3,4,5]") {
 		throw new Error(`${label} must contain five executed gating samples`);
 	}
 	if (
@@ -4747,7 +4784,9 @@ function validateBaselineSampleEvidence(
 				typeof sample.fallbackCategory !== "string",
 		)
 	) {
-		throw new Error(`${label} exact physical baseline must dispatch native_fallback with the selected category in every sample`);
+		throw new Error(
+			`${label} exact physical baseline must dispatch native_fallback with the selected category in every sample`,
+		);
 	}
 	for (const sample of samples) {
 		if (!Number.isFinite(sample.cpuMs) || !sample.jobs) throw new Error(`${label} sample lacks CPU or job evidence`);
@@ -4765,7 +4804,9 @@ function validateBaselineSampleEvidence(
 					sample.promptInputTokens !== sample.tokens.candidate ||
 					sample.tokens.candidate > sample.tokens.budget
 				) {
-					throw new Error(`${label} synthetic sample ${sample.sample} has inconsistent Lossless takeover evidence`);
+					throw new Error(
+						`${label} synthetic sample ${sample.sample} has inconsistent Lossless takeover evidence`,
+					);
 				}
 			} else if (sample.status?.route === "native_fallback") {
 				if (!sample.fallbackCategory) {
@@ -4773,7 +4814,9 @@ function validateBaselineSampleEvidence(
 				}
 			} else if (sample.status?.route === "native_passthrough") {
 				if (sample.fallbackCategory !== null) {
-					throw new Error(`${label} synthetic sample ${sample.sample} has inconsistent native passthrough evidence`);
+					throw new Error(
+						`${label} synthetic sample ${sample.sample} has inconsistent native passthrough evidence`,
+					);
 				}
 			} else {
 				throw new Error(`${label} synthetic sample ${sample.sample} has no truthful baseline route evidence`);
@@ -4785,12 +4828,10 @@ function validateBaselineSampleEvidence(
 		samples,
 		label,
 		Boolean(
-			report.fixture.harnessSourceHash &&
-				HISTORICAL_BASELINE_SOURCE_HASHES.has(report.fixture.harnessSourceHash),
+			report.fixture.harnessSourceHash && HISTORICAL_BASELINE_SOURCE_HASHES.has(report.fixture.harnessSourceHash),
 		),
 		frozenClassification,
 	);
-
 }
 function validateSampleEvidence(
 	report: ReplayReport,
@@ -4808,7 +4849,7 @@ function validateSampleEvidence(
 	}
 	const synthetic = frozenClassification === "historical-reconstruction-impossible";
 	const samples = synthetic ? report.syntheticPair?.samples : report.samples;
-	if (!samples || samples.length !== 5) throw new Error(`${label} must contain five executed gating samples`);
+	if (samples?.length !== 5) throw new Error(`${label} must contain five executed gating samples`);
 	if (canonicalJson(samples.map(sample => sample.sample)) !== "[1,2,3,4,5]") {
 		throw new Error(`${label} gating sample ordinals must be exactly 1 through 5`);
 	}
@@ -4842,7 +4883,9 @@ function validateSampleEvidence(
 	for (const sample of samples) {
 		if (!Number.isFinite(sample.cpuMs) || !sample.jobs) throw new Error(`${label} sample lacks CPU or job evidence`);
 		if (canonicalJson(workFor(sample)) !== canonicalJson(expectedWork)) {
-			throw new Error(`${label} sample ${sample.sample} deterministic work counters drifted between prepared clones`);
+			throw new Error(
+				`${label} sample ${sample.sample} deterministic work counters drifted between prepared clones`,
+			);
 		}
 		const expectedKeys = sample.sourceRows.map(row => row.sourceKey);
 		const expectedAttemptScope = synthetic ? report.syntheticPair?.scope.projectId : report.fixture.projectId;
@@ -4864,7 +4907,9 @@ function validateSampleEvidence(
 			sample.status.committed !== true ||
 			sample.status.hasMetrics !== true
 		) {
-			throw new Error(`${label} ${synthetic ? "synthetic " : ""}sample ${sample.sample} did not commit an explicit measured Lossless takeover`);
+			throw new Error(
+				`${label} ${synthetic ? "synthetic " : ""}sample ${sample.sample} did not commit an explicit measured Lossless takeover`,
+			);
 		}
 		if (
 			!sample.tokens ||
@@ -4873,7 +4918,9 @@ function validateSampleEvidence(
 			sample.tokens.candidate > sample.tokens.budget ||
 			sample.tokens.nonMessage < 0
 		) {
-			throw new Error(`${label} ${synthetic ? "synthetic " : ""}sample ${sample.sample} exceeded or contradicted the measured LCM message-token budget`);
+			throw new Error(
+				`${label} ${synthetic ? "synthetic " : ""}sample ${sample.sample} exceeded or contradicted the measured LCM message-token budget`,
+			);
 		}
 		if (sample.providerAttempts !== 0) throw new Error(`${label} sample ${sample.sample} made provider attempts`);
 		if (sample.storeRowsChanged !== 0) {
@@ -4889,7 +4936,9 @@ function validateSampleEvidence(
 			!sample.handles.allMatchStore ||
 			sample.handles.count !== sample.handles.unique
 		) {
-			throw new Error(`${label} sample ${sample.sample} has no exact provider-visible resolved historical handle binding`);
+			throw new Error(
+				`${label} sample ${sample.sample} has no exact provider-visible resolved historical handle binding`,
+			);
 		}
 		if (
 			!sample.postStoreHash ||
@@ -4918,7 +4967,8 @@ async function validateCaptureArtifacts(report: ReplayReport, label: string): Pr
 	const resolvedPath = report.artifacts?.resolvedPrefix;
 	const sourcePath = report.artifacts?.sourceSnapshot;
 	const identity = report.fixture.prefixIdentity;
-	if (!rawPath || !resolvedPath || !sourcePath || !identity) throw new Error(`${label} immutable capture artifacts are missing`);
+	if (!rawPath || !resolvedPath || !sourcePath || !identity)
+		throw new Error(`${label} immutable capture artifacts are missing`);
 	const [raw, resolved, sourceText] = await Promise.all([
 		Bun.file(await assertArtifactPath(rawPath, `${label} raw prefix`, "read")).text(),
 		Bun.file(await assertArtifactPath(resolvedPath, `${label} resolved prefix`, "read")).text(),
@@ -4938,7 +4988,8 @@ async function validateCaptureArtifacts(report: ReplayReport, label: string): Pr
 		throw new Error(`${label} raw prefix is not valid JSONL`);
 	}
 	const marker = entries.findLast(entry => entry.id === report.fixture.markerId);
-	if (!marker || marker.parentId !== report.fixture.parentId) throw new Error(`${label} selected marker identity mismatch`);
+	if (!marker || marker.parentId !== report.fixture.parentId)
+		throw new Error(`${label} selected marker identity mismatch`);
 	const expectedFallback = typeof marker.lcmFallback === "string" ? marker.lcmFallback : undefined;
 	const maintenanceAuthoritative =
 		report.fixture.requestTokensFloor === undefined ||
@@ -5045,7 +5096,10 @@ function assertRetryTriggerBehavior(storePath: string, label: string): void {
 				lease_expires_at = 100, retry_epoch = 1, lease_policy_token = '${policyToken}',
 				lease_mutation_nonce = '${nonce}' WHERE job_id = '__lcm_replay_probe__'`);
 		};
-		expectSqliteRejection(() => claim("wrong-token", "nonce-1"), `${label} accepted a claim under a blocked retry policy`);
+		expectSqliteRejection(
+			() => claim("wrong-token", "nonce-1"),
+			`${label} accepted a claim under a blocked retry policy`,
+		);
 		db.run(`UPDATE summary_retry_policies SET retry_key = 'probe/model', epoch = 1,
 			claim_token = 'claim-token', updated_at = 1 WHERE project_id = '__lcm_replay_probe__'`);
 		expectSqliteRejection(
@@ -5053,7 +5107,10 @@ function assertRetryTriggerBehavior(storePath: string, label: string): void {
 			`${label} accepted a direct leased insert with the wrong policy token`,
 		);
 		insertLeased("claim-token");
-		expectSqliteRejection(() => claim("wrong-token", "nonce-1"), `${label} accepted a claim with the wrong policy token`);
+		expectSqliteRejection(
+			() => claim("wrong-token", "nonce-1"),
+			`${label} accepted a claim with the wrong policy token`,
+		);
 		claim("claim-token", "nonce-1");
 		expectSqliteRejection(
 			() => db.run("UPDATE summary_jobs SET worker_id = 'worker-2' WHERE job_id = '__lcm_replay_probe__'"),
@@ -5165,18 +5222,22 @@ async function validatePristineStoreArtifact(
 ): Promise<{ pristine: SqliteReport; prepared: SqliteReport }> {
 	const recordedPath = report.artifacts?.sqliteSnapshot;
 	const pristine = report.storeEvidence?.pristine;
-	if (!recordedPath || !pristine?.path || !pristine.byteHash || !pristine.logicalHash) throw new Error(`${label} pristine SQLite snapshot path/byte/logical evidence required`);
-	if (path.resolve(recordedPath) !== path.resolve(pristine.path)) throw new Error(`${label} pristine snapshot path mismatch`);
+	if (!recordedPath || !pristine?.path || !pristine.byteHash || !pristine.logicalHash)
+		throw new Error(`${label} pristine SQLite snapshot path/byte/logical evidence required`);
+	if (path.resolve(recordedPath) !== path.resolve(pristine.path))
+		throw new Error(`${label} pristine snapshot path mismatch`);
 	const snapshotPath = await assertArtifactPath(recordedPath, `${label} SQLite snapshot`, "read");
 	const bytes = new Uint8Array(await Bun.file(snapshotPath).arrayBuffer());
-	if (hashBytes(bytes) !== pristine.byteHash || report.fixture.sqliteSnapshotHash !== pristine.byteHash) throw new Error(`${label} pristine snapshot byte hash mismatch`);
+	if (hashBytes(bytes) !== pristine.byteHash || report.fixture.sqliteSnapshotHash !== pristine.byteHash)
+		throw new Error(`${label} pristine snapshot byte hash mismatch`);
 	const store = sqliteReport(
 		snapshotPath,
 		report.fixture.projectId,
 		report.fixture.sessionId,
 		report.fixture.branchId,
 	);
-	if (store.quickCheck !== "ok" || pristine.quickCheck !== "ok") throw new Error(`${label} pristine SQLite quick_check failed`);
+	if (store.quickCheck !== "ok" || pristine.quickCheck !== "ok")
+		throw new Error(`${label} pristine SQLite quick_check failed`);
 	const legacyNormalizer = Boolean(
 		report.fixture.harnessSourceHash && HISTORICAL_BASELINE_SOURCE_HASHES.has(report.fixture.harnessSourceHash),
 	);
@@ -5271,18 +5332,16 @@ async function validateSyntheticPairArtifact(
 	}
 }
 
-
 async function validateCancellationControlArtifact(report: ReplayReport, label: string): Promise<void> {
 	const control = report.cancellationControl;
 	if (!control) return;
-	const templatePath = await assertArtifactPath(control.templatePath, `${label} cancellation control template`, "read");
-	const bytes = new Uint8Array(await Bun.file(templatePath).arrayBuffer());
-	const store = sqliteReport(
-		templatePath,
-		control.scope.projectId,
-		control.scope.sessionId,
-		control.scope.branchId,
+	const templatePath = await assertArtifactPath(
+		control.templatePath,
+		`${label} cancellation control template`,
+		"read",
 	);
+	const bytes = new Uint8Array(await Bun.file(templatePath).arrayBuffer());
+	const store = sqliteReport(templatePath, control.scope.projectId, control.scope.sessionId, control.scope.branchId);
 	if (
 		hashBytes(bytes) !== control.templateEvidence.byteHash ||
 		!templateEvidenceMatchesStore(store, control.templateEvidence, false) ||
@@ -5301,13 +5360,9 @@ function comparisonResult(
 		baseline.fixture.reconstruction.baselineEligibility?.classification ??
 		baseline.fixture.reconstruction.classification;
 	const syntheticMigration =
-		frozen === "historical-reconstruction-impossible"
-			? harnessCompatibility?.syntheticWorkloadMigration
-			: undefined;
+		frozen === "historical-reconstruction-impossible" ? harnessCompatibility?.syntheticWorkloadMigration : undefined;
 	const qualificationCandidate =
-		frozen === "historical-reconstruction-impossible"
-			? candidate.syntheticPair!.samples[0]!
-			: candidate.samples[0]!;
+		frozen === "historical-reconstruction-impossible" ? candidate.syntheticPair!.samples[0]! : candidate.samples[0]!;
 	const result = {
 		harnessSchema: candidate.harnessSchema,
 		workloadFingerprint: candidate.workloadFingerprint,
@@ -5372,7 +5427,9 @@ export async function compareReplayReports(
 	baseline: ReplayReport,
 	candidate: ReplayReport,
 ): Promise<Record<string, unknown>> {
-	const frozen = baseline.fixture.reconstruction.baselineEligibility?.classification ?? baseline.fixture.reconstruction.classification;
+	const frozen =
+		baseline.fixture.reconstruction.baselineEligibility?.classification ??
+		baseline.fixture.reconstruction.classification;
 	validateBaselineSampleEvidence(baseline, "baseline", frozen);
 	validateSampleEvidence(candidate, "candidate", frozen);
 	validateCancellationControl(baseline, "baseline", false);
@@ -5457,11 +5514,13 @@ async function compare(options: CompareOptions): Promise<Record<string, unknown>
 	const candidate = JSON.parse(new TextDecoder().decode(candidateBytes)) as ReplayReport;
 	const declaration = harnessCompatibilityManifest.pairs.find(
 		pair =>
-			pair.baseline === baseline.fixture.harnessSourceHash &&
-			pair.candidate === candidate.fixture.harnessSourceHash,
+			pair.baseline === baseline.fixture.harnessSourceHash && pair.candidate === candidate.fixture.harnessSourceHash,
 	);
 	if (!declaration) throw new Error("comparison requires a manifest-declared historical baseline report");
-	const declaredPath = lexicalArtifactPath(path.resolve(REPO_ROOT, declaration.baselineArtifact.path), "historical baseline");
+	const declaredPath = lexicalArtifactPath(
+		path.resolve(REPO_ROOT, declaration.baselineArtifact.path),
+		"historical baseline",
+	);
 	const [actualPath, expectedPath] = await Promise.all([fs.realpath(options.baseline), fs.realpath(declaredPath)]);
 	if (actualPath !== expectedPath || hashBytes(baselineBytes) !== declaration.baselineArtifact.sha256) {
 		throw new Error("comparison requires the immutable manifest-declared historical baseline artifact");

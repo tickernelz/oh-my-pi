@@ -109,6 +109,8 @@ async function createContext() {
 	const handleBtwCopyKey = vi.fn(async () => true);
 	const canBranchBtw = vi.fn(() => false);
 	const canCopyBtw = vi.fn(() => false);
+	const hasActiveBtw = vi.fn(() => false);
+	const handlesBtwBranchKey = vi.fn(() => false);
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
@@ -210,7 +212,8 @@ async function createContext() {
 		toggleThinkingBlockVisibility: vi.fn(),
 		showModelSelector,
 		updateEditorBorderColor: vi.fn(),
-		hasActiveBtw: vi.fn(() => false),
+		hasActiveBtw,
+		handlesBtwBranchKey,
 		handleBtwBranchKey,
 		canBranchBtw,
 		canCopyBtw,
@@ -242,6 +245,8 @@ async function createContext() {
 			handleBtwBranchKey,
 			addInputListener,
 			canBranchBtw,
+			hasActiveBtw,
+			handlesBtwBranchKey,
 			handleBtwCopyKey,
 			canCopyBtw,
 			showError,
@@ -392,7 +397,7 @@ describe("InputController keybinding setup", () => {
 
 	it("routes b to branch a branchable /btw panel", async () => {
 		const { InputController, ctx, spies } = await createContext();
-		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		spies.handlesBtwBranchKey.mockReturnValue(true);
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -406,7 +411,7 @@ describe("InputController keybinding setup", () => {
 
 	it("lets b fall through while the editor has draft text", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		spies.handlesBtwBranchKey.mockReturnValue(true);
 		editor.setText("build a branch");
 		const controller = new InputController(ctx);
 
@@ -419,8 +424,23 @@ describe("InputController keybinding setup", () => {
 		expect(spies.handleBtwBranchKey).not.toHaveBeenCalled();
 	});
 
-	it("lets b fall through when /btw is not branchable", async () => {
+	it("consumes b while a completed /btw branch is unavailable", async () => {
 		const { InputController, ctx, spies } = await createContext();
+		spies.handlesBtwBranchKey.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const listener = spies.addInputListener.mock.calls[1]?.[0];
+		expect(listener).toBeDefined();
+		const result = listener?.("b");
+
+		expect(result).toEqual({ consume: true });
+		expect(spies.handleBtwBranchKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets b reach the composer before an active /btw answer is branchable", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		spies.hasActiveBtw.mockReturnValue(true);
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -434,7 +454,7 @@ describe("InputController keybinding setup", () => {
 
 	it("lets b fall through while another input is focused", async () => {
 		const { InputController, ctx, setFocused, spies } = await createContext();
-		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		spies.handlesBtwBranchKey.mockReturnValue(true);
 		setFocused({ pasteText: vi.fn() });
 		const controller = new InputController(ctx);
 

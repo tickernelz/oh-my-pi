@@ -1,3 +1,4 @@
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentIdentity,
 	AgentTelemetryConfig,
@@ -7,7 +8,6 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import { escapeXmlAttribute, escapeXmlText } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import adviseDescription from "../prompts/advisor/advise-tool.md" with { type: "text" };
 
 const adviseSchema = type({

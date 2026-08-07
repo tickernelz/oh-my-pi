@@ -1,5 +1,5 @@
 import { jsonSchemaToTypeScript, toolWireSchema } from "../utils/schema";
-import { renderToolExamples } from "./examples";
+import { renderToolExamplesJsdoc } from "./examples";
 import type { InbandTool } from "./types";
 
 /**
@@ -18,7 +18,7 @@ export function renderToolInventory(tools: readonly InbandTool[]): string {
 		if (description) {
 			for (const line of description.split("\n")) lines.push(`// ${line}`.trimEnd());
 		}
-		const examples = renderToolExamples(tool);
+		const examples = renderToolExamplesJsdoc(tool);
 		if (examples) {
 			if (description) lines.push("//");
 			for (const line of examples.split("\n")) lines.push(`// ${line}`.trimEnd());

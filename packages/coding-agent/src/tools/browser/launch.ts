@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, getPuppeteerDir, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
-import type * as BrowsersNs from "@puppeteer/browsers";
+import type * as BrowsersNs from "@oh-my-pi/pi-utils/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
 import stealthActivityScript from "../puppeteer/01_stealth_activity.txt" with { type: "text" };
@@ -115,15 +115,15 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 let browsersModule: typeof BrowsersNs | undefined;
 async function loadBrowsers(): Promise<typeof BrowsersNs> {
 	if (!browsersModule) {
-		browsersModule = await import("@puppeteer/browsers");
+		browsersModule = await import("@oh-my-pi/pi-utils/browsers");
 	}
 	return browsersModule;
 }
 
 /**
- * Resolve the Chromium executable puppeteer will launch, lazily downloading it
- * on first use via @puppeteer/browsers. Skipped when a system Chromium (NixOS)
- * or PUPPETEER_EXECUTABLE_PATH is set. The browser is cached under
+ * Resolve the Chromium executable puppeteer will launch, honoring
+ * PUPPETEER_EXECUTABLE_PATH before system browser detection and lazily
+ * downloading Chromium otherwise. The browser is cached under
  * ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when platform
  * detection fails (puppeteer default resolution takes over). Exported so
  * real-browser tests can probe launchability and skip on hosts missing
@@ -131,10 +131,10 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 export async function ensureChromiumExecutable(): Promise<string | undefined> {
-	const sysChrome = resolveSystemChromium();
-	if (sysChrome) return sysChrome;
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
+	const sysChrome = await resolveSystemChromium();
+	if (sysChrome) return sysChrome;
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
 	chromiumExecutablePromise = (async () => {
@@ -166,13 +166,13 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 			buildId,
 			cacheDir,
 			platform,
-			downloadProgressCallback: (downloaded, total) => {
-				if (total <= 0) return;
-				const pct = Math.floor((downloaded / total) * 100);
-				if (pct >= lastReportedPercent + 10 || downloaded === total) {
+			downloadProgressCallback: ({ downloadedBytes, totalBytes }) => {
+				if (totalBytes <= 0) return;
+				const pct = Math.floor((downloadedBytes / totalBytes) * 100);
+				if (pct >= lastReportedPercent + 10 || downloadedBytes === totalBytes) {
 					lastReportedPercent = pct;
 					logger.debug(
-						`Chromium download: ${pct}% (${Math.round(downloaded / 1_000_000)} / ${Math.round(total / 1_000_000)} MB)`,
+						`Chromium download: ${pct}% (${Math.round(downloadedBytes / 1_000_000)} / ${Math.round(totalBytes / 1_000_000)} MB)`,
 					);
 				}
 			},
@@ -193,16 +193,47 @@ let resolvedChromium: string | null | undefined; // undefined = unchecked; null 
 function isExecutableFile(p: string): boolean {
 	try {
 		const st = fs.statSync(p);
-		return st.isFile();
+		if (!st.isFile()) return false;
+		if (process.platform === "win32") return true;
+		fs.accessSync(p, fs.constants.X_OK);
+		return true;
 	} catch {
 		return false;
 	}
 }
 
-function systemChromiumCandidates(): string[] {
-	const home = os.homedir();
+async function isChromiumExecutable(p: string): Promise<boolean> {
+	if (!isExecutableFile(p)) return false;
+	try {
+		const probeTimeoutMs = 3000;
+		const proc = Bun.spawn([p, "--version"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			signal: AbortSignal.timeout(probeTimeoutMs),
+			killSignal: "SIGKILL",
+		});
+		const stdout = await Promise.race([
+			new Response(proc.stdout).text(),
+			Bun.sleep(probeTimeoutMs + 500).then(() => null),
+		]);
+		if (stdout === null) return false;
+		await proc.exited;
+		return proc.exitCode === 0 && /Chrom|Edg/i.test(stdout);
+	} catch {
+		return false;
+	}
+}
+
+/** Flatpak application id published by the Ungoogled Chromium project. */
+const UNGOOGLED_CHROMIUM_FLATPAK_ID = "io.github.ungoogled_software.ungoogled_chromium";
+
+function systemChromiumCandidates(
+	platform: NodeJS.Platform = process.platform,
+	home = os.homedir(),
+	which: (name: string) => string | null | undefined = $which,
+): string[] {
 	const candidates: string[] = [];
-	switch (process.platform) {
+	switch (platform) {
 		case "darwin": {
 			for (const root of ["/Applications", path.join(home, "Applications")]) {
 				candidates.push(
@@ -219,7 +250,7 @@ function systemChromiumCandidates(): string[] {
 		case "linux": {
 			const names = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"];
 			for (const name of names) {
-				const found = $which(name);
+				const found = which(name);
 				if (found) candidates.push(found);
 			}
 			candidates.push(
@@ -238,6 +269,19 @@ function systemChromiumCandidates(): string[] {
 			if (onNixos) {
 				candidates.push(path.join(home, ".nix-profile/bin/chromium"), "/run/current-system/sw/bin/chromium");
 			}
+			for (const name of ["ungoogled-chromium", "ungoogled-chromium-browser"]) {
+				const found = which(name);
+				if (found) candidates.push(found);
+			}
+			candidates.push(
+				// Ungoogled Chromium. Distro and AUR packages that keep the plain
+				// `chromium` name are already covered above; these are the paths
+				// unique to it, including the system and per-user Flatpak shims.
+				"/usr/bin/ungoogled-chromium",
+				"/usr/bin/ungoogled-chromium-browser",
+				`/var/lib/flatpak/exports/bin/${UNGOOGLED_CHROMIUM_FLATPAK_ID}`,
+				path.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
+			);
 			break;
 		}
 		case "win32": {
@@ -259,13 +303,13 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-function resolveSystemChromium(): string | undefined {
+async function resolveSystemChromium(): Promise<string | undefined> {
 	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
 	const seen = new Set<string>();
 	for (const candidate of systemChromiumCandidates()) {
 		if (!candidate || seen.has(candidate)) continue;
 		seen.add(candidate);
-		if (isExecutableFile(candidate)) {
+		if (await isChromiumExecutable(candidate)) {
 			resolvedChromium = candidate;
 			logger.debug("Using system Chrome/Chromium", { path: candidate });
 			return candidate;
@@ -864,6 +908,19 @@ export async function applyStealthPatches(
 	await configureUserAgentTargets(browser, targetState);
 	state.browserSession = targetState.browserSession;
 	await injectStealthScripts(page);
+}
+
+/** Exposes executable candidates for detection tests. */
+export function systemChromiumCandidatesForTest(
+	platform: NodeJS.Platform = process.platform,
+	home?: string,
+	which?: (name: string) => string | null | undefined,
+): string[] {
+	return systemChromiumCandidates(platform, home, which);
+}
+
+export async function chromiumExecutableProbeForTest(executablePath: string): Promise<boolean> {
+	return isChromiumExecutable(executablePath);
 }
 
 export function stealthIgnoreDefaultArgsForTest(executablePath: string | undefined): string[] {

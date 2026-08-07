@@ -7,6 +7,7 @@ import {
 	formatHashlineHeader,
 	MismatchError as HashlineMismatchError,
 } from "@oh-my-pi/hashline";
+import { type Type, type } from "@oh-my-pi/omptype";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	canonicalSnapshotKey,
@@ -19,7 +20,6 @@ import {
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { type Type, type } from "arktype";
 
 beforeAll(async () => {
 	resetSettingsForTest();

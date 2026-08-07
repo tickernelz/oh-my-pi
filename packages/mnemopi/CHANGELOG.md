@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [17.2.10] - 2026-08-06
+
+### Changed
+
+- Updated internal LRU cache implementation.
+
+## [17.2.6] - 2026-08-03
+
+### Added
+
+- Added opt-in SQLite page-size configuration for file-backed databases, configurable via the `MNEMOPI_DB_PAGE_SIZE` environment variable or the `pageSize` option in `openDatabase`. Existing databases retain their original page size.
+
 ## [17.2.3] - 2026-08-01
 
 ### Fixed

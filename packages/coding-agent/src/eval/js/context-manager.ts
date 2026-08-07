@@ -8,6 +8,7 @@ import {
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
+import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
 import { attachSessionOwner, resolveOwnerScopedSessionKey, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
@@ -48,6 +49,26 @@ interface PendingRun {
 	resolve(value: { value: unknown }): void;
 	reject(error: Error): void;
 	toolCalls: Map<string, AbortController>;
+	/**
+	 * Host calls currently inside a `deferExternalAbort` phase — `agent()`
+	 * isolation worktree setup and merge/cherry-pick, which ignore their abort
+	 * once started. Settling the run while one is live would return the cell on
+	 * top of a git operation still rewriting the repo, so the abort path drains
+	 * this first. Mirrors the Python bridge's shielded-signal contract.
+	 */
+	deferDepth: number;
+	/** Resolves once {@link deferDepth} falls back to zero. */
+	deferDrained?: PromiseWithResolvers<void>;
+	/** Set once the turn was cancelled; blocks new bridge calls during the drain. */
+	aborted: boolean;
+	/**
+	 * A worker `result` withheld because the cell still has bridge calls in
+	 * flight. `#runOne` reports a finished run without awaiting its pending
+	 * tools, so a floated or caught `agent()` would otherwise settle the run —
+	 * tearing down the abort listener — while the subagent kept going with
+	 * nothing left able to cancel it. Delivered once the last call drains.
+	 */
+	heldResult?: Extract<WorkerOutbound, { type: "result" }>;
 	settled: boolean;
 }
 
@@ -267,6 +288,8 @@ async function runOnce(
 		resolve,
 		reject,
 		toolCalls: new Map(),
+		deferDepth: 0,
+		aborted: false,
 		settled: false,
 	};
 	session.pending.set(runId, pending);
@@ -274,9 +297,21 @@ async function runOnce(
 	const onAbort = (): void => {
 		const reason = options.runState.signal?.reason;
 		const abortError = reasonToError(reason, "Execution aborted");
-		// Cancel any in-flight tool calls first.
+		// Stop delegated work at once — this is what kills spawned subagents —
+		// and refuse further bridge calls so the drain below stays bounded to
+		// phases that had already started.
+		pending.aborted = true;
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(abortError);
-		// Hard-kill the worker — only way to interrupt synchronous user code.
+		// A critical host phase ignores its abort once started (isolation
+		// worktree setup, merge/cherry-pick). Killing the worker now would
+		// settle the cell on top of a git operation still in progress, so wait
+		// for it. Hard-kill is still the only way to interrupt synchronous user
+		// code, hence it stays the terminal step either way.
+		const drained = pending.deferDepth > 0 ? pending.deferDrained?.promise : undefined;
+		if (drained) {
+			void drained.then(() => killSessionFor(session, abortError, { force: true }));
+			return;
+		}
 		void killSessionFor(session, abortError, { force: true });
 	};
 
@@ -458,6 +493,25 @@ function handleSessionMessage(session: JsSession, msg: WorkerOutbound): void {
 	}
 }
 
+/**
+ * Maintain {@link PendingRun.deferDepth} from the bridge's pause/resume status
+ * events so an abort can wait out a critical `agent()` phase instead of
+ * settling the cell over a half-applied merge.
+ */
+function trackDeferPhase(pending: PendingRun, event: JsStatusEvent): void {
+	if (event.deferExternalAbort !== true) return;
+	if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
+		pending.deferDepth++;
+		pending.deferDrained ??= Promise.withResolvers<void>();
+		return;
+	}
+	if (event.op !== EVAL_TIMEOUT_RESUME_OP || pending.deferDepth === 0) return;
+	pending.deferDepth--;
+	if (pending.deferDepth > 0) return;
+	pending.deferDrained?.resolve();
+	pending.deferDrained = undefined;
+}
+
 async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, { type: "tool-call" }>): Promise<void> {
 	const pending = session.pending.get(msg.runId);
 	if (!pending) {
@@ -468,31 +522,65 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 		});
 		return;
 	}
+	if (pending.aborted) {
+		safeSend(session, {
+			type: "tool-reply",
+			id: msg.id,
+			reply: { ok: false, error: { message: "Run was interrupted" } },
+		});
+		return;
+	}
 	const ctrl = new AbortController();
 	pending.toolCalls.set(msg.id, ctrl);
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
 			signal: ctrl.signal,
-			emitStatus: (event: JsStatusEvent) => pending.runState.onDisplay?.({ type: "status", event }),
+			emitStatus: (event: JsStatusEvent) => {
+				trackDeferPhase(pending, event);
+				pending.runState.onDisplay?.({ type: "status", event });
+			},
 		});
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
 	} catch (error) {
 		safeSend(session, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });
 	} finally {
 		pending.toolCalls.delete(msg.id);
+		// Last call of a run whose worker result was withheld: settle it now.
+		const held = pending.heldResult;
+		if (held && !pending.settled && !pending.aborted && pending.toolCalls.size === 0) {
+			finishPending(pending, held);
+		}
 	}
 }
 
-function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: "result" }>): void {
-	const pending = session.pending.get(msg.runId);
-	if (!pending || pending.settled) return;
+/** Deliver a worker `result` to the waiting {@link runOnce}. */
+function finishPending(pending: PendingRun, msg: Extract<WorkerOutbound, { type: "result" }>): void {
 	pending.settled = true;
+	pending.heldResult = undefined;
 	if (msg.ok) {
 		pending.resolve({ value: undefined });
 		return;
 	}
 	pending.reject(errorFromPayload(msg.error));
+}
+
+function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: "result" }>): void {
+	const pending = session.pending.get(msg.runId);
+	if (!pending || pending.settled) return;
+	// Once the turn is cancelled the scheduled kill is the sole settler, so a
+	// late worker result can't cut the abort drain short.
+	if (pending.aborted) return;
+	// A cell owns every bridge call it starts. The worker finishes a run without
+	// awaiting its outstanding tool calls, so `agent(...)` that is floated or
+	// caught would settle the run here — `runOnce` then drops the abort listener
+	// and the pending entry, leaving the subagent running with nothing able to
+	// cancel it. Hold the result until the last call drains.
+	if (pending.toolCalls.size > 0) {
+		pending.heldResult = msg;
+		return;
+	}
+	finishPending(pending, msg);
 }
 
 async function killSessionFor(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {

@@ -545,6 +545,28 @@ describe("github copilot tiered context windows", () => {
 		expect(variant?.cost).toEqual({ input: 4, output: 18, cacheRead: 0.4, cacheWrite: 0 });
 	});
 
+	it("prices the base model from its default tier", async () => {
+		const { models } = await discoverCopilotModels({
+			data: [
+				tieredCopilotEntry({
+					id: "gpt-5.6-luna",
+					name: "GPT-5.6 Luna",
+					window: 1_050_000,
+					maxOutput: 50_000,
+					defaultContextMax: 200_000,
+					longContextMax: 1_000_000,
+					defaultPrices: { input: 20, output: 120, cache: 2 },
+					longPrices: { input: 40, output: 180, cache: 4 },
+				}),
+			],
+		});
+
+		const base = models.find(candidate => candidate.id === "gpt-5.6-luna");
+		expect(base?.cost).toMatchObject({ input: 0.2, output: 1.2, cacheRead: 0.02 });
+		const variant = models.find(candidate => candidate.id === "gpt-5.6-luna-1m");
+		expect(variant?.cost).toMatchObject({ input: 0.4, output: 1.8, cacheRead: 0.04 });
+	});
+
 	it("keeps legacy tier-capped responses unchanged and synthesizes no variant", async () => {
 		const { models } = await discoverCopilotModels({
 			data: [

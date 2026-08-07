@@ -106,6 +106,7 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
+		expect(header?.previousSessionFiles).toEqual([path.resolve(oldFile)]);
 		expect(hasAssistantEntry(entries)).toBe(true);
 	});
 
@@ -148,6 +149,7 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
+		expect(header?.previousSessionFiles).toBeUndefined();
 	});
 
 	it("recreates file from memory when old file is deleted (assistant exists)", async () => {

@@ -5,7 +5,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	compareDownstreamVersions,
 	DOWNSTREAM_INSTALL_COMMAND,
 	selectLatestDownstreamRelease,
 } from "@oh-my-pi/pi-coding-agent/cli/downstream-release";
@@ -25,7 +24,7 @@ import {
 import Update from "@oh-my-pi/pi-coding-agent/commands/update";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { CliConfig } from "@oh-my-pi/pi-utils/cli";
-import { resolveBuildProvenance } from "@oh-my-pi/pi-utils/version";
+import { compareVersions, resolveBuildProvenance } from "@oh-my-pi/pi-utils/version";
 
 const tempDirs: string[] = [];
 
@@ -128,9 +127,9 @@ describe("downstream version provenance", () => {
 
 describe("downstream release selection", () => {
 	it("orders numeric LCM revisions and upstream versions with SemVer precedence", () => {
-		expect(compareDownstreamVersions("17.1.3-lcm.10", "17.1.3-lcm.9")).toBeGreaterThan(0);
-		expect(compareDownstreamVersions("17.2.0-lcm.1", "17.1.99-lcm.999")).toBeGreaterThan(0);
-		expect(compareDownstreamVersions("17.1.3-lcm.7", "17.1.3-lcm.7")).toBe(0);
+		expect(compareVersions("17.1.3-lcm.10", "17.1.3-lcm.9")).toBeGreaterThan(0);
+		expect(compareVersions("17.2.0-lcm.1", "17.1.99-lcm.999")).toBeGreaterThan(0);
+		expect(compareVersions("17.1.3-lcm.7", "17.1.3-lcm.7")).toBe(0);
 	});
 
 	it("selects the highest downstream prerelease and ignores drafts, development, or upstream-shaped tags", () => {

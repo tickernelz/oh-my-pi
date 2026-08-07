@@ -1,5 +1,12 @@
-import { LRUCache } from "lru-cache/raw";
-import { Lexer, Marked, type Token, Tokenizer, type TokenizerAndRendererExtension, type Tokens } from "marked";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import {
+	Lexer,
+	Marked,
+	type Token,
+	Tokenizer,
+	type TokenizerAndRendererExtension,
+	type Tokens,
+} from "@oh-my-pi/pi-utils/marked";
 import { latexToBlock } from "../latex-block";
 import { inlineMathSpanEnd, isBareMathEnvironment, latexToUnicode } from "../latex-to-unicode";
 import type { SymbolTheme } from "../symbols";
@@ -804,11 +811,11 @@ markdownParser.use({
 // (no `m` flag), and stickiness only removes the futile later attempts. The
 // flags/anchor guard below skips any rule a future marked version changes.
 class AnchoredAtZero extends RegExp {
-	exec(str: string): RegExpExecArray | null {
+	override exec(str: string): RegExpExecArray | null {
 		this.lastIndex = 0; // sticky matches set lastIndex; rules are shared
 		return super.exec(str);
 	}
-	test(str: string): boolean {
+	override test(str: string): boolean {
 		this.lastIndex = 0;
 		return super.test(str);
 	}
@@ -2816,7 +2823,13 @@ export class Markdown implements Component, NativeScrollbackCommittedRows, Nativ
 		while (wrapped.length > 1 && wrapped[wrapped.length - 1] === "") {
 			wrapped.pop();
 		}
-		return wrapped;
+		// The native wrap deliberately leaves fg color and bold/italic open at
+		// line ends so continuation lines can re-open them. Table rows splice
+		// every cell line between unstyled border glyphs, so an open style
+		// (e.g. mdCode) would bleed into the "│" and the following cells.
+		// Terminate each line at default fg, clearing bold/italic but keeping
+		// any ambient background (message-bg rendering) intact.
+		return wrapped.map(line => `${line}\x1b[22m\x1b[23m\x1b[39m`);
 	}
 
 	/**

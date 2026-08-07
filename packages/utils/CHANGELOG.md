@@ -11,6 +11,48 @@
 - Path containment now treats dot-prefixed child names such as `..cache` as in-root while still rejecting actual parent traversal.
 - Added a `postmortem.quit` configuration option to safely handle shutdown paths when the terminal output has already disconnected.
 - Fixed `extractRetryHint` to honor the longest valid delay across retry headers, formatted markers, and prose hints instead of stopping at the first match.
+### Fixed
+
+- Fixed the in-house `marked` list tokenizer still consuming a trailing blank run into the list token at end of input (17.2.10 fixed only the mid-document case). `- item\n\n` now lexes as a tight list plus a `space` token, matching real marked, instead of a loose list whose raw includes the blank.
+
+## [17.2.10] - 2026-08-06
+
+### Added
+
+- Introduced zero-dependency in-house modules replacing external packages, importable via `@oh-my-pi/pi-utils/<module>`: `acp` (Agent Client Protocol), `browsers` (Chrome for Testing discovery/install), `chalk` (ANSI styling), `dates` (date formatting), `dom` (HTML parser, WHATWG DOM subset, and CSS selectors), `docx` (DOCX to HTML), `headers` (browser header generation), `lru` (LRU cache), `marked` (GFM markdown lexer/parser), `readability` (article extraction), `template` (Handlebars-compatible templating), `turndown` (HTML to Markdown), `vterm` (headless terminal emulator), and `xml` (XML parser).
+- Added postmortem fatal recovery hint providers to allow applications to print actionable recovery commands before cleanup starts.
+
+### Changed
+
+- Rewrote the logger file backend in-house, maintaining the identical line format, daily rotation, and pruning behavior without external dependencies.
+
+### Fixed
+
+- Fixed PowerShell (`powershell.exe` / `pwsh`) support when used as a custom `shellPath` by correctly passing `-NoLogo -Command` (and `-NoProfile` under `PI_BASH_NO_LOGIN`) instead of POSIX flags.
+- Fixed the in-house `marked` list tokenizer consuming the trailing blank line into the list token when the next top-level line was a plain paragraph. The blank now always becomes a separate `space` token (matching real marked), so a list's token shape no longer depends on what follows it — restoring the TUI streaming lexer's freeze invariant — and a list followed by a paragraph is tight, not loose, per CommonMark.
+- Added the missing Handlebars built-in `lookup` helper to the in-house `template` engine (`{{lookup obj key}}`, proto-safe property access; a user-registered `lookup` helper still takes precedence).
+
+### Removed
+
+- Removed external dependencies on `handlebars`, `winston`, and `winston-daily-rotate-file`.
+
+## [17.2.9] - 2026-08-05
+
+### Added
+
+- Added a public `compareVersions` utility (`@oh-my-pi/pi-utils`) that compares two version strings with SemVer-2.0 prerelease ordering, build-metadata stripping, and numeric segment comparison without float overflow; never throws.
+
+### Fixed
+
+- Honor the current process `PATH` when caching executable lookups, preventing stale tool paths after environment reloads.
+- Parsed account-cap reset windows such as “Your limit will reset in 13 minutes” so credential backoff honors the provider's full reset duration.
+
+## [17.2.6] - 2026-08-03
+
+### Added
+
+- Added a shared `file-lock` utility backed by process-owned native OS locks with automatic crash release and bounded asynchronous retry.
+
 ## [17.2.5] - 2026-08-03
 
 ### Added

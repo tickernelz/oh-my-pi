@@ -91,4 +91,28 @@ describe("extractRetryHint", () => {
 		const headers = new Headers({ "retry-after": "120", "x-ratelimit-reset-after": "30" });
 		expect(extractRetryHint(headers, "retry-after-ms=1000; try again in 1 hour")).toBe(60 * 60_000);
 	});
+
+	// Devin returns HTTP 403 with "Your limit will reset in 13 minutes" for an
+	// account-scoped message rate cap. Without recognizing "will reset in", the
+	// credential is blocked for the 1-minute default instead of 13 minutes and
+	// can be reselected and hammered while the cap remains active.
+	it("parses Devin 'Your limit will reset in 13 minutes' as 13 minutes", () => {
+		expect(extractRetryHint(undefined, "Your limit will reset in 13 minutes")).toBe(13 * 60_000);
+	});
+
+	it("parses bare 'reset in 13 minutes' phrasing", () => {
+		expect(extractRetryHint(undefined, "reset in 13 minutes")).toBe(13 * 60_000);
+	});
+
+	it("parses 'will reset in 2h' phrasing", () => {
+		expect(extractRetryHint(undefined, "will reset in 2h")).toBe(2 * 60 * 60_000);
+	});
+
+	// A quota body can carry both a generic retry hint and the account reset
+	// window ("Please retry in 5s. Your limit will reset in 13 minutes"). The
+	// account-reset hint must take precedence so the exhausted credential stays
+	// blocked for the full stated window instead of the short generic retry.
+	it("prefers the account reset window over a shorter retry hint", () => {
+		expect(extractRetryHint(undefined, "Please retry in 5s. Your limit will reset in 13 minutes")).toBe(13 * 60_000);
+	});
 });

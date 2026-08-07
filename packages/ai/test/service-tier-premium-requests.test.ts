@@ -78,14 +78,17 @@ describe("resolveModelServiceTier", () => {
 });
 
 describe("shouldSendServiceTier", () => {
-	it("sends every tier on the OpenAI family and supported tiers elsewhere", () => {
+	it("sends every explicit tier on the OpenAI family, omits auto, supported tiers elsewhere", () => {
 		for (const p of ["openai", "openai-codex"] as const) {
 			expect(shouldSendServiceTier("flex", p)).toBe(true);
 			expect(shouldSendServiceTier("scale", p)).toBe(true);
 			expect(shouldSendServiceTier("priority", p)).toBe(true);
 			expect(shouldSendServiceTier("default", p)).toBe(true);
-			expect(shouldSendServiceTier("auto", p)).toBe(true);
+			// `auto` is OpenAI's implicit default and the Codex endpoint rejects it — never sent.
+			expect(shouldSendServiceTier("auto", p)).toBe(false);
 		}
+		expect(shouldSendServiceTier("auto", codex)).toBe(false);
+		expect(shouldSendServiceTier("auto", customOpenAI)).toBe(false);
 		expect(shouldSendServiceTier("flex", "openrouter")).toBe(true);
 		expect(shouldSendServiceTier("default", "openrouter")).toBe(false);
 		expect(shouldSendServiceTier("priority", customCodex)).toBe(true);

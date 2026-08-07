@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,7 +10,11 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { applyLlamaCppQwenThinking, discoveryProbeTimeoutMs } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
+import {
+	applyLlamaCppQwenThinking,
+	discoverOllamaModels,
+	discoveryProbeTimeoutMs,
+} from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -1161,6 +1165,41 @@ describe("ModelRegistry runtime discovery", () => {
 		expect((plain?.compat as DialectFields | undefined)?.reasoningDisableMode).not.toBe("qwen-template-false");
 	});
 
+	test("discovery timeout rejects even when fetch ignores abort", async () => {
+		vi.useFakeTimers();
+		try {
+			const pending = Promise.withResolvers<Response>();
+			let outcome: string | undefined;
+			void discoverOllamaModels(
+				{
+					provider: "ollama",
+					api: "openai-responses",
+					baseUrl: "http://127.0.0.1:11434",
+					discovery: { type: "ollama", timeoutMs: 25 },
+					optional: true,
+				},
+				{
+					fetch: () => pending.promise,
+					getBearerApiKeyResolver: async () => undefined,
+				},
+			).then(
+				() => {
+					outcome = "resolved";
+				},
+				error => {
+					outcome = error instanceof DOMException ? error.name : String(error);
+				},
+			);
+
+			vi.advanceTimersByTime(25);
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+
+			expect(outcome).toBe("TimeoutError");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("configured provider discovery accepts timeoutMs and passes it to probes", async () => {
 		const customConfigPath = path.join(tempDir, "models.yml");
 		fs.writeFileSync(
@@ -2131,6 +2170,80 @@ providers:
 		const unknown = registry.find("openai-test", "unknown-proxy-model");
 		expect(unknown?.contextWindow).toBe(128000);
 		expect(unknown?.reasoning).toBe(false);
+	});
+
+	test("openai-models-list discovery reads server-advertised input modalities for ids absent from the catalog", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9996",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9996/v1/models") {
+				// Custom virtual tier ids that are absent from the bundled
+				// catalog: their vision support can only come from the server row.
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "high", object: "model", input: ["text", "image"] },
+							{ id: "leftover", object: "model", architecture: { input_modalities: ["text", "image"] } },
+							{ id: "synthetic-tier", object: "model", input_modalities: ["text", "image"] },
+							{ id: "low", object: "model", input: ["text"] },
+							{ id: "medium", object: "model" },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		// Direct `input`, top-level `input_modalities`, and OpenRouter-style
+		// `architecture.input_modalities` all surface vision support.
+		expect(registry.find("openai-test", "high")?.input).toEqual(["text", "image"]);
+		expect(registry.find("openai-test", "leftover")?.input).toEqual(["text", "image"]);
+		expect(registry.find("openai-test", "synthetic-tier")?.input).toEqual(["text", "image"]);
+		// Server explicitly reports text-only; no image support invented.
+		expect(registry.find("openai-test", "low")?.input).toEqual(["text"]);
+		// Silent server → default text-only fallback.
+		expect(registry.find("openai-test", "medium")?.input).toEqual(["text"]);
+	});
+
+	test("lm-studio discovery keeps native VLM modalities over a thin OpenAI row", async () => {
+		writeRawModelsJson({
+			"lm-studio-test": {
+				baseUrl: "http://127.0.0.1:9995",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "lm-studio" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9995/v1/models") {
+				return new Response(JSON.stringify({ data: [{ id: "local-vlm", object: "model", input: ["text"] }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:9995/api/v0/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "local-vlm", type: "vlm", capabilities: ["vision"], state: "loaded" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("lm-studio-test", "local-vlm")?.input).toEqual(["text", "image"]);
 	});
 
 	test("proxy discovery honors API-reported context_length and endpoint routing", async () => {

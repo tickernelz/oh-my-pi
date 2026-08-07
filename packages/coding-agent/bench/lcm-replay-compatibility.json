@@ -3,8 +3,8 @@
 	"pairs": [
 		{
 			"baseline": "da43b5239ee196a0f188aa3f0db7957aaf41ab42166153ba211a12526359e3b5",
-			"candidate": "963640b7c2a07f4ceeba79be988e392529085b55e03a5542dd33384034ea4dd3",
-			"reason": "v4 evidence hardening with exact journal/store/handle/route/write binding; the candidate identity refresh preserves the declared 2,411-source, 70,359-token synthetic shape (no shape migration) and permits only hard-wait removal from 30,000ms to null plus schema 9 to 10",
+			"candidate": "5320a0e2e1909419ac7309eeb5057ab2bfd7ae6ee97913fc77804524aad7acb7",
+			"reason": "v4 evidence hardening with exact journal/store/handle/route/write binding; the candidate identity was re-keyed after behavior-preserving upstream Biome normalization, while the declared 2,411-source, 70,359-token synthetic shape and immutable baseline metrics remain unchanged; only hard-wait removal from 30,000ms to null plus schema 9 to 10 is permitted",
 			"baselineArtifact": {
 				"path": "compaction-results/lcm-replay/baseline-authoritative.json",
 				"sha256": "657ff2616c2f915adbd5a5cba68b27ad2d1e5fe50bcf535c28705f38fc2f5a1f"

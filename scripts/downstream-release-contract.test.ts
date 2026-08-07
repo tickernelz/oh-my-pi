@@ -142,7 +142,7 @@ describe("downstream release governance", () => {
 				const run = typeof step.run === "string" ? step.run : "";
 				expect(uses, `${name} step ${index}`).not.toMatch(/release|publish|attest/i);
 				expect(run, `${name} step ${index}`).not.toMatch(
-					/\b(?:npm|bun)\s+(?:run\s+)?(?:publish|prepublishOnly)\b|\bgh\s+release\b|scripts\/(?:release|setup-npm-trust|ci-release-publish|ci-update-brew-formula|ci-macos-(?:sign|upload-secrets))/i,
+					/\b(?:npm|bun)\s+(?:run\s+)?(?:publish|prepublishOnly)\b|\bgh\s+release\b|scripts\/(?:release(?!\.test\.ts\b)|setup-npm-trust|ci-release-publish|ci-update-brew-formula|ci-macos-(?:sign|upload-secrets))/i,
 				);
 			}
 		}

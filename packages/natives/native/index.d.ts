@@ -61,6 +61,22 @@ export declare class DesktopSession {
   close(): Promise<undefined>
 }
 
+/**
+ * Process-owned cross-platform advisory lock.
+ *
+ * `tryAcquire()` is non-blocking; its returned handle reports whether it won
+ * through `acquired`. Ownership ends on `release()`, garbage collection, or
+ * process exit; `release()` is idempotent.
+ */
+export declare class FileLock {
+  /** Try to acquire `path` without blocking. */
+  static tryAcquire(path: string): FileLock
+  /** Whether this handle owns the requested lock. */
+  get acquired(): boolean
+  /** Release this handle's ownership without affecting a successor. */
+  release(): void
+}
+
 /** WebRTC peer that accepts 16 kHz mono PCM and renders remote Opus audio. */
 export declare class LiveWebRtcPeer {
   /**
@@ -263,7 +279,7 @@ export declare function __ompInstallTokioRuntime(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV17_2_5(): void
+export declare function __piNativesV17_2_10(): void
 
 /**
  * Apply ast-grep rewrite rules to matching files; honors `dryRun` and returns

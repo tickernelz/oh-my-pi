@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-agent-core",
-  "version": "17.2.5",
+  "version": "17.2.10",
   "description": "General-purpose agent with transport abstraction, state management, and attachment support",
   "homepage": "https://github.com/tickernelz/oh-my-pi#readme",
   "author": "Can Boluk",
@@ -44,6 +44,7 @@
     "@opentelemetry/api": "catalog:"
   },
   "devDependencies": {
+    "@oh-my-pi/omptype": "catalog:",
     "@opentelemetry/context-async-hooks": "catalog:",
     "@opentelemetry/sdk-trace-base": "catalog:",
     "@types/bun": "catalog:"

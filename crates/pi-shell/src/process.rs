@@ -1400,8 +1400,8 @@ impl Process {
 	/// Signal this process and its live descendants (children first), skipping
 	/// any pid in `protected`.
 	///
-	/// `protected` shields the harness and its ancestor chain: a
-	/// run-cancellation sweep must never hard-kill the host. On Windows the
+	/// `protected` shields the harness itself: a run-cancellation sweep must
+	/// never hard-kill the host. On Windows the
 	/// descendant tree is derived from raw `th32ParentProcessID` values that
 	/// outlive their recorded parent, so a freshly spawned child whose recycled
 	/// pid matches the harness's stale parent pid makes the harness enumerate
@@ -1509,39 +1509,24 @@ impl Process {
 	}
 }
 
-/// The harness pid plus its resolvable ancestor chain — the set of processes a
-/// run-cancellation sweep must never signal.
+/// The harness pid — the one process a run-cancellation sweep must never
+/// signal.
 ///
 /// On Unix the descendant walk is identity-pinned (pidfd / start-time), so the
 /// host can never appear as a false descendant and this set is a harmless
 /// no-op safety net. On Windows the descendant tree is derived from raw
 /// `th32ParentProcessID` values that survive their recorded parent's death: a
 /// freshly spawned child whose recycled pid matches the harness's stale parent
-/// pid makes the harness (and any of its ancestors) enumerate as a false
-/// descendant, so cancelling a timed-out bash run would `TerminateProcess` the
-/// host with no cleanup and no `session_exit` record (#7452, related #4605).
+/// pid makes the harness enumerate as a false descendant, so cancelling a
+/// timed-out bash run would `TerminateProcess` the host with no cleanup and no
+/// `session_exit` record (#7452, related #4605).
 ///
-/// The host pid is inserted first, before any `Process::from_pid`, so the
-/// harness stays protected even when an ancestor handle cannot be opened.
+/// Do not walk the host's numeric parent chain here. On Windows the host's
+/// recorded parent pid can itself have been recycled onto the cancellation
+/// target; treating that raw pid as protected would spare the hung command and
+/// prune all of its descendants from cleanup.
 fn host_protected_pids() -> HashSet<i32> {
-	let mut protected = HashSet::new();
-	let Ok(mut pid) = i32::try_from(std::process::id()) else {
-		return protected;
-	};
-	// Bound the walk: a corrupted or cyclic parent chain must not loop forever.
-	for _ in 0..64 {
-		if !protected.insert(pid) {
-			break;
-		}
-		let Some(parent) = Process::from_pid(pid).and_then(|process| process.ppid()) else {
-			break;
-		};
-		if parent <= 0 || parent == pid {
-			break;
-		}
-		pid = parent;
-	}
-	protected
+	i32::try_from(std::process::id()).into_iter().collect()
 }
 
 /// True when `pid` is itself protected or descends — within the enumerated
@@ -1917,22 +1902,23 @@ const fn platform_process_group_alive(_pgid: i32) -> bool {
 mod tests {
 	use super::*;
 
-	/// The harness pid must always be in the protected set, even before any
-	/// ancestor handle can be resolved: it is inserted before the first
-	/// `Process::from_pid`. Without this, a run-cancellation sweep that
-	/// enumerated the host as a false descendant would hard-kill the session.
+	/// The harness pid must be the only protected pid. Including its recorded
+	/// parent would be unsafe on Windows: that stale numeric pid can have been
+	/// recycled onto the timed-out command, causing cancellation to spare the
+	/// hung target and its whole subtree.
 	#[test]
 	fn host_protected_pids_includes_self() {
 		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
-		assert!(
-			host_protected_pids().contains(&self_pid),
-			"the harness pid must always be protected from cancellation sweeps",
+		assert_eq!(
+			host_protected_pids(),
+			HashSet::from([self_pid]),
+			"only the harness pid may be protected from cancellation sweeps",
 		);
 	}
 
-	/// Regression test for #7452: a cancellation sweep must never signal a pid
-	/// in the protected (host + ancestors) set, even when it is enumerated as
-	/// the sweep root. On Windows a recycled pid can make the harness surface as
+	/// Regression test for #7452: a cancellation sweep must never signal the
+	/// protected host pid, even when it is enumerated as the sweep root. On
+	/// Windows a recycled pid can make the harness surface as
 	/// a false descendant of a just-spawned child; `TerminateProcess`-ing it
 	/// killed the whole session with no `session_exit` record. The observable
 	/// defense — provable cross-platform — is that `signal_tree_excluding`
@@ -1951,7 +1937,7 @@ mod tests {
 
 		// Treat the child's pid as protected (standing in for the harness/an
 		// ancestor). The sweep must refuse to signal it.
-		let protected: HashSet<i32> = [child_pid].into_iter().collect();
+		let protected: HashSet<i32> = HashSet::from([child_pid]);
 		let signaled = root.signal_tree_excluding(KILL_SIGNAL, &protected);
 		assert_eq!(signaled, 0, "a protected root must never be signalled");
 
@@ -1979,8 +1965,8 @@ mod tests {
 	#[test]
 	fn protected_subtree_is_pruned_not_just_the_pid() {
 		// root(1) -> host(2, protected) -> worker(3); root(1) -> real_child(4).
-		let parents: HashMap<i32, i32> = [(2, 1), (3, 2), (4, 1)].into_iter().collect();
-		let protected: HashSet<i32> = [2].into_iter().collect();
+		let parents: HashMap<i32, i32> = HashMap::from([(2, 1), (3, 2), (4, 1)]);
+		let protected: HashSet<i32> = HashSet::from([2]);
 
 		assert!(
 			pid_in_protected_subtree(2, &protected, &parents),

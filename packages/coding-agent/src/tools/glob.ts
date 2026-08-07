@@ -1,12 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import * as natives from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { formatGroupedPaths, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { splitMemoryGlobPattern } from "../internal-urls/memory-protocol";
@@ -415,7 +415,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				try {
 					stat = await fs.promises.stat(target.searchPath);
 				} catch (err) {
-					if (isEnoent(err)) {
+					// ENAMETOOLONG can never name a real target; surface a clean
+					// "Path not found" instead of leaking the raw errno (issue #7597).
+					if (isEnoent(err) || hasFsCode(err, "ENAMETOOLONG")) {
 						if (isSingle) throw new ToolError(`Path not found: ${scopePath}`);
 						return [];
 					}

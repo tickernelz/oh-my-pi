@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { type as arkType } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ComputerTool, computerApproval, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type {
@@ -19,7 +20,6 @@ import type {
 	DesktopWindow,
 	PointerOptions,
 } from "@oh-my-pi/pi-natives";
-import { type as arkType } from "arktype";
 
 const capabilities: DesktopCapabilities = {
 	backend: "fake",

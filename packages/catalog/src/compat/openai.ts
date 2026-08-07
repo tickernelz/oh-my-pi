@@ -583,7 +583,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		wireModelIdMode,
 		isVercelGatewayHost: isVercelGateway,
 		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
-		extraBody: isDirectDeepseekReasoning ? { thinking: { type: "enabled" } } : undefined,
+		extraBody: undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 		// Kimi-family ids trigger MFJS on any host, not just native base URLs:
 		// proxies (OpenRouter, custom gateways) forward `tools.function.parameters`
@@ -604,10 +604,24 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	};
 
 	applyCompatOverrides(compat, spec.compat);
+	const deepseekThinking = compat.extraBody?.thinking;
+	if (
+		isDirectDeepseekReasoning &&
+		typeof deepseekThinking === "object" &&
+		deepseekThinking !== null &&
+		"type" in deepseekThinking &&
+		deepseekThinking.type === "enabled"
+	) {
+		const extraBody = { ...compat.extraBody };
+		delete extraBody.thinking;
+		compat.extraBody = Object.keys(extraBody).length > 0 ? extraBody : undefined;
+	}
 	if (spec.compat?.reasoningDisableMode === undefined) {
 		compat.reasoningDisableMode = requiresEnabledThinking
 			? "omit"
-			: resolveReasoningDisableMode(compat.thinkingFormat);
+			: isDirectDeepseekReasoning
+				? "zai-thinking-disabled"
+				: resolveReasoningDisableMode(compat.thinkingFormat);
 	}
 	if (spec.compat?.omitReasoningEffort === undefined && !compat.supportsReasoningEffort) {
 		compat.omitReasoningEffort = true;
@@ -615,7 +629,12 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	mergeModelReasoningEffortMap(compat, spec.id, isMimoReasoningEffortModel);
 
 	const whenThinkingPolicy =
-		spec.compat?.whenThinking ?? (isOpenCodeProvider && spec.reasoning ? OPENCODE_WHEN_THINKING : undefined);
+		spec.compat?.whenThinking ??
+		(isDirectDeepseekReasoning
+			? { extraBody: { ...compat.extraBody, thinking: { type: "enabled" } } }
+			: isOpenCodeProvider && spec.reasoning
+				? OPENCODE_WHEN_THINKING
+				: undefined);
 	if (whenThinkingPolicy) {
 		const variant: ResolvedOpenAICompat = { ...compat };
 		applyCompatOverrides(variant, whenThinkingPolicy);

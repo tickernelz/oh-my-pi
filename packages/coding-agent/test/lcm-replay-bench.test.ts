@@ -878,7 +878,7 @@ describe("LCM replay immutable identity", () => {
 		}
 		baseline.fixture.harnessSourceHash = "da43b5239ee196a0f188aa3f0db7957aaf41ab42166153ba211a12526359e3b5";
 		delete baseline.fixture.harnessIdentityHash;
-		candidate.fixture.harnessSourceHash = "963640b7c2a07f4ceeba79be988e392529085b55e03a5542dd33384034ea4dd3";
+		candidate.fixture.harnessSourceHash = "5320a0e2e1909419ac7309eeb5057ab2bfd7ae6ee97913fc77804524aad7acb7";
 		candidate.fixture.harnessIdentityHash = replayHarnessIdentityHash(candidate.fixture.harnessSourceHash);
 		baseline.workloadFingerprint = replayWorkloadFingerprint(baseline);
 		candidate.workloadFingerprint = replayWorkloadFingerprint(candidate);
